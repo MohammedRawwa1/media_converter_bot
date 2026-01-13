@@ -132,7 +132,25 @@ class EnhancedMediaHandler:
     
     async def handle_media_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Main entry point for media messages."""
-        user_id = update.effective_user.id
+        # Log incoming update for debugging dispatch issues
+        try:
+            user_id = update.effective_user.id
+        except Exception:
+            user_id = None
+
+        try:
+            logger.info(
+                "Incoming message update: user_id=%s update_id=%s msg_id=%s has_video=%s has_document=%s has_audio=%s text=%s",
+                user_id,
+                getattr(update, 'update_id', None),
+                getattr(getattr(update, 'message', None), 'message_id', None),
+                bool(getattr(update.message, 'video', None)),
+                bool(getattr(update.message, 'document', None)),
+                bool(getattr(update.message, 'audio', None)),
+                (getattr(update.message, 'text', None) or '')[:200]
+            )
+        except Exception:
+            logger.exception("Failed to log incoming message update")
         # Enforce access control for private bots
         try:
             if not is_user_allowed(user_id):
