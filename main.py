@@ -451,6 +451,8 @@ def setup_handlers(application: Application) -> None:
     application.add_handler(MessageHandler(filters.Video.ALL, handler_manager.handle_media_message))
     application.add_handler(MessageHandler(filters.Audio.ALL, handler_manager.handle_media_message))
     application.add_handler(MessageHandler(filters.Document.ALL, handler_manager.handle_media_message))
+    # Fallback catch-all to help debug message dispatching (non-command updates)
+    application.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, handler_manager.handle_media_message))
     
     # Callback query handler for menu interactions
     application.add_handler(CallbackQueryHandler(handler_manager.callback_handler))
