@@ -1,0 +1,7 @@
+# Render Deployment Configuration
+# This file tells Render how to run the bot
+
+web:
+  command: "python main.py"
+  env: python
+  runtime: python-3.11.7
