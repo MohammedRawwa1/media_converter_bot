@@ -1059,7 +1059,7 @@ class EnhancedMediaHandler:
             await query.edit_message_text(
                 "FFmpeg-python binding is not available on the server. This operation requires ffmpeg-python."
             )
-            logger.warning("ffmpeg-python not available for take_screenshot")
+            logger.info("ffmpeg-python not available for take_screenshot; falling back to CLI where possible")
             return
 
         try:
