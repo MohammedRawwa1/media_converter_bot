@@ -685,7 +685,7 @@ class EnhancedMediaHandler:
         async def do_conversion():
             # Lock the input file to prevent concurrent access
             if AsyncFileLock:
-                lock = AsyncFileLock(path)
+                lock = await AsyncFileLock.acquire(current_file['path'])
                 async with lock:
                     output_path = f"storage/output/{current_file['id']}_audio.mp3"
                     success = await self.converter.extract_audio_from_video(
@@ -1576,8 +1576,8 @@ class EnhancedMediaHandler:
             else:
                 await update.message.reply_text("❌ Invalid CRF. Enter 18-51.")
                 for key in list(context.user_data.keys()):
-                if key.startswith("awaiting_"):
-                    del context.user_data[key]
+                    if key.startswith("awaiting_"):
+                        del context.user_data[key]
         
         elif context.user_data.get('awaiting_resolution'):
             if 'x' in user_input:
