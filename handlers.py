@@ -4,7 +4,7 @@ import os
 import tempfile
 import json
 from typing import Dict, List, Optional
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto
 from telegram.ext import CallbackContext, ConversationHandler, MessageHandler, filters, ContextTypes
 from telegram.error import BadRequest
 import logging
@@ -40,6 +40,12 @@ try:
     import ffmpeg
 except Exception:
     ffmpeg = None
+
+# Optional MongoDB model (best-effort import)
+try:
+    from models import MediaConversionModel
+except Exception:
+    MediaConversionModel = None
 
 # Conversation states
 SELECT_TIME, SELECT_RESOLUTION, SELECT_BITRATE, MERGE_FILES, CUSTOM_INPUT = range(5)
@@ -1499,10 +1505,23 @@ class EnhancedMediaHandler:
     async def log_media_to_db(self, user_id: int, file_info: Dict):
         """Log media processing to MongoDB."""
         try:
-            db = await MongoDB.get_db()
-            if db:
-                collection = db['media_conversions']
-                
+            if MediaConversionModel is None:
+                logger.info("MongoDB model not available; skipping DB logging")
+                return
+
+            # If a MongoDB URL is not configured, skip logging
+            import os
+            mongo_url = os.environ.get('MONGODB_URL')
+            if not mongo_url:
+                logger.info('MONGODB_URL not set; skipping DB logging')
+                return
+
+            # Lazy-import motor and initialize model
+            try:
+                from motor.motor_asyncio import AsyncIOMotorClient
+                client = AsyncIOMotorClient(mongo_url)
+                db_model = MediaConversionModel(client, db_name=os.environ.get('MONGODB_NAME', None) or 'media_conversion_bot')
+
                 log_entry = {
                     'user_id': user_id,
                     'file_name': file_info['name'],
@@ -1511,9 +1530,11 @@ class EnhancedMediaHandler:
                     'timestamp': datetime.now(),
                     'action': 'upload'
                 }
-                
-                await collection.insert_one(log_entry)
+
+                await db_model.log_conversion(log_entry)
                 logger.info(f"Logged media upload for user {user_id}")
+            except Exception as e:
+                logger.error(f"Failed to log to MongoDB: {e}")
         except Exception as e:
             logger.error(f"Failed to log to MongoDB: {e}")
     
