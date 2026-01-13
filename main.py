@@ -797,6 +797,17 @@ try:
             # Preferred queue attribute for Application
             if hasattr(BOT_APPLICATION, 'update_queue'):
                 await BOT_APPLICATION.update_queue.put(update)
+                logger.info("Enqueued Telegram update %s to Application.update_queue", getattr(update, 'update_id', None))
+                # Best-effort: schedule immediate processing if an API is available
+                try:
+                    if hasattr(BOT_APPLICATION, 'process_update'):
+                        asyncio.create_task(BOT_APPLICATION.process_update(update))
+                        logger.debug("Scheduled Application.process_update for update %s", getattr(update, 'update_id', None))
+                    elif hasattr(BOT_APPLICATION, 'bot') and hasattr(BOT_APPLICATION.bot, 'process_update'):
+                        asyncio.create_task(BOT_APPLICATION.bot.process_update(update))
+                        logger.debug("Scheduled bot.process_update for update %s", getattr(update, 'update_id', None))
+                except Exception as e_proc:
+                    logger.debug("Could not schedule immediate processing: %s", e_proc)
             elif hasattr(BOT_APPLICATION, 'bot') and hasattr(BOT_APPLICATION.bot, 'process_update'):
                 # last-resort synchronous processing
                 await BOT_APPLICATION.bot.process_update(update)
