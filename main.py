@@ -2,7 +2,6 @@
 import asyncio
 import logging
 import time
-import subprocess
 from fastapi import FastAPI, Request, HTTPException
 from telegram import Update
 from telegram.ext import (
@@ -18,10 +17,7 @@ from telegram.error import TelegramError
 from config import (
     BOT_TOKEN,
     WEBHOOK_URL,
-    ALLOWED_USER_IDS,
-    ADMIN_USER_ID,
     is_user_allowed,
-    persist_allowed_users,
 )
 from utils import ensure_directories, MediaMenuBuilder
 from handlers import EnhancedMediaHandler
@@ -40,6 +36,7 @@ logger = logging.getLogger(__name__)
 # -------------------------------------------------------------------
 BOT_APPLICATION: Application | None = None
 BOT_STARTED_AT = time.time()
+ACTIVE_TASKS: set[asyncio.Task] = set()  # Track tasks to cancel on shutdown
 
 # -------------------------------------------------------------------
 # Command handlers
@@ -110,9 +107,7 @@ async def telegram_webhook(request: Request):
     data = await request.json()
     update = Update.de_json(data, BOT_APPLICATION.bot)
 
-    # THIS IS THE CRITICAL LINE
     await BOT_APPLICATION.process_update(update)
-
     return {"ok": True}
 
 
@@ -153,10 +148,17 @@ async def startup():
 
 @app.on_event("shutdown")
 async def shutdown():
-    global BOT_APPLICATION
+    global BOT_APPLICATION, ACTIVE_TASKS
+
+    logger.info("🛑 Shutting down bot")
+
+    # Cancel all active background tasks to prevent memory leaks
+    for task in ACTIVE_TASKS:
+        task.cancel()
+    ACTIVE_TASKS.clear()
 
     if BOT_APPLICATION:
-        logger.info("🛑 Shutting down bot")
         await BOT_APPLICATION.stop()
         await BOT_APPLICATION.shutdown()
         BOT_APPLICATION = None
+    logger.info("✅ Bot shutdown complete")
