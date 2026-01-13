@@ -97,7 +97,8 @@ try:
     SENTRY_DSN = __import__('os').environ.get('SENTRY_DSN')
     if SENTRY_DSN:
         try:
-            import sentry_sdk
+            import importlib
+            sentry_sdk = importlib.import_module('sentry_sdk')
             sentry_sdk.init(dsn=SENTRY_DSN, traces_sample_rate=0.0)
             logger.info("Sentry initialized")
         except Exception as se:
@@ -410,7 +411,7 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
         try:
             await context.bot.send_message(
                 chat_id=update.effective_chat.id,
-                text=error_msg,
+                text=user_message,
                 reply_markup=MediaMenuBuilder.get_main_menu() if MediaMenuBuilder else None,
                 parse_mode='Markdown'
             )
@@ -798,6 +799,13 @@ try:
             if hasattr(BOT_APPLICATION, 'update_queue'):
                 await BOT_APPLICATION.update_queue.put(update)
                 logger.info("Enqueued Telegram update %s to Application.update_queue", getattr(update, 'update_id', None))
+                # Also schedule dispatcher.process_update so updates are handled
+                try:
+                    if hasattr(BOT_APPLICATION, 'dispatcher') and hasattr(BOT_APPLICATION.dispatcher, 'process_update'):
+                        asyncio.create_task(BOT_APPLICATION.dispatcher.process_update(update))
+                        logger.debug("Scheduled dispatcher.process_update for update %s", getattr(update, 'update_id', None))
+                except Exception as e_sched:
+                    logger.debug("Could not schedule dispatcher processing: %s", e_sched)
             elif hasattr(BOT_APPLICATION, 'bot') and hasattr(BOT_APPLICATION.bot, 'process_update'):
                 # last-resort synchronous processing (only used if no update_queue exists)
                 await BOT_APPLICATION.bot.process_update(update)
