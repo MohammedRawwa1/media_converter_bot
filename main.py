@@ -280,8 +280,28 @@ def setup_handlers(application: Application) -> None:
     application.add_handler(CommandHandler("cancel", cancel_command))
     
     # Media file handlers (videos, audio, documents)
-    # Use PTB v20+ filter constants (uppercase). Combine into a single handler.
-    media_filter = filters.VIDEO | filters.AUDIO | filters.DOCUMENT
+    # Build the media filter defensively to support multiple PTB versions.
+    def _get_filter(*names):
+        for n in names:
+            f = getattr(filters, n, None)
+            if f is not None:
+                return f
+        return None
+
+    f_video = _get_filter('VIDEO', 'Video', 'video')
+    f_audio = _get_filter('AUDIO', 'Audio', 'audio')
+    f_document = _get_filter('DOCUMENT', 'Document', 'document')
+
+    if f_video or f_audio or f_document:
+        media_filter = None
+        for f in (f_video, f_audio, f_document):
+            if f is None:
+                continue
+            media_filter = f if media_filter is None else (media_filter | f)
+    else:
+        # Fall back to capturing all messages and let the handler decide.
+        media_filter = filters.ALL
+
     application.add_handler(MessageHandler(media_filter, handler_manager.handle_media_message))
     
     # Callback query handler for menu interactions
