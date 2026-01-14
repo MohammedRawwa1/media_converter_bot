@@ -2,10 +2,9 @@
 from datetime import datetime, timedelta
 from typing import Any, Dict, Optional
 
-try:
-    from pymongo import IndexModel
-except ImportError:
-    IndexModel = None
+# Avoid importing pymongo at module import time; handle missing dependency
+# at runtime so the module can be imported even if pymongo isn't installed.
+IndexModel = None
 import logging
 
 logger = logging.getLogger(__name__)
