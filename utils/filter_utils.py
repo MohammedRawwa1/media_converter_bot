@@ -3,6 +3,7 @@
 Provide a single function to build a media filter (video|audio|document)
 defensively so the code works across PTB versions and import variants.
 """
+
 from typing import Optional
 
 
@@ -15,20 +16,21 @@ def build_media_filter(filters_module) -> Optional[object]:
     or provide a callable `.filter`). If none are usable, it falls
     back to `filters_module.ALL`.
     """
+
     def _get_filter(*names):
         for n in names:
             f = getattr(filters_module, n, None)
             if f is None:
                 continue
-            if hasattr(f, 'data_filter') or hasattr(f, '__or__'):
+            if hasattr(f, "data_filter") or hasattr(f, "__or__"):
                 return f
-            if callable(getattr(f, 'filter', None)):
+            if callable(getattr(f, "filter", None)):
                 return f
         return None
 
-    f_video = _get_filter('VIDEO', 'Video', 'video')
-    f_audio = _get_filter('AUDIO', 'Audio', 'audio')
-    f_document = _get_filter('DOCUMENT', 'Document', 'document')
+    f_video = _get_filter("VIDEO", "Video", "video")
+    f_audio = _get_filter("AUDIO", "Audio", "audio")
+    f_document = _get_filter("DOCUMENT", "Document", "document")
 
     media_filter = None
     for f in (f_video, f_audio, f_document):
@@ -42,6 +44,6 @@ def build_media_filter(filters_module) -> Optional[object]:
 
     if media_filter is None:
         # Fall back to a permissive catch-all filter if available
-        return getattr(filters_module, 'ALL', None)
+        return getattr(filters_module, "ALL", None)
 
     return media_filter
