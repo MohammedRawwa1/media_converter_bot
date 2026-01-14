@@ -180,4 +180,5 @@ async def start_cleanup_task():
 
 def stop_cleanup_task():
     """Stop the cleanup manager."""
+
     cleanup_manager.stop()
