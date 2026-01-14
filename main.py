@@ -349,7 +349,7 @@ def setup_handlers(application: Application) -> None:
     
     logger.info("✅ All handlers registered successfully")
 
-async def main() -> None:
+async def main(background: bool = False) -> None:
     """Start the bot."""
     # Validate BOT_TOKEN
     if not BOT_TOKEN:
@@ -462,21 +462,22 @@ async def main() -> None:
     try:
         # Start the bot with PTB v20+ proper async context
         logger.info("Starting bot with PTB v20+...")
-        
-        async with application:
-            await application.initialize()  # Initialize the application
-            await application.start()       # Start the update processing loop
-            # Signal that bot is ready to process updates via dispatcher
+
+        # Background mode (used when running under ASGI/FastAPI):
+        # initialize and start the Application but avoid using the
+        # `async with application` context manager or blocking
+        # `run_polling()` call which conflict with ASGI lifecycle.
+        if background:
+            await application.initialize()
+            await application.start()
             try:
                 BOT_READY.set()
             except Exception:
                 pass
-            
+
+            polling_task = None
             if WEBHOOK_URL:
-                # Webhook mode - PTB v20+ handles everything
                 logger.info(f"🌐 Starting bot in webhook mode: {WEBHOOK_URL}")
-                
-                # Set webhook
                 try:
                     await application.bot.set_webhook(
                         url=WEBHOOK_URL,
@@ -487,27 +488,27 @@ async def main() -> None:
                     logger.info(f"✅ Webhook set successfully: {WEBHOOK_URL}")
                 except Exception as e:
                     logger.error(f"Failed to set webhook: {e}")
+                    # let caller observe failure via exception
                     raise
-                
-                # For Render/ASGI deployment, we'll use the FastAPI approach below
-                logger.info("Bot initialized for webhook mode - FastAPI will handle incoming requests")
-                
             else:
-                # Polling mode
-                logger.info("🚀 Starting bot in polling mode")
-                await application.run_polling(
-                    allowed_updates=["message", "callback_query", "edited_message"],
-                    drop_pending_updates=False
+                # Start polling in a background task so this coroutine can
+                # remain as the ASGI-managed background task.
+                logger.info("🚀 Starting bot polling in background task")
+                polling_task = asyncio.create_task(
+                    application.run_polling(
+                        allowed_updates=["message", "callback_query", "edited_message"],
+                        drop_pending_updates=False
+                    )
                 )
-            
-            # Keep the application running until signal triggers shutdown_event
+
+            # Wait for shutdown_event or cancellation; FastAPI will cancel
+            # this task on shutdown which will raise CancelledError here.
             try:
                 await shutdown_event.wait()
                 logger.info("Shutdown event received, stopping bot...")
-            except (KeyboardInterrupt, SystemExit):
-                logger.info("Bot stopping due to keyboard/system exit")
+            except asyncio.CancelledError:
+                logger.info("Background bot task cancelled; stopping application")
             finally:
-                # Attempt to delete webhook (if set) and stop background cleanup
                 if WEBHOOK_URL:
                     try:
                         await application.bot.delete_webhook(drop_pending_updates=False)
@@ -520,6 +521,14 @@ async def main() -> None:
                     logger.info("Cleanup manager stop requested")
                 except Exception as e:
                     logger.error(f"Error stopping cleanup manager: {e}")
+
+                if polling_task:
+                    try:
+                        polling_task.cancel()
+                        await polling_task
+                    except Exception:
+                        pass
+
                 try:
                     await application.stop()
                 finally:
@@ -527,7 +536,40 @@ async def main() -> None:
                         BOT_READY.clear()
                     except Exception:
                         pass
-                
+
+        else:
+            # Non-ASGI mode: use the context manager as before which manages
+            # the application's lifecycle (initialize/start/stop) and blocks
+            # on polling or webhook mode until shutdown.
+            async with application:
+                await application.initialize()
+                await application.start()
+                try:
+                    BOT_READY.set()
+                except Exception:
+                    pass
+
+                if WEBHOOK_URL:
+                    logger.info(f"🌐 Starting bot in webhook mode: {WEBHOOK_URL}")
+                    try:
+                        await application.bot.set_webhook(
+                            url=WEBHOOK_URL,
+                            allowed_updates=["message", "callback_query", "edited_message"],
+                            max_connections=100,
+                            drop_pending_updates=False
+                        )
+                        logger.info(f"✅ Webhook set successfully: {WEBHOOK_URL}")
+                    except Exception as e:
+                        logger.error(f"Failed to set webhook: {e}")
+                        raise
+
+                else:
+                    logger.info("🚀 Starting bot in polling mode")
+                    await application.run_polling(
+                        allowed_updates=["message", "callback_query", "edited_message"],
+                        drop_pending_updates=False
+                    )
+
     except KeyboardInterrupt:
         logger.info("⌨️  Bot interrupted by user (Ctrl+C)")
     except asyncio.CancelledError:
@@ -733,7 +775,7 @@ try:
     async def _start_bot_background():
         # Launch main() as a background task so uvicorn also serves ASGI endpoints
         try:
-            task = asyncio.create_task(main())
+            task = asyncio.create_task(main(background=True))
             app.state.bot_task = task
 
             def _on_done(t: asyncio.Task):
