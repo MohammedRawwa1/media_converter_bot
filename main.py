@@ -274,6 +274,25 @@ def setup_handlers(application: Application) -> None:
     # Initialize handler manager
     handler_manager = EnhancedMediaHandler()
 
+    # Initialize MongoDB model if MONGO_URI provided
+    try:
+        import os
+        mongo_uri = os.environ.get("MONGO_URI")
+        if mongo_uri:
+            try:
+                from motor.motor_asyncio import AsyncIOMotorClient
+                from models import MediaConversionModel
+
+                client = AsyncIOMotorClient(mongo_uri)
+                model = MediaConversionModel(client)
+                handler_manager.db_model = model
+                application.bot_data["db_model"] = model
+                logger.info("✅ MongoDB model initialized for logging conversions")
+            except Exception:
+                logger.exception("Failed to initialize MongoDB model (motor)")
+    except Exception:
+        logger.debug("MONGO_URI check skipped")
+
     # Command handlers
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("help", help_command))
