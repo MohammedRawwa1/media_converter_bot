@@ -31,6 +31,7 @@ from .callbacks import (
     SAMPLE,
     SCREENSHOTS_MENU,
     SEND_FILE,
+    CONVERT_FORMAT_MENU,
     THUMBNAIL_GRID,
     TRIM_AUDIO,
     TRIM_VIDEO,
@@ -65,7 +66,7 @@ class MediaMenuBuilder:
         elif file_type == "audio":
             buttons = [
                 [
-                    InlineKeyboardButton("🎧 Convert Format", callback_data=f"{FORMAT_PREFIX}menu"),
+                    InlineKeyboardButton("🎧 Convert Format", callback_data=CONVERT_FORMAT_MENU),
                     InlineKeyboardButton("🎚️ Adjust Bitrate", callback_data=BITRATE_PREFIX + "menu"),
                 ],
                 [
@@ -271,7 +272,7 @@ class MediaMenuBuilder:
         """Get video tools menu."""
         buttons = [
             [
-                InlineKeyboardButton("🎬 Convert Format", callback_data=f"{FORMAT_PREFIX}video"),
+                InlineKeyboardButton("🎬 Convert Format", callback_data=CONVERT_FORMAT_MENU),
                 InlineKeyboardButton("📉 Compress", callback_data=COMPRESS_MENU),
             ],
             [
