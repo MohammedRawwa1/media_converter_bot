@@ -10,17 +10,17 @@ import config
 
 # Optional imports
 try:
-    import aiofiles
+    import aiofiles  # noqa: F401
 except ImportError:
     aiofiles = None
 
 try:
-    import ffmpeg
+    import ffmpeg  # noqa: F401
 except ImportError:
     ffmpeg = None
 
 try:
-    from PIL import Image
+    from PIL import Image  # noqa: F401
 except ImportError:
     Image = None
 
@@ -57,7 +57,7 @@ class ExtendedMediaConverter:
                 *full_cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
             )
 
-            stdout, stderr = await process.communicate()
+            _, stderr = await process.communicate()
 
             if process.returncode == 0:
                 return True, "Success"
@@ -110,13 +110,13 @@ class ExtendedMediaConverter:
         return (await self.execute_ffmpeg(cmd, input_path, output_path))[0]
 
     async def extract_audio_from_video(
-        self, input_path: str, output_path: str, format: str = "mp3", bitrate: str = "192k"
+        self, input_path: str, output_path: str, fmt: str = "mp3", bitrate: str = "192k"
     ) -> bool:
         """Extract audio from video."""
         cmd = [
             "-vn",  # No video
             "-acodec",
-            "libmp3lame" if format == "mp3" else "copy",
+            "libmp3lame" if fmt == "mp3" else "copy",
             "-ab",
             bitrate,
             "-ar",
