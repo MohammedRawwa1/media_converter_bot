@@ -82,6 +82,21 @@ NORMALIZE_AUDIO = "normalize_audio"
 TRIM_VIDEO = "trim_video"
 TRIM_AUDIO = "trim_audio"
 
+# UI-friendly aliases (kept for keyboard builders)
+THUMBNAIL_EXTRACTOR = THUMBNAIL_GRID
+CAPTION_EDITOR = "caption_editor"
+MEDIA_FORWARDER = "media_forwarder"
+STREAM_REMOVER = "stream_remover"
+STREAM_EXTRACTOR = EXTRACT_STREAMS
+VIDEO_TRIMMER = TRIM_VIDEO
+VIDEO_MERGER = MERGE_VIDEOS_START
+VIDEOS_SPLITTER = "video_splitter"
+MANUAL_SHOTS = "manual_shots"
+VIDEO_TO_AUDIO = "video_to_audio"
+SUBTITLE_MERGER = "subtitle_merger"
+VIDEO_RENAMER = "video_renamer"
+VIDEO_CONVERTER = CONVERT_FORMAT_MENU
+
 # Optimization presets
 OPTIMIZE_WEB = "optimize_web"
 OPTIMIZE_MOBILE = "optimize_mobile"
