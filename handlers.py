@@ -5,7 +5,7 @@ import tempfile
 import json
 from typing import Dict, List, Optional
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto
-from telegram.ext import ContextTypes, ConversationHandler, MessageHandler, filters, ContextTypes
+from telegram.ext import ContextTypes, ConversationHandler, MessageHandler, filters
 from telegram.error import BadRequest
 import logging
 from datetime import datetime
@@ -28,10 +28,11 @@ except ImportError:
 
 # Import ACL helper
 try:
-    from config import is_user_allowed
+    from config import is_user_allowed, MAX_FILE_SIZE
 except Exception:
     def is_user_allowed(_):
         return True
+    MAX_FILE_SIZE = 4 * 1024**3
 
 logger = logging.getLogger(__name__)
 
@@ -129,6 +130,37 @@ class EnhancedMediaHandler:
     def get_active_conversions(self) -> Dict[int, str]:
         """Get all active conversions."""
         return self.active_conversions.copy()
+
+    async def _check_conversion_quota(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+        """Enforce per-user conversion rate limits if configured.
+
+        Returns True if the user may proceed, False if they are rate-limited
+        (and an informational message has been sent).
+        """
+        try:
+            user_id = update.effective_user.id
+        except Exception:
+            user_id = None
+
+        try:
+            conversion_limiter = None
+            if context and getattr(context, 'application', None):
+                conversion_limiter = context.application.bot_data.get('conversion_rate_limiter')
+            if conversion_limiter and user_id is not None:
+                allowed, message = await conversion_limiter.can_convert(str(user_id))
+                if not allowed:
+                    try:
+                        if getattr(update, 'callback_query', None):
+                            await update.callback_query.edit_message_text(message)
+                        elif getattr(update, 'message', None):
+                            await update.message.reply_text(message)
+                    except Exception:
+                        logger.debug("Failed to notify user about conversion rate limit")
+                return allowed
+        except Exception:
+            # On any error, allow the conversion to proceed (fail-open)
+            logger.debug("Conversion quota check failed, allowing conversion")
+        return True
     
     async def handle_media_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Main entry point for media messages."""
@@ -180,6 +212,20 @@ class EnhancedMediaHandler:
         
         # Schedule session cleanup (resets timer on each interaction)
         self._schedule_session_cleanup(user_id)
+
+        # Respect Telegram API rate limits if a limiter is provided in bot_data
+        try:
+            api_limiter = None
+            if context and getattr(context, 'bot_data', None) is not None:
+                api_limiter = context.bot_data.get('api_rate_limiter')
+            if api_limiter and user_id is not None:
+                try:
+                    await api_limiter.wait_if_needed(str(user_id))
+                except Exception:
+                    # If rate limiter fails, continue but log
+                    logger.debug('API rate limiter wait failed or was skipped')
+        except Exception:
+            pass
         
         # Check if message has video
         if update.message.video:
@@ -196,8 +242,11 @@ class EnhancedMediaHandler:
         video = update.message.video
         user_id = update.effective_user.id
         
-        # Check file size
-        max_size = 4 * 1024**3  # 4GB
+        # Check file size (configurable)
+        try:
+            max_size = int(MAX_FILE_SIZE)
+        except Exception:
+            max_size = 4 * 1024**3
         if video.file_size > max_size:
             await update.message.reply_text(
                 "❌ File too large (max 4GB).\n"
@@ -676,6 +725,10 @@ class EnhancedMediaHandler:
         if not current_file or current_file['type'] != 'video':
             await query.edit_message_text("❌ No video file found.")
             return
+
+        # Conversion quota enforcement
+        if not await self._check_conversion_quota(update, context):
+            return
         
         # Check rate limiting
         conversion_limiter = context.application.bot_data.get('conversion_rate_limiter')
@@ -768,6 +821,9 @@ class EnhancedMediaHandler:
         """Compress video with specified CRF."""
         query = update.callback_query
         user_id = update.effective_user.id
+
+        if not await self._check_conversion_quota(update, context):
+            return
         
         if crf == "custom":
             await query.edit_message_text("Enter CRF value (18-51, lower=better quality):")
@@ -839,6 +895,9 @@ class EnhancedMediaHandler:
     async def merge_videos(self, update: Update, context: ContextTypes.DEFAULT_TYPE, session: Dict):
         """Merge multiple videos."""
         query = update.callback_query
+
+        if not await self._check_conversion_quota(update, context):
+            return
         
         if 'merge_list' not in session or len(session['merge_list']) < 2:
             await query.edit_message_text(
@@ -875,6 +934,9 @@ class EnhancedMediaHandler:
     async def merge_audios(self, update: Update, context: ContextTypes.DEFAULT_TYPE, session: Dict):
         """Merge multiple audio files."""
         query = update.callback_query
+
+        if not await self._check_conversion_quota(update, context):
+            return
         
         if 'merge_list' not in session or len(session['merge_list']) < 2:
             await query.edit_message_text(
@@ -915,6 +977,9 @@ class EnhancedMediaHandler:
         
         if not current_file or current_file['type'] != 'video':
             await query.edit_message_text("❌ No video file found.")
+            return
+
+        if not await self._check_conversion_quota(update, context):
             return
         
         await query.edit_message_text("🔉 Removing audio...")
@@ -960,6 +1025,9 @@ class EnhancedMediaHandler:
             for key in list(context.user_data.keys()):
                 if key.startswith("awaiting_"):
                     del context.user_data[key]
+
+        if not await self._check_conversion_quota(update, context):
+            return
         
         if resolution not in res_map:
             await query.edit_message_text("❌ Invalid resolution.")
@@ -1055,6 +1123,10 @@ class EnhancedMediaHandler:
         if not current_file or current_file['type'] != 'video':
             await query.edit_message_text("❌ No video file found.")
             return
+
+        # Conversion quota enforcement
+        if not await self._check_conversion_quota(update, context):
+            return
         
         await query.edit_message_text("🔧 Attempting to repair video...")
         
@@ -1080,6 +1152,10 @@ class EnhancedMediaHandler:
         
         if not current_file or current_file['type'] != 'video':
             await query.edit_message_text("❌ No video file found.")
+            return
+
+        # Conversion quota enforcement
+        if not await self._check_conversion_quota(update, context):
             return
         
         # Get video duration for calculations (try ffmpeg-python binding, fallback to error)
@@ -1185,6 +1261,9 @@ class EnhancedMediaHandler:
         if not current_file or current_file['type'] != 'video':
             await query.edit_message_text("❌ No video file found.")
             return
+
+        if not await self._check_conversion_quota(update, context):
+            return
         
         await query.edit_message_text("🎞️ Extracting streams...")
         
@@ -1225,6 +1304,9 @@ class EnhancedMediaHandler:
         if not current_file or current_file['type'] != 'video':
             await query.edit_message_text("❌ No video file found.")
             return
+
+        if not await self._check_conversion_quota(update, context):
+            return
         
         await query.edit_message_text("🎵 Extracting audio...")
         
@@ -1252,6 +1334,9 @@ class EnhancedMediaHandler:
         
         if not current_file or current_file['type'] != 'audio':
             await query.edit_message_text("❌ No audio file found.")
+            return
+
+        if not await self._check_conversion_quota(update, context):
             return
         
         await query.edit_message_text(f"🔄 Converting to {format_type.upper()}...")
@@ -1291,6 +1376,9 @@ class EnhancedMediaHandler:
         if not current_file or current_file['type'] != 'audio':
             await query.edit_message_text("❌ No audio file found.")
             return
+
+        if not await self._check_conversion_quota(update, context):
+            return
         
         if bitrate == 'custom':
             await query.edit_message_text("Enter bitrate (e.g., 128k, 320k):")
@@ -1327,6 +1415,9 @@ class EnhancedMediaHandler:
         
         if not current_file or current_file['type'] != 'audio':
             await query.edit_message_text("❌ No audio file found.")
+            return
+
+        if not await self._check_conversion_quota(update, context):
             return
         
         await query.edit_message_text("🔊 Normalizing audio...")
@@ -1496,6 +1587,9 @@ class EnhancedMediaHandler:
         if not current_file:
             await query.edit_message_text("❌ No file found.")
             return
+
+        if not await self._check_conversion_quota(update, context):
+            return
         
         await query.edit_message_text("🎬 Generating 30-second sample...")
         
@@ -1645,7 +1739,10 @@ class EnhancedMediaHandler:
                 end_time = user_input
                 
                 await update.message.reply_text(f"✂️ Trimming from {start_time} to {end_time}...")
-                
+
+                if not await self._check_conversion_quota(update, context):
+                    return
+
                 output_path = f"storage/output/{current_file['id']}_trimmed.mp4"
                 success = await self.converter.trim_video(
                     current_file['path'], output_path, start_time, end_time
