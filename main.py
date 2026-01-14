@@ -6,43 +6,49 @@ Main entry point for media conversion bot - Updated for PTB v20+
 import asyncio
 import logging
 import signal
-import sys
-import subprocess
 import time
+import subprocess
+import threading
+
 from telegram import Update
+from telegram.error import TelegramError
 from telegram.ext import (
     Application,
-    CommandHandler,
-    MessageHandler,
     CallbackQueryHandler,
+    CommandHandler,
     ContextTypes,
-    filters
+    MessageHandler,
+    filters,
 )
-from telegram.error import TelegramError
 
-from config import BOT_TOKEN, WEBHOOK_URL, MAX_FILE_SIZE, FFMPEG_PATH, ALLOWED_USER_IDS, ADMIN_USER_ID, is_user_allowed, persist_allowed_users
 import config as cfg
-from utils import (
-    ensure_directories,
-    MediaMenuBuilder,
-)
-from utils.rate_limiter import TelegramAPIRateLimiter, ConversionRateLimiter
-from utils.webhook_monitor import WebhookRecoveryManager
-from utils.error_handler import (
-    setup_comprehensive_logging,
-    get_error_handler,
+from config import (
+    ADMIN_USER_ID,
+    ALLOWED_USER_IDS,
+    BOT_TOKEN,
+    FFMPEG_PATH,
+    WEBHOOK_URL,
+    is_user_allowed,
+    persist_allowed_users,
 )
 from handlers import EnhancedMediaHandler
 from tasks import (
     start_cleanup_task,
     stop_cleanup_task,
 )
+from utils import (
+    MediaMenuBuilder,
+    ensure_directories,
+)
+from utils.error_handler import (
+    get_error_handler,
+    setup_comprehensive_logging,
+)
+from utils.rate_limiter import ConversionRateLimiter, TelegramAPIRateLimiter
+from utils.webhook_monitor import WebhookRecoveryManager
 
 # Configure comprehensive logging with rotation
-logging.basicConfig(
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.INFO
-)
+logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # Bot application handle for metrics and introspection when started under ASGI
@@ -50,7 +56,6 @@ BOT_APPLICATION = None
 BOT_STARTED_AT = None
 START_TIME = time.time()
 BOT_READY = asyncio.Event()
-import threading
 
 # Simple in-memory Prometheus-style counters
 METRICS = {
@@ -62,6 +67,7 @@ METRICS = {
 }
 METRICS_LOCK = threading.Lock()
 
+
 def check_ffmpeg_available() -> bool:
     """Return True if ffmpeg is callable from PATH or configured FFMPEG_PATH."""
     try:
@@ -70,30 +76,28 @@ def check_ffmpeg_available() -> bool:
     except Exception:
         return False
 
+
 # Setup comprehensive logging with file rotation
 try:
-    setup_comprehensive_logging(
-        log_file="logs/bot.log",
-        level=logging.INFO,
-        max_bytes=10485760,  # 10MB
-        backup_count=5
-    )
+    setup_comprehensive_logging(log_file="logs/bot.log", level=logging.INFO, max_bytes=10485760, backup_count=5)  # 10MB
 except Exception as e:
     logger.warning(f"Could not setup rotating file handler: {e}")
 
 # Initialize Sentry if configured via SENTRY_DSN environment variable
 try:
-    SENTRY_DSN = __import__('os').environ.get('SENTRY_DSN')
+    SENTRY_DSN = __import__("os").environ.get("SENTRY_DSN")
     if SENTRY_DSN:
         try:
             import importlib
-            sentry_sdk = importlib.import_module('sentry_sdk')
+
+            sentry_sdk = importlib.import_module("sentry_sdk")
             sentry_sdk.init(dsn=SENTRY_DSN, traces_sample_rate=0.0)
             logger.info("Sentry initialized")
         except Exception as se:
             logger.warning(f"Failed to initialize Sentry: {se}")
 except Exception:
     pass
+
 
 # Command handlers
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -107,9 +111,9 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     except Exception:
         await update.message.reply_text("Access denied. (ACL check failed)")
         return
-    
+
     user_name = update.effective_user.first_name
-    
+
     welcome_text = f"""
 🎬 **Welcome to Media Conversion Bot** 🎧
 
@@ -140,13 +144,10 @@ Hello {user_name}! I can help you convert, compress, and process media files.
 
 Send me a file to get started! 🚀
 """
-    
-    await update.message.reply_text(
-        welcome_text,
-        reply_markup=MediaMenuBuilder.get_main_menu(),
-        parse_mode='Markdown'
-    )
+
+    await update.message.reply_text(welcome_text, reply_markup=MediaMenuBuilder.get_main_menu(), parse_mode="Markdown")
     logger.info(f"User {user_id} ({user_name}) started the bot")
+
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Help command handler."""
@@ -198,19 +199,17 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 **Need help?** Just send a file and use the menus! 🎯
 """
-    
-    await update.message.reply_text(
-        help_text,
-        parse_mode='Markdown'
-    )
+
+    await update.message.reply_text(help_text, parse_mode="Markdown")
+
 
 async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Cancel current operation."""
     await update.message.reply_text(
-        "❌ Operation cancelled.\n\n"
-        "Send /start to see available options.",
-        reply_markup=MediaMenuBuilder.get_main_menu()
+        "❌ Operation cancelled.\n\n" "Send /start to see available options.",
+        reply_markup=MediaMenuBuilder.get_main_menu(),
     )
+
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle errors in the application with comprehensive logging."""
@@ -218,15 +217,15 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
     if isinstance(context.error, asyncio.CancelledError):
         logger.info("Task was cancelled")
         return
-    
+
     # Get error handler instance
     error_handler_inst = get_error_handler()
-    
+
     # Extract user info if available
     user_id = None
-    if update and hasattr(update, 'effective_user') and update.effective_user:
+    if update and hasattr(update, "effective_user") and update.effective_user:
         user_id = update.effective_user.id
-    
+
     # Log detailed error
     error_info = error_handler_inst.log_error(
         context.error,
@@ -235,26 +234,26 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
         user_id=user_id,
         additional_info={
             "update_type": type(update).__name__ if update else "None",
-        }
+        },
     )
-    
+
     # Log full traceback
     logger.error("Exception while handling an update:", exc_info=context.error)
-    
+
     # Handle Telegram-specific errors
     if isinstance(context.error, TelegramError):
         logger.warning(f"Telegram API error: {context.error}")
-    
+
     # Get user-friendly message
-    user_message = error_info['user_message']
-    
+    user_message = error_info["user_message"]
+
     # Try to send error message to user
     if update and update.effective_message:
         try:
             await update.effective_message.reply_text(
                 user_message,
                 reply_markup=MediaMenuBuilder.get_main_menu() if MediaMenuBuilder else None,
-                parse_mode='Markdown'
+                parse_mode="Markdown",
             )
         except Exception as e:
             logger.error(f"Failed to send error message to user: {e}")
@@ -264,27 +263,29 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
                 chat_id=update.effective_chat.id,
                 text=user_message,
                 reply_markup=MediaMenuBuilder.get_main_menu() if MediaMenuBuilder else None,
-                parse_mode='Markdown'
+                parse_mode="Markdown",
             )
         except Exception as e:
             logger.error(f"Failed to send error to chat: {e}")
+
 
 def setup_handlers(application: Application) -> None:
     """Setup all bot handlers."""
     # Initialize handler manager
     handler_manager = EnhancedMediaHandler()
-    
+
     # Command handlers
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("cancel", cancel_command))
-    
+
     # Media file handlers (videos, audio, documents)
     # Build the media filter defensively to support multiple PTB versions.
     # Build a resilient media filter using a shared helper (supports
     # multiple PTB versions and import variants).
     try:
         from utils.filter_utils import build_media_filter
+
         media_filter = build_media_filter(filters)
         if media_filter is None:
             media_filter = filters.ALL
@@ -293,10 +294,10 @@ def setup_handlers(application: Application) -> None:
         media_filter = filters.ALL
 
     application.add_handler(MessageHandler(media_filter, handler_manager.handle_media_message))
-    
+
     # Callback query handler for menu interactions
     application.add_handler(CallbackQueryHandler(handler_manager.callback_handler))
-    
+
     # Admin commands (manage allowed users)
     async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_id = update.effective_user.id
@@ -305,13 +306,13 @@ def setup_handlers(application: Application) -> None:
             await update.message.reply_text("Unauthorized: admin only")
             return
 
-        args = context.args if hasattr(context, 'args') else []
+        args = context.args if hasattr(context, "args") else []
         if not args:
             await update.message.reply_text("Usage: /admin add|remove|list <user_id>")
             return
 
         cmd = args[0].lower()
-        if cmd == 'list':
+        if cmd == "list":
             users = sorted(list(ALLOWED_USER_IDS))
             await update.message.reply_text(f"Allowed users: {users}")
             return
@@ -326,28 +327,29 @@ def setup_handlers(application: Application) -> None:
             await update.message.reply_text("Invalid user id")
             return
 
-        if cmd == 'add':
+        if cmd == "add":
             cfg.ALLOWED_USER_IDS.add(target)
             persist_allowed_users()
             await update.message.reply_text(f"Added {target} to allowed users")
             return
-        if cmd == 'remove':
+        if cmd == "remove":
             cfg.ALLOWED_USER_IDS.discard(target)
             persist_allowed_users()
             await update.message.reply_text(f"Removed {target} from allowed users")
             return
 
         await update.message.reply_text("Unknown admin command")
-    
-    application.add_handler(CommandHandler('admin', admin_command))
-    
+
+    application.add_handler(CommandHandler("admin", admin_command))
+
     # Store handler manager in bot_data for access in other handlers
-    application.bot_data['handler_manager'] = handler_manager
-    
+    application.bot_data["handler_manager"] = handler_manager
+
     # Error handler (must be added last)
     application.add_error_handler(error_handler)
-    
+
     logger.info("✅ All handlers registered successfully")
+
 
 async def main(background: bool = False) -> None:
     """Start the bot."""
@@ -355,49 +357,42 @@ async def main(background: bool = False) -> None:
     if not BOT_TOKEN:
         logger.error("BOT_TOKEN not set in environment variables!")
         raise ValueError("BOT_TOKEN is required. Set it in .env file.")
-    
+
     # Create the Application for PTB v20+
     application = Application.builder().token(BOT_TOKEN).build()
-    
+
     # Expose application for ASGI metrics and introspection
     global BOT_APPLICATION, BOT_STARTED_AT
     BOT_APPLICATION = application
     BOT_STARTED_AT = time.time()
-    
+
     # Expose ACL into application context
     try:
-        application.bot_data['allowed_user_ids'] = ALLOWED_USER_IDS
-        application.bot_data['admin_user_id'] = ADMIN_USER_ID
+        application.bot_data["allowed_user_ids"] = ALLOWED_USER_IDS
+        application.bot_data["admin_user_id"] = ADMIN_USER_ID
     except Exception:
-        application.bot_data['allowed_user_ids'] = set()
-        application.bot_data['admin_user_id'] = None
-    
+        application.bot_data["allowed_user_ids"] = set()
+        application.bot_data["admin_user_id"] = None
+
     # Initialize rate limiters
     api_limiter = TelegramAPIRateLimiter()
     conversion_limiter = ConversionRateLimiter(conversions_per_hour=100)
-    
+
     # Attach rate limiters to application context
-    application.bot_data['api_rate_limiter'] = api_limiter
-    application.bot_data['conversion_rate_limiter'] = conversion_limiter
-    
+    application.bot_data["api_rate_limiter"] = api_limiter
+    application.bot_data["conversion_rate_limiter"] = conversion_limiter
+
     logger.info("Rate limiters initialized")
     logger.info(f"  - API limit: {TelegramAPIRateLimiter.GENERAL_LIMIT} calls/sec globally")
     logger.info(f"  - Per-user limit: {TelegramAPIRateLimiter.PER_USER_LIMIT} call/sec")
-    logger.info(f"  - Conversion limit: 100 conversions/hour per user")
-    
+    logger.info("  - Conversion limit: 100 conversions/hour per user")
+
     # Setup handlers
     setup_handlers(application)
-    
+
     # Create directories
-    await ensure_directories(
-        "storage",
-        "storage/input",
-        "storage/output",
-        "storage/temp",
-        "storage/thumbnails",
-        "logs"
-    )
-    
+    await ensure_directories("storage", "storage/input", "storage/output", "storage/temp", "storage/thumbnails", "logs")
+
     # Start cleanup manager
     try:
         asyncio.create_task(start_cleanup_task())
@@ -414,17 +409,18 @@ async def main(background: bool = False) -> None:
     # Check ffmpeg-python binding availability (best-effort)
     try:
         import importlib
-        ffmpeg_bind = importlib.import_module('ffmpeg')
+
+        importlib.import_module("ffmpeg")
         logger.info("ffmpeg-python (python binding) is available")
         # Reduce noisy logs from ffmpeg/ffmpeg-python internals where possible
         try:
-            logging.getLogger('ffmpeg').setLevel(logging.ERROR)
-            logging.getLogger('ffmpeg._core').setLevel(logging.ERROR)
+            logging.getLogger("ffmpeg").setLevel(logging.ERROR)
+            logging.getLogger("ffmpeg._core").setLevel(logging.ERROR)
         except Exception:
             pass
     except Exception:
         logger.info("ffmpeg-python not available; falling back to CLI ffmpeg calls")
-    
+
     # Initialize webhook recovery manager if using webhooks
     webhook_manager = None
     if WEBHOOK_URL:
@@ -458,7 +454,7 @@ async def main(background: bool = False) -> None:
         except Exception:
             # SIGTERM may not be available on some platforms
             pass
-    
+
     try:
         # Start the bot with PTB v20+ proper async context
         logger.info("Starting bot with PTB v20+...")
@@ -483,7 +479,7 @@ async def main(background: bool = False) -> None:
                         url=WEBHOOK_URL,
                         allowed_updates=["message", "callback_query", "edited_message"],
                         max_connections=100,
-                        drop_pending_updates=False
+                        drop_pending_updates=False,
                     )
                     logger.info(f"✅ Webhook set successfully: {WEBHOOK_URL}")
                 except Exception as e:
@@ -561,7 +557,7 @@ async def main(background: bool = False) -> None:
                             url=WEBHOOK_URL,
                             allowed_updates=["message", "callback_query", "edited_message"],
                             max_connections=100,
-                            drop_pending_updates=False
+                            drop_pending_updates=False,
                         )
                         logger.info(f"✅ Webhook set successfully: {WEBHOOK_URL}")
                     except Exception as e:
@@ -571,8 +567,7 @@ async def main(background: bool = False) -> None:
                 else:
                     logger.info("🚀 Starting bot in polling mode")
                     await application.run_polling(
-                        allowed_updates=["message", "callback_query", "edited_message"],
-                        drop_pending_updates=False
+                        allowed_updates=["message", "callback_query", "edited_message"], drop_pending_updates=False
                     )
 
     except KeyboardInterrupt:
@@ -582,6 +577,7 @@ async def main(background: bool = False) -> None:
     except Exception as e:
         logger.error(f"❌ Error starting bot: {e}", exc_info=True)
         raise
+
 
 if __name__ == "__main__":
     try:
@@ -593,7 +589,7 @@ if __name__ == "__main__":
 
 # FastAPI app for webhook handling - PTB v20+ compatible
 try:
-    from fastapi import FastAPI, Request, HTTPException
+    from fastapi import FastAPI, HTTPException, Request
     from fastapi.responses import Response
     from telegram import Update as TgUpdate
 
@@ -603,8 +599,8 @@ try:
     async def health():
         dispatcher_ready = False
         try:
-            dispatcher = getattr(BOT_APPLICATION, 'dispatcher', None)
-            dispatcher_ready = bool(dispatcher and hasattr(dispatcher, 'process_update'))
+            dispatcher = getattr(BOT_APPLICATION, "dispatcher", None)
+            dispatcher_ready = bool(dispatcher and hasattr(dispatcher, "process_update"))
         except Exception:
             dispatcher_ready = False
 
@@ -614,7 +610,7 @@ try:
             "bot_ready": BOT_READY.is_set(),
             "dispatcher_ready": dispatcher_ready,
             "startup_time": BOT_STARTED_AT,
-            "error": getattr(app.state, 'startup_error', None)
+            "error": getattr(app.state, "startup_error", None),
         }
 
     @app.post("/telegram/webhook")
@@ -645,28 +641,30 @@ try:
         # Increment webhook counter
         try:
             with METRICS_LOCK:
-                METRICS['webhooks_received'] += 1
+                METRICS["webhooks_received"] += 1
         except Exception:
             pass
 
         # Helper: background retry dispatcher
         async def _background_retry_dispatch(u, attempts=12, delay=0.5):
-            disp = getattr(BOT_APPLICATION, 'dispatcher', None)
+            disp = getattr(BOT_APPLICATION, "dispatcher", None)
             for i in range(attempts):
                 try:
-                    disp = getattr(BOT_APPLICATION, 'dispatcher', None)
-                    if disp and hasattr(disp, 'process_update'):
+                    disp = getattr(BOT_APPLICATION, "dispatcher", None)
+                    if disp and hasattr(disp, "process_update"):
                         with METRICS_LOCK:
-                            METRICS['dispatch_attempts'] += 1
+                            METRICS["dispatch_attempts"] += 1
                         await disp.process_update(u)
                         with METRICS_LOCK:
-                            METRICS['updates_dispatched'] += 1
-                        logger.info(f"Background dispatched update {getattr(u, 'update_id', 'unknown')} on attempt {i+1}")
+                            METRICS["updates_dispatched"] += 1
+                        logger.info(
+                            f"Background dispatched update {getattr(u, 'update_id', 'unknown')} on attempt {i+1}"
+                        )
                         return True
                 except Exception as e:
                     logger.debug(f"Background dispatch attempt {i+1} failed: {e}")
                     with METRICS_LOCK:
-                        METRICS['dispatch_failures'] += 1
+                        METRICS["dispatch_failures"] += 1
                 await asyncio.sleep(delay)
             logger.error(f"Background dispatch exhausted for update {getattr(u, 'update_id', 'unknown')}")
             return False
@@ -674,29 +672,34 @@ try:
         # Try immediate dispatch with a few attempts (fast path)
         attempts = 6
         for i in range(attempts):
-            dispatcher = getattr(BOT_APPLICATION, 'dispatcher', None)
-            if dispatcher and hasattr(dispatcher, 'process_update'):
+            dispatcher = getattr(BOT_APPLICATION, "dispatcher", None)
+            if dispatcher and hasattr(dispatcher, "process_update"):
                 try:
                     with METRICS_LOCK:
-                        METRICS['dispatch_attempts'] += 1
+                        METRICS["dispatch_attempts"] += 1
                     await dispatcher.process_update(update)
                     with METRICS_LOCK:
-                        METRICS['updates_dispatched'] += 1
-                    logger.info(f"Dispatched update {getattr(update, 'update_id', 'unknown')} via dispatcher.process_update on attempt {i+1}")
-                    return {"ok": True, "update_id": getattr(update, 'update_id', None), "dispatched": True}
+                        METRICS["updates_dispatched"] += 1
+                    update_id = getattr(update, "update_id", "unknown")
+                    logger.info(
+                        "Dispatched update %s via dispatcher.process_update on attempt %s",
+                        update_id,
+                        i + 1,
+                    )
+                    return {"ok": True, "update_id": getattr(update, "update_id", None), "dispatched": True}
                 except Exception as e:
                     logger.warning(f"Immediate dispatcher attempt {i+1} failed: {e}")
                     with METRICS_LOCK:
-                        METRICS['dispatch_failures'] += 1
+                        METRICS["dispatch_failures"] += 1
             await asyncio.sleep(0.25)
 
         # Immediate dispatch not successful — try to enqueue
         try:
             await BOT_APPLICATION.update_queue.put(update)
             with METRICS_LOCK:
-                METRICS['updates_queued'] += 1
+                METRICS["updates_queued"] += 1
             logger.info(f"Queued update {getattr(update, 'update_id', 'unknown')} after immediate attempts")
-            return {"ok": True, "update_id": getattr(update, 'update_id', None), "queued": True}
+            return {"ok": True, "update_id": getattr(update, "update_id", None), "queued": True}
         except Exception as enqueue_exc:
             logger.warning(f"Enqueue failed: {enqueue_exc}; scheduling background retry and returning 200")
             # Schedule background retry but return 200 immediately (retry-accept policy)
@@ -704,7 +707,7 @@ try:
                 asyncio.create_task(_background_retry_dispatch(update))
             except Exception as e:
                 logger.error(f"Failed to schedule background retry: {e}")
-            return {"ok": True, "update_id": getattr(update, 'update_id', None), "accepted": True}
+            return {"ok": True, "update_id": getattr(update, "update_id", None), "accepted": True}
 
     @app.get("/metrics")
     async def metrics():
@@ -715,7 +718,7 @@ try:
         active_convs = 0
         try:
             if BOT_APPLICATION and BOT_APPLICATION.bot_data:
-                mgr = BOT_APPLICATION.bot_data.get('handler_manager')
+                mgr = BOT_APPLICATION.bot_data.get("handler_manager")
                 if mgr:
                     active_convs = len(mgr.get_active_conversions())
         except Exception:
@@ -751,28 +754,34 @@ try:
         info = {
             "bot_initialized": BOT_APPLICATION is not None,
             "bot_ready": BOT_READY.is_set(),
-            "startup_error": getattr(app.state, 'startup_error', None),
+            "startup_error": getattr(app.state, "startup_error", None),
             "bot_started_at": BOT_STARTED_AT,
         }
 
         try:
-            info['bot_data_keys'] = list(BOT_APPLICATION.bot_data.keys()) if BOT_APPLICATION and BOT_APPLICATION.bot_data else []
+            info["bot_data_keys"] = (
+                list(BOT_APPLICATION.bot_data.keys()) if BOT_APPLICATION and BOT_APPLICATION.bot_data else []
+            )
         except Exception:
-            info['bot_data_keys'] = None
+            info["bot_data_keys"] = None
 
         try:
-            dispatcher = getattr(BOT_APPLICATION, 'dispatcher', None)
-            info['dispatcher_available'] = bool(dispatcher)
-            info['dispatcher_has_process_update'] = bool(dispatcher and hasattr(dispatcher, 'process_update'))
+            dispatcher = getattr(BOT_APPLICATION, "dispatcher", None)
+            info["dispatcher_available"] = bool(dispatcher)
+            info["dispatcher_has_process_update"] = bool(dispatcher and hasattr(dispatcher, "process_update"))
         except Exception:
-            info['dispatcher_available'] = False
-            info['dispatcher_has_process_update'] = False
+            info["dispatcher_available"] = False
+            info["dispatcher_has_process_update"] = False
 
         try:
-            mgr = BOT_APPLICATION.bot_data.get('handler_manager') if BOT_APPLICATION and BOT_APPLICATION.bot_data else None
-            info['active_conversions'] = len(mgr.get_active_conversions()) if mgr else 0
+            mgr = (
+                BOT_APPLICATION.bot_data.get("handler_manager")
+                if BOT_APPLICATION and BOT_APPLICATION.bot_data
+                else None
+            )
+            info["active_conversions"] = len(mgr.get_active_conversions()) if mgr else 0
         except Exception:
-            info['active_conversions'] = None
+            info["active_conversions"] = None
 
         return info
 
@@ -809,7 +818,7 @@ try:
     async def _stop_bot_background():
         # Cancel the background bot task if present
         try:
-            task = getattr(app.state, 'bot_task', None)
+            task = getattr(app.state, "bot_task", None)
             if task and not task.done():
                 task.cancel()
                 try:
