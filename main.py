@@ -280,9 +280,9 @@ def setup_handlers(application: Application) -> None:
     application.add_handler(CommandHandler("cancel", cancel_command))
     
     # Media file handlers (videos, audio, documents)
-    application.add_handler(MessageHandler(filters.Video.ALL, handler_manager.handle_media_message))
-    application.add_handler(MessageHandler(filters.Audio.ALL, handler_manager.handle_media_message))
-    application.add_handler(MessageHandler(filters.Document.ALL, handler_manager.handle_media_message))
+    # Use PTB v20+ filter constants (uppercase). Combine into a single handler.
+    media_filter = filters.VIDEO | filters.AUDIO | filters.DOCUMENT
+    application.add_handler(MessageHandler(media_filter, handler_manager.handle_media_message))
     
     # Callback query handler for menu interactions
     application.add_handler(CallbackQueryHandler(handler_manager.callback_handler))
