@@ -1,6 +1,6 @@
 # main.py
 """
-Main entry point for media conversion bot.
+Main entry point for media conversion bot - Updated for PTB v20+
 """
 
 import asyncio
@@ -15,9 +15,8 @@ from telegram.ext import (
     CommandHandler,
     MessageHandler,
     CallbackQueryHandler,
-    ConversationHandler,
-    filters,
-    ContextTypes
+    ContextTypes,
+    filters
 )
 from telegram.error import TelegramError
 
@@ -38,26 +37,6 @@ from utils.error_handler import (
 )
 from handlers import EnhancedMediaHandler
 from tasks import (
-    convert_video_to_mp3,
-    compress_video,
-    extract_audio,
-    merge_videos,
-    merge_audios,
-    take_screenshot,
-    change_resolution,
-    trim_media,
-    repair_video,
-    optimize_video,
-    create_thumbnail_grid,
-    generate_sample,
-    extract_streams,
-    convert_audio_format,
-    adjust_bitrate,
-    normalize_audio,
-    extract_subtitles,
-    edit_metadata,
-    create_archive,
-    CleanupManager,
     start_cleanup_task,
     stop_cleanup_task
 )
@@ -68,6 +47,7 @@ logging.basicConfig(
     level=logging.INFO
 )
 logger = logging.getLogger(__name__)
+
 # Bot application handle for metrics and introspection when started under ASGI
 BOT_APPLICATION = None
 BOT_STARTED_AT = None
@@ -104,12 +84,7 @@ try:
         except Exception as se:
             logger.warning(f"Failed to initialize Sentry: {se}")
 except Exception:
-    # Best-effort only; do not fail startup if Sentry init cannot be performed
     pass
-
-# Conversation states
-SELECT_TIME, SELECT_RESOLUTION, SELECT_BITRATE, MERGE_FILES, CUSTOM_INPUT = range(5)
-
 
 # Command handlers
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -123,6 +98,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     except Exception:
         await update.message.reply_text("Access denied. (ACL check failed)")
         return
+    
     user_name = update.effective_user.first_name
     
     welcome_text = f"""
@@ -162,7 +138,6 @@ Send me a file to get started! 🚀
         parse_mode='Markdown'
     )
     logger.info(f"User {user_id} ({user_name}) started the bot")
-
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Help command handler."""
@@ -220,146 +195,13 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         parse_mode='Markdown'
     )
 
-
-async def convert_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Convert command handler."""
-    await update.message.reply_text(
-        "🔄 **Format Conversion**\n"
-        "Send me a media file, then select conversion options from the menu.\n\n"
-        "Supported formats:\n"
-        "• Video: MP4, AVI, MOV, MKV, FLV, WEBM, WMV, 3GP\n"
-        "• Audio: MP3, WAV, AAC, FLAC, OGG, M4A, WMA, OPUS\n\n"
-        "Just send a file to get started! 📤",
-        parse_mode='Markdown'
-    )
-
-
-async def compress_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Compress command handler."""
-    await update.message.reply_text(
-        "📉 **Video Compression**\n"
-        "Send a video file to reduce its size while maintaining quality.\n\n"
-        "**Options available:**\n"
-        "• Quality presets (High → Extreme compression)\n"
-        "• Resolution reduction (4K → 1080p, etc.)\n"
-        "• Custom CRF values (18-51)\n"
-        "• Bitrate adjustment\n\n"
-        "Send a video to see compression options! 🎬",
-        parse_mode='Markdown'
-    )
-
-
-async def merge_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Merge command handler."""
-    await update.message.reply_text(
-        "🔀 **File Merging**\n"
-        "Combine multiple videos or audio files into one.\n\n"
-        "**How to use:**\n"
-        "1. Send first file\n"
-        "2. Send second file\n"
-        "3. Send more files (optional)\n"
-        "4. Select 'Start Merge' from menu\n\n"
-        "Send your first file to begin! 📁",
-        parse_mode='Markdown'
-    )
-
-
-async def info_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Info command handler."""
-    await update.message.reply_text(
-        "📊 **Media Information**\n"
-        "Send any media file to get detailed analysis:\n\n"
-        "**Information includes:**\n"
-        "• File format & size\n"
-        "• Duration & bitrate\n"
-        "• Video: Resolution, FPS, codec\n"
-        "• Audio: Channels, sample rate, codec\n"
-        "• Metadata (title, artist, etc.)\n\n"
-        "Send a file to analyze! 🔍",
-        parse_mode='Markdown'
-    )
-
-
-async def screenshot_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Screenshot command handler."""
-    await update.message.reply_text(
-        "🖼️ **Screenshot Capture**\n"
-        "Take screenshots from videos at specific times.\n\n"
-        "**Options:**\n"
-        "• Single screenshot (start/middle/end/custom)\n"
-        "• Multiple screenshots grid (2-20)\n"
-        "• Thumbnail grid (3x3, 4x4)\n\n"
-        "Send a video to capture frames! 🎞️",
-        parse_mode='Markdown'
-    )
-
-
-async def trim_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Trim command handler."""
-    await update.message.reply_text(
-        "✂️ **Media Trimming**\n"
-        "Cut videos or audio files to specific segments.\n\n"
-        "**How to use:**\n"
-        "1. Send a video/audio file\n"
-        "2. Select 'Trim' from menu\n"
-        "3. Enter start time (HH:MM:SS)\n"
-        "4. Enter end time (HH:MM:SS)\n"
-        "5. Get trimmed file\n\n"
-        "Supports frame-accurate trimming! ⏱️",
-        parse_mode='Markdown'
-    )
-
-
-async def extract_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Extract command handler."""
-    await update.message.reply_text(
-        "🎞️ **Stream Extraction**\n"
-        "Extract components from media files:\n\n"
-        "**Can extract:**\n"
-        "• Audio tracks from videos\n"
-        "• Video stream (without audio)\n"
-        "• Subtitles (SRT, ASS, VTT)\n"
-        "• All streams separately\n\n"
-        "Send a file to extract components! 📦",
-        parse_mode='Markdown'
-    )
-
-
-async def upload_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Upload instruction handler for large files."""
-    await update.message.reply_text(
-        "📤 **Upload Instructions**\n"
-        "For files larger than Telegram limits, provide a direct HTTP(S) download link or upload to a cloud storage (Google Drive, Dropbox, S3) and share the link.\n"
-        "You can also split large files locally and send parts, or contact the admin for alternative upload methods.",
-        parse_mode='Markdown'
-    )
-
-
-async def optimize_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Optimize command handler."""
-    await update.message.reply_text(
-        "⚡ **Media Optimization**\n"
-        "Optimize files for specific use cases:\n\n"
-        "**Presets available:**\n"
-        "• 🌐 For Web - Fast loading\n"
-        "• 📱 For Mobile - Small size\n"
-        "• 📺 For TV - High quality\n"
-        "• 💾 For Storage - Max compression\n"
-        "• 🔧 Custom - Fine-tune\n\n"
-        "Send a file to optimize! 🚀",
-        parse_mode='Markdown'
-    )
-
-
-async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Cancel current operation."""
     await update.message.reply_text(
         "❌ Operation cancelled.\n\n"
         "Send /start to see available options.",
         reply_markup=MediaMenuBuilder.get_main_menu()
     )
-    return ConversationHandler.END
-
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle errors in the application with comprehensive logging."""
@@ -417,15 +259,6 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
             )
         except Exception as e:
             logger.error(f"Failed to send error to chat: {e}")
-    
-    # Attempt cleanup if we have context
-    if hasattr(context, 'user_data'):
-        # Signal any running tasks to stop
-        if 'conversion_task' in context.user_data:
-            task = context.user_data['conversion_task']
-            if isinstance(task, asyncio.Task) and not task.done():
-                task.cancel()
-
 
 def setup_handlers(application: Application) -> None:
     """Setup all bot handlers."""
@@ -435,29 +268,17 @@ def setup_handlers(application: Application) -> None:
     # Command handlers
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("help", help_command))
-    application.add_handler(CommandHandler("convert", convert_command))
-    application.add_handler(CommandHandler("compress", compress_command))
-    application.add_handler(CommandHandler("merge", merge_command))
-    application.add_handler(CommandHandler("info", info_command))
-    application.add_handler(CommandHandler("screenshot", screenshot_command))
-    application.add_handler(CommandHandler("trim", trim_command))
-    application.add_handler(CommandHandler("extract", extract_command))
-    application.add_handler(CommandHandler("optimize", optimize_command))
     application.add_handler(CommandHandler("cancel", cancel_command))
-    application.add_handler(CommandHandler("upload", upload_command))
     
     # Media file handlers (videos, audio, documents)
-    # Use PTB v20+ filter classes to avoid legacy attribute names
     application.add_handler(MessageHandler(filters.Video.ALL, handler_manager.handle_media_message))
     application.add_handler(MessageHandler(filters.Audio.ALL, handler_manager.handle_media_message))
     application.add_handler(MessageHandler(filters.Document.ALL, handler_manager.handle_media_message))
-    # Fallback catch-all to help debug message dispatching (non-command updates)
-    application.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, handler_manager.handle_media_message))
     
     # Callback query handler for menu interactions
     application.add_handler(CallbackQueryHandler(handler_manager.callback_handler))
+    
     # Admin commands (manage allowed users)
-    from telegram.ext import CommandHandler
     async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_id = update.effective_user.id
         # Only admin may manage allowed users
@@ -498,7 +319,7 @@ def setup_handlers(application: Application) -> None:
             return
 
         await update.message.reply_text("Unknown admin command")
-    # Register admin command
+    
     application.add_handler(CommandHandler('admin', admin_command))
     
     # Store handler manager in bot_data for access in other handlers
@@ -509,46 +330,6 @@ def setup_handlers(application: Application) -> None:
     
     logger.info("✅ All handlers registered successfully")
 
-
-async def shutdown(application: Application):
-    """Graceful shutdown handler."""
-    logger.info("Starting graceful shutdown...")
-    
-    try:
-        # Cancel all pending tasks
-        pending = asyncio.all_tasks()
-        pending_count = len(pending)
-        
-        if pending_count > 0:
-            logger.info(f"Cancelling {pending_count} pending tasks...")
-            for task in pending:
-                if not task.done():
-                    task.cancel()
-        
-        # Wait for cancellation with timeout
-        if pending_count > 0:
-            try:
-                await asyncio.wait_for(
-                    asyncio.gather(*pending, return_exceptions=True),
-                    timeout=30
-                )
-                logger.info("All tasks cancelled gracefully")
-            except asyncio.TimeoutError:
-                logger.warning("Shutdown timeout - some tasks still running")
-        
-        # Cleanup resources
-        try:
-            stop_cleanup_task()
-            logger.info("Cleanup manager stopped")
-        except Exception as e:
-            logger.error(f"Error stopping cleanup manager: {e}")
-        
-        logger.info("Graceful shutdown complete")
-    
-    except Exception as e:
-        logger.error(f"Error during shutdown: {e}")
-
-
 async def main() -> None:
     """Start the bot."""
     # Validate BOT_TOKEN
@@ -556,12 +337,14 @@ async def main() -> None:
         logger.error("BOT_TOKEN not set in environment variables!")
         raise ValueError("BOT_TOKEN is required. Set it in .env file.")
     
-    # Create the Application
+    # Create the Application for PTB v20+
     application = Application.builder().token(BOT_TOKEN).build()
+    
     # Expose application for ASGI metrics and introspection
     global BOT_APPLICATION, BOT_STARTED_AT
     BOT_APPLICATION = application
     BOT_STARTED_AT = time.time()
+    
     # Expose ACL into application context
     try:
         application.bot_data['allowed_user_ids'] = ALLOWED_USER_IDS
@@ -633,115 +416,50 @@ async def main() -> None:
         except Exception as e:
             logger.error(f"Failed to start webhook recovery manager: {e}")
     
-    # Setup signal handlers for graceful shutdown
-    shutdown_event = asyncio.Event()
-    running_tasks = set()
-    
-    def signal_handler(signum, frame):
-        """Handle signals (SIGINT, SIGTERM) for graceful shutdown."""
-        try:
-            signal_name = signal.Signals(signum).name if hasattr(signal, 'Signals') else str(signum)
-        except:
-            signal_name = str(signum)
-        
-        logger.warning(f"🛑 Received {signal_name} - initiating graceful shutdown...")
-        shutdown_event.set()
-    
     try:
-        # Register signal handlers for graceful shutdown
-        signal.signal(signal.SIGINT, signal_handler)   # Handle Ctrl+C
-        signal.signal(signal.SIGTERM, signal_handler)  # Handle termination
-        if hasattr(signal, 'SIGBREAK'):  # Windows
-            signal.signal(signal.SIGBREAK, signal_handler)
+        # Start the bot with PTB v20+ proper async context
+        logger.info("Starting bot with PTB v20+...")
         
-        logger.info("✅ Signal handlers registered (SIGINT, SIGTERM, SIGBREAK)")
-    except Exception as e:
-        logger.warning(f"⚠️  Could not register signal handlers: {e}")
-    
-    # Store shutdown event in application context for handlers to access
-    application.bot_data['shutdown_event'] = shutdown_event
-    application.bot_data['running_tasks'] = running_tasks
-    
-    async def shutdown_handler():
-        """Handle graceful shutdown."""
-        logger.info("⏳ Beginning graceful shutdown sequence...")
-        
-        # Cancel all running conversion tasks
-        if running_tasks:
-            logger.info(f"📋 Cancelling {len(running_tasks)} running tasks...")
-            for task in running_tasks:
-                if not task.done():
-                    task.cancel()
+        async with application:
+            await application.initialize()  # Initialize the application
+            await application.start()       # Start the update processing loop
             
-            # Wait for tasks to finish cancelling
-            try:
-                await asyncio.wait(running_tasks, timeout=10)
-            except Exception as e:
-                logger.error(f"Error waiting for tasks: {e}")
-        
-        # Stop webhook recovery manager
-        if webhook_manager:
-            try:
-                await webhook_manager.stop()
-                logger.info("✅ Webhook recovery manager stopped")
-            except Exception as e:
-                logger.error(f"Error stopping webhook manager: {e}")
-        
-        # Stop cleanup manager
-        try:
-            stop_cleanup_task()
-            logger.info("✅ Cleanup manager stopped")
-        except Exception as e:
-            logger.error(f"Error stopping cleanup manager: {e}")
-        
-        # Delete webhook to prevent future updates
-        if WEBHOOK_URL:
-            try:
-                await application.bot.delete_webhook()
-                logger.info("✅ Telegram webhook deleted")
-            except Exception as e:
-                logger.error(f"Error deleting webhook: {e}")
-        
-        logger.info("✅ Graceful shutdown complete")
-    
-    try:
-        # Start the bot
-        logger.info("Starting bot...")
-        
-        if WEBHOOK_URL:
-            # Webhook mode with proper async handling
-            logger.info(f"🌐 Starting bot in webhook mode: {WEBHOOK_URL}")
-            
-            # Set webhook for Telegram with proper parameters
-            try:
-                webhook_info = await application.bot.set_webhook(
-                    url=WEBHOOK_URL,
+            if WEBHOOK_URL:
+                # Webhook mode - PTB v20+ handles everything
+                logger.info(f"🌐 Starting bot in webhook mode: {WEBHOOK_URL}")
+                
+                # Set webhook
+                try:
+                    await application.bot.set_webhook(
+                        url=WEBHOOK_URL,
+                        allowed_updates=["message", "callback_query", "edited_message"],
+                        max_connections=100,
+                        drop_pending_updates=False
+                    )
+                    logger.info(f"✅ Webhook set successfully: {WEBHOOK_URL}")
+                except Exception as e:
+                    logger.error(f"Failed to set webhook: {e}")
+                    raise
+                
+                # For Render/ASGI deployment, we'll use the FastAPI approach below
+                logger.info("Bot initialized for webhook mode - FastAPI will handle incoming requests")
+                
+            else:
+                # Polling mode
+                logger.info("🚀 Starting bot in polling mode")
+                await application.run_polling(
                     allowed_updates=["message", "callback_query", "edited_message"],
-                    max_connections=100,
                     drop_pending_updates=False
                 )
-                logger.info(f"✅ Webhook set successfully: {webhook_info.url}")
-            except Exception as e:
-                logger.error(f"Failed to set webhook: {e}")
-                raise
             
-            # Start webhook server
-            logger.info("🚀 Starting webhook server on port 8443...")
-            await application.run_webhook(
-                listen="0.0.0.0",
-                port=8443,
-                url_path="/telegram",
-                webhook_url=WEBHOOK_URL,
-                drop_pending_updates=False
-            )
-        else:
-            # Polling mode
-            logger.info("🚀 Starting bot in polling mode")
-            await application.run_polling(
-                allowed_updates=["message", "callback_query", "edited_message"],
-                drop_pending_updates=False
-            )
-            
+            # Keep the application running
+            try:
+                await asyncio.Event().wait()  # Keep running until interrupted
+            except (KeyboardInterrupt, SystemExit):
+                logger.info("Bot stopping...")
+            finally:
+                await application.stop()
+                
     except KeyboardInterrupt:
         logger.info("⌨️  Bot interrupted by user (Ctrl+C)")
     except asyncio.CancelledError:
@@ -749,11 +467,6 @@ async def main() -> None:
     except Exception as e:
         logger.error(f"❌ Error starting bot: {e}", exc_info=True)
         raise
-    finally:
-        # Execute graceful shutdown
-        logger.info("⏹️  Stopping bot...")
-        await shutdown_handler()
-
 
 if __name__ == "__main__":
     try:
@@ -763,69 +476,53 @@ if __name__ == "__main__":
     except Exception as e:
         logger.error(f"Fatal error: {e}")
 
-# Expose a minimal FastAPI app so the project can be started with Uvicorn
+# FastAPI app for webhook handling - PTB v20+ compatible
 try:
-    from fastapi import FastAPI
+    from fastapi import FastAPI, Request, HTTPException
+    from fastapi.responses import Response
+    from telegram import Update as TgUpdate
 
-    app = FastAPI(title="Media Conversion Bot - Health")
+    app = FastAPI(title="Media Conversion Bot - PTB v20+")
 
     @app.get("/health")
     async def health():
-        return {"status": "ok"}
-
-    # Telegram webhook endpoint: post JSON updates from Telegram here
-    from fastapi import Request, HTTPException
-    from telegram import Update as TgUpdate
+        return {"status": "ok", "bot_initialized": BOT_APPLICATION is not None}
 
     @app.post("/telegram/webhook")
     async def telegram_webhook(request: Request):
+        """PTB v20+ compatible webhook endpoint."""
         if not BOT_APPLICATION:
+            logger.error("Bot application not initialized")
             raise HTTPException(status_code=503, detail="Bot not initialized")
+        
         try:
             data = await request.json()
-        except Exception:
+            logger.debug(f"Received webhook data: {data}")
+        except Exception as e:
+            logger.error(f"Invalid JSON in webhook: {e}")
             raise HTTPException(status_code=400, detail="Invalid JSON")
 
-        # Build Update object
         try:
+            # Build Update object for PTB v20+
             update = TgUpdate.de_json(data, BOT_APPLICATION.bot)
-        except Exception:
-            try:
-                update = TgUpdate(**data)
-            except Exception as e:
-                logger.error(f"Failed to construct Update: {e}")
-                raise HTTPException(status_code=400, detail="Invalid update payload")
-
-        # Enqueue update to the Application for processing
-        try:
-            # Preferred queue attribute for Application
-            if hasattr(BOT_APPLICATION, 'update_queue'):
-                await BOT_APPLICATION.update_queue.put(update)
-                logger.info("Enqueued Telegram update %s to Application.update_queue", getattr(update, 'update_id', None))
-                # Also schedule dispatcher.process_update so updates are handled
-                try:
-                    if hasattr(BOT_APPLICATION, 'dispatcher') and hasattr(BOT_APPLICATION.dispatcher, 'process_update'):
-                        asyncio.create_task(BOT_APPLICATION.dispatcher.process_update(update))
-                        logger.debug("Scheduled dispatcher.process_update for update %s", getattr(update, 'update_id', None))
-                except Exception as e_sched:
-                    logger.debug("Could not schedule dispatcher processing: %s", e_sched)
-            elif hasattr(BOT_APPLICATION, 'bot') and hasattr(BOT_APPLICATION.bot, 'process_update'):
-                # last-resort synchronous processing (only used if no update_queue exists)
-                await BOT_APPLICATION.bot.process_update(update)
-            else:
-                # Try dispatcher
-                if hasattr(BOT_APPLICATION, 'dispatcher') and hasattr(BOT_APPLICATION.dispatcher, 'process_update'):
-                    await BOT_APPLICATION.dispatcher.process_update(update)
-                else:
-                    logger.error("No known method to enqueue updates on Application")
-                    raise HTTPException(status_code=500, detail="Server not configured to process updates")
+            if not update:
+                raise ValueError("Failed to create Update object")
+            logger.info(f"Processing update {getattr(update, 'update_id', 'unknown')}")
         except Exception as e:
-            logger.error(f"Error enqueuing Telegram update: {e}")
-            raise HTTPException(status_code=500, detail="Failed to enqueue update")
+            logger.error(f"Failed to construct Update: {e}")
+            raise HTTPException(status_code=400, detail="Invalid update payload")
 
-        return {"ok": True}
+        try:
+            # PTB v20+ approach: Simply queue the update
+            # The Application's internal dispatcher will handle processing
+            await BOT_APPLICATION.update_queue.put(update)
+            logger.info(f"Successfully queued update {getattr(update, 'update_id', 'unknown')}")
+            
+        except Exception as e:
+            logger.error(f"Error queuing Telegram update: {e}")
+            raise HTTPException(status_code=500, detail="Failed to queue update")
 
-    from fastapi import Response
+        return {"ok": True, "update_id": getattr(update, 'update_id', None)}
 
     @app.get("/metrics")
     async def metrics():
@@ -879,6 +576,6 @@ try:
         except Exception as e:
             logger.error(f"Error stopping background bot task: {e}")
 
-except Exception:
-    # FastAPI not available or import failed; skip ASGI app export
+except Exception as e:
+    logger.warning(f"FastAPI not available or import failed: {e}")
     app = None
