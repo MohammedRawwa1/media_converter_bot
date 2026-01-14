@@ -193,6 +193,36 @@ class ExtendedMediaConverter:
             return sorted([f for f in os.listdir(base_dir) if f.startswith(prefix)])
         return []
 
+    async def split_video_range(self, input_path: str, start: float, end: float, output_path: str) -> bool:
+        """Split a single range from video between start and end (seconds).
+
+        Uses ffmpeg with -ss and -to (or -t) to cut the segment.
+        """
+        try:
+            # Use -ss before -i for faster seeking then -to relative to the start
+            # Build cmd such that execute_ffmpeg appends the output_path
+            duration = end - start
+            # Use precise seeking: -ss START -t DURATION -c copy
+            cmd = ["-ss", str(start), "-t", str(duration), "-c", "copy"]
+            return (await self.execute_ffmpeg(cmd, input_path, output_path))[0]
+        except Exception as e:
+            logger.error(f"split_video_range error: {e}")
+            return False
+
+    async def burn_subtitles(self, input_path: str, subtitle_path: str, output_path: str) -> bool:
+        """Hardcode (burn) subtitles into the video using ffmpeg subtitles filter.
+
+        Note: This requires ffmpeg built with libass or the subtitles filter available.
+        """
+        try:
+            # Use vf subtitles filter; need to ensure subtitle_path is an absolute path
+            abs_sub = os.path.abspath(subtitle_path)
+            cmd = ["-vf", f"subtitles={abs_sub}", "-c:v", "libx264", "-c:a", "copy"]
+            return (await self.execute_ffmpeg(cmd, input_path, output_path))[0]
+        except Exception as e:
+            logger.error(f"burn_subtitles error: {e}")
+            return False
+
     async def extract_subtitles(self, input_path: str, output_path: str) -> bool:
         """Extract subtitles from video."""
         cmd = ["-map", "0:s:0", "-c:s", "mov_text"]  # or 'copy' for original format
