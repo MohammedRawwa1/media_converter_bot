@@ -16,28 +16,43 @@ SEND_FILE = "send_file"
 
 # Conversion/format prefixes
 FORMAT_PREFIX = "format_"
+
+
 def format_key(fmt: str) -> str:
     return f"{FORMAT_PREFIX}{fmt}"
 
+
 # Compression
 COMPRESS_PREFIX = "compress_"
+
+
 def compress_key(crf: str) -> str:
     return f"{COMPRESS_PREFIX}{crf}"
 
+
 # Resolution
 RES_PREFIX = "res_"
+
+
 def res_key(name: str) -> str:
     return f"{RES_PREFIX}{name}"
 
+
 # Bitrate
 BITRATE_PREFIX = "bitrate_"
+
+
 def bitrate_key(val: str) -> str:
     return f"{BITRATE_PREFIX}{val}"
 
+
 # Screenshot
 SCREENSHOT_PREFIX = "screenshot_"
+
+
 def screenshot_key(opt: str) -> str:
     return f"{SCREENSHOT_PREFIX}{opt}"
+
 
 # Merge
 MERGE_ADD = "merge_add"
