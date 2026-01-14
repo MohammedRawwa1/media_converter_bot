@@ -9,7 +9,7 @@ import signal
 import sys
 import subprocess
 import time
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -25,20 +25,17 @@ import config as cfg
 from utils import (
     ensure_directories,
     MediaMenuBuilder,
-    progress_tracker,
-    cleanup_directory
 )
 from utils.rate_limiter import TelegramAPIRateLimiter, ConversionRateLimiter
 from utils.webhook_monitor import WebhookRecoveryManager
 from utils.error_handler import (
     setup_comprehensive_logging,
     get_error_handler,
-    handle_conversion_error
 )
 from handlers import EnhancedMediaHandler
 from tasks import (
     start_cleanup_task,
-    stop_cleanup_task
+    stop_cleanup_task,
 )
 
 # Configure comprehensive logging with rotation
@@ -52,6 +49,18 @@ logger = logging.getLogger(__name__)
 BOT_APPLICATION = None
 BOT_STARTED_AT = None
 START_TIME = time.time()
+BOT_READY = asyncio.Event()
+import threading
+
+# Simple in-memory Prometheus-style counters
+METRICS = {
+    "webhooks_received": 0,
+    "updates_dispatched": 0,
+    "updates_queued": 0,
+    "dispatch_failures": 0,
+    "dispatch_attempts": 0,
+}
+METRICS_LOCK = threading.Lock()
 
 def check_ffmpeg_available() -> bool:
     """Return True if ffmpeg is callable from PATH or configured FFMPEG_PATH."""
@@ -415,6 +424,30 @@ async def main() -> None:
             logger.info("Webhook recovery manager started")
         except Exception as e:
             logger.error(f"Failed to start webhook recovery manager: {e}")
+
+    # Setup graceful shutdown using signals (works on Unix and has Windows fallbacks)
+    loop = asyncio.get_running_loop()
+    shutdown_event = asyncio.Event()
+
+    def _request_shutdown(sig_name: str = None):
+        logger.info(f"Shutdown requested via signal: {sig_name}")
+        try:
+            loop.call_soon_threadsafe(shutdown_event.set)
+        except Exception:
+            # last-resort: set result via asyncio.ensure_future
+            asyncio.ensure_future(shutdown_event.set())
+
+    try:
+        loop.add_signal_handler(signal.SIGINT, lambda: _request_shutdown("SIGINT"))
+        loop.add_signal_handler(signal.SIGTERM, lambda: _request_shutdown("SIGTERM"))
+    except NotImplementedError:
+        # Fallback for Windows or event loops that don't support add_signal_handler
+        signal.signal(signal.SIGINT, lambda s, f: loop.call_soon_threadsafe(shutdown_event.set))
+        try:
+            signal.signal(signal.SIGTERM, lambda s, f: loop.call_soon_threadsafe(shutdown_event.set))
+        except Exception:
+            # SIGTERM may not be available on some platforms
+            pass
     
     try:
         # Start the bot with PTB v20+ proper async context
@@ -423,6 +456,11 @@ async def main() -> None:
         async with application:
             await application.initialize()  # Initialize the application
             await application.start()       # Start the update processing loop
+            # Signal that bot is ready to process updates via dispatcher
+            try:
+                BOT_READY.set()
+            except Exception:
+                pass
             
             if WEBHOOK_URL:
                 # Webhook mode - PTB v20+ handles everything
@@ -452,13 +490,33 @@ async def main() -> None:
                     drop_pending_updates=False
                 )
             
-            # Keep the application running
+            # Keep the application running until signal triggers shutdown_event
             try:
-                await asyncio.Event().wait()  # Keep running until interrupted
+                await shutdown_event.wait()
+                logger.info("Shutdown event received, stopping bot...")
             except (KeyboardInterrupt, SystemExit):
-                logger.info("Bot stopping...")
+                logger.info("Bot stopping due to keyboard/system exit")
             finally:
-                await application.stop()
+                # Attempt to delete webhook (if set) and stop background cleanup
+                if WEBHOOK_URL:
+                    try:
+                        await application.bot.delete_webhook(drop_pending_updates=False)
+                        logger.info("Webhook deleted on shutdown")
+                    except Exception as e:
+                        logger.warning(f"Failed to delete webhook on shutdown: {e}")
+
+                try:
+                    stop_cleanup_task()
+                    logger.info("Cleanup manager stop requested")
+                except Exception as e:
+                    logger.error(f"Error stopping cleanup manager: {e}")
+                try:
+                    await application.stop()
+                finally:
+                    try:
+                        BOT_READY.clear()
+                    except Exception:
+                        pass
                 
     except KeyboardInterrupt:
         logger.info("⌨️  Bot interrupted by user (Ctrl+C)")
@@ -486,7 +544,21 @@ try:
 
     @app.get("/health")
     async def health():
-        return {"status": "ok", "bot_initialized": BOT_APPLICATION is not None}
+        dispatcher_ready = False
+        try:
+            dispatcher = getattr(BOT_APPLICATION, 'dispatcher', None)
+            dispatcher_ready = bool(dispatcher and hasattr(dispatcher, 'process_update'))
+        except Exception:
+            dispatcher_ready = False
+
+        return {
+            "status": "ok",
+            "bot_initialized": BOT_APPLICATION is not None,
+            "bot_ready": BOT_READY.is_set(),
+            "dispatcher_ready": dispatcher_ready,
+            "startup_time": BOT_STARTED_AT,
+            "error": getattr(app.state, 'startup_error', None)
+        }
 
     @app.post("/telegram/webhook")
     async def telegram_webhook(request: Request):
@@ -494,7 +566,7 @@ try:
         if not BOT_APPLICATION:
             logger.error("Bot application not initialized")
             raise HTTPException(status_code=503, detail="Bot not initialized")
-        
+
         try:
             data = await request.json()
             logger.debug(f"Received webhook data: {data}")
@@ -503,26 +575,79 @@ try:
             raise HTTPException(status_code=400, detail="Invalid JSON")
 
         try:
-            # Build Update object for PTB v20+
+            # Build Update object early so we can retry dispatching even if the
+            # application is still initializing.
             update = TgUpdate.de_json(data, BOT_APPLICATION.bot)
             if not update:
                 raise ValueError("Failed to create Update object")
-            logger.info(f"Processing update {getattr(update, 'update_id', 'unknown')}")
+            logger.info(f"Received update {getattr(update, 'update_id', 'unknown')}")
         except Exception as e:
             logger.error(f"Failed to construct Update: {e}")
             raise HTTPException(status_code=400, detail="Invalid update payload")
 
+        # Increment webhook counter
         try:
-            # PTB v20+ approach: Simply queue the update
-            # The Application's internal dispatcher will handle processing
-            await BOT_APPLICATION.update_queue.put(update)
-            logger.info(f"Successfully queued update {getattr(update, 'update_id', 'unknown')}")
-            
-        except Exception as e:
-            logger.error(f"Error queuing Telegram update: {e}")
-            raise HTTPException(status_code=500, detail="Failed to queue update")
+            with METRICS_LOCK:
+                METRICS['webhooks_received'] += 1
+        except Exception:
+            pass
 
-        return {"ok": True, "update_id": getattr(update, 'update_id', None)}
+        # Helper: background retry dispatcher
+        async def _background_retry_dispatch(u, attempts=12, delay=0.5):
+            disp = getattr(BOT_APPLICATION, 'dispatcher', None)
+            for i in range(attempts):
+                try:
+                    disp = getattr(BOT_APPLICATION, 'dispatcher', None)
+                    if disp and hasattr(disp, 'process_update'):
+                        with METRICS_LOCK:
+                            METRICS['dispatch_attempts'] += 1
+                        await disp.process_update(u)
+                        with METRICS_LOCK:
+                            METRICS['updates_dispatched'] += 1
+                        logger.info(f"Background dispatched update {getattr(u, 'update_id', 'unknown')} on attempt {i+1}")
+                        return True
+                except Exception as e:
+                    logger.debug(f"Background dispatch attempt {i+1} failed: {e}")
+                    with METRICS_LOCK:
+                        METRICS['dispatch_failures'] += 1
+                await asyncio.sleep(delay)
+            logger.error(f"Background dispatch exhausted for update {getattr(u, 'update_id', 'unknown')}")
+            return False
+
+        # Try immediate dispatch with a few attempts (fast path)
+        attempts = 6
+        for i in range(attempts):
+            dispatcher = getattr(BOT_APPLICATION, 'dispatcher', None)
+            if dispatcher and hasattr(dispatcher, 'process_update'):
+                try:
+                    with METRICS_LOCK:
+                        METRICS['dispatch_attempts'] += 1
+                    await dispatcher.process_update(update)
+                    with METRICS_LOCK:
+                        METRICS['updates_dispatched'] += 1
+                    logger.info(f"Dispatched update {getattr(update, 'update_id', 'unknown')} via dispatcher.process_update on attempt {i+1}")
+                    return {"ok": True, "update_id": getattr(update, 'update_id', None), "dispatched": True}
+                except Exception as e:
+                    logger.warning(f"Immediate dispatcher attempt {i+1} failed: {e}")
+                    with METRICS_LOCK:
+                        METRICS['dispatch_failures'] += 1
+            await asyncio.sleep(0.25)
+
+        # Immediate dispatch not successful — try to enqueue
+        try:
+            await BOT_APPLICATION.update_queue.put(update)
+            with METRICS_LOCK:
+                METRICS['updates_queued'] += 1
+            logger.info(f"Queued update {getattr(update, 'update_id', 'unknown')} after immediate attempts")
+            return {"ok": True, "update_id": getattr(update, 'update_id', None), "queued": True}
+        except Exception as enqueue_exc:
+            logger.warning(f"Enqueue failed: {enqueue_exc}; scheduling background retry and returning 200")
+            # Schedule background retry but return 200 immediately (retry-accept policy)
+            try:
+                asyncio.create_task(_background_retry_dispatch(update))
+            except Exception as e:
+                logger.error(f"Failed to schedule background retry: {e}")
+            return {"ok": True, "update_id": getattr(update, 'update_id', None), "accepted": True}
 
     @app.get("/metrics")
     async def metrics():
@@ -549,16 +674,77 @@ try:
             f"media_bot_ffmpeg_available {ffmpeg_ok}",
             "# HELP media_bot_active_conversions Number of active conversions",
             f"media_bot_active_conversions {active_convs}",
+            "# HELP media_bot_webhooks_received Total webhooks received",
+            f"media_bot_webhooks_received {METRICS.get('webhooks_received', 0)}",
+            "# HELP media_bot_updates_dispatched Total updates dispatched by dispatcher",
+            f"media_bot_updates_dispatched {METRICS.get('updates_dispatched', 0)}",
+            "# HELP media_bot_updates_queued Total updates queued to application",
+            f"media_bot_updates_queued {METRICS.get('updates_queued', 0)}",
+            "# HELP media_bot_dispatch_failures Total dispatch failures",
+            f"media_bot_dispatch_failures {METRICS.get('dispatch_failures', 0)}",
+            "# HELP media_bot_dispatch_attempts Total dispatch attempts",
+            f"media_bot_dispatch_attempts {METRICS.get('dispatch_attempts', 0)}",
         ]
 
         return Response("\n".join(lines), media_type="text/plain; version=0.0.4")
+
+    @app.get("/debug")
+    async def debug_info():
+        """Return debug information: startup error, dispatcher status, bot_data keys."""
+        info = {
+            "bot_initialized": BOT_APPLICATION is not None,
+            "bot_ready": BOT_READY.is_set(),
+            "startup_error": getattr(app.state, 'startup_error', None),
+            "bot_started_at": BOT_STARTED_AT,
+        }
+
+        try:
+            info['bot_data_keys'] = list(BOT_APPLICATION.bot_data.keys()) if BOT_APPLICATION and BOT_APPLICATION.bot_data else []
+        except Exception:
+            info['bot_data_keys'] = None
+
+        try:
+            dispatcher = getattr(BOT_APPLICATION, 'dispatcher', None)
+            info['dispatcher_available'] = bool(dispatcher)
+            info['dispatcher_has_process_update'] = bool(dispatcher and hasattr(dispatcher, 'process_update'))
+        except Exception:
+            info['dispatcher_available'] = False
+            info['dispatcher_has_process_update'] = False
+
+        try:
+            mgr = BOT_APPLICATION.bot_data.get('handler_manager') if BOT_APPLICATION and BOT_APPLICATION.bot_data else None
+            info['active_conversions'] = len(mgr.get_active_conversions()) if mgr else 0
+        except Exception:
+            info['active_conversions'] = None
+
+        return info
 
     @app.on_event("startup")
     async def _start_bot_background():
         # Launch main() as a background task so uvicorn also serves ASGI endpoints
         try:
-            app.state.bot_task = asyncio.create_task(main())
+            task = asyncio.create_task(main())
+            app.state.bot_task = task
+
+            def _on_done(t: asyncio.Task):
+                try:
+                    exc = t.exception()
+                    if exc:
+                        app.state.startup_error = repr(exc)
+                        logger.error(f"Bot background task failed: {exc}")
+                except asyncio.CancelledError:
+                    pass
+
+            task.add_done_callback(_on_done)
+
             logger.info("Background bot task started via ASGI startup event")
+
+            # Wait briefly for the bot to become ready to process updates
+            try:
+                await asyncio.wait_for(BOT_READY.wait(), timeout=15.0)
+                logger.info("Bot signalled ready within startup window")
+            except asyncio.TimeoutError:
+                logger.warning("Bot did not become ready within 15s startup window")
         except Exception as e:
             logger.error(f"Failed to start bot in background: {e}")
 
