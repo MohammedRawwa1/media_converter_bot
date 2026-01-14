@@ -281,25 +281,15 @@ def setup_handlers(application: Application) -> None:
     
     # Media file handlers (videos, audio, documents)
     # Build the media filter defensively to support multiple PTB versions.
-    def _get_filter(*names):
-        for n in names:
-            f = getattr(filters, n, None)
-            if f is not None:
-                return f
-        return None
-
-    f_video = _get_filter('VIDEO', 'Video', 'video')
-    f_audio = _get_filter('AUDIO', 'Audio', 'audio')
-    f_document = _get_filter('DOCUMENT', 'Document', 'document')
-
-    if f_video or f_audio or f_document:
-        media_filter = None
-        for f in (f_video, f_audio, f_document):
-            if f is None:
-                continue
-            media_filter = f if media_filter is None else (media_filter | f)
-    else:
-        # Fall back to capturing all messages and let the handler decide.
+    # Build a resilient media filter using a shared helper (supports
+    # multiple PTB versions and import variants).
+    try:
+        from utils.filter_utils import build_media_filter
+        media_filter = build_media_filter(filters)
+        if media_filter is None:
+            media_filter = filters.ALL
+    except Exception:
+        # In case the helper isn't available for any reason, fall back to ALL
         media_filter = filters.ALL
 
     application.add_handler(MessageHandler(media_filter, handler_manager.handle_media_message))
