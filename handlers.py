@@ -74,6 +74,14 @@ class EnhancedMediaHandler:
         # Telemetry for malformed callbacks
         self.bad_callback_counts: Dict[str, int] = {}
 
+        # Ensure session persistence directory exists for multi-worker setups
+        self._session_store_dir = os.path.join(os.path.dirname(__file__), "storage", "temp_sessions")
+        try:
+            os.makedirs(self._session_store_dir, exist_ok=True)
+        except Exception:
+            # Best-effort; continue if cannot create
+            logger.debug("Could not create session store dir: %s", self._session_store_dir)
+
     async def _cleanup_session(self, user_id: int):
         """Cleanup user session asynchronously."""
         if user_id not in self.user_sessions:
@@ -126,6 +134,49 @@ class EnhancedMediaHandler:
             self.session_timeouts[user_id] = handle
         except RuntimeError:
             logger.error("Failed to schedule session cleanup - no event loop")
+
+    # ---------- Session persistence helpers (simple JSON store) ----------
+    def _session_file(self, user_id: int) -> str:
+        return os.path.join(self._session_store_dir, f"session_{user_id}.json")
+
+    def _persist_session(self, user_id: int) -> None:
+        """Persist minimal session info to disk for cross-worker retrieval."""
+        try:
+            session = self.user_sessions.get(user_id)
+            if not session:
+                # remove existing file if session cleared
+                path = self._session_file(user_id)
+                if os.path.exists(path):
+                    try:
+                        os.remove(path)
+                    except Exception:
+                        pass
+                return
+
+            minimal = {
+                "current_file": session.get("current_file"),
+                "merge_list": session.get("merge_list", []),
+            }
+            with open(self._session_file(user_id), "w", encoding="utf-8") as fh:
+                json.dump(minimal, fh, ensure_ascii=False)
+        except Exception:
+            logger.exception("Failed to persist session for user %s", user_id)
+
+    def _load_persisted_session(self, user_id: int) -> Optional[Dict]:
+        """Load persisted session if available. Returns session dict or None."""
+        try:
+            path = self._session_file(user_id)
+            if not os.path.exists(path):
+                return None
+            with open(path, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+            # Ensure merge_list present
+            if "merge_list" not in data:
+                data["merge_list"] = []
+            return data
+        except Exception:
+            logger.exception("Failed to load persisted session for user %s", user_id)
+            return None
 
     async def _run_with_concurrency_limit(
         self, user_id: int, task_name: str, coroutine
@@ -411,6 +462,12 @@ class EnhancedMediaHandler:
             "name": update.message.caption or f"video_{video.file_id[:8]}.mp4",
         }
 
+        # Persist session so callbacks handled by other workers can access
+        try:
+            self._persist_session(user_id)
+        except Exception:
+            logger.debug("Could not persist session after video download")
+
         # Log to MongoDB if needed
         await self.log_media_to_db(user_id, session["current_file"])
 
@@ -545,6 +602,12 @@ class EnhancedMediaHandler:
             "name": file_name,
         }
 
+        # Persist session for cross-worker access
+        try:
+            self._persist_session(user_id)
+        except Exception:
+            logger.debug("Could not persist session after document download")
+
         # Show appropriate menu
         await update.message.reply_text(
             f"✅ {file_type.capitalize()} downloaded!\n"
@@ -672,7 +735,16 @@ class EnhancedMediaHandler:
 
             # Ensure session exists
             if user_id not in self.user_sessions:
-                self.user_sessions[user_id] = {"files": {}, "current_file": None}
+                # Try to load persisted session (useful when running multiple workers)
+                persisted = self._load_persisted_session(user_id)
+                if persisted:
+                    self.user_sessions[user_id] = {
+                        "files": {},
+                        "current_file": persisted.get("current_file"),
+                        "merge_list": persisted.get("merge_list", []),
+                    }
+                else:
+                    self.user_sessions[user_id] = {"files": {}, "current_file": None}
 
             session = self.user_sessions[user_id]
             current_file = session.get("current_file")
@@ -796,10 +868,18 @@ class EnhancedMediaHandler:
 
             # Audio tools
             elif data == "convert_format_menu":
+                # Determine appropriate media type for format menu (video vs audio)
+                media_type = "audio"
+                try:
+                    if current_file and current_file.get("type") == "video":
+                        media_type = "video"
+                except Exception:
+                    media_type = "audio"
+
                 await self.safe_edit(
                     query,
-                    "🔄 **Convert Audio Format**\nSelect target format:",
-                    reply_markup=MediaMenuBuilder.get_format_menu("audio"),
+                    "🔄 **Convert Format**\nSelect target format:",
+                    reply_markup=MediaMenuBuilder.get_format_menu(media_type),
                 )
 
             elif isinstance(data, str) and data.startswith("format_"):
@@ -832,6 +912,11 @@ class EnhancedMediaHandler:
                 if "merge_list" not in session:
                     session["merge_list"] = []
                 session["merge_list"].append(path)
+                # Persist session after update
+                try:
+                    self._persist_session(user_id)
+                except Exception:
+                    logger.debug("Could not persist session after merge_add")
                 await self.safe_edit(
                     query,
                     f"➕ Added to merge list. Total files: {len(session['merge_list'])}",
@@ -848,6 +933,10 @@ class EnhancedMediaHandler:
 
             elif data == "merge_clear":
                 session["merge_list"] = []
+                try:
+                    self._persist_session(user_id)
+                except Exception:
+                    logger.debug("Could not persist session after merge_clear")
                 await self.safe_edit(query, "🗑️ Merge list cleared.")
 
             elif data == "framerate_menu":
