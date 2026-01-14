@@ -33,6 +33,19 @@ from .callbacks import (
     SEND_FILE,
     CONVERT_FORMAT_MENU,
     THUMBNAIL_GRID,
+    # UI-friendly aliases used in the main menu
+    THUMBNAIL_EXTRACTOR,
+    CAPTION_EDITOR,
+    MEDIA_FORWARDER,
+    STREAM_REMOVER,
+    STREAM_EXTRACTOR,
+    VIDEOS_SPLITTER,
+    MANUAL_SHOTS,
+    VIDEO_TO_AUDIO,
+    SUBTITLE_MERGER,
+    VIDEO_RENAMER,
+    VIDEO_CONVERTER,
+    CREATE_ARCHIVE,
     TRIM_AUDIO,
     TRIM_VIDEO,
 )
@@ -43,49 +56,37 @@ class MediaMenuBuilder:
 
     @staticmethod
     def get_main_menu(file_type: str = None) -> InlineKeyboardMarkup:
-        """Get main menu based on file type."""
-        if file_type == "video":
-            buttons = [
-                [
-                    InlineKeyboardButton("🎬 Video Tools", callback_data=MENU_VIDEO),
-                    InlineKeyboardButton("🎧 Extract Audio", callback_data=EXTRACT_AUDIO),
-                ],
-                [
-                    InlineKeyboardButton("📉 Compress", callback_data=COMPRESS_MENU),
-                    InlineKeyboardButton("✂️ Trim", callback_data=TRIM_VIDEO),
-                ],
-                [
-                    InlineKeyboardButton("🖼️ Screenshots", callback_data=SCREENSHOTS_MENU),
-                    InlineKeyboardButton("ℹ️ Info", callback_data=INFO),
-                ],
-                [
-                    InlineKeyboardButton("🔀 Merge", callback_data=MERGE_VIDEOS_START),
-                    InlineKeyboardButton("⚡ Optimize", callback_data=OPTIMIZE_MENU),
-                ],
-            ]
-        elif file_type == "audio":
-            buttons = [
-                [
-                    InlineKeyboardButton("🎧 Convert Format", callback_data=CONVERT_FORMAT_MENU),
-                    InlineKeyboardButton("🎚️ Adjust Bitrate", callback_data=BITRATE_PREFIX + "menu"),
-                ],
-                [
-                    InlineKeyboardButton("✂️ Trim Audio", callback_data=TRIM_AUDIO),
-                    InlineKeyboardButton("🔀 Merge", callback_data=MERGE_ADD),
-                ],
-                [
-                    InlineKeyboardButton("📊 Normalize", callback_data=NORMALIZE_AUDIO),
-                    InlineKeyboardButton("ℹ️ Audio Info", callback_data=INFO),
-                ],
-                [InlineKeyboardButton("🔙 Back", callback_data=MENU_MAIN)],
-            ]
-        else:
-            buttons = [
-                [InlineKeyboardButton("📤 Send Media File", callback_data=SEND_FILE)],
-                [InlineKeyboardButton("ℹ️ Help", callback_data=HELP)],
-                [InlineKeyboardButton("🚀 Quick Start", callback_data="quick_start")],
+        """Get main menu based on file type.
+
+        Layout mirrors the provided UI image: many feature buttons arranged
+        in two-column rows. Buttons use canonical callback constants where
+        possible to match handlers' expectations.
+        """
+        # Shared helpers for common rows
+        def row(left_label, left_cb, right_label, right_cb):
+            return [
+                InlineKeyboardButton(left_label, callback_data=left_cb),
+                InlineKeyboardButton(right_label, callback_data=right_cb),
             ]
 
+        # Build rows according to the UI image
+        buttons: List[List[InlineKeyboardButton]] = [
+            row("🖼️ Thumbnail Extractor", THUMBNAIL_EXTRACTOR, "✏️ Caption And Buttons Editor", CAPTION_EDITOR),
+            row("📝 Metadata Editor", EDIT_METADATA, "📤 Media Forwarder", MEDIA_FORWARDER),
+            row("🔇 Stream Remover", STREAM_REMOVER, "🎵 Stream Extractor", STREAM_EXTRACTOR),
+            row("✂️ Video Trimmer", TRIM_VIDEO, "➕ Video Merger", MERGE_VIDEOS_START),
+            row("🔉 Remove Audio", REMOVE_AUDIO, "🔀 Merge And", MERGE_VIEW),
+            row("🎧 Audio Converter", CONVERT_FORMAT_MENU, "🔪 Videos Splitter", VIDEOS_SPLITTER),
+            row("🖼️ Screenshots", SCREENSHOTS_MENU, "🖼️ Manual Shots", MANUAL_SHOTS),
+            row("🎞️ Generate Sample", SAMPLE, "🎵 Video To Audio", VIDEO_TO_AUDIO),
+            row("⚡ Video Optimizer", OPTIMIZE_MENU, "🔗 Subtitle Merger", SUBTITLE_MERGER),
+            row("🎬 Video Converter", VIDEO_CONVERTER, "✏️ Video Renamer", VIDEO_RENAMER),
+            row("🛈 Media Information", INFO, "📦 Create Archive", CREATE_ARCHIVE),
+            [InlineKeyboardButton("❌ Cancel", callback_data=CANCEL)],
+        ]
+
+        # If file_type provided, you may want to prioritize tools, but keep
+        # menu consistent regardless of type for this layout.
         return InlineKeyboardMarkup(buttons)
 
     @staticmethod
