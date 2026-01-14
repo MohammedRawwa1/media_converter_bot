@@ -5,7 +5,7 @@ import tempfile
 import json
 from typing import Dict, List, Optional
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto
-from telegram.ext import ContextTypes, ConversationHandler, MessageHandler, filters
+from telegram.ext import ContextTypes, ConversationHandler, MessageHandler
 from telegram.error import BadRequest
 import logging
 from datetime import datetime
