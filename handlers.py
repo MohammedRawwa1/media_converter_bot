@@ -477,6 +477,44 @@ class EnhancedMediaHandler:
         file_name = document.file_name or f"file_{document.file_id}"
         file_ext = os.path.splitext(file_name)[1].lower()
 
+        # If the user was asked to send a subtitle file, handle specially
+        awaiting_sub = context.user_data.pop("awaiting_subtitle_file", False)
+        awaiting_burn = context.user_data.pop("awaiting_burn_subtitle", False)
+
+        subtitle_exts = {".srt", ".ass", ".vtt"}
+        if (awaiting_sub or awaiting_burn) and file_ext in subtitle_exts:
+            await update.message.reply_text("📥 Downloading subtitle file...")
+            file = await context.bot.get_file(document.file_id)
+            subtitle_path = f"storage/input/{user_id}_{document.file_id}{file_ext}"
+            await file.download_to_drive(subtitle_path)
+
+            # Ensure we have a current video for burning/adding
+            current = session.get("current_file")
+            if not current or current.get("type") != "video":
+                await update.message.reply_text("❌ No video available in session to apply subtitles.")
+                return
+
+            video_path = current["path"]
+            out_path = f"storage/output/{user_id}_subtitled_{os.path.basename(video_path)}"
+
+            if awaiting_burn:
+                await update.message.reply_text("🔧 Burning subtitles into video (this may take a while)...")
+                ok = await self.converter.burn_subtitles(video_path, subtitle_path, out_path)
+            else:
+                await update.message.reply_text("🔧 Adding subtitles as a separate stream (soft subtitles)...")
+                ok = await self.converter.add_subtitles(video_path, subtitle_path, out_path)
+
+            if ok and os.path.exists(out_path):
+                await update.message.reply_text("✅ Subtitles applied. Sending file...")
+                try:
+                    await context.bot.send_document(chat_id=update.effective_chat.id, document=open(out_path, "rb"))
+                except Exception:
+                    await update.message.reply_text("⚠️ Failed to send file; try downloading from the server.")
+            else:
+                await update.message.reply_text("❌ Failed to apply subtitles. See logs for details.")
+
+            return
+
         # Determine file type
         if file_ext in self.converter.supported_formats["video"]:
             file_type = "video"
@@ -520,6 +558,12 @@ class EnhancedMediaHandler:
     ):
         """Handle all callback queries with enhanced features."""
         query = update.callback_query
+        logger.info(
+            "Callback received: user=%s data=%s message_id=%s",
+            getattr(update.effective_user, "id", None),
+            getattr(query, "data", None),
+            getattr(getattr(query, "message", None), "message_id", None),
+        )
         # Defensive: ensure we have a callback_query
         if query is None:
             logger.warning("callback_handler called without callback_query")
@@ -598,6 +642,19 @@ class EnhancedMediaHandler:
             "extract_all": "extract_all_streams",
             # Misc small mappings
             "add_audio": "merge_av_menu",
+            # UI-friendly names mapping to canonical handler keys
+            "thumbnail_grid": "thumbnail_grid",
+            "thumbnail_extractor": "thumbnail_grid",
+            "caption_editor": "caption_editor",
+            "media_forwarder": "media_forwarder",
+            "stream_remover": "remove_audio",
+            "stream_extractor": "extract_streams",
+            "video_splitter": "video_splitter",
+            "manual_shots": "screenshot_custom",
+            "video_to_audio": "convert_mp3",
+            "subtitle_merger": "add_subtitles",
+            "video_renamer": "video_renamer",
+            "video_converter": "convert_format_menu",
         }
 
         # Remap data if an alias exists
@@ -841,6 +898,54 @@ class EnhancedMediaHandler:
                     if key.startswith("awaiting_"):
                         del context.user_data[key]
 
+            elif data == "caption_editor":
+                # Ask user to send a new caption for the current file
+                current_file = session.get("current_file")
+                if not current_file:
+                    await self.safe_edit(query, "❌ No file found to caption.")
+                    return
+                await self.safe_edit(query, "✏️ Send the new caption text:")
+                for key in list(context.user_data.keys()):
+                    if key.startswith("awaiting_"):
+                        del context.user_data[key]
+                context.user_data["awaiting_caption"] = True
+
+            elif data == "video_renamer":
+                current_file = session.get("current_file")
+                if not current_file:
+                    await self.safe_edit(query, "❌ No file found to rename.")
+                    return
+                await self.safe_edit(query, "✏️ Send new filename (include extension):")
+                for key in list(context.user_data.keys()):
+                    if key.startswith("awaiting_"):
+                        del context.user_data[key]
+                context.user_data["awaiting_rename"] = True
+
+            elif data == "video_splitter":
+                current_file = session.get("current_file")
+                if not current_file or current_file.get("type") != "video":
+                    await self.safe_edit(query, "❌ No video file found to split.")
+                    return
+                await self.safe_edit(
+                    query,
+                    "📌 Send split as either 'start-end' in seconds (e.g. 10-30) or 'n' for number of equal parts:",
+                )
+                for key in list(context.user_data.keys()):
+                    if key.startswith("awaiting_"):
+                        del context.user_data[key]
+                context.user_data["awaiting_split"] = True
+
+            elif data == "media_forwarder":
+                current_file = session.get("current_file")
+                if not current_file:
+                    await self.safe_edit(query, "❌ No file to forward.")
+                    return
+                await self.safe_edit(query, "➡️ Send target chat id or @username to forward the file to:")
+                for key in list(context.user_data.keys()):
+                    if key.startswith("awaiting_"):
+                        del context.user_data[key]
+                context.user_data["awaiting_forward_to"] = True
+
             elif data == "merge_audios_menu":
                 await self.safe_edit(
                     query,
@@ -892,9 +997,17 @@ class EnhancedMediaHandler:
                 await self.safe_edit(
                     query, "➕ **Add Subtitles**\nSend subtitle file (.srt, .ass):"
                 )
+                # Expect next document upload to be subtitle file to attach
+                context.user_data["awaiting_subtitle_file"] = True
 
             elif data == "burn_subtitles":
-                await self.safe_edit(query, "✏️ **Burn Subtitles**\nComing soon!")
+                # Ask user to send subtitle file to burn into current video
+                current_file = session.get("current_file")
+                if not current_file or current_file.get("type") != "video":
+                    await self.safe_edit(query, "❌ No video file found to burn subtitles into.")
+                else:
+                    await self.safe_edit(query, "✏️ **Burn Subtitles**\nSend subtitle file (.srt, .ass) to burn into the current video:")
+                    context.user_data["awaiting_burn_subtitle"] = True
 
             # Information
             elif data == "info":
@@ -2207,9 +2320,144 @@ class EnhancedMediaHandler:
                     await update.message.reply_text(
                         "❌ Invalid format. Use WIDTHxHEIGHT."
                     )
-                    for key in list(context.user_data.keys()):
-                        if key.startswith("awaiting_"):
-                            del context.user_data[key]
+            else:
+                await update.message.reply_text(
+                    "❌ Invalid format. Use WIDTHxHEIGHT."
+                )
+
+            for key in list(context.user_data.keys()):
+                if key.startswith("awaiting_"):
+                    del context.user_data[key]
+
+        elif context.user_data.get("awaiting_caption"):
+            # Store caption in session and confirm
+            if not current_file:
+                await update.message.reply_text("❌ No file in session.")
+            else:
+                session["current_file"]["caption"] = user_input
+                await update.message.reply_text("✅ Caption saved.")
+            for key in list(context.user_data.keys()):
+                if key.startswith("awaiting_"):
+                    del context.user_data[key]
+
+        elif context.user_data.get("awaiting_rename"):
+            if not current_file:
+                await update.message.reply_text("❌ No file in session.")
+            else:
+                # Only change stored name, do not move files on disk here
+                session["current_file"]["name"] = user_input
+                await update.message.reply_text(f"✅ Filename set to: {user_input}")
+            for key in list(context.user_data.keys()):
+                if key.startswith("awaiting_"):
+                    del context.user_data[key]
+
+        elif context.user_data.get("awaiting_split"):
+            if not current_file or current_file.get("type") != "video":
+                await update.message.reply_text("❌ No video available to split.")
+            else:
+                # Basic placeholder: accept 'start-end' or integer parts
+                try:
+                    if "-" in user_input:
+                        start_s, end_s = user_input.split("-", 1)
+                        start = float(start_s.strip())
+                        end = float(end_s.strip())
+                        await update.message.reply_text(
+                            f"✅ Split request queued for {start}s to {end}s. Processing..."
+                        )
+                        # Try to call converter.split if available
+                        try:
+                            out = f"storage/output/{current_file['id']}_split_{int(start)}_{int(end)}.mp4"
+                            if hasattr(self.converter, "split_video"):
+                                success = await self.converter.split_video(current_file["path"], start, end, out)
+                                if success and os.path.exists(out):
+                                    with open(out, "rb") as vf:
+                                        await context.bot.send_video(chat_id=update.effective_chat.id, video=vf, caption="✅ Split part")
+                                    os.remove(out)
+                                else:
+                                    await update.message.reply_text("⚠️ Split finished but no file produced.")
+                        except Exception:
+                            logger.exception("split_video failed")
+                    else:
+                        parts = int(user_input.strip())
+                        await update.message.reply_text(f"✅ Split into {parts} parts queued (placeholder).")
+                except Exception:
+                    await update.message.reply_text("❌ Invalid split format. Use 'start-end' or an integer number of parts.")
+            for key in list(context.user_data.keys()):
+                if key.startswith("awaiting_"):
+                    del context.user_data[key]
+
+        elif context.user_data.get("awaiting_forward_to"):
+            if not current_file:
+                await update.message.reply_text("❌ No file to forward.")
+            else:
+                target = user_input.strip()
+                path = current_file.get("path")
+                if not path or not os.path.exists(path):
+                    await update.message.reply_text("❌ Source file not available on disk.")
+                else:
+                    # Resolve & validate target chat (username or id)
+                    try:
+                        # Normalize username (allow with or without @)
+                        if target.startswith("@"):
+                            lookup = target
+                        else:
+                            # try integer id first
+                            try:
+                                lookup = int(target)
+                            except Exception:
+                                lookup = target
+
+                        # This will raise if bot cannot access the chat or it's invalid
+                        dest_chat = await context.bot.get_chat(lookup)
+                    except Exception as e:
+                        logger.warning("Invalid forward target or inaccessible chat: %s", e)
+                        await update.message.reply_text(
+                            "❌ Invalid target or bot cannot access that chat/user. "
+                            "Make sure the chat id is numeric or the user has started the bot (use @username)."
+                        )
+                        for key in list(context.user_data.keys()):
+                            if key.startswith("awaiting_"):
+                                del context.user_data[key]
+                        return
+
+                    # Try sending with validation and robust error handling
+                    try:
+                        file_size = os.path.getsize(path)
+                        # Choose send method; document is a safer fallback for large files
+                        caption = current_file.get("caption", "")
+
+                        if current_file.get("type") == "video":
+                            # Prefer send_video; fallback to send_document on failure
+                            try:
+                                with open(path, "rb") as f:
+                                    await context.bot.send_video(chat_id=dest_chat.id, video=f, caption=caption)
+                            except Exception:
+                                logger.exception("send_video failed, trying send_document as fallback")
+                                with open(path, "rb") as f:
+                                    await context.bot.send_document(chat_id=dest_chat.id, document=f, caption=caption)
+
+                        elif current_file.get("type") == "audio":
+                            try:
+                                with open(path, "rb") as f:
+                                    await context.bot.send_audio(chat_id=dest_chat.id, audio=f, caption=caption)
+                            except Exception:
+                                logger.exception("send_audio failed, trying send_document as fallback")
+                                with open(path, "rb") as f:
+                                    await context.bot.send_document(chat_id=dest_chat.id, document=f, caption=caption)
+
+                        else:
+                            with open(path, "rb") as f:
+                                await context.bot.send_document(chat_id=dest_chat.id, document=f, caption=caption)
+
+                        await update.message.reply_text("✅ Forwarded file successfully.")
+                    except Exception as e:
+                        logger.exception("Failed to forward file to %s: %s", getattr(dest_chat, 'id', lookup), e)
+                        await update.message.reply_text(f"❌ Failed to forward: {e}")
+
+            # Clear awaiting flag regardless of outcome to avoid stuck state
+            for key in list(context.user_data.keys()):
+                if key.startswith("awaiting_"):
+                    del context.user_data[key]
             else:
                 await update.message.reply_text(
                     "❌ Invalid format. Use WIDTHxHEIGHT."
