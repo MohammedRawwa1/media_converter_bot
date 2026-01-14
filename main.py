@@ -491,15 +491,20 @@ async def main(background: bool = False) -> None:
                     # let caller observe failure via exception
                     raise
             else:
-                # Start polling in a background task so this coroutine can
-                # remain as the ASGI-managed background task.
-                logger.info("🚀 Starting bot polling in background task")
-                polling_task = asyncio.create_task(
-                    application.run_polling(
-                        allowed_updates=["message", "callback_query", "edited_message"],
-                        drop_pending_updates=False
-                    )
+                # Polling under an already-running event loop (ASGI/uvicorn)
+                # can cause runtime errors because `run_polling()` tries to
+                # manage the loop. Advise using a webhook or running the
+                # bot in a non-ASGI process. We keep the application started
+                # so webhook mode works; otherwise we won't start polling here.
+                logger.warning(
+                    "Polling under ASGI is unsafe — not starting polling. "
+                    "Set WEBHOOK_URL for webhook mode or run the bot outside ASGI."
                 )
+                polling_task = None
+                try:
+                    BOT_READY.set()
+                except Exception:
+                    pass
 
             # Wait for shutdown_event or cancellation; FastAPI will cancel
             # this task on shutdown which will raise CancelledError here.
