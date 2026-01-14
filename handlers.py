@@ -151,12 +151,36 @@ class EnhancedMediaHandler:
             return await query.edit_message_text(text, **kwargs)
         except BadRequest as e:
             msg = str(e)
+            # Log full BadRequest details for debugging
+            try:
+                await self._log_bad_callback(
+                    "BadRequest_edit",
+                    {
+                        "error": msg,
+                        "callback_data": getattr(query, "data", None),
+                    },
+                    getattr(getattr(query, "from_user", None), "id", None),
+                    getattr(getattr(query, "message", None), "chat", None) and getattr(getattr(query, "message", None), "chat", None).id,
+                    getattr(getattr(query, "message", None), "message_id", None),
+                )
+            except Exception:
+                logger.exception("Failed to log BadRequest in safe_edit")
+
             if (
                 "Message is not modified" in msg
                 or "specified new message content" in msg
             ):
                 logger.debug("Ignored MessageNotModified error during edit")
                 return None
+
+            # Fall back to sending a new message if editing fails for other reasons
+            try:
+                if getattr(query, "message", None):
+                    return await query.message.reply_text(text, **kwargs)
+            except Exception:
+                logger.exception("Fallback reply_text failed after edit BadRequest")
+
+            # If fallback not possible, re-raise the original exception
             raise
 
     async def _require_callback(self, update) -> bool:
@@ -583,300 +607,358 @@ class EnhancedMediaHandler:
         # Import canonical callback names for comparison when needed
         # canonical callback names (if ever needed) are provided by `utils.callbacks`.
         # We don't import them here to avoid unused-name noise from linters.
+        try:
 
-        # Map video bitrate shortcuts to generic bitrate handler
-        if isinstance(data, str) and data.startswith("vbitrate_"):
-            data = "bitrate_" + data.split("_", 1)[1]
+            # Map video bitrate shortcuts to generic bitrate handler
+            if isinstance(data, str) and data.startswith("vbitrate_"):
+                data = "bitrate_" + data.split("_", 1)[1]
 
-        # Ensure session exists
-        if user_id not in self.user_sessions:
-            self.user_sessions[user_id] = {"files": {}, "current_file": None}
+            # Ensure session exists
+            if user_id not in self.user_sessions:
+                self.user_sessions[user_id] = {"files": {}, "current_file": None}
 
-        session = self.user_sessions[user_id]
-        current_file = session.get("current_file")
-
-        # Main menu navigation
-        if data == "menu_main":
-            await self.safe_edit(
-                query,
-                "🎬 **Media Conversion Bot**\nSelect a category:",
-                reply_markup=MediaMenuBuilder.get_main_menu(
-                    current_file["type"] if current_file else None
-                ),
-            )
-
-        elif data == "menu_video":
-            await self.safe_edit(
-                query,
-                "🎬 **Video Tools**\nChoose an action:",
-                reply_markup=MediaMenuBuilder.get_video_tools_menu(),
-            )
-
-        elif data == "menu_audio":
-            await self.safe_edit(
-                query,
-                "🎧 **Audio Tools**\nChoose an action:",
-                reply_markup=MediaMenuBuilder.get_audio_tools_menu(),
-            )
-
-        elif data == "menu_advanced":
-            await self.safe_edit(
-                query,
-                "🔧 **Advanced Tools**\nChoose an action:",
-                reply_markup=MediaMenuBuilder.get_advanced_tools_menu(),
-            )
-
-        # Video tools
-        elif data == "convert_mp3":
-            await self.convert_to_mp3(update, context, session)
-
-        elif data == "compress_menu":
-            await self.safe_edit(
-                query,
-                "📉 **Compression Options**\nSelect quality preset:",
-                reply_markup=MediaMenuBuilder.get_compression_menu(),
-            )
-
-        elif isinstance(data, str) and data.startswith("compress_"):
-            crf = data.split("_")[1]
-            await self.compress_video(update, context, session, crf)
-
-        elif data == "trim_video":
-            await self.safe_edit(
-                query,
-                "✂️ **Video Trimming**\nSend start time (HH:MM:SS):\nExample: 00:01:30",
-            )
-            context.user_data["awaiting_trim"] = "start"
-            for key in list(context.user_data.keys()):
-                if key.startswith("awaiting_"):
-                    del context.user_data[key]
-
-        elif data == "merge_videos_menu":
-            await self.safe_edit(
-                query,
-                "🔀 **Merge Videos**\nSend multiple video files, then click 'Start Merge':",
-                reply_markup=MediaMenuBuilder.get_merge_menu("video"),
-            )
-
-        elif data == "merge_videos_start":
-            await self.merge_videos(update, context, session)
-
-        elif data == "remove_audio":
-            await self.remove_audio(update, context, session)
-
-        elif data == "merge_av_menu":
-            await self.safe_edit(
-                query,
-                "🎵 **Merge Audio with Video**\nFirst send the audio file, then select this option again.",
-            )
-
-        elif data == "resolution_menu":
-            await self.safe_edit(
-                query,
-                "📐 **Change Resolution**\nSelect preset:",
-                reply_markup=MediaMenuBuilder.get_resolution_menu(),
-            )
-
-        elif isinstance(data, str) and data.startswith("res_"):
-            resolution = data.split("_")[1]
-            await self.change_resolution(update, context, session, resolution)
-
-        elif data == "optimize_menu":
-            await self.safe_edit(
-                query,
-                "⚡ **Optimize Video**\nSelect optimization preset:",
-                reply_markup=MediaMenuBuilder.get_optimize_menu(),
-            )
-
-        elif isinstance(data, str) and data.startswith("optimize_"):
-            preset = data.split("_")[1]
-            await self.optimize_video(update, context, session, preset)
-
-        elif data == "repair_video":
-            await self.repair_video(update, context, session)
-
-        elif data == "screenshots_menu":
-            await self.safe_edit(
-                query,
-                "🖼️ **Screenshot Options**\nChoose an option:",
-                reply_markup=MediaMenuBuilder.get_screenshots_menu(),
-            )
-
-        elif isinstance(data, str) and data.startswith("screenshot_"):
-            option = data.split("_")[1]
-            await self.take_screenshot(update, context, session, option)
-
-        elif data == "extract_streams":
-            await self.extract_streams(update, context, session)
-
-        elif data == "extract_audio":
-            await self.extract_audio(update, context, session)
-
-        # Audio tools
-        elif data == "convert_format_menu":
-            await self.safe_edit(
-                query,
-                "🔄 **Convert Audio Format**\nSelect target format:",
-                reply_markup=MediaMenuBuilder.get_format_menu("audio"),
-            )
-
-        elif isinstance(data, str) and data.startswith("format_"):
-            format_type = data.split("_")[1]
-            await self.convert_audio_format(
-                update, context, session, format_type
-            )
-
-        elif data == "bitrate_menu":
-            await self.safe_edit(
-                query,
-                "🎚️ **Adjust Bitrate**\nSelect bitrate:",
-                reply_markup=MediaMenuBuilder.get_bitrate_menu(),
-            )
-
-        # Merge list interactions
-        elif data == "merge_add":
-            # Add the current file to the merge list
+            session = self.user_sessions[user_id]
             current_file = session.get("current_file")
-            if not current_file:
+
+            # Main menu navigation
+            if data == "menu_main":
                 await self.safe_edit(
-                    query, "❌ No current file to add. Send a file first."
+                    query,
+                    "🎬 **Media Conversion Bot**\nSelect a category:",
+                    reply_markup=MediaMenuBuilder.get_main_menu(
+                        current_file["type"] if current_file else None
+                    ),
                 )
-                return
-            path = current_file.get("path")
-            if not path or not os.path.exists(path):
-                await self.safe_edit(query, "❌ File not available to add.")
-                return
-            # Ensure merge_list stores file paths
-            if "merge_list" not in session:
+
+            elif data == "menu_video":
+                await self.safe_edit(
+                    query,
+                    "🎬 **Video Tools**\nChoose an action:",
+                    reply_markup=MediaMenuBuilder.get_video_tools_menu(),
+                )
+
+            elif data == "menu_audio":
+                await self.safe_edit(
+                    query,
+                    "🎧 **Audio Tools**\nChoose an action:",
+                    reply_markup=MediaMenuBuilder.get_audio_tools_menu(),
+                )
+
+            elif data == "menu_advanced":
+                await self.safe_edit(
+                    query,
+                    "🔧 **Advanced Tools**\nChoose an action:",
+                    reply_markup=MediaMenuBuilder.get_advanced_tools_menu(),
+                )
+
+            # Video tools
+            elif data == "convert_mp3":
+                await self.convert_to_mp3(update, context, session)
+
+            elif data == "compress_menu":
+                await self.safe_edit(
+                    query,
+                    "📉 **Compression Options**\nSelect quality preset:",
+                    reply_markup=MediaMenuBuilder.get_compression_menu(),
+                )
+
+            elif isinstance(data, str) and data.startswith("compress_"):
+                crf = data.split("_")[1]
+                await self.compress_video(update, context, session, crf)
+
+            elif data == "trim_video":
+                await self.safe_edit(
+                    query,
+                    "✂️ **Video Trimming**\nSend start time (HH:MM:SS):\nExample: 00:01:30",
+                )
+                context.user_data["awaiting_trim"] = "start"
+                for key in list(context.user_data.keys()):
+                    if key.startswith("awaiting_"):
+                        del context.user_data[key]
+
+            elif data == "merge_videos_menu":
+                await self.safe_edit(
+                    query,
+                    "🔀 **Merge Videos**\nSend multiple video files, then click 'Start Merge':",
+                    reply_markup=MediaMenuBuilder.get_merge_menu("video"),
+                )
+
+            elif data == "merge_videos_start":
+                await self.merge_videos(update, context, session)
+
+            elif data == "remove_audio":
+                await self.remove_audio(update, context, session)
+
+            elif data == "merge_av_menu":
+                await self.safe_edit(
+                    query,
+                    "🎵 **Merge Audio with Video**\nFirst send the audio file, then select this option again.",
+                )
+
+            elif data == "resolution_menu":
+                await self.safe_edit(
+                    query,
+                    "📐 **Change Resolution**\nSelect preset:",
+                    reply_markup=MediaMenuBuilder.get_resolution_menu(),
+                )
+
+            elif isinstance(data, str) and data.startswith("res_"):
+                resolution = data.split("_")[1]
+                await self.change_resolution(update, context, session, resolution)
+
+            elif data == "optimize_menu":
+                await self.safe_edit(
+                    query,
+                    "⚡ **Optimize Video**\nSelect optimization preset:",
+                    reply_markup=MediaMenuBuilder.get_optimize_menu(),
+                )
+
+            elif isinstance(data, str) and data.startswith("optimize_"):
+                preset = data.split("_")[1]
+                await self.optimize_video(update, context, session, preset)
+
+            elif data == "repair_video":
+                await self.repair_video(update, context, session)
+
+            elif data == "screenshots_menu":
+                await self.safe_edit(
+                    query,
+                    "🖼️ **Screenshot Options**\nChoose an option:",
+                    reply_markup=MediaMenuBuilder.get_screenshots_menu(),
+                )
+
+            elif isinstance(data, str) and data.startswith("screenshot_"):
+                option = data.split("_")[1]
+                await self.take_screenshot(update, context, session, option)
+
+            elif data == "extract_streams":
+                await self.extract_streams(update, context, session)
+
+            elif data == "extract_audio":
+                await self.extract_audio(update, context, session)
+
+            # Audio tools
+            elif data == "convert_format_menu":
+                await self.safe_edit(
+                    query,
+                    "🔄 **Convert Audio Format**\nSelect target format:",
+                    reply_markup=MediaMenuBuilder.get_format_menu("audio"),
+                )
+
+            elif isinstance(data, str) and data.startswith("format_"):
+                format_type = data.split("_")[1]
+                await self.convert_audio_format(
+                    update, context, session, format_type
+                )
+
+            elif data == "bitrate_menu":
+                await self.safe_edit(
+                    query,
+                    "🎚️ **Adjust Bitrate**\nSelect bitrate:",
+                    reply_markup=MediaMenuBuilder.get_bitrate_menu(),
+                )
+
+            # Merge list interactions
+            elif data == "merge_add":
+                # Add the current file to the merge list
+                current_file = session.get("current_file")
+                if not current_file:
+                    await self.safe_edit(
+                        query, "❌ No current file to add. Send a file first."
+                    )
+                    return
+                path = current_file.get("path")
+                if not path or not os.path.exists(path):
+                    await self.safe_edit(query, "❌ File not available to add.")
+                    return
+                # Ensure merge_list stores file paths
+                if "merge_list" not in session:
+                    session["merge_list"] = []
+                session["merge_list"].append(path)
+                await self.safe_edit(
+                    query,
+                    f"➕ Added to merge list. Total files: {len(session['merge_list'])}",
+                )
+
+            elif data == "merge_view":
+                if "merge_list" not in session or not session["merge_list"]:
+                    await self.safe_edit(query, "🗒️ Merge list is empty.")
+                else:
+                    names = [os.path.basename(p) for p in session["merge_list"]]
+                    await self.safe_edit(
+                        query, "🗒️ Files in merge list:\n" + "\n".join(names)
+                    )
+
+            elif data == "merge_clear":
                 session["merge_list"] = []
-            session["merge_list"].append(path)
-            await self.safe_edit(
-                query,
-                f"➕ Added to merge list. Total files: {len(session['merge_list'])}",
-            )
+                await self.safe_edit(query, "🗑️ Merge list cleared.")
 
-        elif data == "merge_view":
-            if "merge_list" not in session or not session["merge_list"]:
-                await self.safe_edit(query, "🗒️ Merge list is empty.")
-            else:
-                names = [os.path.basename(p) for p in session["merge_list"]]
+            elif data == "framerate_menu":
                 await self.safe_edit(
-                    query, "🗒️ Files in merge list:\n" + "\n".join(names)
+                    query,
+                    "⏱️ **Change Framerate**\nEnter target FPS (e.g., 24, 30, 60).",
+                )
+                context.user_data["awaiting_framerate"] = True
+                for key in list(context.user_data.keys()):
+                    if key.startswith("awaiting_"):
+                        del context.user_data[key]
+
+            elif data == "fade_menu":
+                await self.safe_edit(query, "📈 Fade In/Out: feature coming soon.")
+
+            elif data == "cancel":
+                # Clear any awaiting inputs and notify user
+                for key in list(context.user_data.keys()):
+                    if key.startswith("awaiting_"):
+                        del context.user_data[key]
+                await self.safe_edit(
+                    query,
+                    "❌ Operation cancelled.",
+                    reply_markup=MediaMenuBuilder.get_main_menu(
+                        current_file["type"] if current_file else None
+                    ),
                 )
 
-        elif data == "merge_clear":
-            session["merge_list"] = []
-            await self.safe_edit(query, "🗑️ Merge list cleared.")
+            elif data == "confirm":
+                await self.safe_edit(
+                    query,
+                    "✅ Confirmed.",
+                    reply_markup=MediaMenuBuilder.get_main_menu(
+                        current_file["type"] if current_file else None
+                    ),
+                )
 
-        elif data == "framerate_menu":
-            await self.safe_edit(
-                query,
-                "⏱️ **Change Framerate**\nEnter target FPS (e.g., 24, 30, 60).",
-            )
-            context.user_data["awaiting_framerate"] = True
-            for key in list(context.user_data.keys()):
-                if key.startswith("awaiting_"):
-                    del context.user_data[key]
+            elif isinstance(data, str) and data.startswith("bitrate_"):
+                bitrate = data.split("_")[1]
+                await self.adjust_bitrate(update, context, session, bitrate)
 
-        elif data == "fade_menu":
-            await self.safe_edit(query, "📈 Fade In/Out: feature coming soon.")
+            elif data == "trim_audio":
+                await self.safe_edit(
+                    query, "✂️ **Trim Audio**\nSend start time (HH:MM:SS):"
+                )
+                context.user_data["awaiting_trim"] = "start"
+                for key in list(context.user_data.keys()):
+                    if key.startswith("awaiting_"):
+                        del context.user_data[key]
 
-        elif data == "cancel":
-            # Clear any awaiting inputs and notify user
-            for key in list(context.user_data.keys()):
-                if key.startswith("awaiting_"):
-                    del context.user_data[key]
-            await self.safe_edit(
-                query,
-                "❌ Operation cancelled.",
-                reply_markup=MediaMenuBuilder.get_main_menu(
-                    current_file["type"] if current_file else None
-                ),
-            )
+            elif data == "merge_audios_menu":
+                await self.safe_edit(
+                    query,
+                    "🔀 **Merge Audio Files**\nSend multiple audio files, then click 'Start Merge':",
+                    reply_markup=MediaMenuBuilder.get_merge_menu("audio"),
+                )
 
-        elif data == "confirm":
-            await self.safe_edit(
-                query,
-                "✅ Confirmed.",
-                reply_markup=MediaMenuBuilder.get_main_menu(
-                    current_file["type"] if current_file else None
-                ),
-            )
+            elif data == "merge_audios_start":
+                await self.merge_audios(update, context, session)
 
-        elif isinstance(data, str) and data.startswith("bitrate_"):
-            bitrate = data.split("_")[1]
-            await self.adjust_bitrate(update, context, session, bitrate)
+            elif data == "normalize_audio":
+                await self.normalize_audio(update, context, session)
 
-        elif data == "trim_audio":
-            await self.safe_edit(
-                query, "✂️ **Trim Audio**\nSend start time (HH:MM:SS):"
-            )
-            context.user_data["awaiting_trim"] = "start"
-            for key in list(context.user_data.keys()):
-                if key.startswith("awaiting_"):
-                    del context.user_data[key]
+            # Advanced tools
+            elif data == "extract_all_streams":
+                await self.extract_all_streams(update, context, session)
 
-        elif data == "merge_audios_menu":
-            await self.safe_edit(
-                query,
-                "🔀 **Merge Audio Files**\nSend multiple audio files, then click 'Start Merge':",
-                reply_markup=MediaMenuBuilder.get_merge_menu("audio"),
-            )
+            elif data == "extract_subtitles":
+                await self.extract_subtitles(update, context, session)
 
-        elif data == "merge_audios_start":
-            await self.merge_audios(update, context, session)
+            elif data == "edit_metadata":
+                await self.safe_edit(
+                    query,
+                    "🏷️ Edit metadata: send JSON (example in README).",
+                )
+                for key in list(context.user_data.keys()):
+                    if key.startswith("awaiting_"):
+                        del context.user_data[key]
 
-        elif data == "normalize_audio":
-            await self.normalize_audio(update, context, session)
+            elif data == "full_info":
+                await self.show_full_info(update, context, session)
 
-        # Advanced tools
-        elif data == "extract_all_streams":
-            await self.extract_all_streams(update, context, session)
+            elif data == "create_archive":
+                await self.create_archive(update, context, session)
 
-        elif data == "extract_subtitles":
-            await self.extract_subtitles(update, context, session)
+            elif data == "batch_process":
+                await self.safe_edit(
+                    query,
+                    "🔀 **Batch Processing**\nComing soon! Send multiple files to process.",
+                )
 
-        elif data == "edit_metadata":
-            await self.safe_edit(
-                query,
-                "🏷️ Edit metadata: send JSON (example in README).",
-            )
-            for key in list(context.user_data.keys()):
-                if key.startswith("awaiting_"):
-                    del context.user_data[key]
+            elif data == "thumbnail_grid":
+                await self.create_thumbnail_grid(update, context, session)
 
-        elif data == "full_info":
-            await self.show_full_info(update, context, session)
+            elif data == "generate_sample":
+                await self.generate_sample(update, context, session)
 
-        elif data == "create_archive":
-            await self.create_archive(update, context, session)
+            elif data == "add_subtitles":
+                await self.safe_edit(
+                    query, "➕ **Add Subtitles**\nSend subtitle file (.srt, .ass):"
+                )
 
-        elif data == "batch_process":
-            await self.safe_edit(
-                query,
-                "🔀 **Batch Processing**\nComing soon! Send multiple files to process.",
-            )
+            elif data == "burn_subtitles":
+                await self.safe_edit(query, "✏️ **Burn Subtitles**\nComing soon!")
 
-        elif data == "thumbnail_grid":
-            await self.create_thumbnail_grid(update, context, session)
+            # Information
+            elif data == "info":
+                await self.show_media_info(update, context, session)
 
-        elif data == "generate_sample":
-            await self.generate_sample(update, context, session)
+            else:
+                await self.safe_edit(query, f"Unknown command: {data}")
+        except Exception as e:
+            # Log unexpected exceptions along with callback metadata
+            try:
+                await self._log_bad_callback(
+                    "callback_handler_exception",
+                    {
+                        "exception": repr(e),
+                        "callback_data": data,
+                    },
+                    getattr(update.effective_user, "id", None),
+                    getattr(update.effective_chat, "id", None),
+                    getattr(getattr(query, "message", None), "message_id", None),
+                )
+            except Exception:
+                logger.exception("Failed to persist callback_handler exception")
 
-        elif data == "add_subtitles":
-            await self.safe_edit(
-                query, "➕ **Add Subtitles**\nSend subtitle file (.srt, .ass):"
-            )
+            # Optional debug dump of full Update JSON when enabled via env
+            try:
+                if os.environ.get("DEBUG_DUMP_UPDATES", "0").lower() in ("1", "true", "yes"):
+                    dump_dir = os.path.join(os.path.dirname(__file__), "logs")
+                    os.makedirs(dump_dir, exist_ok=True)
+                    dump_path = os.path.join(dump_dir, "update_dumps.log")
+                    try:
+                        # Prefer structured dict if Update supports it
+                        if hasattr(update, "to_dict"):
+                            update_data = update.to_dict()
+                        elif hasattr(update, "to_json"):
+                            # to_json may return a JSON string
+                            try:
+                                update_data = json.loads(update.to_json())
+                            except Exception:
+                                update_data = {"repr": repr(update)}
+                        else:
+                            update_data = {"repr": repr(update)}
 
-        elif data == "burn_subtitles":
-            await self.safe_edit(query, "✏️ **Burn Subtitles**\nComing soon!")
+                        entry = {
+                            "timestamp": datetime.utcnow().isoformat() + "Z",
+                            "update_id": getattr(update, "update_id", None),
+                            "callback_data": data,
+                            "exception": repr(e),
+                            "update": update_data,
+                        }
+                        with open(dump_path, "a", encoding="utf-8") as fh:
+                            fh.write(json.dumps(entry, ensure_ascii=False, default=str) + "\n")
+                        logger.info("Wrote update dump to %s", dump_path)
+                    except Exception:
+                        logger.exception("Failed writing update dump for callback exception")
+            except Exception:
+                logger.exception("Failed to evaluate DEBUG_DUMP_UPDATES")
 
-        # Information
-        elif data == "info":
-            await self.show_media_info(update, context, session)
-
-        else:
-            await self.safe_edit(query, f"Unknown command: {data}")
+            logger.exception("Unhandled exception in callback_handler: %s", e)
+            try:
+                await self.safe_edit(query, "⚠️ Internal error while handling the button. Try again later.")
+            except Exception:
+                # Best-effort only
+                logger.exception("Failed to notify user after callback_handler exception")
+            return
 
     # ========== IMPLEMENTATION METHODS ==========
 
