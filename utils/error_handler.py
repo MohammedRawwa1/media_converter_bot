@@ -288,4 +288,47 @@ def setup_comprehensive_logging(
     root_logger.addHandler(file_handler)
     root_logger.setLevel(level)
 
+    # Optional remote integrations
+    # 1) Sentry (DSN via SENTRY_DSN env var)
+    try:
+        sentry_dsn = __import__("os").environ.get("SENTRY_DSN")
+        if sentry_dsn:
+            try:
+                from sentry_sdk import init as sentry_init
+                from sentry_sdk.integrations.logging import LoggingIntegration
+
+                # Integrate logging with Sentry
+                logging_integration = LoggingIntegration(level, level)
+                sentry_init(dsn=sentry_dsn, integrations=[logging_integration])
+                logger.info("✅ Sentry logging initialized")
+            except Exception:
+                logger.exception("Failed to initialize Sentry integration")
+    except Exception:
+        logger.debug("SENTRY_DSN check skipped")
+
+    # 2) AWS CloudWatch via watchtower (LOG_GROUP via AWS_LOG_GROUP env var)
+    try:
+        env = __import__("os").environ
+        cw_group = env.get("AWS_LOG_GROUP")
+        if cw_group:
+            try:
+                import watchtower
+                import boto3
+
+                aws_region = env.get("AWS_REGION")
+                session_kwargs = {}
+                if aws_region:
+                    session_kwargs["region_name"] = aws_region
+
+                # Create CloudWatch handler and attach to root logger
+                cw_handler = watchtower.CloudWatchLogHandler(log_group=cw_group, **session_kwargs)
+                cw_handler.setLevel(level)
+                cw_handler.setFormatter(formatter)
+                root_logger.addHandler(cw_handler)
+                logger.info("✅ CloudWatch logging initialized (group=%s)", cw_group)
+            except Exception:
+                logger.exception("Failed to initialize CloudWatch logging (watchtower)" )
+    except Exception:
+        logger.debug("CloudWatch check skipped")
+
     logger.info("✅ Comprehensive logging initialized")
