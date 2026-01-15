@@ -51,6 +51,19 @@ from utils.webhook_monitor import WebhookRecoveryManager
 logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# Ensure directories exist early (important for Render/ASGI import-time logging)
+try:
+    from setup_directory import setup_bot_directories
+
+    try:
+        setup_bot_directories()
+    except Exception:
+        # Best-effort; continue if cannot create here
+        pass
+except Exception:
+    # setup_directory may not be present or importable in some test environments
+    pass
+
 # Bot application handle for metrics and introspection when started under ASGI
 BOT_APPLICATION = None
 BOT_STARTED_AT = None
