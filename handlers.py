@@ -70,6 +70,7 @@ class EnhancedMediaHandler:
         self.conversion_semaphore = asyncio.Semaphore(
             max_concurrent_conversions
         )
+        self._max_conversions = max_concurrent_conversions
         self.active_conversions: Dict[int, str] = {}  # user_id -> task_name
         # Telemetry for malformed callbacks
         self.bad_callback_counts: Dict[str, int] = {}
@@ -318,6 +319,62 @@ class EnhancedMediaHandler:
             # On any error, allow the conversion to proceed (fail-open)
             logger.debug("Conversion quota check failed, allowing conversion")
         return True
+
+    async def convert_video_format(
+        self,
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+        session: Dict,
+        target_format: str,
+    ):
+        """Convert video to different format."""
+        if not await self._require_callback(update):
+            return
+        query = update.callback_query
+        current_file = session.get("current_file")
+        user_id = update.effective_user.id
+
+        if not current_file or current_file["type"] != "video":
+            await self.safe_edit(query, "❌ No video file found.")
+            return
+
+        if not await self._check_conversion_quota(update, context):
+            return
+
+        await self.safe_edit(query, f"🎬 Converting to {target_format.upper()}...")
+
+        async def do_conversion():
+            input_path = current_file["path"]
+            output_path = f"storage/output/{current_file['id']}_converted.{target_format}"
+
+            success = await self.converter.convert_video_format(
+                input_path, output_path, target_format
+            )
+
+            if success and os.path.exists(output_path):
+                file_size = os.path.getsize(output_path)
+                if file_size > 2 * 1024**3:  # 2GB Telegram limit
+                    await self.safe_edit(
+                        query,
+                        f"❌ Converted file too large ({file_size//1024//1024}MB).\n"
+                        "Try compression first.",
+                    )
+                    os.remove(output_path)
+                else:
+                    with open(output_path, "rb") as video_file:
+                        await context.bot.send_video(
+                            chat_id=update.effective_chat.id,
+                            video=video_file,
+                            caption=f"✅ Converted to {target_format.upper()}",
+                            supports_streaming=True,
+                        )
+                    os.remove(output_path)
+            else:
+                await self.safe_edit(query, "❌ Conversion failed.")
+
+        await self._run_with_concurrency_limit(
+            user_id, f"video_format_conversion_{target_format}", do_conversion()
+        )
 
     async def handle_media_message(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
@@ -1197,15 +1254,10 @@ class EnhancedMediaHandler:
 
         # Check queue status
         active_count = len(self.active_conversions)
-        semaphore_size = self.conversion_semaphore._initial_value
-        max_conversions = semaphore_size + (
-            self.conversion_semaphore._waiters.__len__()
-            if hasattr(self.conversion_semaphore, "_waiters")
-            else 0
-        )
+        max_conversions = getattr(self, "_max_conversions", 1)
 
         if active_count >= max_conversions:
-            queue_position = max_conversions - active_count + 1
+            queue_position = active_count - max_conversions + 1
             await self.safe_edit(
                 query,
                 f"⏳ Queue position: #{queue_position}\n"
@@ -1316,14 +1368,14 @@ class EnhancedMediaHandler:
             return
 
         active_count = len(self.active_conversions)
-        semaphore_size = self.conversion_semaphore._initial_value
+        max_conversions = getattr(self, "_max_conversions", 1)
 
-        if active_count >= semaphore_size:
-            queue_position = semaphore_size - active_count + 1
+        if active_count >= max_conversions:
+            queue_position = active_count - max_conversions + 1
             await self.safe_edit(
                 query,
                 f"⏳ Queue position: #{queue_position}\n"
-                f"Active conversions: {active_count}/{semaphore_size}\n"
+                f"Active conversions: {active_count}/{max_conversions}\n"
                 f"Your compression will start soon...",
             )
         else:
