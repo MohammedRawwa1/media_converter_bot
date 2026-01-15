@@ -22,6 +22,15 @@ def format_key(fmt: str) -> str:
     return f"{FORMAT_PREFIX}{fmt}"
 
 
+# Video format conversions
+FORMAT_MP4 = "format_mp4"
+FORMAT_MKV = "format_mkv"
+FORMAT_AVI = "format_avi"
+FORMAT_MOV = "format_mov"
+FORMAT_WEBM = "format_webm"
+FORMAT_FLV = "format_flv"
+
+
 # Compression
 COMPRESS_PREFIX = "compress_"
 
