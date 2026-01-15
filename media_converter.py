@@ -72,9 +72,27 @@ class ExtendedMediaConverter:
     # ========== VIDEO FEATURES ==========
 
     async def convert_video_format(self, input_path: str, output_path: str, target_format: str = "mp4") -> bool:
-        """Convert video to different format."""
-        cmd = ["-c:v", "copy", "-c:a", "copy", "-strict", "experimental"]
-        return (await self.execute_ffmpeg(cmd, input_path, output_path))[0]
+        """Convert video to different format with proper codec selection."""
+        try:
+            format_configs = {
+                "mp4": ["-c:v", "libx264", "-c:a", "aac", "-strict", "experimental"],
+                "mkv": ["-c:v", "libx264", "-c:a", "aac"],
+                "avi": ["-c:v", "libx264", "-c:a", "mp3"],
+                "mov": ["-c:v", "libx264", "-c:a", "aac"],
+                "webm": ["-c:v", "libvpx-vp9", "-c:a", "libvorbis"],
+                "flv": ["-c:v", "libx264", "-c:a", "aac"],
+            }
+
+            if target_format not in format_configs:
+                logger.error(f"Unsupported video format: {target_format}")
+                return False
+
+            cmd = format_configs[target_format]
+            return (await self.execute_ffmpeg(cmd, input_path, output_path))[0]
+
+        except Exception as e:
+            logger.error(f"Video format conversion error: {e}")
+            return False
 
     async def change_resolution(self, input_path: str, output_path: str, width: int, height: int) -> bool:
         """Change video resolution."""
