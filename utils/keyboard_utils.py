@@ -56,12 +56,7 @@ class MediaMenuBuilder:
 
     @staticmethod
     def get_main_menu(file_type: str = None) -> InlineKeyboardMarkup:
-        """Get main menu based on file type.
-
-        Layout mirrors the provided UI image: many feature buttons arranged
-        in two-column rows. Buttons use canonical callback constants where
-        possible to match handlers' expectations.
-        """
+        """Get main menu based on file type."""
         # Shared helpers for common rows
         def row(left_label, left_cb, right_label, right_cb):
             return [
@@ -69,20 +64,27 @@ class MediaMenuBuilder:
                 InlineKeyboardButton(right_label, callback_data=right_cb),
             ]
 
-        # Build rows according to the UI image
+        # Build rows according to the UI image. Adapt some labels based on
+        # the `file_type` so that video uploads show video-oriented tools.
+        is_video = (file_type == "video")
+
+        conv_label = "🎬 Video Converter" if is_video else "🎧 Audio Converter"
+        conv_cb = CONVERT_FORMAT_MENU
+
+        split_label = "🔪 Videos Splitter" if is_video else "🔪 Split"
+
         buttons: List[List[InlineKeyboardButton]] = [
             row("🖼️ Thumbnail Extractor", THUMBNAIL_EXTRACTOR, "✏️ Caption And Buttons Editor", CAPTION_EDITOR),
             row("📝 Metadata Editor", EDIT_METADATA, "📤 Media Forwarder", MEDIA_FORWARDER),
             row("🔇 Stream Remover", STREAM_REMOVER, "🎵 Stream Extractor", STREAM_EXTRACTOR),
             row("✂️ Video Trimmer", TRIM_VIDEO, "➕ Video Merger", MERGE_VIDEOS_START),
             row("🔉 Remove Audio", REMOVE_AUDIO, "🔀 Merge And", MERGE_VIEW),
-            row("🎧 Audio Converter", CONVERT_FORMAT_MENU, "🔪 Videos Splitter", VIDEOS_SPLITTER),
+            row(conv_label, conv_cb, split_label, VIDEOS_SPLITTER),
             row("🖼️ Screenshots", SCREENSHOTS_MENU, "🖼️ Manual Shots", MANUAL_SHOTS),
             row("🎞️ Generate Sample", SAMPLE, "🎵 Video To Audio", VIDEO_TO_AUDIO),
             row("⚡ Video Optimizer", OPTIMIZE_MENU, "🔗 Subtitle Merger", SUBTITLE_MERGER),
-            row("🎬 Video Converter", VIDEO_CONVERTER, "✏️ Video Renamer", VIDEO_RENAMER),
-            row("🛈 Media Information", INFO, "📦 Create Archive", CREATE_ARCHIVE),
-            [InlineKeyboardButton("❌ Cancel", callback_data=CANCEL)],
+            row("✏️ Video Renamer", VIDEO_RENAMER, "🛈 Media Information", INFO),
+            row("📦 Create Archive", CREATE_ARCHIVE, "❌ Cancel", CANCEL),
         ]
 
         # If file_type provided, you may want to prioritize tools, but keep
@@ -94,7 +96,7 @@ class MediaMenuBuilder:
         """Generic format menu used by handlers; supports 'audio' and 'video'."""
         if media_type == "audio":
             return MediaMenuBuilder.get_audio_format_menu()
-        # Provide a simple video format selector for common containers
+        # FIXED: Video format menu with proper video formats
         buttons = [
             [
                 InlineKeyboardButton("MP4", callback_data="format_mp4"),
@@ -103,6 +105,10 @@ class MediaMenuBuilder:
             [
                 InlineKeyboardButton("AVI", callback_data="format_avi"),
                 InlineKeyboardButton("MOV", callback_data="format_mov"),
+            ],
+            [
+                InlineKeyboardButton("WEBM", callback_data="format_webm"),
+                InlineKeyboardButton("FLV", callback_data="format_flv"),
             ],
             [InlineKeyboardButton("↩️ Back", callback_data=MENU_MAIN)],
         ]
@@ -166,7 +172,7 @@ class MediaMenuBuilder:
                 InlineKeyboardButton("OGG", callback_data="audio_ogg"),
                 InlineKeyboardButton("M4A", callback_data="audio_m4a"),
             ],
-            [InlineKeyboardButton("↩️ Back", callback_data="menu_main")],
+            [InlineKeyboardButton("↩️ Back", callback_data=MENU_MAIN)],
         ]
         return InlineKeyboardMarkup(buttons)
 
