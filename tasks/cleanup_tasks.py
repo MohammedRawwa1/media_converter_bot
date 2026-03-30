@@ -2,10 +2,7 @@
 import asyncio
 import logging
 import os
-import shutil
 import time
-from pathlib import Path
-from typing import List
 
 logger = logging.getLogger(__name__)
 
