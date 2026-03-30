@@ -25,9 +25,10 @@ class RateLimiter:
         """
         self.calls_per_second = calls_per_second
         self.per_user = per_user
-
         # Token bucket: {key -> (tokens, last_refill_time)}
-        self.buckets: Dict[str, Tuple[float, float]] = defaultdict(lambda: (calls_per_second, time.time()))
+        # Ensure at least 1 token capacity so the first operation is allowed
+        initial_tokens = max(1.0, calls_per_second)
+        self.buckets: Dict[str, Tuple[float, float]] = defaultdict(lambda: (initial_tokens, time.time()))
         self._lock = asyncio.Lock()
 
     async def acquire(self, user_id: str = "global", tokens: float = 1.0) -> bool:

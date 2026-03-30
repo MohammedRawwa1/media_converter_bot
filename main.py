@@ -480,7 +480,8 @@ async def main(background: bool = False) -> None:
 
     # Initialize rate limiters
     api_limiter = TelegramAPIRateLimiter()
-    conversion_limiter = ConversionRateLimiter(conversions_per_hour=100)
+    # Set conversions_per_hour to 360 => ~1 conversion per 10 seconds
+    conversion_limiter = ConversionRateLimiter(conversions_per_hour=360)
 
     # Attach rate limiters to application context
     application.bot_data["api_rate_limiter"] = api_limiter
@@ -489,7 +490,7 @@ async def main(background: bool = False) -> None:
     logger.info("Rate limiters initialized")
     logger.info(f"  - API limit: {TelegramAPIRateLimiter.GENERAL_LIMIT} calls/sec globally")
     logger.info(f"  - Per-user limit: {TelegramAPIRateLimiter.PER_USER_LIMIT} call/sec")
-    logger.info("  - Conversion limit: 100 conversions/hour per user")
+    logger.info(f"  - Conversion limit: {conversion_limiter.conversions_per_hour} conversions/hour per user")
 
     # Setup handlers
     setup_handlers(application)
