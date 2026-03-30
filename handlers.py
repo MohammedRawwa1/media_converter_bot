@@ -528,8 +528,9 @@ class EnhancedMediaHandler:
             err_text = str(e) or ""
             upload_url = os.environ.get("WEB_UPLOAD_URL") or "<your-server>/upload"
 
-            # Opt-in userbot fallback: only attempt if explicitly enabled and we
-            # have forward metadata recorded for this file.
+            # Opt-in userbot fallback: try origin-of-forward first (if present),
+            # then fall back to downloading the forwarded message as it appears
+            # in the bot chat (useful when forward metadata lacks origin IDs).
             enable_userbot = os.environ.get("ENABLE_USERBOT", "").lower() in ("1", "true", "yes")
             forward = current_file.get("forward") if current_file else None
             if enable_userbot and forward and forward.get("chat_id") and forward.get("message_id"):
@@ -548,7 +549,47 @@ class EnhancedMediaHandler:
                             logger.debug("Could not persist session after userbot download")
                         return
                 except Exception:
-                    logger.exception("Userbot download fallback failed")
+                    logger.exception("Userbot download fallback failed (origin forward)")
+
+            # If the origin-forward attempt wasn't possible or failed, try to
+            # download the forwarded message from the bot chat itself using
+            # the message id/chat id we stored at registration time (or from
+            # the provided `update` object).
+            if enable_userbot:
+                try:
+                    bot_chat = current_file.get("chat_id")
+                    bot_msg = current_file.get("msg_id")
+                except Exception:
+                    bot_chat = None
+                    bot_msg = None
+
+                # Try to extract from the update if not present in session
+                if not bot_chat or not bot_msg:
+                    try:
+                        if getattr(update, "message", None) and getattr(update.message, "chat", None):
+                            bot_chat = getattr(update.message.chat, "id", None)
+                            bot_msg = getattr(update.message, "message_id", None)
+                        elif getattr(update, "callback_query", None) and getattr(update.callback_query, "message", None):
+                            bot_chat = getattr(update.callback_query.message.chat, "id", None)
+                            bot_msg = getattr(update.callback_query.message, "message_id", None)
+                    except Exception:
+                        pass
+
+                if bot_chat and bot_msg:
+                    try:
+                        from utils.userbot_downloader import download_forward_via_userbot
+
+                        ok = await download_forward_via_userbot(bot_chat, bot_msg, file_path)
+                        if ok and os.path.exists(file_path):
+                            current_file["path"] = file_path
+                            session["current_file"] = current_file
+                            try:
+                                self._persist_session(user_id)
+                            except Exception:
+                                logger.debug("Could not persist session after userbot download (bot chat)")
+                            return
+                    except Exception:
+                        logger.exception("Userbot download fallback failed (bot chat)")
 
             # If it's clearly a size issue, instruct the user to use upload/web URL.
             if "file is too big" in err_text.lower() or "too big" in err_text.lower():
@@ -1090,6 +1131,8 @@ class EnhancedMediaHandler:
             "name": final_name,
             "thumbnail": thumb,
             "forward": forward_info,
+            "chat_id": getattr(update.message, "chat", None) and getattr(update.message.chat, "id", None),
+            "msg_id": getattr(update.message, "message_id", None),
         }
 
         try:
@@ -1168,6 +1211,8 @@ class EnhancedMediaHandler:
             "name": final_name,
             "thumbnail": thumb,
             "forward": forward_info,
+            "chat_id": getattr(update.message, "chat", None) and getattr(update.message.chat, "id", None),
+            "msg_id": getattr(update.message, "message_id", None),
         }
 
         await update.message.reply_text(
@@ -1296,6 +1341,8 @@ class EnhancedMediaHandler:
             "name": final_name,
             "thumbnail": thumb,
             "forward": forward_info,
+            "chat_id": getattr(update.message, "chat", None) and getattr(update.message.chat, "id", None),
+            "msg_id": getattr(update.message, "message_id", None),
         }
 
         try:

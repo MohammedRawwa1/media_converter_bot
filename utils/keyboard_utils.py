@@ -22,6 +22,7 @@ from .callbacks import (
     MERGE_ADD,
     MERGE_CLEAR,
     MERGE_VIDEOS_START,
+    MERGE_AUDIOS_START,
     MERGE_VIEW,
     OPTIMIZE_MENU,
     REMOVE_AUDIO,
