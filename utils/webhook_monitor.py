@@ -144,22 +144,24 @@ class WebhookMonitor:
                 # Wait before next check (supporting current backoff interval)
                 wait = getattr(self, "_current_interval", self.check_interval)
                 await asyncio.sleep(wait)
-        except aiohttp.ClientError as e:
-            # Any aiohttp client errors (DNS, SSL, etc.) should back off
-            self.is_healthy = False
-            self.failed_checks += 1
-            self.consecutive_failures += 1
-            try:
-                self._current_interval = min(self._current_interval * 2, self._max_backoff)
-            except Exception:
-                pass
-            self.last_error = str(e)
-            logger.error(f"❌ Webhook client error: {e}; increasing backoff")
-            return False
 
             except asyncio.CancelledError:
                 logger.info("Webhook monitoring stopped")
                 break
+
+            except aiohttp.ClientError as e:
+                # Any aiohttp client errors (DNS, SSL, etc.) should back off but keep running
+                self.is_healthy = False
+                self.failed_checks += 1
+                self.consecutive_failures += 1
+                try:
+                    self._current_interval = min(self._current_interval * 2, self._max_backoff)
+                except Exception:
+                    pass
+                self.last_error = str(e)
+                logger.error(f"❌ Webhook client error: {e}; increasing backoff")
+                # Sleep for the backoff interval before retrying
+                await asyncio.sleep(getattr(self, "_current_interval", self.check_interval))
 
             except Exception as e:
                 logger.error(f"Error in monitoring loop: {e}")
