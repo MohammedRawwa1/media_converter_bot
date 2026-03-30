@@ -44,6 +44,22 @@ def index():
 
 @app.route("/upload", methods=["POST"])
 def upload():
+    # Optional upload token protection: when `UPLOAD_SECRET` is set in the
+    # environment, require callers to include an `X-Upload-Token` header or
+    # provide `upload_token` as a form/query parameter with the same value.
+    upload_secret = os.environ.get("UPLOAD_SECRET")
+    if upload_secret:
+        incoming_token = (
+            request.headers.get("X-Upload-Token")
+            or request.form.get("upload_token")
+            or request.args.get("upload_token")
+        )
+        if not incoming_token or incoming_token != upload_secret:
+            return (
+                jsonify({"error": "unauthorized", "detail": "missing or invalid upload token"}),
+                401,
+            )
+
     if "file" not in request.files:
         return jsonify({"error": "no file"}), 400
     f = request.files["file"]

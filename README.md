@@ -128,12 +128,47 @@ Code Quality:        ✅ Verified
 ## 📞 Environment Variables
 
 ### Required
-- `BOT_TOKEN` - Your Telegram bot token
+- `BOT_TOKEN` - Your Telegram bot token (set this in your environment or in a `.env` file).
+
+### Important / Useful
+- `MAX_FILE_SIZE` - Maximum allowed file size, interpreted as gigabytes (integer). Example: `MAX_FILE_SIZE=2` means 2 GB. The application multiplies this value by 1024^3 to compute bytes.
+- `WEB_UPLOAD_URL` - Public endpoint for the web uploader (optional). If set, the bot will include this URL in instructions when Telegram refuses to download a file due to size limits.
+ - `UPLOAD_SECRET` - Optional token to protect the web uploader (`/upload`). When set, clients must include the header `X-Upload-Token: <UPLOAD_SECRET>` or a form/query parameter `upload_token=<UPLOAD_SECRET>` with their upload request. Generate a secure token with:
+
+```
+python -c "import secrets; print(secrets.token_urlsafe(32))"
+```
+
+Example upload command using the token (replace variables):
+
+```
+curl -H "X-Upload-Token: $UPLOAD_SECRET" -F "file=@/path/to/video.mp4" $WEB_UPLOAD_URL
+```
 
 ### Optional
-- `WEBHOOK_URL` - For webhook mode
-- `MONGODB_URI` - MongoDB connection string
- - `WEBHOOK_SECRET` - Optional secret token for Telegram webhook security. If set, the app will pass this token to Telegram when calling `set_webhook(..., secret_token=...)` and will validate incoming `X-Telegram-Bot-Api-Secret-Token` headers.
+- `WEBHOOK_URL` - For webhook mode (public URL where Telegram will POST updates).
+- `WEBHOOK_SECRET` - Optional secret token for Telegram webhook security. If set, the app will pass this token to Telegram when calling `set_webhook(..., secret_token=...)` and will validate incoming `X-Telegram-Bot-Api-Secret-Token` headers.
+- `MONGODB_URI` - MongoDB connection string (optional) for conversion logging and job persistence.
+- `REDIS_URL` - Redis connection URL (optional) for job queue/worker integration.
+- `SENTRY_DSN` - Optional Sentry DSN for error monitoring.
+
+### Example `.env`
+Copy `.env.example` and fill values appropriate for your deployment. A minimal example:
+
+```
+BOT_TOKEN=123456:ABCdefGHIjkl_mnopQRstuV
+MAX_FILE_SIZE=2
+WEB_UPLOAD_URL=https://files.example.com/upload
+WEBHOOK_URL=https://your-host/telegram/webhook
+WEBHOOK_SECRET=replace-with-a-secret
+MONGODB_URI=mongodb+srv://user:pass@cluster.example/dbname
+REDIS_URL=redis://localhost:6379/0
+SENTRY_DSN=
+```
+
+### Security note
+- This project does not enable user-account (Pyrogram) downloads by default. Do not add `USERBOT_*` environment variables unless you intentionally enable Pyrogram and understand the security implications (user session strings grant full access to the Telegram account).
+
 
 ---
 

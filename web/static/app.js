@@ -8,6 +8,10 @@ uploadForm.addEventListener('submit', async (e) => {
   const file = fileInput.files[0]
   const fd = new FormData()
   fd.append('file', file)
+  const tokenInput = document.getElementById('uploadTokenInput')
+  if (tokenInput && tokenInput.value) {
+    fd.append('upload_token', tokenInput.value.trim())
+  }
   const res = await fetch('/upload', { method: 'POST', body: fd })
   if (!res.ok) {
     alert('upload failed')
