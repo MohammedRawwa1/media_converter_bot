@@ -6,7 +6,7 @@ import os
 from datetime import datetime
 from typing import Dict, Optional
 
-from telegram import InputMediaPhoto, Update
+from telegram import InputMediaPhoto, Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.error import BadRequest
 from telegram.ext import ContextTypes, ConversationHandler
 
@@ -18,13 +18,29 @@ except ImportError:
 
 try:
     from utils.keyboard_utils import MediaMenuBuilder
+    from utils.job_queue import enqueue_job
+    import uuid
 except ImportError:
     MediaMenuBuilder = None
+    try:
+        enqueue_job
+    except NameError:
+        enqueue_job = None
+    try:
+        uuid
+    except NameError:
+        uuid = None
 
 try:
-    from utils.file_utils import AsyncFileLock
+    from utils.file_utils import AsyncFileLock, detect_filename
 except ImportError:
     AsyncFileLock = None
+
+# Import config module if available (some code references `config.<NAME>`)
+try:
+    import config
+except Exception:
+    config = None
 
 # Import ACL helper
 try:
@@ -36,13 +52,55 @@ except Exception:
 
     MAX_FILE_SIZE = 4 * 1024**3
 
+# Optional user settings helper
+try:
+    from utils import user_settings
+except Exception:
+    user_settings = None
+
 logger = logging.getLogger(__name__)
+
+
+def _parse_time_to_seconds(tstr: str) -> float:
+    """Parse time strings like HH:MM:SS(.ms), MM:SS(.ms) or plain seconds -> seconds (float)."""
+    try:
+        parts = tstr.strip().split(":")
+        if len(parts) == 3:
+            h = int(parts[0])
+            m = int(parts[1])
+            s = float(parts[2])
+            return h * 3600 + m * 60 + s
+        elif len(parts) == 2:
+            m = int(parts[0])
+            s = float(parts[1])
+            return m * 60 + s
+        else:
+            return float(parts[0])
+    except Exception:
+        raise ValueError(f"Invalid time format: {tstr}")
+
+
+def _format_seconds_to_hhmmss(sec: float) -> str:
+    h = int(sec // 3600)
+    m = int((sec % 3600) // 60)
+    s = sec % 60
+    # keep millisecond precision when present
+    if abs(s - int(s)) > 0:
+        return f"{h:02d}:{m:02d}:{s:06.3f}"
+    else:
+        return f"{h:02d}:{m:02d}:{int(s):02d}"
 
 # Optional ffmpeg-python binding (best-effort)
 try:
     import ffmpeg
 except Exception:
     ffmpeg = None
+
+# Probe helper for durations
+try:
+    from utils.ffmpeg_runner import probe_duration
+except Exception:
+    probe_duration = None
 
 # Optional MongoDB model (best-effort import)
 try:
@@ -136,6 +194,97 @@ class EnhancedMediaHandler:
         except RuntimeError:
             logger.error("Failed to schedule session cleanup - no event loop")
 
+    async def _finalize_media_group(self, user_id: int, media_group_id: str):
+        """Called after a short delay to finalize a media_group (album) and add
+        its items to the user's merge_list with a single confirmation message.
+        """
+        try:
+            session = self.user_sessions.get(user_id)
+            if not session:
+                return
+            groups = session.setdefault("media_groups", {})
+            items = groups.pop(media_group_id, [])
+            if not items:
+                return
+
+            # Ensure merge_list exists
+            if "merge_list" not in session:
+                session["merge_list"] = []
+            for it in items:
+                session["merge_list"].append(it)
+
+            # Persist session
+            try:
+                self._persist_session(user_id)
+            except Exception:
+                logger.debug("Could not persist session after finalizing media group")
+
+            # Send a confirmation to the user via direct chat if available
+            # We can't access the Update here; best-effort: log the result
+            logger.info("Finalized media_group %s for user %s: %d items", media_group_id, user_id, len(items))
+        except Exception:
+            logger.exception("Failed to finalize media_group %s for user %s", media_group_id, user_id)
+
+    async def _watch_job_progress(self, query, job_id: str, poll_interval: float = 1.0):
+        """Background task: poll Redis job hash for progress and update the callback message."""
+        try:
+            try:
+                import redis.asyncio as aioredis
+            except Exception:
+                aioredis = None
+
+            if not aioredis:
+                return
+
+            r = aioredis.from_url(os.environ.get("REDIS_URL", "redis://localhost:6379/0"))
+            last_text = None
+            while True:
+                try:
+                    data = await r.hgetall(f"ffmpeg:job:{job_id}")
+                    # hgetall returns bytes keys/values when using aioredis
+                    if not data:
+                        await asyncio.sleep(poll_interval)
+                        continue
+                    # decode
+                    info = {k.decode() if isinstance(k, bytes) else k: v.decode() if isinstance(v, bytes) else v for k, v in data.items()}
+                    status = info.get("status")
+                    progress = info.get("progress")
+                    message = info.get("message") or ""
+
+                    text = f"🔄 Job {job_id} — {status or 'processing'}\nProgress: {progress or '0'}%\n{message}"
+                    kb = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data=f"cancel_job:{job_id}")]])
+                    if text != last_text:
+                        await self.safe_edit(query, text, reply_markup=kb)
+                        last_text = text
+
+                    if status in ("done", "error", "cancelled"):
+                        break
+
+                except Exception:
+                    logger.debug("Error polling job hash for %s", job_id)
+                await asyncio.sleep(poll_interval)
+
+            # final fetch for output or error
+            try:
+                data = await r.hgetall(f"ffmpeg:job:{job_id}")
+                info = {k.decode() if isinstance(k, bytes) else k: v.decode() if isinstance(v, bytes) else v for k, v in data.items()} if data else {}
+                status = info.get("status")
+                output = info.get("output")
+                if status == "done" and output:
+                    await self.safe_edit(query, f"✅ Job {job_id} finished. Output: {output}")
+                elif status == "cancelled":
+                    await self.safe_edit(query, f"⏹️ Job {job_id} was cancelled.")
+                else:
+                    await self.safe_edit(query, f"⚠️ Job {job_id} finished with status: {status}")
+            except Exception:
+                pass
+            try:
+                await r.close()
+            except Exception:
+                pass
+        except Exception:
+            logger.exception("_watch_job_progress failed for %s", job_id)
+
     # ---------- Session persistence helpers (simple JSON store) ----------
     def _session_file(self, user_id: int) -> str:
         return os.path.join(self._session_store_dir, f"session_{user_id}.json")
@@ -205,6 +354,10 @@ class EnhancedMediaHandler:
             msg = str(e)
             # Log full BadRequest details for debugging
             try:
+                msg_obj = getattr(query, "message", None)
+                chat_obj = getattr(msg_obj, "chat", None) if msg_obj else None
+                chat_id = getattr(chat_obj, "id", None) if chat_obj else None
+
                 await self._log_bad_callback(
                     "BadRequest_edit",
                     {
@@ -212,8 +365,8 @@ class EnhancedMediaHandler:
                         "callback_data": getattr(query, "data", None),
                     },
                     getattr(getattr(query, "from_user", None), "id", None),
-                    getattr(getattr(query, "message", None), "chat", None) and getattr(getattr(query, "message", None), "chat", None).id,
-                    getattr(getattr(query, "message", None), "message_id", None),
+                    chat_id,
+                    getattr(msg_obj, "message_id", None),
                 )
             except Exception:
                 logger.exception("Failed to log BadRequest in safe_edit")
@@ -320,6 +473,98 @@ class EnhancedMediaHandler:
             logger.debug("Conversion quota check failed, allowing conversion")
         return True
 
+    async def show_settings(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Display and start interactive settings flow for the user."""
+        user_id = update.effective_user.id
+        if user_settings is None:
+            await update.message.reply_text("⚠️ Settings not available (missing module).")
+            return
+
+        # Build a two-page settings keyboard with toggle switches
+        s = user_settings.get_user_settings(user_id)
+
+        def bool_label(k):
+            return "On" if s.get(k) else "Off"
+
+        page = 1
+        # If called via callback with page param, the caller will handle; default to page 1
+        # Build text and keyboard to match the requested control panel style
+        text = "⚙️ <b>Config Bot Settings</b>\n\n"
+        text += f"• Bulk Mode : {bool_label('bulk_mode')}\n"
+        text += f"• Thumbnail : {'Yes' if s.get('use_custom_thumbnail') else 'No'}\n"
+        text += f"• Rename File : {'Yes' if s.get('prefix') or s.get('suffix') else 'No'}\n"
+
+        kb_page1 = [
+            [InlineKeyboardButton(f"Bulk Mode : { 'On' if s.get('bulk_mode') else 'Off' }", callback_data="toggle_bulk_mode")],
+            [InlineKeyboardButton(f"Thumbnail : { 'Yes' if s.get('use_custom_thumbnail') else 'No' }", callback_data="settings_page:2")],
+            [InlineKeyboardButton(f"Rename File : { 'Yes' if s.get('prefix') or s.get('suffix') else 'No' }", callback_data="noop")],
+            [InlineKeyboardButton("Upload as Audio", callback_data="menu_audio")],
+            [InlineKeyboardButton("Upload as Video", callback_data="menu_video")],
+            [InlineKeyboardButton("Stream Mapper", callback_data="menu_advanced")],
+            [InlineKeyboardButton("Video Metadata", callback_data="full_info")],
+            [InlineKeyboardButton("Mp3 Tag Setting", callback_data="menu_audio")],
+            [InlineKeyboardButton("Audio Settings", callback_data="menu_audio")],
+            [InlineKeyboardButton("Reset Settings", callback_data="noop")],
+            [InlineKeyboardButton("Close Settings", callback_data="menu_main")],
+        ]
+
+        await update.message.reply_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb_page1))
+        context.user_data.clear()
+        context.user_data["settings_page"] = 1
+
+    async def show_bulk_menu(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Show the bulk-mode action menu (either as reply or edit)."""
+        user_id = update.effective_user.id if update and update.effective_user else None
+        s = user_settings.get_user_settings(user_id) if user_settings else {}
+        status = "On" if s.get("bulk_mode") else "Off"
+        text = f"📦 <b>Bulk Mode Actions</b>\n\nCurrent Status >> Bulk Mode : {status}\n\nPlease select your preferred action below 👇"
+
+        try:
+            if getattr(update, "callback_query", None):
+                await self.safe_edit(update.callback_query, text, reply_markup=MediaMenuBuilder.get_bulk_menu(), parse_mode="HTML")
+            elif getattr(update, "message", None):
+                await update.message.reply_text(text, reply_markup=MediaMenuBuilder.get_bulk_menu(), parse_mode="HTML")
+        except Exception:
+            try:
+                if getattr(update, "callback_query", None):
+                    await self.safe_edit(update.callback_query, "⚠️ Failed to open bulk menu.")
+                else:
+                    await update.message.reply_text("⚠️ Failed to open bulk menu.")
+            except Exception:
+                pass
+
+    async def bulk_url_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Enqueue one or more URLs provided as command arguments for processing."""
+        user_id = update.effective_user.id
+        if user_settings is None:
+            await update.message.reply_text("⚠️ Settings not available (missing module).")
+            return
+
+        args = context.args if hasattr(context, "args") else []
+        if not args:
+            await update.message.reply_text("Usage: /bulk_url <url1> [url2 ...]\nYou can also paste multiple URLs in a message.")
+            return
+
+        enqueued = 0
+        for url in args:
+            if not isinstance(url, str) or not url.startswith("http"):
+                continue
+            job_id = str(uuid.uuid4())
+            job = {
+                "job_id": job_id,
+                "source_url": url,
+                "progress_channel": f"ffmpeg:progress:{job_id}",
+                "chat_id": update.effective_chat.id if update and update.effective_chat else None,
+                "cleanup_input": True,
+            }
+            try:
+                await enqueue_job(job)
+                enqueued += 1
+            except Exception:
+                logger.exception("Failed to enqueue bulk URL %s", url)
+
+        await update.message.reply_text(f"✅ Enqueued {enqueued} URL(s) for processing.")
+
     async def convert_video_format(
         self,
         update: Update,
@@ -341,40 +586,44 @@ class EnhancedMediaHandler:
         if not await self._check_conversion_quota(update, context):
             return
 
-        await self.safe_edit(query, f"🎬 Converting to {target_format.upper()}...")
+        await self.safe_edit(query, f"🎬 Queuing conversion to {target_format.upper()}...")
 
-        async def do_conversion():
-            input_path = current_file["path"]
-            output_path = f"storage/output/{current_file['id']}_converted.{target_format}"
+        # Enqueue conversion job to Redis so a worker handles heavy lifting
+        input_path = current_file["path"]
+        output_ext = f".{target_format}"
+        output_path = f"storage/output/{current_file['id']}_converted{output_ext}"
+        job_id = str(uuid.uuid4())
+        job = {
+            "job_id": job_id,
+            "input_path": input_path,
+            "output_path": output_path,
+            "ffmpeg_args": None,  # let worker infer from extension or use default
+            "progress_channel": f"ffmpeg:progress:{job_id}",
+            "chat_id": update.effective_chat.id if update and update.effective_chat else None,
+            "caption": f"Conversion to {target_format.upper()} finished",
+            "cleanup_input": True,
+            "cleanup_output": False,
+        }
 
-            success = await self.converter.convert_video_format(
-                input_path, output_path, target_format
-            )
+        try:
+            await enqueue_job(job)
+        except Exception as e:
+            logger.exception("Failed to enqueue job")
+            await self.safe_edit(query, "❌ Failed to queue conversion.")
+            return
 
-            if success and os.path.exists(output_path):
-                file_size = os.path.getsize(output_path)
-                if file_size > 2 * 1024**3:  # 2GB Telegram limit
-                    await self.safe_edit(
-                        query,
-                        f"❌ Converted file too large ({file_size//1024//1024}MB).\n"
-                        "Try compression first.",
-                    )
-                    os.remove(output_path)
-                else:
-                    with open(output_path, "rb") as video_file:
-                        await context.bot.send_video(
-                            chat_id=update.effective_chat.id,
-                            video=video_file,
-                            caption=f"✅ Converted to {target_format.upper()}",
-                            supports_streaming=True,
-                        )
-                    os.remove(output_path)
-            else:
-                await self.safe_edit(query, "❌ Conversion failed.")
-
-        await self._run_with_concurrency_limit(
-            user_id, f"video_format_conversion_{target_format}", do_conversion()
-        )
+        # Inform user job queued and provide a cancel button
+        try:
+            kb = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data=f"cancel_job:{job_id}")]])
+            await self.safe_edit(query, f"✅ Job queued (ID: {job_id}). I'll send the file when ready.", reply_markup=kb)
+            try:
+                loop = asyncio.get_event_loop()
+                loop.create_task(self._watch_job_progress(query, job_id))
+            except Exception:
+                pass
+        except Exception:
+            await self.safe_edit(query, f"✅ Job queued (ID: {job_id}). I'll send the file when ready.")
+        return
 
     async def handle_media_message(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
@@ -470,6 +719,126 @@ class EnhancedMediaHandler:
         except Exception:
             pass
 
+        # If user is in settings flow and sends a photo, treat as thumbnail upload
+        try:
+            if getattr(context, "user_data", {}).get("awaiting_settings") and getattr(update.message, "photo", None):
+                photos = update.message.photo
+                if photos:
+                    # choose largest
+                    file_obj = photos[-1]
+                    await update.message.reply_text("📥 Downloading thumbnail photo and saving as default...")
+                    file = await context.bot.get_file(file_obj.file_id)
+                    thumb_dir = config.THUMBNAIL_PATH if hasattr(config, "THUMBNAIL_PATH") else "storage/thumbnails"
+                    try:
+                        os.makedirs(thumb_dir, exist_ok=True)
+                    except Exception:
+                        pass
+                    thumb_path = os.path.join(thumb_dir, f"{user_id}_{file_obj.file_id}.jpg")
+                    await file.download_to_drive(thumb_path)
+                    if user_settings:
+                        user_settings.set_user_setting(user_id, "default_thumbnail", thumb_path)
+                        user_settings.set_user_setting(user_id, "save_thumbnail", True)
+                    await update.message.reply_text("✅ Default thumbnail saved.")
+                    # clear awaiting flag
+                    for key in list(context.user_data.keys()):
+                        if key.startswith("awaiting_"):
+                            del context.user_data[key]
+                    return
+        except Exception:
+            logger.exception("Failed to handle thumbnail photo upload")
+
+        # If user is providing mp3 tag JSON while in mp3 tag editor flow
+        try:
+            if getattr(context, "user_data", {}).get("awaiting_mp3_tags") and getattr(update.message, "text", None):
+                text = update.message.text.strip()
+                try:
+                    import json as _json
+
+                    tags = _json.loads(text)
+                except Exception:
+                    await update.message.reply_text("❌ Invalid JSON. Send a JSON object with tag keys and values.")
+                    return
+
+                # Apply tags to current file if available
+                session = self.user_sessions.get(update.effective_user.id, {})
+                current_file = session.get("current_file") if session else None
+                if not current_file or current_file.get("type") != "audio":
+                    await update.message.reply_text("❌ No audio file selected to apply tags.")
+                    # clear awaiting flag
+                    context.user_data.pop("awaiting_mp3_tags", None)
+                    return
+
+                input_path = current_file.get("path")
+                output_path = input_path + ".tagged" + os.path.splitext(input_path)[1]
+                try:
+                    ok = await self.converter.edit_metadata(input_path, output_path, tags)
+                    if ok:
+                        await update.message.reply_text("✅ Tags applied. I'll replace the current file with the tagged version.")
+                        # replace current file path
+                        current_file["path"] = output_path
+                    else:
+                        await update.message.reply_text("❌ Failed to apply tags.")
+                except Exception:
+                    logger.exception("Failed to apply mp3 tags")
+                    await update.message.reply_text("❌ Error while applying tags.")
+
+                # clear awaiting flag
+                context.user_data.pop("awaiting_mp3_tags", None)
+                return
+        except Exception:
+            logger.exception("Failed to handle awaiting_mp3_tags message")
+
+        # If message contains a photo (normal incoming photo, not settings thumbnail),
+        # save it to storage and add to the user's merge_list so multiple pasted
+        # photos are collected automatically.
+        try:
+            if getattr(update.message, "photo", None) and not getattr(context, "user_data", {}).get("awaiting_settings"):
+                photos = update.message.photo
+                if photos:
+                    # choose largest size variant
+                    file_obj = photos[-1]
+                    file = await context.bot.get_file(file_obj.file_id)
+                    input_dir = getattr(config, "INPUT_PATH", "storage/input")
+                    try:
+                        os.makedirs(input_dir, exist_ok=True)
+                    except Exception:
+                        pass
+                    photo_path = os.path.join(input_dir, f"{user_id}_{file_obj.file_id}.jpg")
+                    await file.download_to_drive(photo_path)
+
+                    # If part of an album (media_group_id), collect into temporary group
+                    mgid = getattr(update.message, "media_group_id", None)
+                    if mgid:
+                        groups = session.setdefault("media_groups", {})
+                        lst = groups.setdefault(mgid, [])
+                        lst.append({"path": photo_path, "type": "photo"})
+                        # schedule a finalize in 1s if not scheduled
+                        timers = session.setdefault("media_group_timers", {})
+                        if mgid not in timers:
+                            try:
+                                loop = asyncio.get_event_loop()
+                                handle = loop.call_later(1.0, lambda: asyncio.create_task(self._finalize_media_group(user_id, mgid)))
+                                timers[mgid] = handle
+                            except Exception:
+                                # best-effort: finalize immediately
+                                await self._finalize_media_group(user_id, mgid)
+                        # reply lightly that album item saved (silent)
+                        await update.message.reply_text(f"➕ Photo added to album buffer (media_group).")
+                        return
+
+                    # Non-album single photo: append directly
+                    if "merge_list" not in session:
+                        session["merge_list"] = []
+                    session["merge_list"].append({"path": photo_path, "type": "photo"})
+                    try:
+                        self._persist_session(user_id)
+                    except Exception:
+                        logger.debug("Could not persist session after photo download")
+                    await update.message.reply_text(f"✅ Photo saved to merge list. Total items: {len(session['merge_list'])}")
+                    return
+        except Exception:
+            logger.exception("Failed to auto-handle incoming photo")
+
         # Check if message has video
         if update.message.video:
             await self.handle_video(update, context, session)
@@ -478,8 +847,37 @@ class EnhancedMediaHandler:
         elif update.message.audio:
             await self.handle_audio(update, context, session)
         else:
+            # Detect URLs in text and support bulk URL conversion
+            text = getattr(update.message, "text", "") or ""
+            import re
+
+            urls = re.findall(r"(https?://\S+)", text)
+            if urls:
+                queued = 0
+                for url in urls:
+                    job_id = str(uuid.uuid4())
+                    output_path = f"storage/output/{job_id}.mp4"
+                    job = {
+                        "job_id": job_id,
+                        "source_url": url,
+                        "output_path": output_path,
+                        "ffmpeg_args": ["-c:v", "libx264", "-preset", "fast", "-crf", "23", "-c:a", "aac", "-b:a", "128k"],
+                        "progress_channel": f"ffmpeg:progress:{job_id}",
+                        "chat_id": update.effective_chat.id if update and update.effective_chat else None,
+                        "caption": f"✅ Converted from URL: {url}",
+                        "cleanup_input": True,
+                        "cleanup_output": False,
+                    }
+                    try:
+                        await enqueue_job(job)
+                        queued += 1
+                    except Exception:
+                        logger.exception("Failed to enqueue URL job: %s", url)
+                await update.message.reply_text(f"✅ Queued {queued} URL job(s).")
+                return
+
             await update.message.reply_text(
-                "Please send a video, audio, or document file."
+                "Please send a video, audio, or document file. You can also paste one or more URLs (http/https) to enqueue conversions."
             )
 
     async def handle_video(
@@ -506,9 +904,49 @@ class EnhancedMediaHandler:
         # Download file
         file = await context.bot.get_file(video.file_id)
         ext = ".mp4"  # Telegram videos are usually MP4
-        file_path = f"storage/input/{user_id}_{video.file_id}{ext}"
+        input_dir = getattr(config, "INPUT_PATH", "storage/input")
+        try:
+            os.makedirs(input_dir, exist_ok=True)
+        except Exception:
+            pass
+        file_path = os.path.join(input_dir, f"{user_id}_{video.file_id}{ext}")
 
         await file.download_to_drive(file_path)
+
+        # Probe duration to detect short/preview videos
+        try:
+            if probe_duration:
+                duration = await probe_duration(file_path)
+                if duration is not None and duration < 3.0:
+                    # mark as preview/short clip
+                    session["current_file"] = session.get("current_file", {})
+                    session["current_file"]["is_preview"] = True
+                    session["current_file"]["duration"] = duration
+        except Exception:
+            logger.debug("Failed to probe duration for %s", file_path)
+
+        # Detect a sensible filename and apply user settings
+        final_name = await detect_filename(file_path, update.message)
+        thumb = None
+        try:
+            if user_settings:
+                s = user_settings.get_user_settings(user_id)
+                # remove words
+                for w in s.get("words_remove") or []:
+                    final_name = final_name.replace(w, "")
+                final_name = final_name.strip()
+                # ensure extension
+                if not os.path.splitext(final_name)[1]:
+                    final_name += ext
+                # apply prefix/suffix
+                prefix = s.get("prefix") or ""
+                suffix = s.get("suffix") or ""
+                final_name = f"{prefix}{final_name}{suffix}"
+                # attach thumbnail path if user saved one
+                if s.get("save_thumbnail") and s.get("default_thumbnail"):
+                    thumb = s.get("default_thumbnail")
+        except Exception:
+            logger.exception("Failed to apply user settings to video name")
 
         # Store in session
         session["current_file"] = {
@@ -516,7 +954,8 @@ class EnhancedMediaHandler:
             "type": "video",
             "id": video.file_id,
             "size": video.file_size,
-            "name": update.message.caption or f"video_{video.file_id[:8]}.mp4",
+            "name": final_name,
+            "thumbnail": thumb,
         }
 
         # Persist session so callbacks handled by other workers can access
@@ -529,9 +968,18 @@ class EnhancedMediaHandler:
         await self.log_media_to_db(user_id, session["current_file"])
 
         # Show main menu
+        # Inform user; include preview notice when applicable
+        preview_notice = ""
+        try:
+            if session.get("current_file", {}).get("is_preview"):
+                dur = session.get("current_file", {}).get("duration")
+                preview_notice = f"\n⚠️ Detected short/preview video ({dur:.2f}s)."
+        except Exception:
+            preview_notice = ""
+
         await update.message.reply_text(
             f"✅ Video downloaded!\n"
-            f"📦 Size: {video.file_size // 1024 // 1024} MB\n"
+            f"📦 Size: {video.file_size // 1024 // 1024} MB{preview_notice}\n"
             f"Choose an action:",
             reply_markup=MediaMenuBuilder.get_main_menu("video"),
         )
@@ -560,8 +1008,30 @@ class EnhancedMediaHandler:
             }
             ext = ext_map.get(audio.mime_type, ".mp3")
 
-        file_path = f"storage/input/{user_id}_{audio.file_id}{ext}"
+        input_dir = getattr(config, "INPUT_PATH", "storage/input")
+        try:
+            os.makedirs(input_dir, exist_ok=True)
+        except Exception:
+            pass
+        file_path = os.path.join(input_dir, f"{user_id}_{audio.file_id}{ext}")
         await file.download_to_drive(file_path)
+
+        # Detect a sensible filename for audio and apply user settings
+        final_name = await detect_filename(file_path, update.message)
+        thumb = None
+        try:
+            if user_settings:
+                s = user_settings.get_user_settings(user_id)
+                for w in s.get("words_remove") or []:
+                    final_name = final_name.replace(w, "")
+                final_name = final_name.strip()
+                if not os.path.splitext(final_name)[1]:
+                    final_name += ext
+                final_name = f"{s.get('prefix') or ''}{final_name}{s.get('suffix') or ''}"
+                if s.get("save_thumbnail") and s.get("default_thumbnail"):
+                    thumb = s.get("default_thumbnail")
+        except Exception:
+            logger.exception("Failed to apply user settings to audio name")
 
         # Store in session
         session["current_file"] = {
@@ -569,7 +1039,8 @@ class EnhancedMediaHandler:
             "type": "audio",
             "id": audio.file_id,
             "size": audio.file_size,
-            "name": audio.title or f"audio_{audio.file_id[:8]}{ext}",
+            "name": final_name,
+            "thumbnail": thumb,
         }
 
         # Show audio menu
@@ -647,8 +1118,30 @@ class EnhancedMediaHandler:
 
         # Download file
         file = await context.bot.get_file(document.file_id)
-        file_path = f"storage/input/{user_id}_{document.file_id}{file_ext}"
+        input_dir = getattr(config, "INPUT_PATH", "storage/input")
+        try:
+            os.makedirs(input_dir, exist_ok=True)
+        except Exception:
+            pass
+        file_path = os.path.join(input_dir, f"{user_id}_{document.file_id}{file_ext}")
         await file.download_to_drive(file_path)
+
+        # Detect a sensible filename for document and apply user settings
+        final_name = await detect_filename(file_path, update.message)
+        thumb = None
+        try:
+            if user_settings:
+                s = user_settings.get_user_settings(user_id)
+                for w in s.get("words_remove") or []:
+                    final_name = final_name.replace(w, "")
+                final_name = final_name.strip()
+                if not os.path.splitext(final_name)[1] and file_ext:
+                    final_name += file_ext
+                final_name = f"{s.get('prefix') or ''}{final_name}{s.get('suffix') or ''}"
+                if s.get("save_thumbnail") and s.get("default_thumbnail"):
+                    thumb = s.get("default_thumbnail")
+        except Exception:
+            logger.exception("Failed to apply user settings to document name")
 
         # Store in session
         session["current_file"] = {
@@ -656,7 +1149,8 @@ class EnhancedMediaHandler:
             "type": file_type,
             "id": document.file_id,
             "size": document.file_size,
-            "name": file_name,
+            "name": final_name,
+            "thumbnail": thumb,
         }
 
         # Persist session for cross-worker access
@@ -853,14 +1347,36 @@ class EnhancedMediaHandler:
                 await self.compress_video(update, context, session, crf)
 
             elif data == "trim_video":
+                # Open trimmer selection menu with two dynamic modes
                 await self.safe_edit(
                     query,
-                    "✂️ **Video Trimming**\nSend start time (HH:MM:SS):\nExample: 00:01:30",
+                    "✂️ **Video Trimming**\nChoose a trimmer mode:",
+                    reply_markup=MediaMenuBuilder.get_trimmer_menu(),
                 )
-                context.user_data["awaiting_trim"] = "start"
+
+            elif data == "trimmer_1":
+                # Trimmer 1: ask for start then end time
                 for key in list(context.user_data.keys()):
                     if key.startswith("awaiting_"):
                         del context.user_data[key]
+                context.user_data["awaiting_trimmer"] = "trimmer1_start"
+                await self.safe_edit(
+                    query,
+                    "✂️ Trimmer 1 selected.\nSend START time (HH:MM:SS[.ms])\nExample: 00:01:00",
+                )
+                return
+
+            elif data == "trimmer_2":
+                # Trimmer 2: ask for start then duration
+                for key in list(context.user_data.keys()):
+                    if key.startswith("awaiting_"):
+                        del context.user_data[key]
+                context.user_data["awaiting_trimmer"] = "trimmer2_start"
+                await self.safe_edit(
+                    query,
+                    "✂️ Trimmer 2 selected.\nSend START time (HH:MM:SS[.ms])\nExample: 00:05:00",
+                )
+                return
 
             elif data == "merge_videos_menu":
                 await self.safe_edit(
@@ -941,9 +1457,15 @@ class EnhancedMediaHandler:
 
             elif isinstance(data, str) and data.startswith("format_"):
                 format_type = data.split("_")[1]
-                await self.convert_audio_format(
-                    update, context, session, format_type
-                )
+                # Route to video or audio conversion depending on current file type
+                try:
+                    if current_file and current_file.get("type") == "video":
+                        await self.convert_video_format(update, context, session, format_type)
+                    else:
+                        await self.convert_audio_format(update, context, session, format_type)
+                except Exception:
+                    # Fallback to audio conversion to preserve previous behavior
+                    await self.convert_audio_format(update, context, session, format_type)
 
             elif data == "bitrate_menu":
                 await self.safe_edit(
@@ -978,15 +1500,50 @@ class EnhancedMediaHandler:
                     query,
                     f"➕ Added to merge list. Total files: {len(session['merge_list'])}",
                 )
+                try:
+                    await query.answer("Added to merge list")
+                except Exception:
+                    pass
 
-            elif data == "merge_view":
-                if "merge_list" not in session or not session["merge_list"]:
+            elif isinstance(data, str) and data.startswith("merge_view"):
+                # Support pagination: callback forms: 'merge_view' or 'merge_view:2'
+                try:
+                    parts = data.split(":")
+                    page = int(parts[1]) if len(parts) > 1 else 1
+                except Exception:
+                    page = 1
+
+                merge_list = session.get("merge_list") or []
+                if not merge_list:
                     await self.safe_edit(query, "🗒️ Merge list is empty.")
                 else:
-                    names = [os.path.basename(p) for p in session["merge_list"]]
-                    await self.safe_edit(
-                        query, "🗒️ Files in merge list:\n" + "\n".join(names)
-                    )
+                    per_page = 5
+                    total = len(merge_list)
+                    last_page = max(1, (total + per_page - 1) // per_page)
+                    page = max(1, min(page, last_page))
+                    start = (page - 1) * per_page
+                    end = start + per_page
+                    slice_items = merge_list[start:end]
+
+                    text_lines = [f"🗒️ Merge list ({page}/{last_page}):\n"]
+                    for idx, p in enumerate(slice_items, start=start + 1):
+                        text_lines.append(f"{idx}. {os.path.basename(p)}")
+
+                    # Build navigation buttons
+                    nav_buttons = []
+                    if page > 1:
+                        nav_buttons.append(InlineKeyboardButton("⬅️ Prev", callback_data=f"merge_view:{page-1}"))
+                    if page < last_page:
+                        nav_buttons.append(InlineKeyboardButton("Next ➡️", callback_data=f"merge_view:{page+1}"))
+
+                    control_row = [InlineKeyboardButton("🗑️ Clear", callback_data="merge_clear"), InlineKeyboardButton("↩️ Back", callback_data="menu_main")]
+
+                    kb = [ [InlineKeyboardButton(os.path.basename(p), callback_data="noop") ] for p in slice_items ]
+                    if nav_buttons:
+                        kb.append(nav_buttons)
+                    kb.append(control_row)
+
+                    await self.safe_edit(query, "\n".join(text_lines), reply_markup=InlineKeyboardMarkup(kb))
 
             elif data == "merge_clear":
                 session["merge_list"] = []
@@ -995,6 +1552,10 @@ class EnhancedMediaHandler:
                 except Exception:
                     logger.debug("Could not persist session after merge_clear")
                 await self.safe_edit(query, "🗑️ Merge list cleared.")
+                try:
+                    await query.answer("Merge list cleared")
+                except Exception:
+                    pass
 
             elif data == "framerate_menu":
                 await self.safe_edit(
@@ -1120,6 +1681,7 @@ class EnhancedMediaHandler:
                 for key in list(context.user_data.keys()):
                     if key.startswith("awaiting_"):
                         del context.user_data[key]
+                context.user_data["awaiting_metadata"] = True
 
             elif data == "full_info":
                 await self.show_full_info(update, context, session)
@@ -1127,11 +1689,126 @@ class EnhancedMediaHandler:
             elif data == "create_archive":
                 await self.create_archive(update, context, session)
 
+            elif data == "bulk_menu":
+                # Open the bulk action menu
+                await self.show_bulk_menu(update, context)
+
+            elif data == "video_reorder":
+                # Placeholder for video reorder feature
+                await self.safe_edit(query, "🔁 Video Reorder\n\nThis feature is coming soon — you can manage order via the merge list for now.")
+
+            elif data == "mp3_tag_editor":
+                # Simple entry point for mp3 tag edits (advanced editor may be added later)
+                try:
+                    await self.safe_edit(query, "✏️ Mp3 Tag Editor\n\nSend a JSON object with tag keys and values (example: {\"title\":\"Song\"}).")
+                    # mark awaiting state so next message can be treated as metadata
+                    context.user_data["awaiting_mp3_tags"] = True
+                except Exception:
+                    await self.safe_edit(query, "⚠️ Failed to open Mp3 Tag Editor.")
+
+            elif data == "convert_to_video":
+                # Show video format menu
+                await self.safe_edit(query, "🔄 Convert To Video\nSelect target container:", reply_markup=MediaMenuBuilder.get_format_menu("video"))
+
+            elif data == "convert_to_file":
+                # Generic convert menu
+                await self.safe_edit(query, "🔄 Convert To File\nSelect target format:", reply_markup=MediaMenuBuilder.get_format_menu())
+
             elif data == "batch_process":
                 await self.safe_edit(
                     query,
                     "🔀 **Batch Processing**\nComing soon! Send multiple files to process.",
                 )
+
+            # Settings pagination and toggle handlers
+            elif isinstance(data, str) and data.startswith("settings_page:"):
+                # Show a specific settings page
+                try:
+                    page = int(data.split(":", 1)[1])
+                except Exception:
+                    page = 1
+
+                s = user_settings.get_user_settings(user_id) if user_settings else {}
+                if page == 1:
+                    text = "⚙️ <b>Your Settings — Page 1</b>\n\n"
+                    text += f"• Upload mode: {s.get('upload_mode')}\n"
+                    text += f"• Prefix: {s.get('prefix')!s}\n"
+                    text += f"• Suffix: {s.get('suffix')!s}\n"
+                    kb = [
+                        [InlineKeyboardButton(f"Toggle Save Thumb: {'On' if s.get('save_thumbnail') else 'Off'}", callback_data="toggle_save_thumbnail")],
+                        [InlineKeyboardButton(f"Toggle Bulk Mode: {'On' if s.get('bulk_mode') else 'Off'}", callback_data="toggle_bulk_mode")],
+                        [InlineKeyboardButton("Next ➡️", callback_data="settings_page:2")],
+                        [InlineKeyboardButton("Close", callback_data="menu_main")],
+                    ]
+                    await self.safe_edit(query, text, reply_markup=InlineKeyboardMarkup(kb), parse_mode="HTML")
+                else:
+                    text = "⚙️ <b>Your Settings — Page 2</b>\n\n"
+                    text += f"• Words to remove: {', '.join(s.get('words_remove') or [])}\n"
+                    text += f"• Default thumbnail: {s.get('default_thumbnail')}\n"
+                    kb = [
+                        [InlineKeyboardButton("⬅️ Prev", callback_data="settings_page:1")],
+                        [InlineKeyboardButton("Close", callback_data="menu_main")],
+                    ]
+                    await self.safe_edit(query, text, reply_markup=InlineKeyboardMarkup(kb), parse_mode="HTML")
+
+            elif isinstance(data, str) and data.startswith("toggle_"):
+                # toggle_<key>
+                key = data.split("_", 1)[1]
+                if user_settings is None:
+                    await self.safe_edit(query, "⚠️ Settings not available.")
+                else:
+                    try:
+                        new = user_settings.toggle_user_setting(user_id, key)
+                        await self.safe_edit(query, f"✅ `{key}` set to {new}", parse_mode="Markdown")
+                        try:
+                            await query.answer("Setting updated")
+                        except Exception:
+                            pass
+                    except Exception:
+                        logger.exception("Failed to toggle setting %s for user %s", key, user_id)
+                        await self.safe_edit(query, "⚠️ Failed to change setting.")
+
+            elif isinstance(data, str) and data.startswith("cancel_job:"):
+                # User pressed a Cancel button for a queued job
+                try:
+                    job_id = data.split(":", 1)[1]
+                except Exception:
+                    await self.safe_edit(query, "⚠️ Invalid cancel request.")
+                    return
+
+                try:
+                    from utils.job_queue import cancel_job
+
+                    await cancel_job(job_id)
+                    await self.safe_edit(query, f"⏹️ Cancellation requested for job {job_id}.")
+                    try:
+                        await query.answer("Cancellation requested")
+                    except Exception:
+                        pass
+                except Exception:
+                    logger.exception("Failed to request cancellation for job %s", job_id)
+                    await self.safe_edit(query, "⚠️ Failed to request cancellation.")
+
+            elif data == "add_thumb_instruction":
+                # Provide instructions to the user for adding a custom thumbnail
+                await self.safe_edit(
+                    query,
+                    "To add a custom thumbnail: reply to a photo with the command /addthumb",
+                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Close", callback_data="menu_main")]]),
+                )
+
+            elif data == "delete_custom_thumb":
+                # Delete per-user thumbnail file if present
+                try:
+                    thumb_path = os.path.join(os.path.dirname(__file__), "thumbnails", f"{user_id}.jpg")
+                    if os.path.exists(thumb_path):
+                        os.remove(thumb_path)
+                        await self.safe_edit(query, "🗑️ Custom thumbnail deleted.")
+                    else:
+                        await self.safe_edit(query, "⚠️ No custom thumbnail set.")
+                except Exception:
+                    logger.exception("Failed to delete custom thumbnail for user %s", user_id)
+                    await self.safe_edit(query, "⚠️ Failed to delete thumbnail.")
 
             elif data == "thumbnail_grid":
                 await self.create_thumbnail_grid(update, context, session)
@@ -1152,12 +1829,26 @@ class EnhancedMediaHandler:
                 if not current_file or current_file.get("type") != "video":
                     await self.safe_edit(query, "❌ No video file found to burn subtitles into.")
                 else:
-                    await self.safe_edit(query, "✏️ **Burn Subtitles**\nSend subtitle file (.srt, .ass) to burn into the current video:")
+                    await self.safe_edit(
+                        query,
+                        (
+                            "✏️ **Burn Subtitles**\n"
+                            "Send subtitle file (.srt, .ass) to burn into the current video:"
+                        ),
+                    )
                     context.user_data["awaiting_burn_subtitle"] = True
 
             # Information
             elif data == "info":
                 await self.show_media_info(update, context, session)
+
+            elif data == "noop":
+                # Non-actionable placeholder button pressed; acknowledge silently.
+                try:
+                    await query.answer()
+                except Exception:
+                    pass
+                return
 
             else:
                 await self.safe_edit(query, f"Unknown command: {data}")
@@ -1691,9 +2382,42 @@ class EnhancedMediaHandler:
             "+faststart",
         ]
 
-        success, _ = await self.converter.execute_ffmpeg(
-            cmd, current_file["path"], output_path
-        )
+        # Try to enqueue as a background job to get progress + cancel support
+        if enqueue_job and uuid:
+            job_id = str(uuid.uuid4())
+            job = {
+                "job_id": job_id,
+                "input_path": current_file["path"],
+                "output_path": output_path,
+                "ffmpeg_args": cmd,
+                "progress_channel": f"ffmpeg:progress:{job_id}",
+                "chat_id": update.effective_chat.id if update and update.effective_chat else None,
+                "caption": f"✅ Optimized for {preset}",
+                "cleanup_input": False,
+                "cleanup_output": True,
+            }
+            try:
+                await enqueue_job(job)
+            except Exception:
+                logger.exception("Failed to enqueue optimization job")
+                await self.safe_edit(query, "❌ Failed to queue optimization job.")
+                return
+
+            # Inform user and provide cancel button
+            try:
+                kb = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data=f"cancel_job:{job_id}")]])
+                await self.safe_edit(query, f"✅ Optimization job queued (ID: {job_id}). I'll update you with progress.", reply_markup=kb)
+                try:
+                    loop = asyncio.get_event_loop()
+                    loop.create_task(self._watch_job_progress(query, job_id))
+                except Exception:
+                    pass
+            except Exception:
+                await self.safe_edit(query, f"✅ Optimization job queued (ID: {job_id}).")
+            return
+
+        # Fallback: inline execution if no job queue available
+        success, _ = await self.converter.execute_ffmpeg(cmd, current_file["path"], output_path)
 
         if success and os.path.exists(output_path):
             with open(output_path, "rb") as video_file:
@@ -1726,22 +2450,33 @@ class EnhancedMediaHandler:
 
         await self.safe_edit(query, "🔧 Attempting to repair video...")
 
+        # enqueue repair job
+        job_id = str(uuid.uuid4())
         output_path = f"storage/output/{current_file['id']}_repaired.mp4"
-        success = await self.converter.repair_video(
-            current_file["path"], output_path
-        )
+        job = {
+            "job_id": job_id,
+            "input_path": current_file["path"],
+            "output_path": output_path,
+            "ffmpeg_args": ["-c", "copy"],
+            "progress_channel": f"ffmpeg:progress:{job_id}",
+            "chat_id": update.effective_chat.id if update and update.effective_chat else None,
+            "caption": "✅ Video repaired (if possible)",
+            "cleanup_input": False,
+            "cleanup_output": True,
+        }
 
-        if success and os.path.exists(output_path):
-            with open(output_path, "rb") as video_file:
-                await context.bot.send_video(
-                    chat_id=update.effective_chat.id,
-                    video=video_file,
-                    caption="✅ Video repaired (if possible)",
-                    supports_streaming=True,
-                )
-            os.remove(output_path)
-        else:
-            await self.safe_edit(query, "❌ Repair failed or not needed.")
+        try:
+            await enqueue_job(job)
+            await self.safe_edit(query, f"✅ Repair job queued (ID: {job_id}). I'll send the file when ready.")
+            try:
+                loop = asyncio.get_event_loop()
+                loop.create_task(self._watch_job_progress(query, job_id))
+            except Exception:
+                pass
+        except Exception:
+            logger.exception("Failed to enqueue repair job")
+            await self.safe_edit(query, "❌ Failed to queue repair job.")
+        return
 
     async def take_screenshot(
         self,
@@ -1897,75 +2632,27 @@ class EnhancedMediaHandler:
 
         await self.safe_edit(query, "🎞️ Extracting streams...")
 
-        output_dir = f"storage/output/{current_file['id']}_streams"
-        os.makedirs(output_dir, exist_ok=True)
+        # enqueue extract_streams job to worker for progress/cancel support
+        job_id = str(uuid.uuid4())
+        out_dir = f"storage/output/{current_file['id']}_streams"
+        archive_path = f"{out_dir}.zip"
+        job = {
+            "job_id": job_id,
+            "type": "extract_streams",
+            "input_path": current_file["path"],
+            "output_dir": out_dir,
+            "archive_path": archive_path,
+            "progress_channel": f"ffmpeg:progress:{job_id}",
+            "chat_id": update.effective_chat.id if update and update.effective_chat else None,
+            "cleanup_input": False,
+        }
 
-        extracted = await self.converter.extract_streams(
-            current_file["path"], output_dir
-        )
-
-        if extracted:
-            # Create archive of extracted streams
-            archive_path = f"{output_dir}.zip"
-            await self.converter.create_archive(
-                list(extracted.values()), archive_path
-            )
-
-            if os.path.exists(archive_path):
-                with open(archive_path, "rb") as archive_file:
-                    await context.bot.send_document(
-                        chat_id=update.effective_chat.id,
-                        document=archive_file,
-                        caption=f"✅ Extracted {len(extracted)} streams",
-                    )
-
-                # Cleanup
-                os.remove(archive_path)
-                for file_path in extracted.values():
-                    if os.path.exists(file_path):
-                        os.remove(file_path)
-                os.rmdir(output_dir)
-            else:
-                await self.safe_edit(query, "✅ Streams extracted to folder.")
-        else:
-            await self.safe_edit(
-                query, "❌ No streams found or extraction failed."
-            )
-
-    async def extract_audio(
-        self, update: Update, context: ContextTypes.DEFAULT_TYPE, session: Dict
-    ):
-        """Extract audio from video."""
-        if not await self._require_callback(update):
-            return
-        query = update.callback_query
-        current_file = session.get("current_file")
-
-        if not current_file or current_file["type"] != "video":
-            await self.safe_edit(query, "❌ No video file found.")
-            return
-
-        if not await self._check_conversion_quota(update, context):
-            return
-
-        await self.safe_edit(query, "🎵 Extracting audio...")
-
-        output_path = f"storage/output/{current_file['id']}_audio.mp3"
-        success = await self.converter.extract_audio_from_video(
-            current_file["path"], output_path, "mp3", "192k"
-        )
-
-        if success and os.path.exists(output_path):
-            with open(output_path, "rb") as audio_file:
-                await context.bot.send_audio(
-                    chat_id=update.effective_chat.id,
-                    audio=audio_file,
-                    caption="✅ Audio extracted",
-                    title=f"{current_file['name']}_audio",
-                )
-            os.remove(output_path)
-        else:
-            await self.safe_edit(query, "❌ Failed to extract audio.")
+        await enqueue_job(job)
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data=f"cancel_job:{job_id}")]])
+        await self.safe_edit(query, f"⏳ Job queued: {job_id} — extracting streams", reply_markup=kb)
+        loop = asyncio.get_event_loop()
+        loop.create_task(self._watch_job_progress(job_id))
+        return
 
     async def convert_audio_format(
         self,
@@ -2275,24 +2962,24 @@ class EnhancedMediaHandler:
 
         await self.safe_edit(query, "📦 Creating archive...")
 
-        # Create list of full file paths
+        # enqueue create_archive job so worker handles packaging and progress
         file_paths = [os.path.join(output_dir, f) for f in user_files]
         archive_path = f"storage/output/{user_id}_archive.zip"
+        job_id = str(uuid.uuid4())
+        job = {
+            "job_id": job_id,
+            "type": "create_archive",
+            "files": file_paths,
+            "output_path": archive_path,
+            "progress_channel": f"ffmpeg:progress:{job_id}",
+            "chat_id": update.effective_chat.id if update and update.effective_chat else None,
+        }
 
-        success = await self.converter.create_archive(file_paths, archive_path)
-
-        if success and os.path.exists(archive_path):
-            with open(archive_path, "rb") as archive_file:
-                await context.bot.send_document(
-                    chat_id=update.effective_chat.id,
-                    document=archive_file,
-                    caption=f"✅ Archive of {len(user_files)} files",
-                )
-
-            # Cleanup
-            os.remove(archive_path)
-        else:
-            await self.safe_edit(query, "❌ Failed to create archive.")
+        await enqueue_job(job)
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data=f"cancel_job:{job_id}")]])
+        await self.safe_edit(query, f"⏳ Job queued: {job_id} — creating archive", reply_markup=kb)
+        loop = asyncio.get_event_loop()
+        loop.create_task(self._watch_job_progress(query, job_id))
 
     async def generate_sample(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE, session: Dict
@@ -2312,45 +2999,28 @@ class EnhancedMediaHandler:
 
         await self.safe_edit(query, "🎬 Generating 30-second sample...")
 
+        job_id = str(uuid.uuid4())
         output_path = f"storage/output/{current_file['id']}_sample"
         if current_file["type"] == "video":
             output_path += ".mp4"
-            success = await self.converter.generate_sample(
-                current_file["path"], output_path, 30
-            )
-
-            if success and os.path.exists(output_path):
-                with open(output_path, "rb") as video_file:
-                    await context.bot.send_video(
-                        chat_id=update.effective_chat.id,
-                        video=video_file,
-                        caption="✅ 30-second sample",
-                        supports_streaming=True,
-                    )
-                os.remove(output_path)
-            else:
-                await self.safe_edit(query, "❌ Failed to generate sample.")
-
-        elif current_file["type"] == "audio":
+        else:
             output_path += ".mp3"
-            # Extract first 30 seconds
-            cmd = ["-t", "30", "-c", "copy"]
 
-            success, _ = await self.converter.execute_ffmpeg(
-                cmd, current_file["path"], output_path
-            )
+        job = {
+            "job_id": job_id,
+            "type": "generate_sample",
+            "input_path": current_file["path"],
+            "output_path": output_path,
+            "duration": 30,
+            "progress_channel": f"ffmpeg:progress:{job_id}",
+            "chat_id": update.effective_chat.id if update and update.effective_chat else None,
+        }
 
-            if success and os.path.exists(output_path):
-                with open(output_path, "rb") as audio_file:
-                    await context.bot.send_audio(
-                        chat_id=update.effective_chat.id,
-                        audio=audio_file,
-                        caption="✅ 30-second sample",
-                        title=f"{current_file['name']}_sample",
-                    )
-                os.remove(output_path)
-            else:
-                await self.safe_edit(query, "❌ Failed to generate sample.")
+        await enqueue_job(job)
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data=f"cancel_job:{job_id}")]])
+        await self.safe_edit(query, f"⏳ Job queued: {job_id} — generating sample", reply_markup=kb)
+        loop = asyncio.get_event_loop()
+        loop.create_task(self._watch_job_progress(query, job_id))
 
     async def show_media_info(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE, session: Dict
@@ -2418,8 +3088,185 @@ class EnhancedMediaHandler:
         session = self.user_sessions[user_id]
         current_file = session.get("current_file")
 
+        # --- Dynamic trimmer flow (Trimmer 1 & 2) ---
+        if context.user_data.get("awaiting_trimmer"):
+            mode = context.user_data.get("awaiting_trimmer")
+            try:
+                if mode == "trimmer1_start":
+                    # Validate start time
+                    _ = _parse_time_to_seconds(user_input)
+                    context.user_data["trimmer_start"] = user_input.strip()
+                    context.user_data["awaiting_trimmer"] = "trimmer1_end"
+                    await update.message.reply_text(
+                        "📥 Start time saved. Now send END time (HH:MM:SS[.ms])\nExample: 00:10:00"
+                    )
+                    return
+
+                elif mode == "trimmer1_end":
+                    start = context.user_data.get("trimmer_start")
+                    if not start:
+                        await update.message.reply_text("❌ Missing start time. Please restart Trimmer.")
+                        for k in list(context.user_data.keys()):
+                            if k.startswith("awaiting_") or k.startswith("trimmer_"):
+                                del context.user_data[k]
+                        return
+
+                    # Parse times
+                    start_s = _parse_time_to_seconds(start)
+                    end_s = _parse_time_to_seconds(user_input)
+                    if end_s <= start_s:
+                        await update.message.reply_text("❌ End time must be after start time. Send END time again.")
+                        return
+
+                    # Perform trim
+                    await update.message.reply_text(f"✂️ Trimming from {start} to {user_input}...")
+                    output_path = f"storage/output/{current_file['id']}_trim_{int(start_s)}_{int(end_s)}.mp4"
+                    success = await self.converter.trim_video(current_file["path"], output_path, start, user_input.strip())
+
+                    if success and os.path.exists(output_path):
+                        with open(output_path, "rb") as vf:
+                            await context.bot.send_video(
+                                chat_id=update.effective_chat.id,
+                                video=vf,
+                                caption=f"✅ Trimmed {start} to {user_input}",
+                                supports_streaming=True,
+                            )
+                        os.remove(output_path)
+                    else:
+                        await update.message.reply_text("❌ Failed to trim video.")
+
+                    # Cleanup state
+                    for k in list(context.user_data.keys()):
+                        if k.startswith("awaiting_") or k.startswith("trimmer_") or k.startswith("trimmer"):
+                            del context.user_data[k]
+                    return
+
+                elif mode == "trimmer2_start":
+                    # Save start and ask for duration
+                    _ = _parse_time_to_seconds(user_input)
+                    context.user_data["trimmer_start"] = user_input.strip()
+                    context.user_data["awaiting_trimmer"] = "trimmer2_duration"
+                    await update.message.reply_text(
+                        "📥 Start time saved. Now send DURATION (HH:MM:SS[.ms] or seconds)\nExample: 00:10:00"
+                    )
+                    return
+
+                elif mode == "trimmer2_duration":
+                    start = context.user_data.get("trimmer_start")
+                    if not start:
+                        await update.message.reply_text("❌ Missing start time. Please restart Trimmer.")
+                        for k in list(context.user_data.keys()):
+                            if k.startswith("awaiting_") or k.startswith("trimmer_"):
+                                del context.user_data[k]
+                        return
+
+                    try:
+                        start_s = _parse_time_to_seconds(start)
+                        dur_s = _parse_time_to_seconds(user_input)
+                        end_s = start_s + dur_s
+                        end_str = _format_seconds_to_hhmmss(end_s)
+                    except ValueError:
+                        await update.message.reply_text("❌ Invalid duration format. Use HH:MM:SS or seconds.")
+                        return
+
+                    await update.message.reply_text(f"✂️ Trimming from {start} for duration {user_input} (to {end_str})...")
+                    output_path = f"storage/output/{current_file['id']}_trim_{int(start_s)}_{int(end_s)}.mp4"
+                    success = await self.converter.trim_video(current_file["path"], output_path, start, end_str)
+
+                    if success and os.path.exists(output_path):
+                        with open(output_path, "rb") as vf:
+                            await context.bot.send_video(
+                                chat_id=update.effective_chat.id,
+                                video=vf,
+                                caption=f"✅ Trimmed {start} + {user_input}",
+                                supports_streaming=True,
+                            )
+                        os.remove(output_path)
+                    else:
+                        await update.message.reply_text("❌ Failed to trim video.")
+
+                    # Cleanup
+                    for k in list(context.user_data.keys()):
+                        if k.startswith("awaiting_") or k.startswith("trimmer_") or k.startswith("trimmer"):
+                            del context.user_data[k]
+                    return
+            except ValueError as e:
+                await update.message.reply_text(str(e))
+                return
+
         # Check what we're waiting for
-        if context.user_data.get("awaiting_crf"):
+        if context.user_data.get("awaiting_settings"):
+            if user_settings is None:
+                await update.message.reply_text("⚠️ Settings backend not available.")
+            else:
+                cmd = user_input.strip()
+                lower = cmd.lower()
+                try:
+                    if lower.startswith("set prefix:"):
+                        val = cmd.split(":", 1)[1].strip()
+                        user_settings.set_user_setting(user_id, "prefix", val)
+                        await update.message.reply_text(f"✅ Prefix set to: {val}")
+                    elif lower.startswith("set suffix:"):
+                        val = cmd.split(":", 1)[1].strip()
+                        user_settings.set_user_setting(user_id, "suffix", val)
+                        await update.message.reply_text(f"✅ Suffix set to: {val}")
+                    elif lower.startswith("set upload_mode:"):
+                        val = cmd.split(":", 1)[1].strip().lower()
+                        if val in ("video", "file", "zip"):
+                            user_settings.set_user_setting(user_id, "upload_mode", val)
+                            await update.message.reply_text(f"✅ Upload mode set to: {val}")
+                        else:
+                            await update.message.reply_text("❌ Invalid upload_mode. Choose video|file|zip")
+                    elif lower == "toggle save_thumbnail":
+                        cur = user_settings.get_user_settings(user_id).get("save_thumbnail", False)
+                        user_settings.set_user_setting(user_id, "save_thumbnail", not cur)
+                        await update.message.reply_text(f"✅ save_thumbnail set to: {not cur}")
+                    elif lower.startswith("set thumb_url:"):
+                        val = cmd.split(":", 1)[1].strip()
+                        user_settings.set_user_setting(user_id, "default_thumbnail", val)
+                        user_settings.set_user_setting(user_id, "save_thumbnail", True)
+                        await update.message.reply_text("✅ Default thumbnail saved.")
+                    elif lower == "clear_thumb":
+                        user_settings.set_user_setting(user_id, "default_thumbnail", None)
+                        user_settings.set_user_setting(user_id, "save_thumbnail", False)
+                        await update.message.reply_text("✅ Default thumbnail cleared.")
+                    elif lower.startswith("add_word:"):
+                        word = cmd.split(":", 1)[1].strip()
+                        s = user_settings.get_user_settings(user_id)
+                        words = list(s.get("words_remove") or [])
+                        if word and word not in words:
+                            words.append(word)
+                            user_settings.set_user_setting(user_id, "words_remove", words)
+                            await update.message.reply_text(f"✅ Added word to remove: {word}")
+                        else:
+                            await update.message.reply_text("⚠️ Word empty or already present.")
+                    elif lower.startswith("remove_word:"):
+                        word = cmd.split(":", 1)[1].strip()
+                        s = user_settings.get_user_settings(user_id)
+                        words = list(s.get("words_remove") or [])
+                        if word in words:
+                            words.remove(word)
+                            user_settings.set_user_setting(user_id, "words_remove", words)
+                            await update.message.reply_text(f"✅ Removed word: {word}")
+                        else:
+                            await update.message.reply_text("⚠️ Word not found in list.")
+                    elif lower == "list_words":
+                        s = user_settings.get_user_settings(user_id)
+                        words = s.get("words_remove") or []
+                        await update.message.reply_text("Words to remove: " + (", ".join(words) if words else "(none)"))
+                    elif lower == "clear_words":
+                        user_settings.set_user_setting(user_id, "words_remove", [])
+                        await update.message.reply_text("✅ Cleared words remover list.")
+                    else:
+                        await update.message.reply_text("❓ Unknown settings command. Send /settings for instructions.")
+                except Exception:
+                    await update.message.reply_text("⚠️ Failed to update settings.")
+
+            for key in list(context.user_data.keys()):
+                if key.startswith("awaiting_"):
+                    del context.user_data[key]
+
+        elif context.user_data.get("awaiting_crf"):
             if user_input.isdigit() and 18 <= int(user_input) <= 51:
                 await self.compress_video(update, context, session, user_input)
             else:
@@ -2512,7 +3359,11 @@ class EnhancedMediaHandler:
                                 success = await self.converter.split_video(current_file["path"], start, end, out)
                                 if success and os.path.exists(out):
                                     with open(out, "rb") as vf:
-                                        await context.bot.send_video(chat_id=update.effective_chat.id, video=vf, caption="✅ Split part")
+                                        await context.bot.send_video(
+                                            chat_id=update.effective_chat.id,
+                                            video=vf,
+                                            caption="✅ Split part",
+                                        )
                                     os.remove(out)
                                 else:
                                     await update.message.reply_text("⚠️ Split finished but no file produced.")
@@ -2520,9 +3371,13 @@ class EnhancedMediaHandler:
                             logger.exception("split_video failed")
                     else:
                         parts = int(user_input.strip())
-                        await update.message.reply_text(f"✅ Split into {parts} parts queued (placeholder).")
+                        await update.message.reply_text(
+                            f"✅ Split into {parts} parts queued (placeholder)."
+                        )
                 except Exception:
-                    await update.message.reply_text("❌ Invalid split format. Use 'start-end' or an integer number of parts.")
+                    await update.message.reply_text(
+                        "❌ Invalid split format. Use 'start-end' or an integer number of parts."
+                    )
             for key in list(context.user_data.keys()):
                 if key.startswith("awaiting_"):
                     del context.user_data[key]
@@ -2554,7 +3409,7 @@ class EnhancedMediaHandler:
                         logger.warning("Invalid forward target or inaccessible chat: %s", e)
                         await update.message.reply_text(
                             "❌ Invalid target or bot cannot access that chat/user. "
-                            "Make sure the chat id is numeric or the user has started the bot (use @username)."
+                            "Provide a numeric chat id or ensure the user has started the bot (use @username)."
                         )
                         for key in list(context.user_data.keys()):
                             if key.startswith("awaiting_"):
@@ -2563,7 +3418,6 @@ class EnhancedMediaHandler:
 
                     # Try sending with validation and robust error handling
                     try:
-                        file_size = os.path.getsize(path)
                         # Choose send method; document is a safer fallback for large files
                         caption = current_file.get("caption", "")
 
