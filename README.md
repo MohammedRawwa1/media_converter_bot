@@ -133,6 +133,7 @@ Code Quality:        ✅ Verified
 ### Optional
 - `WEBHOOK_URL` - For webhook mode
 - `MONGODB_URI` - MongoDB connection string
+ - `WEBHOOK_SECRET` - Optional secret token for Telegram webhook security. If set, the app will pass this token to Telegram when calling `set_webhook(..., secret_token=...)` and will validate incoming `X-Telegram-Bot-Api-Secret-Token` headers.
 
 ---
 

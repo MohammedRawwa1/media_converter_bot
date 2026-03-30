@@ -14,6 +14,7 @@ Steps
 2. On Render: New → Web Service → Connect your repo.
 3. In "Environment": set `BOT_TOKEN`.
    - If you plan to use webhooks, set `WEBHOOK_URL` to https://<your-service>.onrender.com/telegram/webhook
+   - (Optional, recommended) set `WEBHOOK_SECRET` to a random secret string. The app will configure Telegram with this `secret_token` and validate incoming requests using the `X-Telegram-Bot-Api-Secret-Token` header.
 4. build command: leave empty (Render auto-detects) or set `pip install -r requirements.txt`
 5. start command: `uvicorn main:app --host 0.0.0.0 --port 8000 --workers 4`
 6. Set health check to `/health`.

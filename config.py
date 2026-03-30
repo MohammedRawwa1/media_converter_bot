@@ -9,6 +9,7 @@ ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
 # Basic required configuration
 BOT_TOKEN = os.getenv("BOT_TOKEN") or ""
 WEBHOOK_URL = os.getenv("WEBHOOK_URL") or ""
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET") or os.getenv("TELEGRAM_SECRET_TOKEN") or os.getenv("WEBHOOK_SECRET_TOKEN") or ""
 
 # Storage and limits
 STORAGE_PATH = os.getenv("STORAGE_PATH", os.path.join(ROOT_DIR, "storage"))

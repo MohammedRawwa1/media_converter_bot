@@ -29,6 +29,7 @@ from config import (
     BOT_TOKEN,
     FFMPEG_PATH,
     WEBHOOK_URL,
+    WEBHOOK_SECRET,
     is_user_allowed,
     persist_allowed_users,
 )
@@ -585,6 +586,7 @@ async def main(background: bool = False) -> None:
                         allowed_updates=["message", "callback_query", "edited_message"],
                         max_connections=100,
                         drop_pending_updates=False,
+                        secret_token=WEBHOOK_SECRET or None,
                     )
                     logger.info(f"✅ Webhook set successfully: {WEBHOOK_URL}")
                 except Exception as e:
@@ -663,6 +665,7 @@ async def main(background: bool = False) -> None:
                             allowed_updates=["message", "callback_query", "edited_message"],
                             max_connections=100,
                             drop_pending_updates=False,
+                            secret_token=WEBHOOK_SECRET or None,
                         )
                         logger.info(f"✅ Webhook set successfully: {WEBHOOK_URL}")
                     except Exception as e:
@@ -721,6 +724,18 @@ try:
     @app.post("/telegram/webhook")
     async def telegram_webhook(request: Request):
         """PTB v20+ compatible webhook endpoint."""
+        # Verify secret token header if configured
+        try:
+            if WEBHOOK_SECRET:
+                incoming = request.headers.get("X-Telegram-Bot-Api-Secret-Token")
+                if not incoming or incoming != WEBHOOK_SECRET:
+                    logger.warning("Invalid webhook secret token: %s", incoming)
+                    raise HTTPException(status_code=403, detail="Invalid secret token")
+        except HTTPException:
+            raise
+        except Exception:
+            logger.exception("Error validating webhook secret token")
+            raise HTTPException(status_code=500, detail="Webhook validation error")
         if not BOT_APPLICATION:
             logger.error("Bot application not initialized")
             raise HTTPException(status_code=503, detail="Bot not initialized")
