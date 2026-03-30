@@ -1,5 +1,4 @@
 # media_schema.py
-from datetime import datetime
 
 try:
     from pymongo import IndexModel
