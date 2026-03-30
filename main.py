@@ -710,6 +710,26 @@ try:
 
     app = FastAPI(title="Media Conversion Bot - PTB v20+")
 
+    # Mount legacy Flask-based web UI (if present) under '/flask' so the
+    # web uploader and static UI remain available when running under ASGI/uvicorn.
+    try:
+        from starlette.middleware.wsgi import WSGIMiddleware
+        from fastapi.responses import RedirectResponse
+
+        import web.webapp as flask_webapp
+
+        # Mount the Flask app at /flask (flask routes like /upload become /flask/upload)
+        app.mount("/flask", WSGIMiddleware(flask_webapp.app))
+
+        # Provide a compatibility redirect so requests to /upload still work.
+        @app.get("/upload")
+        async def _upload_redirect():
+            return RedirectResponse(url="/flask/upload")
+
+        logger.info("Mounted Flask web UI at /flask and redirect /upload -> /flask/upload")
+    except Exception as e:
+        logger.warning(f"Could not mount Flask web UI: {e}")
+
     @app.get("/health")
     async def health():
         dispatcher_ready = False
