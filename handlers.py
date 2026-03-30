@@ -473,6 +473,78 @@ class EnhancedMediaHandler:
             logger.debug("Conversion quota check failed, allowing conversion")
         return True
 
+    async def _ensure_current_file_downloaded(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE, session: Dict
+    ):
+        """Ensure the session's current_file is downloaded locally. Raises Exception on failure."""
+        user_id = update.effective_user.id if update and update.effective_user else None
+        current_file = session.get("current_file") if session else None
+        if not current_file:
+            raise Exception("No file in session")
+
+        # If already downloaded, nothing to do
+        path = current_file.get("path")
+        if path and os.path.exists(path):
+            return
+
+        file_id = current_file.get("id") or current_file.get("file_id")
+        if not file_id:
+            raise Exception("No file identifier available to download")
+
+        # Check size against MAX_FILE_SIZE if present
+        try:
+            max_size = int(MAX_FILE_SIZE)
+        except Exception:
+            max_size = 4 * 1024**3
+        size = current_file.get("size")
+        if size and size > max_size:
+            raise Exception(f"File too large ({size//1024//1024}MB). Max allowed: {max_size//1024//1024}MB")
+
+        # Attempt to fetch file via Telegram API
+        try:
+            file = await context.bot.get_file(file_id)
+        except Exception as e:
+            logger.exception("get_file failed for %s: %s", file_id, e)
+            err_text = str(e)
+            if "File is too big" in err_text:
+                raise Exception("Telegram reports the file is too big to download via the bot.")
+            raise
+
+        # Choose extension fallback based on declared type or name
+        ext = ""
+        t = current_file.get("type")
+        name = current_file.get("name") or ""
+        if t == "video":
+            ext = ".mp4"
+        elif t == "audio":
+            ext = os.path.splitext(name)[1] or ".mp3"
+        else:
+            ext = os.path.splitext(name)[1] or ""
+
+        input_dir = getattr(config, "INPUT_PATH", "storage/input")
+        try:
+            os.makedirs(input_dir, exist_ok=True)
+        except Exception:
+            pass
+        file_path = os.path.join(input_dir, f"{user_id}_{file_id}{ext}")
+
+        await file.download_to_drive(file_path)
+
+        # Attempt to detect a better filename now that the file is present
+        try:
+            final_name = await detect_filename(file_path, getattr(update, "message", None))
+            if final_name:
+                current_file["name"] = final_name
+        except Exception:
+            logger.debug("detect_filename failed after download")
+
+        current_file["path"] = file_path
+        session["current_file"] = current_file
+        try:
+            self._persist_session(user_id)
+        except Exception:
+            logger.debug("Could not persist session after download")
+
     async def show_settings(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Display and start interactive settings flow for the user."""
         user_id = update.effective_user.id
@@ -587,6 +659,15 @@ class EnhancedMediaHandler:
             return
 
         await self.safe_edit(query, f"🎬 Queuing conversion to {target_format.upper()}...")
+
+        # Ensure file is available locally (lazy-download)
+        if not current_file.get("path") or not os.path.exists(current_file.get("path") or ""):
+            try:
+                await self._ensure_current_file_downloaded(update, context, session)
+                current_file = session.get("current_file")
+            except Exception as e:
+                await self.safe_edit(query, f"❌ Failed to download file: {e}")
+                return
 
         # Enqueue conversion job to Redis so a worker handles heavy lifting
         input_path = current_file["path"]
@@ -892,87 +973,44 @@ class EnhancedMediaHandler:
             )
             return
 
-        await update.message.reply_text("📥 Downloading video...")
-
-        # Download file
-        file = await context.bot.get_file(video.file_id)
-        ext = ".mp4"  # Telegram videos are usually MP4
-        input_dir = getattr(config, "INPUT_PATH", "storage/input")
-        try:
-            os.makedirs(input_dir, exist_ok=True)
-        except Exception:
-            pass
-        file_path = os.path.join(input_dir, f"{user_id}_{video.file_id}{ext}")
-
-        await file.download_to_drive(file_path)
-
-        # Probe duration to detect short/preview videos
-        try:
-            if probe_duration:
-                duration = await probe_duration(file_path)
-                if duration is not None and duration < 3.0:
-                    # mark as preview/short clip
-                    session["current_file"] = session.get("current_file", {})
-                    session["current_file"]["is_preview"] = True
-                    session["current_file"]["duration"] = duration
-        except Exception:
-            logger.debug("Failed to probe duration for %s", file_path)
-
-        # Detect a sensible filename and apply user settings
-        final_name = await detect_filename(file_path, update.message)
+        # Register file lazily (do not download yet). We'll download on-demand
+        file_id = video.file_id
+        ext = ".mp4"
+        default_name = f"{user_id}_{file_id}{ext}"
+        final_name = default_name
         thumb = None
         try:
             if user_settings:
                 s = user_settings.get_user_settings(user_id)
-                # remove words
-                for w in s.get("words_remove") or []:
-                    final_name = final_name.replace(w, "")
-                final_name = final_name.strip()
-                # ensure extension
-                if not os.path.splitext(final_name)[1]:
-                    final_name += ext
-                # apply prefix/suffix
                 prefix = s.get("prefix") or ""
                 suffix = s.get("suffix") or ""
                 final_name = f"{prefix}{final_name}{suffix}"
-                # attach thumbnail path if user saved one
                 if s.get("save_thumbnail") and s.get("default_thumbnail"):
                     thumb = s.get("default_thumbnail")
         except Exception:
             logger.exception("Failed to apply user settings to video name")
 
-        # Store in session
         session["current_file"] = {
-            "path": file_path,
+            "path": None,
             "type": "video",
-            "id": video.file_id,
+            "id": file_id,
             "size": video.file_size,
             "name": final_name,
             "thumbnail": thumb,
         }
 
-        # Persist session so callbacks handled by other workers can access
         try:
             self._persist_session(user_id)
         except Exception:
-            logger.debug("Could not persist session after video download")
+            logger.debug("Could not persist session after registering video")
 
         # Log to MongoDB if needed
         await self.log_media_to_db(user_id, session["current_file"])
 
-        # Show main menu
-        # Inform user; include preview notice when applicable
-        preview_notice = ""
-        try:
-            if session.get("current_file", {}).get("is_preview"):
-                dur = session.get("current_file", {}).get("duration")
-                preview_notice = f"\n⚠️ Detected short/preview video ({dur:.2f}s)."
-        except Exception:
-            preview_notice = ""
-
+        # Show main menu immediately (lazy download)
         await update.message.reply_text(
-            f"✅ Video downloaded!\n"
-            f"📦 Size: {video.file_size // 1024 // 1024} MB{preview_notice}\n"
+            f"✅ Video registered!\n"
+            f"📦 Size: {video.file_size // 1024 // 1024} MB\n"
             f"Choose an action:",
             reply_markup=MediaMenuBuilder.get_main_menu("video"),
         )
@@ -984,13 +1022,9 @@ class EnhancedMediaHandler:
         audio = update.message.audio
         user_id = update.effective_user.id
 
-        await update.message.reply_text("📥 Downloading audio...")
-
-        # Download file
-        file = await context.bot.get_file(audio.file_id)
-        ext = ".mp3"  # Default
+        # Register audio lazily (do not download yet).
+        ext = ".mp3"
         if audio.mime_type:
-            # Extract extension from mime type
             ext_map = {
                 "audio/mpeg": ".mp3",
                 "audio/wav": ".wav",
@@ -1001,16 +1035,8 @@ class EnhancedMediaHandler:
             }
             ext = ext_map.get(audio.mime_type, ".mp3")
 
-        input_dir = getattr(config, "INPUT_PATH", "storage/input")
-        try:
-            os.makedirs(input_dir, exist_ok=True)
-        except Exception:
-            pass
-        file_path = os.path.join(input_dir, f"{user_id}_{audio.file_id}{ext}")
-        await file.download_to_drive(file_path)
-
-        # Detect a sensible filename for audio and apply user settings
-        final_name = await detect_filename(file_path, update.message)
+        default_name = audio.title or f"{user_id}_{audio.file_id}{ext}"
+        final_name = default_name
         thumb = None
         try:
             if user_settings:
@@ -1026,9 +1052,8 @@ class EnhancedMediaHandler:
         except Exception:
             logger.exception("Failed to apply user settings to audio name")
 
-        # Store in session
         session["current_file"] = {
-            "path": file_path,
+            "path": None,
             "type": "audio",
             "id": audio.file_id,
             "size": audio.file_size,
@@ -1036,9 +1061,8 @@ class EnhancedMediaHandler:
             "thumbnail": thumb,
         }
 
-        # Show audio menu
         await update.message.reply_text(
-            f"✅ Audio downloaded!\n"
+            f"✅ Audio registered!\n"
             f"🎵 {audio.title or 'Unknown title'}\n"
             f"Choose an action:",
             reply_markup=MediaMenuBuilder.get_main_menu("audio"),
@@ -1122,36 +1146,9 @@ class EnhancedMediaHandler:
             )
             return
 
-        await update.message.reply_text(f"📥 Downloading {file_type}...")
-
-        # Download file (wrap get_file in try/except to handle API 'File is too big')
-        try:
-            file = await context.bot.get_file(document.file_id)
-        except Exception as e:
-            # Catch Telegram API errors such as 'File is too big' and inform user
-            try:
-                err_text = str(e)
-            except Exception:
-                err_text = ""
-            logger.exception("get_file failed for document %s: %s", getattr(document, 'file_id', None), err_text)
-            if "File is too big" in err_text:
-                await update.message.reply_text(
-                    "❌ Telegram reports the file is too big to download via the bot. "
-                    "Please provide a direct URL or use the web upload endpoint."
-                )
-                return
-            # Re-raise unexpected errors so they are logged by the outer handler
-            raise
-        input_dir = getattr(config, "INPUT_PATH", "storage/input")
-        try:
-            os.makedirs(input_dir, exist_ok=True)
-        except Exception:
-            pass
-        file_path = os.path.join(input_dir, f"{user_id}_{document.file_id}{file_ext}")
-        await file.download_to_drive(file_path)
-
-        # Detect a sensible filename for document and apply user settings
-        final_name = await detect_filename(file_path, update.message)
+        # For subtitle flows we still need to download immediately (handled above).
+        # Otherwise register the document lazily and show the menu.
+        final_name = file_name
         thumb = None
         try:
             if user_settings:
@@ -1167,9 +1164,8 @@ class EnhancedMediaHandler:
         except Exception:
             logger.exception("Failed to apply user settings to document name")
 
-        # Store in session
         session["current_file"] = {
-            "path": file_path,
+            "path": None,
             "type": file_type,
             "id": document.file_id,
             "size": document.file_size,
@@ -1177,15 +1173,13 @@ class EnhancedMediaHandler:
             "thumbnail": thumb,
         }
 
-        # Persist session for cross-worker access
         try:
             self._persist_session(user_id)
         except Exception:
-            logger.debug("Could not persist session after document download")
+            logger.debug("Could not persist session after registering document")
 
-        # Show appropriate menu
         await update.message.reply_text(
-            f"✅ {file_type.capitalize()} downloaded!\n"
+            f"✅ {file_type.capitalize()} registered!\n"
             f"📁 {file_name}\n"
             f"Choose an action:",
             reply_markup=MediaMenuBuilder.get_main_menu(file_type),
@@ -2064,6 +2058,15 @@ class EnhancedMediaHandler:
                 else:
                     await self.safe_edit(query, "❌ Conversion failed.")
 
+        # Ensure file downloaded before conversion (lazy-download)
+        if not current_file.get("path") or not os.path.exists(current_file.get("path") or ""):
+            try:
+                await self._ensure_current_file_downloaded(update, context, session)
+                current_file = session.get("current_file")
+            except Exception as e:
+                await self.safe_edit(query, f"❌ Failed to download file: {e}")
+                return
+
         await self._run_with_concurrency_limit(
             user_id, "mp3_conversion", do_conversion()
         )
@@ -2155,6 +2158,15 @@ class EnhancedMediaHandler:
                     os.remove(output_path)
             else:
                 await self.safe_edit(query, "❌ Compression failed.")
+
+        # Ensure file downloaded before compression (lazy-download)
+        if not current_file.get("path") or not os.path.exists(current_file.get("path") or ""):
+            try:
+                await self._ensure_current_file_downloaded(update, context, session)
+                current_file = session.get("current_file")
+            except Exception as e:
+                await self.safe_edit(query, f"❌ Failed to download file: {e}")
+                return
 
         await self._run_with_concurrency_limit(
             user_id, "compression", do_compression()
@@ -2274,6 +2286,15 @@ class EnhancedMediaHandler:
 
         await self.safe_edit(query, "🔉 Removing audio...")
 
+        # Ensure file downloaded (lazy-download)
+        if not current_file.get("path") or not os.path.exists(current_file.get("path") or ""):
+            try:
+                await self._ensure_current_file_downloaded(update, context, session)
+                current_file = session.get("current_file")
+            except Exception as e:
+                await self.safe_edit(query, f"❌ Failed to download file: {e}")
+                return
+
         output_path = f"storage/output/{current_file['id']}_no_audio.mp4"
         success = await self.converter.remove_audio(
             current_file["path"], output_path
@@ -2340,6 +2361,15 @@ class EnhancedMediaHandler:
             query, f"📐 Changing resolution to {width}x{height}..."
         )
 
+        # Ensure file downloaded (lazy-download)
+        if not current_file.get("path") or not os.path.exists(current_file.get("path") or ""):
+            try:
+                await self._ensure_current_file_downloaded(update, context, session)
+                current_file = session.get("current_file")
+            except Exception as e:
+                await self.safe_edit(query, f"❌ Failed to download file: {e}")
+                return
+
         output_path = (
             f"storage/output/{current_file['id']}_{width}x{height}.mp4"
         )
@@ -2403,6 +2433,15 @@ class EnhancedMediaHandler:
 
         encoder_preset, crf, bitrate = preset_map[preset]
         await self.safe_edit(query, f"⚡ Optimizing for {preset}...")
+
+        # Ensure file downloaded (lazy-download)
+        if not current_file.get("path") or not os.path.exists(current_file.get("path") or ""):
+            try:
+                await self._ensure_current_file_downloaded(update, context, session)
+                current_file = session.get("current_file")
+            except Exception as e:
+                await self.safe_edit(query, f"❌ Failed to download file: {e}")
+                return
 
         output_path = f"storage/output/{current_file['id']}_optimized.mp4"
 
@@ -2489,6 +2528,14 @@ class EnhancedMediaHandler:
             return
 
         await self.safe_edit(query, "🔧 Attempting to repair video...")
+        # Ensure file downloaded (lazy-download)
+        if not current_file.get("path") or not os.path.exists(current_file.get("path") or ""):
+            try:
+                await self._ensure_current_file_downloaded(update, context, session)
+                current_file = session.get("current_file")
+            except Exception as e:
+                await self.safe_edit(query, f"❌ Failed to download file: {e}")
+                return
 
         # enqueue repair job
         job_id = str(uuid.uuid4())
@@ -2558,6 +2605,15 @@ class EnhancedMediaHandler:
                 "ffmpeg-python not available for take_screenshot; falling back to CLI where possible"
             )
             return
+
+        # Ensure file downloaded (lazy-download)
+        if not current_file.get("path") or not os.path.exists(current_file.get("path") or ""):
+            try:
+                await self._ensure_current_file_downloaded(update, context, session)
+                current_file = session.get("current_file")
+            except Exception as e:
+                await self.safe_edit(query, f"❌ Failed to download file: {e}")
+                return
 
         try:
             probe = ffmpeg_mod.probe(current_file["path"])
@@ -2635,6 +2691,15 @@ class EnhancedMediaHandler:
             await self.safe_edit(query, "❌ No video file found.")
             return
 
+        # Ensure file downloaded (lazy-download)
+        if not current_file.get("path") or not os.path.exists(current_file.get("path") or ""):
+            try:
+                await self._ensure_current_file_downloaded(update, context, session)
+                current_file = session.get("current_file")
+            except Exception as e:
+                await self.safe_edit(query, f"❌ Failed to download file: {e}")
+                return
+
         await self.safe_edit(query, "🖼️ Creating thumbnail grid...")
 
         output_path = f"storage/output/{current_file['id']}_grid.jpg"
@@ -2669,6 +2734,15 @@ class EnhancedMediaHandler:
 
         if not await self._check_conversion_quota(update, context):
             return
+
+        # Ensure file downloaded (lazy-download)
+        if not current_file.get("path") or not os.path.exists(current_file.get("path") or ""):
+            try:
+                await self._ensure_current_file_downloaded(update, context, session)
+                current_file = session.get("current_file")
+            except Exception as e:
+                await self.safe_edit(query, f"❌ Failed to download file: {e}")
+                return
 
         await self.safe_edit(query, "🎞️ Extracting streams...")
 
@@ -2717,6 +2791,15 @@ class EnhancedMediaHandler:
         await self.safe_edit(
             query, f"🔄 Converting to {format_type.upper()}..."
         )
+
+        # Ensure file downloaded (lazy-download)
+        if not current_file.get("path") or not os.path.exists(current_file.get("path") or ""):
+            try:
+                await self._ensure_current_file_downloaded(update, context, session)
+                current_file = session.get("current_file")
+            except Exception as e:
+                await self.safe_edit(query, f"❌ Failed to download file: {e}")
+                return
 
         output_path = (
             f"storage/output/{current_file['id']}_converted.{format_type}"
@@ -2783,6 +2866,15 @@ class EnhancedMediaHandler:
         # Convert with specific bitrate
         cmd = ["-c:a", "libmp3lame", "-b:a", bitrate]
 
+        # Ensure file downloaded (lazy-download)
+        if not current_file.get("path") or not os.path.exists(current_file.get("path") or ""):
+            try:
+                await self._ensure_current_file_downloaded(update, context, session)
+                current_file = session.get("current_file")
+            except Exception as e:
+                await self.safe_edit(query, f"❌ Failed to download file: {e}")
+                return
+
         success, _ = await self.converter.execute_ffmpeg(
             cmd, current_file["path"], output_path
         )
@@ -2829,6 +2921,15 @@ class EnhancedMediaHandler:
             "192k",
         ]
 
+        # Ensure file downloaded (lazy-download)
+        if not current_file.get("path") or not os.path.exists(current_file.get("path") or ""):
+            try:
+                await self._ensure_current_file_downloaded(update, context, session)
+                current_file = session.get("current_file")
+            except Exception as e:
+                await self.safe_edit(query, f"❌ Failed to download file: {e}")
+                return
+
         success, _ = await self.converter.execute_ffmpeg(
             cmd, current_file["path"], output_path
         )
@@ -2867,6 +2968,15 @@ class EnhancedMediaHandler:
             return
 
         await self.safe_edit(query, "📝 Extracting subtitles...")
+
+        # Ensure file downloaded (lazy-download)
+        if not current_file.get("path") or not os.path.exists(current_file.get("path") or ""):
+            try:
+                await self._ensure_current_file_downloaded(update, context, session)
+                current_file = session.get("current_file")
+            except Exception as e:
+                await self.safe_edit(query, f"❌ Failed to download file: {e}")
+                return
 
         output_path = f"storage/output/{current_file['id']}_subtitles.srt"
         success = await self.converter.extract_subtitles(
@@ -2918,6 +3028,15 @@ class EnhancedMediaHandler:
             )
             logger.warning("ffmpeg-python not available for media analysis")
             return
+
+        # Ensure file downloaded (lazy-download)
+        if not current_file.get("path") or not os.path.exists(current_file.get("path") or ""):
+            try:
+                await self._ensure_current_file_downloaded(update, context, session)
+                current_file = session.get("current_file")
+            except Exception as e:
+                await self.safe_edit(query, f"❌ Failed to download file: {e}")
+                return
 
         try:
             probe = ffmpeg_mod.probe(current_file["path"])
@@ -3038,6 +3157,14 @@ class EnhancedMediaHandler:
             return
 
         await self.safe_edit(query, "🎬 Generating 30-second sample...")
+        # Ensure file downloaded (lazy-download)
+        if not current_file.get("path") or not os.path.exists(current_file.get("path") or ""):
+            try:
+                await self._ensure_current_file_downloaded(update, context, session)
+                current_file = session.get("current_file")
+            except Exception as e:
+                await self.safe_edit(query, f"❌ Failed to download file: {e}")
+                return
 
         job_id = str(uuid.uuid4())
         output_path = f"storage/output/{current_file['id']}_sample"
