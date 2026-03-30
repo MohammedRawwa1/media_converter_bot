@@ -81,6 +81,7 @@ class ExtendedMediaConverter:
                 "mov": ["-c:v", "libx264", "-c:a", "aac"],
                 "webm": ["-c:v", "libvpx-vp9", "-c:a", "libvorbis"],
                 "flv": ["-c:v", "libx264", "-c:a", "aac"],
+                "m4v": ["-c:v", "libx264", "-c:a", "aac", "-strict", "experimental"],
             }
 
             if target_format not in format_configs:
@@ -227,6 +228,42 @@ class ExtendedMediaConverter:
             logger.error(f"split_video_range error: {e}")
             return False
 
+    async def trim_video(self, input_path: str, output_path: str, start_time: str, end_time: str) -> bool:
+        """Trim a segment from input between `start_time` and `end_time`.
+
+        Time strings should be in HH:MM:SS(.xxx) or MM:SS(.xxx) or seconds format.
+        """
+        try:
+            # Parse times into seconds
+            def _to_seconds(tstr: str) -> float:
+                parts = tstr.split(":")
+                if len(parts) == 3:
+                    h = int(parts[0])
+                    m = int(parts[1])
+                    s = float(parts[2])
+                    return h * 3600 + m * 60 + s
+                elif len(parts) == 2:
+                    m = int(parts[0])
+                    s = float(parts[1])
+                    return m * 60 + s
+                else:
+                    return float(parts[0])
+
+            start_s = _to_seconds(start_time)
+            end_s = _to_seconds(end_time)
+            if end_s <= start_s:
+                logger.error("trim_video: end_time must be greater than start_time")
+                return False
+
+            duration = end_s - start_s
+
+            # Use copy where possible for speed; rely on execute_ffmpeg to build command
+            cmd = ["-ss", str(start_time), "-t", str(duration), "-c", "copy"]
+            return (await self.execute_ffmpeg(cmd, input_path, output_path))[0]
+        except Exception as e:
+            logger.exception("trim_video failed: %s", e)
+            return False
+
     async def burn_subtitles(self, input_path: str, subtitle_path: str, output_path: str) -> bool:
         """Hardcode (burn) subtitles into the video using ffmpeg subtitles filter.
 
@@ -325,8 +362,35 @@ class ExtendedMediaConverter:
 
     async def generate_sample(self, input_path: str, output_path: str, duration: int = 30) -> bool:
         """Generate sample/preview of video."""
-        cmd = ["-t", str(duration), "-c", "copy"]
-        return (await self.execute_ffmpeg(cmd, input_path, output_path))[0]
+        # Prefer re-encoding to an H.264/AAC MP4 with faststart for Telegram
+        # when the requested output is MP4; otherwise try to copy streams.
+        try:
+            if output_path.lower().endswith(".mp4"):
+                cmd = [
+                    "-t",
+                    str(duration),
+                    "-c:v",
+                    "libx264",
+                    "-preset",
+                    "veryfast",
+                    "-crf",
+                    "28",
+                    "-c:a",
+                    "aac",
+                    "-b:a",
+                    "96k",
+                    "-movflags",
+                    "+faststart",
+                ]
+            else:
+                cmd = ["-t", str(duration), "-c", "copy"]
+
+            return (await self.execute_ffmpeg(cmd, input_path, output_path))[0]
+        except Exception as e:
+            logger.exception("generate_sample failed: %s", e)
+            # Fallback to copying a range
+            cmd = ["-t", str(duration), "-c", "copy"]
+            return (await self.execute_ffmpeg(cmd, input_path, output_path))[0]
 
     async def create_archive(self, file_paths: List[str], output_path: str) -> bool:
         """Create ZIP archive of files."""
@@ -360,6 +424,8 @@ class ExtendedMediaConverter:
             cmd = ["-c:a", "pcm_s16le"]
         elif target_format == "aac":
             cmd = ["-c:a", "aac", "-b:a", "128k"]
+        elif target_format == "opus":
+            cmd = ["-c:a", "libopus", "-b:a", "96k"]
         else:
             cmd = ["-c:a", "copy"]
 
