@@ -99,3 +99,20 @@ def is_user_allowed(user_id: int) -> bool:
         return user_id in ALLOWED_USER_IDS
     except Exception:
         return False
+# Normalize MongoDB environment variable names for compatibility.
+# Some deployments use MONGO_URI, others MONGODB_URL or MONGO_URL — accept any.
+_canonical_mongo = (
+    os.getenv("MONGO_URI")
+    or os.getenv("MONGODB_URL")
+    or os.getenv("MONGODB_URI")
+    or os.getenv("MONGO_URL")
+)
+if _canonical_mongo:
+    # Ensure common names are present in os.environ so all modules find it.
+    os.environ.setdefault("MONGO_URI", _canonical_mongo)
+    os.environ.setdefault("MONGODB_URL", _canonical_mongo)
+    os.environ.setdefault("MONGO_URL", _canonical_mongo)
+    os.environ.setdefault("MONGODB_URI", _canonical_mongo)
+
+# Expose a canonical variable for other modules to import if desired.
+MONGO_URI = os.getenv("MONGO_URI", "")
