@@ -670,7 +670,7 @@ class EnhancedMediaHandler:
         try:
             if MediaMenuBuilder and hasattr(MediaMenuBuilder, "get_bulk_menu"):
                 try:
-                    kb = MediaMenuBuilder.get_bulk_menu()
+                    kb = MediaMenuBuilder.get_bulk_menu(s)
                 except Exception:
                     logger.exception("MediaMenuBuilder.get_bulk_menu() raised an exception")
                     kb = None
@@ -1927,6 +1927,92 @@ class EnhancedMediaHandler:
             elif data == "bulk_menu":
                 # Open the bulk action menu
                 await self.show_bulk_menu(update, context)
+
+            elif isinstance(data, str) and data.startswith("bulk_toggle:"):
+                # Toggle a boolean bulk setting for the user
+                try:
+                    key = data.split(":", 1)[1]
+                except Exception:
+                    key = None
+                if not key:
+                    await self.safe_edit(query, "⚠️ Invalid toggle request.")
+                    return
+
+                try:
+                    if user_settings:
+                        new = user_settings.toggle_user_setting(user_id, key)
+                    else:
+                        # fallback to session-scoped bulk settings
+                        sess = session or self.user_sessions.setdefault(user_id, {})
+                        b = sess.setdefault("bulk_settings", {})
+                        cur = bool(b.get(key))
+                        new = not cur
+                        b[key] = new
+
+                    await self.safe_edit(query, f"✅ {key.replace('_', ' ').title()}: {'On' if new else 'Off'}")
+                    # re-render the bulk menu to show updated status
+                    await self.show_bulk_menu(update, context)
+                except Exception:
+                    logger.exception("Failed to toggle bulk setting %s", key)
+                    await self.safe_edit(query, "⚠️ Failed to toggle setting")
+
+            elif data == "bulk_apply":
+                # Apply bulk actions to files in session.merge_list or current_file
+                try:
+                    sess = session or self.user_sessions.get(user_id, {})
+                    files = sess.get("merge_list") or []
+                    if not files and sess.get("current_file"):
+                        files = [sess.get("current_file")]
+
+                    if not files:
+                        await self.safe_edit(query, "❌ No files selected for bulk processing.")
+                        return
+
+                    enqueued = 0
+                    for f in list(files):
+                        try:
+                            # Ensure file is downloaded locally (best-effort)
+                            if not f.get("path") or not os.path.exists(f.get("path") or ""):
+                                try:
+                                    await self._ensure_current_file_downloaded(update, context, sess)
+                                except Exception:
+                                    # try next file if download failed
+                                    logger.debug("bulk: download failed for %s", f.get("id"))
+                                    continue
+
+                            if not f.get("path"):
+                                continue
+
+                            job_id = str(uuid.uuid4()) if uuid else None
+                            out_path = f"storage/output/{f.get('id')}_bulk.mp4"
+                            job = {
+                                "job_id": job_id,
+                                "input_path": f.get("path"),
+                                "output_path": out_path,
+                                "ffmpeg_args": None,
+                                "progress_channel": f"ffmpeg:progress:{job_id}",
+                                "chat_id": update.effective_chat.id if update and getattr(update, 'effective_chat', None) else None,
+                                "caption": f"Bulk conversion finished for {f.get('name') or f.get('id')}",
+                                "cleanup_input": True,
+                                "cleanup_output": False,
+                            }
+
+                            if enqueue_job:
+                                try:
+                                    await enqueue_job(job)
+                                    enqueued += 1
+                                except Exception:
+                                    logger.exception("Failed to enqueue bulk job for %s", f.get('id'))
+                            else:
+                                sess.setdefault('queued_bulk_jobs', []).append(job)
+                                enqueued += 1
+                        except Exception:
+                            logger.exception("Failed processing bulk file %s", f.get('id'))
+
+                    await self.safe_edit(query, f"✅ Bulk apply queued for {enqueued} file(s).")
+                except Exception:
+                    logger.exception("bulk_apply failed")
+                    await self.safe_edit(query, "⚠️ Failed to apply bulk actions.")
 
             elif data == "video_reorder":
                 # Placeholder for video reorder feature

@@ -248,18 +248,39 @@ class MediaMenuBuilder:
         return InlineKeyboardMarkup(buttons)
 
     @staticmethod
-    def get_bulk_menu() -> InlineKeyboardMarkup:
-        """Bulk mode action grid matching the pictured layout."""
-        buttons = [
-            [InlineKeyboardButton("📦 Create Archive", callback_data=CREATE_ARCHIVE), InlineKeyboardButton("🔇 Remove Audios", callback_data=REMOVE_AUDIO)],
-            [InlineKeyboardButton("🔁 Video Reorder", callback_data=VIDEO_REORDER), InlineKeyboardButton("📼 Convert To M4V", callback_data=FORMAT_M4V)],
-            [InlineKeyboardButton("🔉 Convert To AAC", callback_data="format_aac"), InlineKeyboardButton("🎬 Convert To MP4", callback_data=FORMAT_MP4)],
-            [InlineKeyboardButton("🎵 Convert To MP3", callback_data="audio_mp3"), InlineKeyboardButton("🔊 Convert To OPUS", callback_data=FORMAT_OPUS)],
-            [InlineKeyboardButton("🔗 Convert To File", callback_data=CONVERT_TO_FILE), InlineKeyboardButton("🎥 Convert To Video", callback_data=CONVERT_TO_VIDEO)],
-            [InlineKeyboardButton("🔀 Audio Merger", callback_data=MERGE_AUDIOS_START), InlineKeyboardButton("🔀 Video Merger", callback_data=MERGE_VIDEOS_START)],
-            [InlineKeyboardButton("✏️ Mp3 Tag Editor", callback_data=MP3_TAG_EDITOR), InlineKeyboardButton("🔎 Go to Help", callback_data=HELP)],
-            [InlineKeyboardButton("↩️ Back", callback_data=MENU_MAIN)],
+    def get_bulk_menu(settings: dict = None) -> InlineKeyboardMarkup:
+        """Bulk mode toggles menu. `settings` is a dict of current user settings.
+
+        This menu presents toggle switches for bulk-mode actions instead of
+        immediate single-file actions.
+        """
+        # default empty settings
+        s = settings or {}
+
+        items = [
+            ("Convert to MP4", "bulk_convert_mp4"),
+            ("Compress", "bulk_compress"),
+            ("Extract Audio", "bulk_extract_audio"),
+            ("Remove Audio", "bulk_remove_audio"),
+            ("Rename Files", "bulk_rename"),
+            ("Optimize", "bulk_optimize"),
         ]
+
+        buttons = []
+        # build two-toggle rows
+        row = []
+        for i, (label, key) in enumerate(items):
+            val = bool(s.get(key))
+            text = f"{label} — {'On' if val else 'Off'}"
+            row.append(InlineKeyboardButton(text, callback_data=f"bulk_toggle:{key}"))
+            if len(row) == 2:
+                buttons.append(row)
+                row = []
+        if row:
+            buttons.append(row)
+
+        # actions: apply and back
+        buttons.append([InlineKeyboardButton("▶️ Apply Bulk", callback_data="bulk_apply"), InlineKeyboardButton("↩️ Back", callback_data=MENU_MAIN)])
         return InlineKeyboardMarkup(buttons)
 
     @staticmethod
