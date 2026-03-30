@@ -1107,10 +1107,41 @@ class EnhancedMediaHandler:
             )
             return
 
+        # Check file size (if provided) to avoid calling get_file on huge files
+        try:
+            max_size = int(MAX_FILE_SIZE)
+        except Exception:
+            max_size = 4 * 1024**3
+
+        doc_size = getattr(document, "file_size", None)
+        if doc_size and doc_size > max_size:
+            await update.message.reply_text(
+                f"❌ File too large ({doc_size // 1024 // 1024} MB). "
+                f"Maximum allowed is {max_size // 1024 // 1024} MB.\n"
+                "For large files please provide a direct download URL or use the web upload endpoint."
+            )
+            return
+
         await update.message.reply_text(f"📥 Downloading {file_type}...")
 
-        # Download file
-        file = await context.bot.get_file(document.file_id)
+        # Download file (wrap get_file in try/except to handle API 'File is too big')
+        try:
+            file = await context.bot.get_file(document.file_id)
+        except Exception as e:
+            # Catch Telegram API errors such as 'File is too big' and inform user
+            try:
+                err_text = str(e)
+            except Exception:
+                err_text = ""
+            logger.exception("get_file failed for document %s: %s", getattr(document, 'file_id', None), err_text)
+            if "File is too big" in err_text:
+                await update.message.reply_text(
+                    "❌ Telegram reports the file is too big to download via the bot. "
+                    "Please provide a direct URL or use the web upload endpoint."
+                )
+                return
+            # Re-raise unexpected errors so they are logged by the outer handler
+            raise
         input_dir = getattr(config, "INPUT_PATH", "storage/input")
         try:
             os.makedirs(input_dir, exist_ok=True)
