@@ -9,6 +9,10 @@ from flask_cors import CORS
 import config
 import redis as redis_sync
 import threading
+try:
+    import boto3
+except Exception:
+    boto3 = None
 
 app = Flask(__name__, static_folder="static")
 CORS(app)
@@ -191,6 +195,114 @@ def upload():
             return jsonify({"error": "job queue not available on server", "detail": str(e)}), 503
 
     return jsonify({"job_id": job_id})
+
+
+@app.route("/presign", methods=["POST"])
+def presign():
+    """Return a presigned S3 POST (or PUT) for client direct upload.
+
+    Request JSON or form data: `filename`.
+    Requires `UPLOAD_SECRET` when configured.
+    """
+    upload_secret = os.environ.get("UPLOAD_SECRET")
+    if upload_secret:
+        incoming_token = (
+            request.headers.get("X-Upload-Token")
+            or request.form.get("upload_token")
+            or request.args.get("upload_token")
+        )
+        if not incoming_token or incoming_token != upload_secret:
+            return (
+                jsonify({"error": "unauthorized", "detail": "missing or invalid upload token"}),
+                401,
+            )
+
+    filename = None
+    try:
+        data = request.get_json(silent=True) or {}
+        filename = data.get("filename") or request.form.get("filename") or request.args.get("filename")
+    except Exception:
+        filename = request.form.get("filename") or request.args.get("filename")
+
+    if not filename:
+        return jsonify({"error": "filename required"}), 400
+
+    if not boto3:
+        return jsonify({"error": "boto3 not available on server"}), 501
+
+    bucket = os.environ.get("S3_BUCKET")
+    if not bucket:
+        return jsonify({"error": "S3_BUCKET not configured"}), 500
+
+    key = f"uploads/{uuid.uuid4().hex}_{os.path.basename(filename)}"
+
+    try:
+        s3 = boto3.client(
+            "s3",
+            region_name=os.environ.get("S3_REGION") or None,
+            endpoint_url=os.environ.get("S3_ENDPOINT") or None,
+            aws_access_key_id=os.environ.get("AWS_ACCESS_KEY_ID"),
+            aws_secret_access_key=os.environ.get("AWS_SECRET_ACCESS_KEY"),
+        )
+        # prefer a POST form upload (fields + url)
+        post = s3.generate_presigned_post(Bucket=bucket, Key=key, ExpiresIn=3600)
+        # also provide a presigned GET url for later worker download reference
+        get_url = s3.generate_presigned_url("get_object", Params={"Bucket": bucket, "Key": key}, ExpiresIn=3600 * 24)
+        return jsonify({"method": "POST", "url": post["url"], "fields": post["fields"], "key": key, "get_url": get_url})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/enqueue_from_url", methods=["POST"])
+def enqueue_from_url():
+    """Enqueue a job that downloads from a public or presigned URL.
+
+    Request JSON: `source_url` (required), `original_filename` (optional).
+    Requires `UPLOAD_SECRET` when configured.
+    """
+    upload_secret = os.environ.get("UPLOAD_SECRET")
+    if upload_secret:
+        incoming_token = (
+            request.headers.get("X-Upload-Token")
+            or request.json.get("upload_token") if request.is_json else request.form.get("upload_token")
+            or request.args.get("upload_token")
+        )
+        if not incoming_token or incoming_token != upload_secret:
+            return (
+                jsonify({"error": "unauthorized", "detail": "missing or invalid upload token"}),
+                401,
+            )
+
+    data = request.get_json(silent=True) or {}
+    source_url = data.get("source_url") or request.form.get("source_url") or request.args.get("source_url")
+    original_filename = data.get("original_filename") or request.form.get("original_filename") or request.args.get("original_filename")
+
+    if not source_url:
+        return jsonify({"error": "source_url required"}), 400
+
+    job_id = str(uuid.uuid4())
+    output_filename = (os.path.splitext(original_filename or job_id)[0] + ".mp4") if original_filename else f"{job_id}.mp4"
+    output_path = os.path.join(OUTPUT_DIR, output_filename)
+
+    job = {
+        "job_id": job_id,
+        "source_url": source_url,
+        "output_path": output_path,
+        "original_filename": original_filename or output_filename,
+        "output_filename": output_filename,
+        "ffmpeg_args": ["-c:v", "libx264", "-preset", "fast", "-crf", "23", "-c:a", "aac", "-b:a", "128k"],
+        "progress_channel": f"ffmpeg:progress:{job_id}",
+        "cleanup_input": True,
+    }
+
+    if enqueue_job:
+        try:
+            asyncio.run(enqueue_job(job))
+            return jsonify({"job_id": job_id})
+        except Exception as e:
+            return jsonify({"error": f"failed to enqueue: {e}"}), 500
+    else:
+        return jsonify({"error": "job queue not available on server"}), 503
 
 
 async def _get_job_hash(job_id: str):
