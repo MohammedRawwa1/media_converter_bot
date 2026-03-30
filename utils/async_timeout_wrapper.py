@@ -6,7 +6,6 @@ Ensures no operation hangs indefinitely.
 
 import asyncio
 import logging
-import signal
 from functools import wraps
 from typing import Any, Callable, Coroutine, Optional, Tuple
 
@@ -115,7 +114,7 @@ async def run_subprocess_with_timeout(
             try:
                 process.kill()
                 await asyncio.wait_for(process.wait(), timeout=5)
-            except:
+            except Exception:
                 pass
         raise
 
@@ -125,7 +124,7 @@ async def run_subprocess_with_timeout(
             try:
                 process.kill()
                 await asyncio.wait_for(process.wait(), timeout=5)
-            except:
+            except Exception:
                 pass
         raise
 
