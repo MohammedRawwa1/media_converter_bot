@@ -3,7 +3,7 @@
 Keyboard menu builders for Telegram bot.
 """
 
-from typing import Any, Dict, List
+from typing import List
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
@@ -14,26 +14,22 @@ from .callbacks import (
     COMPRESS_MENU,
     CONFIRM,
     EDIT_METADATA,
-    EXTRACT_AUDIO,
     FORMAT_PREFIX,
-    HELP,
     INFO,
+    HELP,
     MENU_MAIN,
-    MENU_VIDEO,
+    MERGE_MENU,
     MERGE_ADD,
     MERGE_CLEAR,
     MERGE_VIDEOS_START,
     MERGE_VIEW,
-    NORMALIZE_AUDIO,
     OPTIMIZE_MENU,
     REMOVE_AUDIO,
     RESOLUTION_MENU,
     SAMPLE,
     SCREENSHOTS_MENU,
-    SEND_FILE,
     CONVERT_FORMAT_MENU,
     THUMBNAIL_GRID,
-    # UI-friendly aliases used in the main menu
     THUMBNAIL_EXTRACTOR,
     CAPTION_EDITOR,
     MEDIA_FORWARDER,
@@ -44,10 +40,19 @@ from .callbacks import (
     VIDEO_TO_AUDIO,
     SUBTITLE_MERGER,
     VIDEO_RENAMER,
-    VIDEO_CONVERTER,
     CREATE_ARCHIVE,
-    TRIM_AUDIO,
     TRIM_VIDEO,
+    TRIM_MENU,
+    TRIMMER_1,
+    TRIMMER_2,
+    BULK_MENU,
+    VIDEO_REORDER,
+    CONVERT_TO_FILE,
+    CONVERT_TO_VIDEO,
+    MP3_TAG_EDITOR,
+    FORMAT_M4V,
+    FORMAT_OPUS,
+    FORMAT_MP4,
 )
 
 
@@ -77,7 +82,7 @@ class MediaMenuBuilder:
             row("🖼️ Thumbnail Extractor", THUMBNAIL_EXTRACTOR, "✏️ Caption And Buttons Editor", CAPTION_EDITOR),
             row("📝 Metadata Editor", EDIT_METADATA, "📤 Media Forwarder", MEDIA_FORWARDER),
             row("🔇 Stream Remover", STREAM_REMOVER, "🎵 Stream Extractor", STREAM_EXTRACTOR),
-            row("✂️ Video Trimmer", TRIM_VIDEO, "➕ Video Merger", MERGE_VIDEOS_START),
+            row("✂️ Video Trimmer", TRIM_VIDEO, "➕ Video Merger", MERGE_MENU),
             row("🔉 Remove Audio", REMOVE_AUDIO, "🔀 Merge And", MERGE_VIEW),
             row(conv_label, conv_cb, split_label, VIDEOS_SPLITTER),
             row("🖼️ Screenshots", SCREENSHOTS_MENU, "🖼️ Manual Shots", MANUAL_SHOTS),
@@ -221,6 +226,31 @@ class MediaMenuBuilder:
                 InlineKeyboardButton("🖼️ Grid (3x3)", callback_data="screenshot_grid_3"),
                 InlineKeyboardButton("🖼️ Grid (4x4)", callback_data="screenshot_grid_4"),
             ],
+            [InlineKeyboardButton("↩️ Back", callback_data=MENU_MAIN)],
+        ]
+        return InlineKeyboardMarkup(buttons)
+
+    @staticmethod
+    def get_trimmer_menu() -> InlineKeyboardMarkup:
+        """Get trimmer selection menu with two dynamic modes."""
+        buttons = [
+            [InlineKeyboardButton("Trimmer 1: Start -> End", callback_data=TRIMMER_1)],
+            [InlineKeyboardButton("Trimmer 2: Start + Duration", callback_data=TRIMMER_2)],
+            [InlineKeyboardButton("↩️ Back", callback_data=MENU_MAIN)],
+        ]
+        return InlineKeyboardMarkup(buttons)
+
+    @staticmethod
+    def get_bulk_menu() -> InlineKeyboardMarkup:
+        """Bulk mode action grid matching the pictured layout."""
+        buttons = [
+            [InlineKeyboardButton("📦 Create Archive", callback_data=CREATE_ARCHIVE), InlineKeyboardButton("🔇 Remove Audios", callback_data=REMOVE_AUDIO)],
+            [InlineKeyboardButton("🔁 Video Reorder", callback_data=VIDEO_REORDER), InlineKeyboardButton("📼 Convert To M4V", callback_data=FORMAT_M4V)],
+            [InlineKeyboardButton("🔉 Convert To AAC", callback_data="format_aac"), InlineKeyboardButton("🎬 Convert To MP4", callback_data=FORMAT_MP4)],
+            [InlineKeyboardButton("🎵 Convert To MP3", callback_data="audio_mp3"), InlineKeyboardButton("🔊 Convert To OPUS", callback_data=FORMAT_OPUS)],
+            [InlineKeyboardButton("🔗 Convert To File", callback_data=CONVERT_TO_FILE), InlineKeyboardButton("🎥 Convert To Video", callback_data=CONVERT_TO_VIDEO)],
+            [InlineKeyboardButton("🔀 Audio Merger", callback_data=MERGE_AUDIOS_START), InlineKeyboardButton("🔀 Video Merger", callback_data=MERGE_VIDEOS_START)],
+            [InlineKeyboardButton("✏️ Mp3 Tag Editor", callback_data=MP3_TAG_EDITOR), InlineKeyboardButton("🔎 Go to Help", callback_data=HELP)],
             [InlineKeyboardButton("↩️ Back", callback_data=MENU_MAIN)],
         ]
         return InlineKeyboardMarkup(buttons)
