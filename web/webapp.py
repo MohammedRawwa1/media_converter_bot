@@ -60,16 +60,53 @@ def upload():
                 401,
             )
 
-    if "file" not in request.files:
-        return jsonify({"error": "no file"}), 400
-    f = request.files["file"]
+    forward_hash = request.form.get("forward_hash") or request.args.get("forward_hash")
+    f = request.files.get("file")
+    # Require either a file upload or a forward_hash that the server can fetch
+    if not f and not forward_hash:
+        return jsonify({"error": "no file or forward_hash provided"}), 400
+
     # Allow empty filenames (e.g. telegram quick-preview). We'll try to
     # detect/sanitize a sensible original filename after saving.
     job_id = str(uuid.uuid4())
-    filename = f.filename or ""
-    ext = os.path.splitext(filename)[1] or ".mp4"
-    input_path = os.path.join(INPUT_DIR, f"{job_id}{ext}")
-    f.save(input_path)
+    if f:
+        filename = f.filename or ""
+        ext = os.path.splitext(filename)[1] or ".mp4"
+        input_path = os.path.join(INPUT_DIR, f"{job_id}{ext}")
+        f.save(input_path)
+    else:
+        # Attempt to fetch forwarded message metadata persisted earlier
+        try:
+            from utils.forward_store import load_forward_metadata
+
+            meta = load_forward_metadata(forward_hash)
+            if not meta:
+                return jsonify({"error": "invalid forward_hash"}), 400
+        except Exception as e:
+            return jsonify({"error": "failed to load forward metadata", "detail": str(e)}), 500
+
+        # Determine extension from original metadata or fallback to .mp4
+        filename = meta.get("name") or ""
+        ext = os.path.splitext(filename)[1] or ".mp4"
+        input_path = os.path.join(INPUT_DIR, f"{job_id}{ext}")
+
+        # Try to download using an opt-in userbot (Telethon) if available
+        try:
+            from utils.userbot_downloader import download_forward_via_userbot
+        except Exception:
+            return jsonify({"error": "userbot_downloader not available on server"}), 500
+
+        try:
+            ok = asyncio.run(
+                download_forward_via_userbot(
+                    meta.get("chat_id"), meta.get("message_id") or meta.get("msg_id"), input_path, msg_date=meta.get("registered_at") or meta.get("created_at"), file_unique_id=meta.get("file_unique_id")
+                )
+            )
+        except Exception as e:
+            return jsonify({"error": "userbot download failed", "detail": str(e)}), 500
+
+        if not ok or not os.path.exists(input_path):
+            return jsonify({"error": "userbot failed to fetch forwarded media"}), 500
 
     # Detect or sanitize the original filename. Prefer the uploaded name,
     # otherwise probe the file to derive a sensible name.
@@ -297,7 +334,10 @@ def events(job_id):
             if job_hash:
                 yield f"data: {json.dumps(job_hash)}\n\n"
 
-            red_url = os.environ.get('REDIS_URL', 'redis://localhost:6379/0')
+            red_url = os.environ.get('REDIS_URL')
+            if not red_url:
+                # No Redis configured for this deployment; finish after initial state
+                return
             r = redis_sync.from_url(red_url, decode_responses=True)
             pub = r.pubsub(ignore_subscribe_messages=True)
             channel = f"ffmpeg:progress:{job_id}"

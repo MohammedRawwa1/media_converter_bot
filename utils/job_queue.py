@@ -1,20 +1,38 @@
 import json
 import os
+import asyncio
+import logging
 from typing import Optional
+from urllib.parse import urlparse
 
 try:
     import redis.asyncio as aioredis
 except Exception:
     aioredis = None
 
-REDIS_URL = os.environ.get("REDIS_URL", "redis://localhost:6379/0")
+# Do not hard-code localhost defaults. Require REDIS_URL to be set in environment
+DEFAULT_REDIS_URL = None
 JOB_LIST = "ffmpeg:jobs"
 
 
 async def get_redis():
     if not aioredis:
         raise RuntimeError("redis.asyncio is required for job queue")
-    return aioredis.from_url(REDIS_URL)
+    # read the env var at call-time so runtime env changes or late injection work
+    redis_url = os.environ.get("REDIS_URL")
+    if not redis_url:
+        raise RuntimeError("REDIS_URL environment variable is not set")
+    # Log a masked host:port for diagnostics (do not print credentials)
+    try:
+        parsed = urlparse(redis_url)
+        hostport = parsed.hostname or ""
+        if parsed.port:
+            hostport = f"{hostport}:{parsed.port}"
+        logging.getLogger(__name__).debug("Connecting to Redis at %s (scheme=%s)", hostport, parsed.scheme)
+    except Exception:
+        pass
+
+    return aioredis.from_url(redis_url)
 
 
 async def enqueue_job(job: dict) -> None:

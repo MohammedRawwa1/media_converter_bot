@@ -23,7 +23,9 @@ MAX_CONCURRENT_TASKS = int(os.getenv("MAX_CONCURRENT_TASKS", "5"))
 
 # Binaries and external services
 FFMPEG_PATH = os.getenv("FFMPEG_PATH", "ffmpeg")
-REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
+# Do not assume a localhost Redis in production; prefer an empty default so
+# deployments must explicitly configure `REDIS_URL` when required.
+REDIS_URL = os.getenv("REDIS_URL", "")
 
 # Admin and ACL
 _allowed_file = os.path.join(STORAGE_PATH, "allowed_users.json")
