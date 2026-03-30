@@ -9,6 +9,7 @@ import signal
 import time
 import subprocess
 import threading
+import os
 
 from telegram import Update
 from telegram.error import TelegramError
@@ -46,6 +47,7 @@ from utils.error_handler import (
 )
 from utils.rate_limiter import ConversionRateLimiter, TelegramAPIRateLimiter
 from utils.webhook_monitor import WebhookRecoveryManager
+from utils.job_queue import cancel_job
 
 # Configure comprehensive logging with rotation
 logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
@@ -63,6 +65,16 @@ try:
 except Exception:
     # setup_directory may not be present or importable in some test environments
     pass
+
+    # Ensure storage directories from config exist (best-effort)
+    try:
+        os.makedirs(cfg.STORAGE_PATH, exist_ok=True)
+        os.makedirs(cfg.INPUT_PATH, exist_ok=True)
+        os.makedirs(cfg.OUTPUT_PATH, exist_ok=True)
+        os.makedirs(cfg.TEMP_PATH, exist_ok=True)
+        os.makedirs(cfg.THUMBNAIL_PATH, exist_ok=True)
+    except Exception:
+        logger.debug("Could not ensure storage directories; continuing")
 
 # Bot application handle for metrics and introspection when started under ASGI
 BOT_APPLICATION = None
@@ -330,6 +342,16 @@ def setup_handlers(application: Application) -> None:
     # Callback query handler for menu interactions
     application.add_handler(CallbackQueryHandler(handler_manager.callback_handler))
 
+    # Register custom thumbnail commands if module available
+    try:
+        from custom_thumbnail import add_thumb, del_thumb
+
+        application.add_handler(CommandHandler("addthumb", add_thumb))
+        application.add_handler(CommandHandler("delthumb", del_thumb))
+        logger.info("Registered custom thumbnail commands (/addthumb, /delthumb)")
+    except Exception:
+        logger.debug("custom_thumbnail handlers not registered")
+
     # Admin commands (manage allowed users)
     async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_id = update.effective_user.id
@@ -374,6 +396,56 @@ def setup_handlers(application: Application) -> None:
 
     application.add_handler(CommandHandler("admin", admin_command))
 
+    # Admin: cancel a queued/running job by id
+    async def canceljob_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        user_id = update.effective_user.id
+        # restrict to admin or allowed users
+        if ADMIN_USER_ID and user_id != ADMIN_USER_ID:
+            await update.message.reply_text("Unauthorized: admin only")
+            return
+
+        args = context.args if hasattr(context, "args") else []
+        if not args:
+            await update.message.reply_text("Usage: /canceljob <job_id>")
+            return
+
+        job_id = args[0]
+        try:
+            await cancel_job(job_id)
+            await update.message.reply_text(f"Requested cancellation for job {job_id}")
+        except Exception as e:
+            logger.exception("Failed to request cancel for job %s: %s", job_id, e)
+            await update.message.reply_text(f"Failed to cancel job {job_id}: {e}")
+
+    application.add_handler(CommandHandler("canceljob", canceljob_command))
+
+    # Settings command - forward to handler manager's show_settings
+    async def settings_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        try:
+            await handler_manager.show_settings(update, context)
+        except Exception:
+            await update.message.reply_text("⚠️ Failed to open settings.")
+
+    application.add_handler(CommandHandler("settings", settings_command))
+    application.add_handler(CommandHandler("usettings", settings_command))
+    application.add_handler(CommandHandler("usersettings", settings_command))
+
+    async def bulk_url_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        try:
+            await handler_manager.bulk_url_command(update, context)
+        except Exception:
+            await update.message.reply_text("⚠️ Failed to enqueue bulk URLs.")
+
+    application.add_handler(CommandHandler("bulk_url", bulk_url_command))
+
+    async def bulk_menu_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        try:
+            await handler_manager.show_bulk_menu(update, context)
+        except Exception:
+            await update.message.reply_text("⚠️ Failed to open bulk menu.")
+
+    application.add_handler(CommandHandler("bulkmenu", bulk_menu_command))
+
     # Store handler manager in bot_data for access in other handlers
     application.bot_data["handler_manager"] = handler_manager
 
@@ -392,6 +464,13 @@ async def main(background: bool = False) -> None:
 
     # Create the Application for PTB v20+
     application = Application.builder().token(BOT_TOKEN).build()
+
+    # Expose external service config into application context
+    try:
+        application.bot_data["redis_url"] = getattr(cfg, "REDIS_URL", None)
+        application.bot_data["ffmpeg_path"] = getattr(cfg, "FFMPEG_PATH", "ffmpeg")
+    except Exception:
+        pass
 
     # Expose application for ASGI metrics and introspection
     global BOT_APPLICATION, BOT_STARTED_AT
