@@ -1123,6 +1123,16 @@ class EnhancedMediaHandler:
         except Exception:
             forward_info = None
 
+        # capture message date and file unique id for better userbot fallback
+        msg_date = None
+        try:
+            if getattr(update, "message", None) and getattr(update.message, "date", None):
+                msg_date = update.message.date.isoformat()
+        except Exception:
+            msg_date = None
+
+        file_unique_id = getattr(video, "file_unique_id", None)
+
         session["current_file"] = {
             "path": None,
             "type": "video",
@@ -1133,6 +1143,8 @@ class EnhancedMediaHandler:
             "forward": forward_info,
             "chat_id": getattr(update.message, "chat", None) and getattr(update.message.chat, "id", None),
             "msg_id": getattr(update.message, "message_id", None),
+            "msg_date": msg_date,
+            "file_unique_id": file_unique_id,
         }
 
         try:
@@ -1203,6 +1215,15 @@ class EnhancedMediaHandler:
         except Exception:
             forward_info = None
 
+        msg_date = None
+        try:
+            if getattr(update, "message", None) and getattr(update.message, "date", None):
+                msg_date = update.message.date.isoformat()
+        except Exception:
+            msg_date = None
+
+        file_unique_id = getattr(audio, "file_unique_id", None)
+
         session["current_file"] = {
             "path": None,
             "type": "audio",
@@ -1213,6 +1234,8 @@ class EnhancedMediaHandler:
             "forward": forward_info,
             "chat_id": getattr(update.message, "chat", None) and getattr(update.message.chat, "id", None),
             "msg_id": getattr(update.message, "message_id", None),
+            "msg_date": msg_date,
+            "file_unique_id": file_unique_id,
         }
 
         await update.message.reply_text(
@@ -1333,6 +1356,26 @@ class EnhancedMediaHandler:
         except Exception:
             forward_info = None
 
+        msg_date = None
+        try:
+            if getattr(update, "message", None) and getattr(update.message, "date", None):
+                msg_date = update.message.date.isoformat()
+        except Exception:
+            msg_date = None
+
+        # document may be a photo, file or other; attempt to extract unique id
+        file_unique_id = None
+        try:
+            if getattr(document, "file_unique_id", None):
+                file_unique_id = document.file_unique_id
+            else:
+                # photos stored in message.photo list
+                photos = getattr(update.message, "photo", None)
+                if photos:
+                    file_unique_id = getattr(photos[-1], "file_unique_id", None)
+        except Exception:
+            file_unique_id = None
+
         session["current_file"] = {
             "path": None,
             "type": file_type,
@@ -1343,6 +1386,8 @@ class EnhancedMediaHandler:
             "forward": forward_info,
             "chat_id": getattr(update.message, "chat", None) and getattr(update.message.chat, "id", None),
             "msg_id": getattr(update.message, "message_id", None),
+            "msg_date": msg_date,
+            "file_unique_id": file_unique_id,
         }
 
         try:
