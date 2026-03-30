@@ -722,13 +722,25 @@ class EnhancedMediaHandler:
                                     from utils.job_queue import enqueue_job as _enqueue
 
                                     await _enqueue(job)
-                                    # notify user
+                                    # notify user (prefer editing the callback message when available)
                                     try:
-                                        await (update.message.reply_text if getattr(update, 'message', None) else update.callback_query.message.reply_text)(
-                                            f"✅ Fetched forwarded media and queued conversion (job {job_id})."
-                                        )
+                                        q = getattr(update, "callback_query", None)
+                                        if q is not None:
+                                            await self.safe_edit(q, f"✅ Fetched forwarded media and queued conversion (job {job_id}).")
+                                            try:
+                                                loop = asyncio.get_event_loop()
+                                                loop.create_task(self._watch_job_progress(q, job_id))
+                                            except Exception:
+                                                pass
+                                        else:
+                                            # fallback to replying in chat when no callback_query
+                                            if getattr(update, "message", None):
+                                                try:
+                                                    await update.message.reply_text(f"✅ Fetched forwarded media and queued conversion (job {job_id}).")
+                                                except Exception:
+                                                    pass
                                     except Exception:
-                                        pass
+                                        logger.exception("Failed to notify user after enqueue for %s", fh)
                                     # cleanup saved forward metadata
                                     try:
                                         from utils.forward_store import delete_forward_metadata
