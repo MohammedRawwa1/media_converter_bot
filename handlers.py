@@ -596,14 +596,34 @@ class EnhancedMediaHandler:
                 await self.safe_edit(update.callback_query, text, reply_markup=MediaMenuBuilder.get_bulk_menu(), parse_mode="HTML")
             elif getattr(update, "message", None):
                 await update.message.reply_text(text, reply_markup=MediaMenuBuilder.get_bulk_menu(), parse_mode="HTML")
-        except Exception:
+            else:
+                # No message or callback present; nothing to do
+                logger.warning("show_bulk_menu called without message or callback")
+                return
+        except Exception as e:
+            logger.exception("Failed to show bulk menu: %s", e)
+            # Try a resilient fallback: send a plain message to the chat if available
             try:
+                chat_id = None
                 if getattr(update, "callback_query", None):
-                    await self.safe_edit(update.callback_query, "⚠️ Failed to open bulk menu.")
+                    try:
+                        await update.callback_query.answer()
+                    except Exception:
+                        pass
+                    if getattr(update.callback_query, "message", None) and getattr(update.callback_query.message, "chat", None):
+                        chat_id = update.callback_query.message.chat.id
+                elif getattr(update, "message", None) and getattr(update.message, "chat", None):
+                    chat_id = update.message.chat.id
+
+                if chat_id:
+                    try:
+                        await context.bot.send_message(chat_id=chat_id, text="⚠️ Failed to open bulk menu.")
+                    except Exception:
+                        logger.exception("Fallback send_message failed for bulk menu")
                 else:
-                    await update.message.reply_text("⚠️ Failed to open bulk menu.")
+                    logger.error("No chat_id available to notify user about bulk menu failure")
             except Exception:
-                pass
+                logger.exception("Secondary fallback for bulk menu failed")
 
     async def bulk_url_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Enqueue one or more URLs provided as command arguments for processing."""

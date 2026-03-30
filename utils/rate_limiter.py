@@ -26,8 +26,10 @@ class RateLimiter:
         self.calls_per_second = calls_per_second
         self.per_user = per_user
         # Token bucket: {key -> (tokens, last_refill_time)}
-        # Ensure at least 1 token capacity so the first operation is allowed
-        initial_tokens = max(1.0, calls_per_second)
+        # Ensure capacity is at least 1 so the first operation is allowed.
+        # Use `capacity` for refill cap (was incorrectly using calls_per_second).
+        self.capacity = max(1.0, calls_per_second)
+        initial_tokens = float(self.capacity)
         self.buckets: Dict[str, Tuple[float, float]] = defaultdict(lambda: (initial_tokens, time.time()))
         self._lock = asyncio.Lock()
 
@@ -49,9 +51,13 @@ class RateLimiter:
             now = time.time()
             elapsed = now - last_time
 
-            # Refill tokens based on elapsed time
+            # Refill tokens based on elapsed time (tokens per second)
             refill_rate = self.calls_per_second
-            new_tokens = min(self.calls_per_second, current_tokens + (elapsed * refill_rate))
+            # Don't exceed bucket capacity when refilling
+            try:
+                new_tokens = min(self.capacity, current_tokens + (elapsed * refill_rate))
+            except Exception:
+                new_tokens = min(initial_tokens, current_tokens + (elapsed * refill_rate))
 
             if new_tokens >= tokens:
                 self.buckets[key] = (new_tokens - tokens, now)
@@ -83,18 +89,31 @@ class RateLimiter:
         stats = {}
 
         if user_id:
-            tokens, last_time = self.buckets.get(user_id, (self.calls_per_second, time.time()))
+            tokens, last_time = self.buckets.get(user_id, (self.capacity, time.time()))
+            # Compute time until at least one token is available
+            if self.calls_per_second > 0:
+                tokens_needed = max(0.0, 1.0 - tokens)
+                seconds_until_refill = tokens_needed / self.calls_per_second
+            else:
+                seconds_until_refill = float("inf")
+
             stats[user_id] = {
                 "available_tokens": tokens,
                 "last_refill": last_time,
-                "seconds_until_refill": max(0, (1.0 / self.calls_per_second) - (time.time() - last_time)),
+                "seconds_until_refill": max(0.0, seconds_until_refill),
             }
         else:
             for key, (tokens, last_time) in self.buckets.items():
+                if self.calls_per_second > 0:
+                    tokens_needed = max(0.0, 1.0 - tokens)
+                    seconds_until_refill = tokens_needed / self.calls_per_second
+                else:
+                    seconds_until_refill = float("inf")
+
                 stats[key] = {
                     "available_tokens": tokens,
                     "last_refill": last_time,
-                    "seconds_until_refill": max(0, (1.0 / self.calls_per_second) - (time.time() - last_time)),
+                    "seconds_until_refill": max(0.0, seconds_until_refill),
                 }
 
         return stats

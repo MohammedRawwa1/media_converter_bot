@@ -8,6 +8,7 @@ from flask_cors import CORS
 
 import config
 import redis as redis_sync
+import threading
 
 app = Flask(__name__, static_folder="static")
 CORS(app)
@@ -19,6 +20,9 @@ INPUT_DIR = getattr(config, "INPUT_PATH", "storage/input")
 OUTPUT_DIR = getattr(config, "OUTPUT_PATH", "storage/output")
 os.makedirs(INPUT_DIR, exist_ok=True)
 os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+# In-memory fallback job store when Redis is not available (best-effort)
+JOB_STORE = {}
 
 # Try to use async job queue helpers when available
 try:
@@ -93,7 +97,45 @@ def upload():
         except Exception as e:
             return jsonify({"error": f"failed to enqueue: {e}"}), 500
     else:
-        return jsonify({"error": "job queue not available on server"}), 503
+        # Fallback: start a background thread that runs a synchronous conversion
+        # using the local media converter so uploads work without Redis.
+        try:
+            from media_converter import ExtendedMediaConverter
+
+            def _worker(j):
+                jid = j["job_id"]
+                JOB_STORE[jid] = {"job_id": jid, "progress": 0.0, "status": "processing"}
+                try:
+                    conv = ExtendedMediaConverter()
+                    loop = asyncio.new_event_loop()
+                    try:
+                        asyncio.set_event_loop(loop)
+                        # Use optimize_video as a sensible default to produce MP4 preview
+                        success = loop.run_until_complete(conv.optimize_video(j["input_path"], j["output_path"]))
+                    finally:
+                        try:
+                            loop.close()
+                        except Exception:
+                            pass
+
+                    if success and os.path.exists(j["output_path"]):
+                        JOB_STORE[jid]["progress"] = 100.0
+                        JOB_STORE[jid]["status"] = "done"
+                        JOB_STORE[jid]["output"] = j["output_path"]
+                        JOB_STORE[jid]["message"] = "done"
+                    else:
+                        JOB_STORE[jid]["progress"] = 0.0
+                        JOB_STORE[jid]["status"] = "error"
+                        JOB_STORE[jid]["message"] = "conversion_failed"
+                except Exception as ex:
+                    JOB_STORE[jid]["progress"] = 0.0
+                    JOB_STORE[jid]["status"] = "error"
+                    JOB_STORE[jid]["message"] = str(ex)
+
+            t = threading.Thread(target=_worker, args=(job,), daemon=True)
+            t.start()
+        except Exception as e:
+            return jsonify({"error": "job queue not available on server", "detail": str(e)}), 503
 
     return jsonify({"job_id": job_id})
 
@@ -156,6 +198,21 @@ def status(job_id):
 
         return jsonify(resp)
 
+    # Fallback: check in-memory JOB_STORE (when Redis/job queue not available)
+    try:
+        local = JOB_STORE.get(job_id)
+    except Exception:
+        local = None
+    if local:
+        resp = {
+            "job_id": job_id,
+            "progress": float(local.get("progress", 0.0)),
+            "message": local.get("message", "processing" if local.get("status") != "done" else "done"),
+            "status": local.get("status", "processing"),
+            "output": local.get("output"),
+        }
+        return jsonify(resp)
+
     # Fallback: check if output file exists
     out_path = os.path.join(OUTPUT_DIR, f"{job_id}.mp4")
     if os.path.exists(out_path):
@@ -163,6 +220,7 @@ def status(job_id):
 
     # otherwise queued
     return jsonify({"job_id": job_id, "progress": 0.0, "message": "queued", "status": "queued"})
+
 
 
 @app.route("/download/<job_id>", methods=["GET"])
@@ -183,6 +241,17 @@ def download(job_id):
         except TypeError:
             # older Flask versions
             return send_file(output_path, as_attachment=True, attachment_filename=filename)
+
+    # Check in-memory JOB_STORE for output path
+    try:
+        local = JOB_STORE.get(job_id)
+    except Exception:
+        local = None
+    if local and local.get("output") and os.path.exists(local.get("output")):
+        try:
+            return send_file(local.get("output"), as_attachment=True, download_name=os.path.basename(local.get("output")))
+        except TypeError:
+            return send_file(local.get("output"), as_attachment=True, attachment_filename=os.path.basename(local.get("output")))
 
     # Fallback: look for storage/output/{job_id}.mp4
     out_path = os.path.join(OUTPUT_DIR, f"{job_id}.mp4")
