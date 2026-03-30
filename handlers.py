@@ -497,14 +497,14 @@ class EnhancedMediaHandler:
         kb_page1 = [
             [InlineKeyboardButton(f"Bulk Mode : { 'On' if s.get('bulk_mode') else 'Off' }", callback_data="toggle_bulk_mode")],
             [InlineKeyboardButton(f"Thumbnail : { 'Yes' if s.get('use_custom_thumbnail') else 'No' }", callback_data="settings_page:2")],
-            [InlineKeyboardButton(f"Rename File : { 'Yes' if s.get('prefix') or s.get('suffix') else 'No' }", callback_data="noop")],
+            [InlineKeyboardButton(f"Rename File : { 'Yes' if s.get('prefix') or s.get('suffix') else 'No' }", callback_data="video_renamer")],
             [InlineKeyboardButton("Upload as Audio", callback_data="menu_audio")],
             [InlineKeyboardButton("Upload as Video", callback_data="menu_video")],
             [InlineKeyboardButton("Stream Mapper", callback_data="menu_advanced")],
             [InlineKeyboardButton("Video Metadata", callback_data="full_info")],
-            [InlineKeyboardButton("Mp3 Tag Setting", callback_data="menu_audio")],
+            [InlineKeyboardButton("Mp3 Tag Setting", callback_data="mp3_tag_editor")],
             [InlineKeyboardButton("Audio Settings", callback_data="menu_audio")],
-            [InlineKeyboardButton("Reset Settings", callback_data="noop")],
+            [InlineKeyboardButton("Reset Settings", callback_data="reset_settings")],
             [InlineKeyboardButton("Close Settings", callback_data="menu_main")],
         ]
 
@@ -672,14 +672,7 @@ class EnhancedMediaHandler:
         # Enforce access control for private bots
         try:
             if not is_user_allowed(user_id):
-                await update.message.reply_text(
-                    "Access denied. This bot is private.",
-                    reply_markup=(
-                        MediaMenuBuilder.get_main_menu()
-                        if MediaMenuBuilder
-                        else None
-                    ),
-                )
+                await update.message.reply_text("Access denied. This bot is private.")
                 return
         except Exception:
             # If ACL check fails for any reason, default to deny-safe
@@ -1767,6 +1760,22 @@ class EnhancedMediaHandler:
                     except Exception:
                         logger.exception("Failed to toggle setting %s for user %s", key, user_id)
                         await self.safe_edit(query, "⚠️ Failed to change setting.")
+
+            elif data == "reset_settings":
+                # Reset user's settings to defaults (confirmation shown)
+                if user_settings is None:
+                    await self.safe_edit(query, "⚠️ Settings not available.")
+                else:
+                    try:
+                        user_settings.clear_user_settings(user_id)
+                        await self.safe_edit(query, "✅ Your settings have been reset to defaults.")
+                        try:
+                            await query.answer("Settings reset")
+                        except Exception:
+                            pass
+                    except Exception:
+                        logger.exception("Failed to reset settings for user %s", user_id)
+                        await self.safe_edit(query, "⚠️ Failed to reset settings.")
 
             elif isinstance(data, str) and data.startswith("cancel_job:"):
                 # User pressed a Cancel button for a queued job

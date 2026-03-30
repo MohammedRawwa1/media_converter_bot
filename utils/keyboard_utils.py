@@ -74,7 +74,9 @@ class MediaMenuBuilder:
         is_video = (file_type == "video")
 
         conv_label = "🎬 Video Converter" if is_video else "🎧 Audio Converter"
-        conv_cb = CONVERT_FORMAT_MENU
+        # Use explicit `video_converter` callback so the UI shows the video converter
+        # alias; handlers remap this alias to the canonical `convert_format_menu`.
+        conv_cb = "video_converter"
 
         split_label = "🔪 Videos Splitter" if is_video else "🔪 Split"
 
@@ -89,7 +91,11 @@ class MediaMenuBuilder:
             row("🎞️ Generate Sample", SAMPLE, "🎵 Video To Audio", VIDEO_TO_AUDIO),
             row("⚡ Video Optimizer", OPTIMIZE_MENU, "🔗 Subtitle Merger", SUBTITLE_MERGER),
             row("✏️ Video Renamer", VIDEO_RENAMER, "🛈 Media Information", INFO),
-            row("📦 Create Archive", CREATE_ARCHIVE, "❌ Cancel", CANCEL),
+            # Single-button rows for create/archive and final cancel button
+            [InlineKeyboardButton("📦 Create Archive", callback_data=CREATE_ARCHIVE)],
+            # Add quick access to bulk actions
+            [InlineKeyboardButton("📦 Bulk Actions", callback_data="bulk_menu")],
+            [InlineKeyboardButton("❌ Cancel", callback_data=CANCEL)],
         ]
 
         # If file_type provided, you may want to prioritize tools, but keep

@@ -158,7 +158,7 @@ Available slash commands (exact):
 Send me a file to get started! 🚀
 """
 
-    await update.message.reply_text(welcome_text, reply_markup=MediaMenuBuilder.get_main_menu(), parse_mode="Markdown")
+    await update.message.reply_text(welcome_text, parse_mode="Markdown")
     logger.info(f"User {user_id} ({user_name}) started the bot")
 
 
@@ -220,7 +220,6 @@ async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     """Cancel current operation."""
     await update.message.reply_text(
         "❌ Operation cancelled.\n\n" "Send /start to see available options.",
-        reply_markup=MediaMenuBuilder.get_main_menu(),
     )
 
 
@@ -263,11 +262,7 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
     # Try to send error message to user
     if update and update.effective_message:
         try:
-            await update.effective_message.reply_text(
-                user_message,
-                reply_markup=MediaMenuBuilder.get_main_menu() if MediaMenuBuilder else None,
-                parse_mode="Markdown",
-            )
+            await update.effective_message.reply_text(user_message, parse_mode="Markdown")
         except Exception as e:
             logger.error(f"Failed to send error message to user: {e}")
     elif update and update.effective_chat:
@@ -275,7 +270,6 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
             await context.bot.send_message(
                 chat_id=update.effective_chat.id,
                 text=user_message,
-                reply_markup=MediaMenuBuilder.get_main_menu() if MediaMenuBuilder else None,
                 parse_mode="Markdown",
             )
         except Exception as e:
