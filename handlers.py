@@ -526,32 +526,12 @@ class EnhancedMediaHandler:
             logger.exception("get_file failed for %s: %s", file_id, e)
             err_text = str(e)
             if "File is too big" in err_text or "too big" in err_text:
-                # Try userbot fallback if available
-                try:
-                    try:
-                        from utils.userbot_downloader import download_file_via_userbot
-                    except Exception as ue:
-                        raise Exception(
-                            "Telegram reports the file is too big to download via the bot."
-                            " Userbot fallback unavailable: {}".format(ue)
-                        )
-
-                    # Attempt to download via user account
-                    saved = await download_file_via_userbot(file_id, file_path)
-                    # Update session with saved path
-                    current_file["path"] = saved
-                    session["current_file"] = current_file
-                    try:
-                        self._persist_session(user_id)
-                    except Exception:
-                        logger.debug("Could not persist session after userbot download")
-                    return
-                except Exception as ue:
-                    logger.exception("Userbot download fallback failed: %s", ue)
-                    raise Exception(
-                        "Telegram reports the file is too big to download via the bot. "
-                        "Userbot fallback failed: {}".format(ue)
-                    )
+                upload_url = os.environ.get("WEB_UPLOAD_URL") or "<your-server>/upload"
+                # Provide a clear, non-invasive instruction - do not attempt userbot downloads.
+                raise Exception(
+                    "Telegram reports the file is too big to download via the bot. "
+                    f"Please either upload the file via the web uploader (POST to {upload_url}) or provide a direct public URL to the file."
+                )
             # Other get_file errors: re-raise
             raise
 
