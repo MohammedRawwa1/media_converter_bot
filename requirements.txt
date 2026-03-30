@@ -16,3 +16,4 @@ watchtower==2.0.*
 redis>=4.6.0
 prometheus_client>=0.17.0
 websockets>=11.0
+telethon>=2.0.0

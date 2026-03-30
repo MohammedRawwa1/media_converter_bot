@@ -167,7 +167,7 @@ SENTRY_DSN=
 ```
 
 ### Security note
-- This project does not enable user-account (Pyrogram) downloads by default. Do not add `USERBOT_*` environment variables unless you intentionally enable Pyrogram and understand the security implications (user session strings grant full access to the Telegram account).
+- This project does not enable user-account downloads by default. Do not add `API_ID`, `API_HASH`, or any session string environment variables unless you intentionally enable the user-account fallback (set `ENABLE_USERBOT=1`) and understand the security implications — a session string grants full access to the Telegram account.
 
 
 ---

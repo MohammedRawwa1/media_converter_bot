@@ -519,19 +519,44 @@ class EnhancedMediaHandler:
         file_path = os.path.join(input_dir, f"{user_id}_{file_id}{ext}")
 
         # Attempt to fetch file via Telegram API (bot). If Telegram refuses due to
-        # file size, attempt an optional userbot (user account) download fallback.
+        # file size or access rules, optionally try a user-account (userbot) fallback
+        # if configured via env (`ENABLE_USERBOT` + API_ID/API_HASH).
         try:
             file = await context.bot.get_file(file_id)
         except Exception as e:
             logger.exception("get_file failed for %s: %s", file_id, e)
-            err_text = str(e)
-            if "File is too big" in err_text or "too big" in err_text:
-                upload_url = os.environ.get("WEB_UPLOAD_URL") or "<your-server>/upload"
-                # Provide a clear, non-invasive instruction - do not attempt userbot downloads.
+            err_text = str(e) or ""
+            upload_url = os.environ.get("WEB_UPLOAD_URL") or "<your-server>/upload"
+
+            # Opt-in userbot fallback: only attempt if explicitly enabled and we
+            # have forward metadata recorded for this file.
+            enable_userbot = os.environ.get("ENABLE_USERBOT", "").lower() in ("1", "true", "yes")
+            forward = current_file.get("forward") if current_file else None
+            if enable_userbot and forward and forward.get("chat_id") and forward.get("message_id"):
+                try:
+                    from utils.userbot_downloader import download_forward_via_userbot
+
+                    ok = await download_forward_via_userbot(
+                        forward.get("chat_id"), forward.get("message_id"), file_path
+                    )
+                    if ok and os.path.exists(file_path):
+                        current_file["path"] = file_path
+                        session["current_file"] = current_file
+                        try:
+                            self._persist_session(user_id)
+                        except Exception:
+                            logger.debug("Could not persist session after userbot download")
+                        return
+                except Exception:
+                    logger.exception("Userbot download fallback failed")
+
+            # If it's clearly a size issue, instruct the user to use upload/web URL.
+            if "file is too big" in err_text.lower() or "too big" in err_text.lower():
                 raise Exception(
                     "Telegram reports the file is too big to download via the bot. "
                     f"Please either upload the file via the web uploader (POST to {upload_url}) or provide a direct public URL to the file."
                 )
+
             # Other get_file errors: re-raise
             raise
 
@@ -1042,6 +1067,21 @@ class EnhancedMediaHandler:
         except Exception:
             logger.exception("Failed to apply user settings to video name")
 
+        # Capture forward metadata when available (useful for userbot fallback)
+        forward_info = None
+        try:
+            fch = getattr(update.message, "forward_from_chat", None)
+            f_msg_id = getattr(update.message, "forward_from_message_id", None)
+            if fch or f_msg_id:
+                tmp = {}
+                if fch:
+                    tmp["chat_id"] = getattr(fch, "id", None) or getattr(fch, "username", None)
+                if f_msg_id:
+                    tmp["message_id"] = f_msg_id
+                forward_info = tmp
+        except Exception:
+            forward_info = None
+
         session["current_file"] = {
             "path": None,
             "type": "video",
@@ -1049,6 +1089,7 @@ class EnhancedMediaHandler:
             "size": video.file_size,
             "name": final_name,
             "thumbnail": thumb,
+            "forward": forward_info,
         }
 
         try:
@@ -1104,6 +1145,21 @@ class EnhancedMediaHandler:
         except Exception:
             logger.exception("Failed to apply user settings to audio name")
 
+        # Capture forward metadata when available (useful for userbot fallback)
+        forward_info = None
+        try:
+            fch = getattr(update.message, "forward_from_chat", None)
+            f_msg_id = getattr(update.message, "forward_from_message_id", None)
+            if fch or f_msg_id:
+                tmp = {}
+                if fch:
+                    tmp["chat_id"] = getattr(fch, "id", None) or getattr(fch, "username", None)
+                if f_msg_id:
+                    tmp["message_id"] = f_msg_id
+                forward_info = tmp
+        except Exception:
+            forward_info = None
+
         session["current_file"] = {
             "path": None,
             "type": "audio",
@@ -1111,6 +1167,7 @@ class EnhancedMediaHandler:
             "size": audio.file_size,
             "name": final_name,
             "thumbnail": thumb,
+            "forward": forward_info,
         }
 
         await update.message.reply_text(
@@ -1216,6 +1273,21 @@ class EnhancedMediaHandler:
         except Exception:
             logger.exception("Failed to apply user settings to document name")
 
+        # Capture forward metadata when available (useful for userbot fallback)
+        forward_info = None
+        try:
+            fch = getattr(update.message, "forward_from_chat", None)
+            f_msg_id = getattr(update.message, "forward_from_message_id", None)
+            if fch or f_msg_id:
+                tmp = {}
+                if fch:
+                    tmp["chat_id"] = getattr(fch, "id", None) or getattr(fch, "username", None)
+                if f_msg_id:
+                    tmp["message_id"] = f_msg_id
+                forward_info = tmp
+        except Exception:
+            forward_info = None
+
         session["current_file"] = {
             "path": None,
             "type": file_type,
@@ -1223,6 +1295,7 @@ class EnhancedMediaHandler:
             "size": document.file_size,
             "name": final_name,
             "thumbnail": thumb,
+            "forward": forward_info,
         }
 
         try:
