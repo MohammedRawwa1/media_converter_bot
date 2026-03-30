@@ -8,6 +8,7 @@ import logging
 import time
 from datetime import datetime
 from typing import Dict
+from email.utils import parsedate_to_datetime
 
 import aiohttp
 
@@ -33,7 +34,14 @@ class WebhookMonitor:
         self.failed_checks = 0
         self.consecutive_failures = 0
         self.monitor_task = None
+        # Current sleep interval (supports exponential backoff on transient errors)
+        self._current_interval = check_interval
+        # Upper bound for backoff (seconds)
+        self._max_backoff = max(check_interval * 8, 3600)
 
+        # Last observed HTTP status code or exception message (for diagnostics)
+        self.last_status_code = None
+        self.last_error = None
     async def health_check(self) -> bool:
         """
         Perform a health check on the webhook.
@@ -44,42 +52,74 @@ class WebhookMonitor:
         try:
             async with aiohttp.ClientSession() as session:
                 async with session.head(self.webhook_url, timeout=aiohttp.ClientTimeout(total=10)) as response:
-                    is_healthy = response.status in [200, 404, 405]  # Accept various responses
+                    status = response.status
 
                     self.check_count += 1
                     self.last_check = datetime.now()
 
-                    if is_healthy:
+                    self.last_status_code = status
+                    # Healthy responses (allow 200/404/405 as acceptable for probes)
+                    if status in (200, 404, 405):
                         self.is_healthy = True
                         self.consecutive_failures = 0
-                        logger.debug(f"✅ Webhook health check passed (status: {response.status})")
+                        # Reset interval after success
+                        if getattr(self, "_current_interval", None) is not None:
+                            self._current_interval = self.check_interval
+                        logger.debug(f"✅ Webhook health check passed (status: {status})")
                         return True
-                    else:
+
+                    # Rate-limited: back off exponentially instead of hammering endpoint
+                    if status == 429:
                         self.is_healthy = False
                         self.failed_checks += 1
                         self.consecutive_failures += 1
-                        logger.warning(f"⚠️ Webhook health check failed (status: {response.status})")
+                        # Increase backoff interval
+                        old = getattr(self, "_current_interval", self.check_interval)
+                        self._current_interval = min(old * 2, self._max_backoff)
+                        logger.warning(
+                            f"⚠️ Webhook health check rate-limited (status: 429). Backing off from {old}s to {self._current_interval}s"
+                        )
                         return False
+
+                    # Other non-success statuses
+                    self.is_healthy = False
+                    self.failed_checks += 1
+                    self.consecutive_failures += 1
+                    logger.warning(f"⚠️ Webhook health check failed (status: {status})")
+                    return False
 
         except asyncio.TimeoutError:
             self.is_healthy = False
             self.failed_checks += 1
             self.consecutive_failures += 1
-            logger.error("❌ Webhook health check timeout")
+            # Exponential backoff on timeout
+            try:
+                self._current_interval = min(self._current_interval * 2, self._max_backoff)
+            except Exception:
+                pass
+            logger.error("❌ Webhook health check timeout; increasing backoff")
             return False
 
         except aiohttp.ClientConnectorError as e:
             self.is_healthy = False
             self.failed_checks += 1
             self.consecutive_failures += 1
-            logger.error(f"❌ Webhook connection error: {e}")
+            try:
+                self._current_interval = min(self._current_interval * 2, self._max_backoff)
+            except Exception:
+                pass
+            logger.error(f"❌ Webhook connection error: {e}; increasing backoff")
             return False
 
         except Exception as e:
             self.is_healthy = False
             self.failed_checks += 1
             self.consecutive_failures += 1
-            logger.error(f"❌ Webhook health check error: {e}")
+            try:
+                self._current_interval = min(self._current_interval * 2, self._max_backoff)
+            except Exception:
+                pass
+            logger.error(f"❌ Webhook health check error: {e}; increasing backoff")
             return False
 
     async def start_monitoring(self):
@@ -101,8 +141,21 @@ class WebhookMonitor:
                         f"Total failures: {self.failed_checks}/{self.check_count}"
                     )
 
-                # Wait before next check
-                await asyncio.sleep(self.check_interval)
+                # Wait before next check (supporting current backoff interval)
+                wait = getattr(self, "_current_interval", self.check_interval)
+                await asyncio.sleep(wait)
+        except aiohttp.ClientError as e:
+            # Any aiohttp client errors (DNS, SSL, etc.) should back off
+            self.is_healthy = False
+            self.failed_checks += 1
+            self.consecutive_failures += 1
+            try:
+                self._current_interval = min(self._current_interval * 2, self._max_backoff)
+            except Exception:
+                pass
+            self.last_error = str(e)
+            logger.error(f"❌ Webhook client error: {e}; increasing backoff")
+            return False
 
             except asyncio.CancelledError:
                 logger.info("Webhook monitoring stopped")
