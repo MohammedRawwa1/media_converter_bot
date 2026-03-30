@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Media Convert</title>
+  <link rel="stylesheet" href="styles.css">
+  <script defer src="app.js"></script>
+</head>
+<body>
+  <div class="container">
+    <h1>Media Conversion</h1>
+
+    <form id="uploadForm">
+      <label class="file-label">
+        <input type="file" id="fileInput" name="file" required />
+        <span class="file-cta">Choose a file</span>
+      </label>
+      <button type="submit" class="btn">Upload & Convert</button>
+    </form>
+
+    <div id="jobs" class="jobs"></div>
+  </div>
+</body>
+</html>
