@@ -3,8 +3,7 @@ import asyncio
 import logging
 import os
 import tempfile
-from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -123,7 +122,7 @@ async def convert_video_to_mp3(
         logger.error("Conversion was cancelled")
         try:
             process.kill()
-        except:
+        except Exception:
             pass
         return False, "Conversion was cancelled"
     except Exception as e:
@@ -197,7 +196,7 @@ async def compress_video(
         logger.error("Compression was cancelled")
         try:
             process.kill()
-        except:
+        except Exception:
             pass
         return False, "Compression was cancelled"
     except Exception as e:
@@ -301,7 +300,7 @@ async def merge_videos(video_paths: List[str], output_path: str, timeout_seconds
         if concat_file and os.path.exists(concat_file):
             try:
                 os.unlink(concat_file)
-            except:
+            except Exception:
                 pass
 
 
@@ -360,7 +359,7 @@ async def merge_audios(audio_paths: List[str], output_path: str, timeout_seconds
         if concat_file and os.path.exists(concat_file):
             try:
                 os.unlink(concat_file)
-            except:
+            except Exception:
                 pass
 
 
@@ -482,7 +481,7 @@ async def repair_video(input_path: str, output_path: str) -> Tuple[bool, str]:
         stdout, stderr = await process.communicate()
 
         if process.returncode == 0:
-            logger.info(f"Successfully repaired video")
+            logger.info("Successfully repaired video")
             return True, "Repair successful"
         else:
             error = stderr.decode("utf-8", errors="ignore")[:200]
@@ -523,7 +522,7 @@ async def optimize_video(input_path: str, output_path: str, preset: str = "slow"
         stdout, stderr = await process.communicate()
 
         if process.returncode == 0:
-            logger.info(f"Successfully optimized video")
+            logger.info("Successfully optimized video")
             return True, "Optimization successful"
         else:
             error = stderr.decode("utf-8", errors="ignore")[:200]
@@ -556,7 +555,7 @@ async def create_thumbnail_grid(input_path: str, output_path: str, rows: int = 3
         stdout, stderr = await process.communicate()
 
         if process.returncode == 0:
-            logger.info(f"Successfully created thumbnail grid")
+            logger.info("Successfully created thumbnail grid")
             return True, "Thumbnail grid created"
         else:
             error = stderr.decode("utf-8", errors="ignore")[:200]
@@ -570,7 +569,31 @@ async def create_thumbnail_grid(input_path: str, output_path: str, rows: int = 3
 async def generate_sample(input_path: str, output_path: str, duration: int = 30) -> Tuple[bool, str]:
     """Generate sample/preview asynchronously."""
     try:
-        cmd = ["ffmpeg", "-y", "-i", input_path, "-t", str(duration), "-c", "copy", output_path]
+        # For mp4 outputs, re-encode to H.264/AAC and add movflags for streaming
+        if output_path.lower().endswith('.mp4'):
+            cmd = [
+                "ffmpeg",
+                "-y",
+                "-i",
+                input_path,
+                "-t",
+                str(duration),
+                "-c:v",
+                "libx264",
+                "-preset",
+                "veryfast",
+                "-crf",
+                "28",
+                "-c:a",
+                "aac",
+                "-b:a",
+                "96k",
+                "-movflags",
+                "+faststart",
+                output_path,
+            ]
+        else:
+            cmd = ["ffmpeg", "-y", "-i", input_path, "-t", str(duration), "-c", "copy", output_path]
 
         process = await asyncio.create_subprocess_exec(
             *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
@@ -707,7 +730,7 @@ async def adjust_bitrate(
         stdout, stderr = await process.communicate()
 
         if process.returncode == 0:
-            logger.info(f"Successfully adjusted bitrate")
+            logger.info("Successfully adjusted bitrate")
             return True, "Bitrate adjusted"
         else:
             error = stderr.decode("utf-8", errors="ignore")[:200]
@@ -740,7 +763,7 @@ async def normalize_audio(input_path: str, output_path: str) -> Tuple[bool, str]
         stdout, stderr = await process.communicate()
 
         if process.returncode == 0:
-            logger.info(f"Successfully normalized audio")
+            logger.info("Successfully normalized audio")
             return True, "Audio normalized"
         else:
             error = stderr.decode("utf-8", errors="ignore")[:200]
@@ -763,7 +786,7 @@ async def extract_subtitles(input_path: str, output_path: str) -> Tuple[bool, st
         stdout, stderr = await process.communicate()
 
         if process.returncode == 0:
-            logger.info(f"Successfully extracted subtitles")
+            logger.info("Successfully extracted subtitles")
             return True, "Subtitles extracted"
         else:
             error = stderr.decode("utf-8", errors="ignore")[:200]
@@ -791,7 +814,7 @@ async def edit_metadata(input_path: str, output_path: str, metadata: Dict[str, s
         stdout, stderr = await process.communicate()
 
         if process.returncode == 0:
-            logger.info(f"Successfully edited metadata")
+            logger.info("Successfully edited metadata")
             return True, "Metadata updated"
         else:
             error = stderr.decode("utf-8", errors="ignore")[:200]
