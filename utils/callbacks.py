@@ -8,6 +8,8 @@ MENU_MAIN = "menu_main"
 MENU_VIDEO = "menu_video"
 MENU_AUDIO = "menu_audio"
 MENU_ADVANCED = "menu_advanced"
+# Shorthand to show the merge menu (used by main menu)
+MERGE_MENU = "merge_videos_menu"
 
 # Actions
 INFO = "info"
@@ -91,6 +93,11 @@ NORMALIZE_AUDIO = "normalize_audio"
 TRIM_VIDEO = "trim_video"
 TRIM_AUDIO = "trim_audio"
 
+# Trimmer submenu and specific trimmer modes
+TRIM_MENU = "trim_menu"
+TRIMMER_1 = "trimmer_1"
+TRIMMER_2 = "trimmer_2"
+
 # UI-friendly aliases (kept for keyboard builders)
 THUMBNAIL_EXTRACTOR = THUMBNAIL_GRID
 CAPTION_EDITOR = "caption_editor"
@@ -130,3 +137,14 @@ FRAMERATE_MENU = "framerate_menu"
 # Confirm/cancel
 CONFIRM = "confirm"
 CANCEL = "cancel"
+
+# Bulk menu and extra conversion targets
+BULK_MENU = "bulk_menu"
+VIDEO_REORDER = "video_reorder"
+CONVERT_TO_FILE = "convert_to_file"
+CONVERT_TO_VIDEO = "convert_to_video"
+MP3_TAG_EDITOR = "mp3_tag_editor"
+
+# Additional formats
+FORMAT_M4V = "format_m4v"
+FORMAT_OPUS = "format_opus"
