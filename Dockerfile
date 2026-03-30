@@ -13,4 +13,4 @@ COPY . /app
 RUN pip install --upgrade pip && pip install -r requirements.txt
 ENV FFMPEG_PATH=/usr/bin/ffmpeg FFPROBE_PATH=/usr/bin/ffprobe PORT=10000
 EXPOSE 10000
-CMD ["sh", "-c", "python scripts/check_env.py && uvicorn main:app --host 0.0.0.0 --port $PORT"]
+CMD ["sh", "-c", "if [ -f ./scripts/check_env.py ]; then python ./scripts/check_env.py || exit 1; fi; uvicorn main:app --host 0.0.0.0 --port $PORT"]
