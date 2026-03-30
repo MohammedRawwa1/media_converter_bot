@@ -7,7 +7,7 @@ import asyncio
 import logging
 import time
 from datetime import datetime
-from typing import Dict, Optional
+from typing import Dict
 
 import aiohttp
 
@@ -65,7 +65,7 @@ class WebhookMonitor:
             self.is_healthy = False
             self.failed_checks += 1
             self.consecutive_failures += 1
-            logger.error(f"❌ Webhook health check timeout")
+            logger.error("❌ Webhook health check timeout")
             return False
 
         except aiohttp.ClientConnectorError as e:
