@@ -142,30 +142,18 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     welcome_text = f"""
 🎬 **Welcome to Media Conversion Bot** 🎧
 
-Hello {user_name}! I can help you convert, compress, and process media files.
+Hello {user_name}! Send a media file and choose an action from the menu.
 
-**📤 How to use:**
-1. Send me any media file (video, audio, or document)
-2. Choose from the interactive menu
-3. Get your processed file!
-
-**⚡ Quick Commands:**
-/help - View all features
-/convert - Convert file format
-/compress - Reduce file size
-/merge - Combine multiple files
-/info - Show media information
-/trim - Cut video/audio segments
-/screenshot - Capture frames
-/extract - Extract streams
-/optimize - Optimize for web/mobile
+Available slash commands (exact):
+/start - Show this welcome message
+/help - Show feature list and usage
+/settings - Open your user settings (aliases: /usettings, /usersettings)
+/bulkmenu - Open bulk/URL tools
 /cancel - Cancel current operation
-/admin - Admin management (if you're the admin)
-
-**Supported Formats:**
-🎬 Video: MP4, AVI, MOV, MKV, FLV, WEBM, WMV
-🎧 Audio: MP3, WAV, AAC, FLAC, OGG, M4A
-📄 Documents: All other file types
+/canceljob <job_id> - Request cancellation for a queued/running job (admin only)
+/admin add|remove|list <user_id> - Manage allowed users (admin only)
+/addthumb - Add default thumbnail (if enabled)
+/delthumb - Remove default thumbnail (if enabled)
 
 Send me a file to get started! 🚀
 """
@@ -338,6 +326,17 @@ def setup_handlers(application: Application) -> None:
         media_filter = filters.ALL
 
     application.add_handler(MessageHandler(media_filter, handler_manager.handle_media_message))
+
+    # Ensure a fallback handler is present for non-command messages. Some
+    # environments or PTB build variants may not provide the expected media
+    # filters; adding a permissive non-command fallback ensures file messages
+    # still reach `handle_media_message`.
+    try:
+        fallback_filter = filters.ALL & ~filters.COMMAND
+        application.add_handler(MessageHandler(fallback_filter, handler_manager.handle_media_message))
+        logger.info("Fallback media handler registered for non-command messages")
+    except Exception:
+        logger.debug("Fallback media handler not registered")
 
     # Callback query handler for menu interactions
     application.add_handler(CallbackQueryHandler(handler_manager.callback_handler))
