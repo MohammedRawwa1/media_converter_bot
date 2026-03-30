@@ -48,7 +48,6 @@ class BotErrorHandler:
     @staticmethod
     def categorize_error(exception: Exception, context: Optional[str] = None) -> str:
         """Categorize exception to determine user-friendly message."""
-        exc_type = type(exception).__name__
         exc_str = str(exception).lower()
 
         # Check for common error patterns
@@ -121,7 +120,7 @@ class BotErrorHandler:
         # Keep in memory log (with size limit)
         self.error_log.append(error_entry)
         if len(self.error_log) > self.max_log_size:
-            self.error_log = self.error_log[-self.max_log_size :]
+            self.error_log = self.error_log[-self.max_log_size:]
 
         return error_entry
 
@@ -313,7 +312,6 @@ def setup_comprehensive_logging(
         if cw_group:
             try:
                 import watchtower
-                import boto3
 
                 aws_region = env.get("AWS_REGION")
                 session_kwargs = {}
@@ -327,7 +325,7 @@ def setup_comprehensive_logging(
                 root_logger.addHandler(cw_handler)
                 logger.info("✅ CloudWatch logging initialized (group=%s)", cw_group)
             except Exception:
-                logger.exception("Failed to initialize CloudWatch logging (watchtower)" )
+                logger.exception("Failed to initialize CloudWatch logging (watchtower)")
     except Exception:
         logger.debug("CloudWatch check skipped")
 
