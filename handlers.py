@@ -500,17 +500,7 @@ class EnhancedMediaHandler:
         if size and size > max_size:
             raise Exception(f"File too large ({size//1024//1024}MB). Max allowed: {max_size//1024//1024}MB")
 
-        # Attempt to fetch file via Telegram API
-        try:
-            file = await context.bot.get_file(file_id)
-        except Exception as e:
-            logger.exception("get_file failed for %s: %s", file_id, e)
-            err_text = str(e)
-            if "File is too big" in err_text:
-                raise Exception("Telegram reports the file is too big to download via the bot.")
-            raise
-
-        # Choose extension fallback based on declared type or name
+        # Prepare extension and paths early so fallback download (userbot) can use them
         ext = ""
         t = current_file.get("type")
         name = current_file.get("name") or ""
@@ -528,6 +518,44 @@ class EnhancedMediaHandler:
             pass
         file_path = os.path.join(input_dir, f"{user_id}_{file_id}{ext}")
 
+        # Attempt to fetch file via Telegram API (bot). If Telegram refuses due to
+        # file size, attempt an optional userbot (user account) download fallback.
+        try:
+            file = await context.bot.get_file(file_id)
+        except Exception as e:
+            logger.exception("get_file failed for %s: %s", file_id, e)
+            err_text = str(e)
+            if "File is too big" in err_text or "too big" in err_text:
+                # Try userbot fallback if available
+                try:
+                    try:
+                        from utils.userbot_downloader import download_file_via_userbot
+                    except Exception as ue:
+                        raise Exception(
+                            "Telegram reports the file is too big to download via the bot."
+                            " Userbot fallback unavailable: {}".format(ue)
+                        )
+
+                    # Attempt to download via user account
+                    saved = await download_file_via_userbot(file_id, file_path)
+                    # Update session with saved path
+                    current_file["path"] = saved
+                    session["current_file"] = current_file
+                    try:
+                        self._persist_session(user_id)
+                    except Exception:
+                        logger.debug("Could not persist session after userbot download")
+                    return
+                except Exception as ue:
+                    logger.exception("Userbot download fallback failed: %s", ue)
+                    raise Exception(
+                        "Telegram reports the file is too big to download via the bot. "
+                        "Userbot fallback failed: {}".format(ue)
+                    )
+            # Other get_file errors: re-raise
+            raise
+
+        # Download with the bot (if we reached here, get_file succeeded)
         await file.download_to_drive(file_path)
 
         # Attempt to detect a better filename now that the file is present
@@ -590,19 +618,37 @@ class EnhancedMediaHandler:
         s = user_settings.get_user_settings(user_id) if user_settings else {}
         status = "On" if s.get("bulk_mode") else "Off"
         text = f"📦 <b>Bulk Mode Actions</b>\n\nCurrent Status >> Bulk Mode : {status}\n\nPlease select your preferred action below 👇"
+        # Build keyboard defensively. MediaMenuBuilder may be missing or raise,
+        # so capture failures and still show a helpful message.
+        kb = None
+        try:
+            if MediaMenuBuilder and hasattr(MediaMenuBuilder, "get_bulk_menu"):
+                try:
+                    kb = MediaMenuBuilder.get_bulk_menu()
+                except Exception:
+                    logger.exception("MediaMenuBuilder.get_bulk_menu() raised an exception")
+                    kb = None
+        except Exception:
+            # If the import resolved to None or something unexpected, continue
+            kb = None
 
         try:
             if getattr(update, "callback_query", None):
-                await self.safe_edit(update.callback_query, text, reply_markup=MediaMenuBuilder.get_bulk_menu(), parse_mode="HTML")
+                if kb:
+                    await self.safe_edit(update.callback_query, text, reply_markup=kb, parse_mode="HTML")
+                else:
+                    await self.safe_edit(update.callback_query, text, parse_mode="HTML")
             elif getattr(update, "message", None):
-                await update.message.reply_text(text, reply_markup=MediaMenuBuilder.get_bulk_menu(), parse_mode="HTML")
+                if kb:
+                    await update.message.reply_text(text, reply_markup=kb, parse_mode="HTML")
+                else:
+                    await update.message.reply_text(text, parse_mode="HTML")
             else:
-                # No message or callback present; nothing to do
                 logger.warning("show_bulk_menu called without message or callback")
                 return
         except Exception as e:
             logger.exception("Failed to show bulk menu: %s", e)
-            # Try a resilient fallback: send a plain message to the chat if available
+            # Try a resilient fallback: notify the user directly via any available channel
             try:
                 chat_id = None
                 if getattr(update, "callback_query", None):
@@ -615,13 +661,19 @@ class EnhancedMediaHandler:
                 elif getattr(update, "message", None) and getattr(update.message, "chat", None):
                     chat_id = update.message.chat.id
 
-                if chat_id:
+                # Prefer sending through context.bot if available
+                if chat_id and getattr(context, "bot", None):
                     try:
                         await context.bot.send_message(chat_id=chat_id, text="⚠️ Failed to open bulk menu.")
                     except Exception:
                         logger.exception("Fallback send_message failed for bulk menu")
                 else:
-                    logger.error("No chat_id available to notify user about bulk menu failure")
+                    # Try to message the user directly
+                    try:
+                        if getattr(update, "effective_user", None) and getattr(context, "bot", None):
+                            await context.bot.send_message(chat_id=update.effective_user.id, text="⚠️ Failed to open bulk menu.")
+                    except Exception:
+                        logger.exception("Secondary fallback for bulk menu failed")
             except Exception:
                 logger.exception("Secondary fallback for bulk menu failed")
 

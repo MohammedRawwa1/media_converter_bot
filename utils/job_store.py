@@ -27,7 +27,15 @@ async def save_job(job: Dict[str, Any]) -> None:
     """Insert a new job document. Job dict must contain `job_id`."""
     if _db is None:
         return
-    await _db.jobs.insert_one({**job, "status": job.get("status", "queued")})
+    # Tag job with bot_id when available so multiple bots can share one DB
+    doc = {**job, "status": job.get("status", "queued")}
+    try:
+        bot_id = job.get("bot_id") or os.environ.get("BOT_ID") or os.environ.get("BOT_USERNAME")
+        if bot_id:
+            doc["bot_id"] = bot_id
+    except Exception:
+        pass
+    await _db.jobs.insert_one(doc)
 
 
 async def update_job(job_id: str, fields: Dict[str, Any]) -> None:

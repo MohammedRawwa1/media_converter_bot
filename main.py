@@ -292,7 +292,14 @@ def setup_handlers(application: Application) -> None:
                 from models import MediaConversionModel
 
                 client = AsyncIOMotorClient(mongo_uri)
-                model = MediaConversionModel(client)
+                # Determine bot_id from environment if provided (BOT_ID or BOT_USERNAME)
+                bot_id = os.environ.get("BOT_ID") or os.environ.get("BOT_USERNAME") or os.environ.get("BOT_NAME")
+                model = MediaConversionModel(
+                    client,
+                    db_name=os.environ.get("MONGODB_NAME") or "media_conversion_bot",
+                    bot_id=bot_id,
+                    collection_prefix=os.environ.get("MONGODB_COLLECTION_PREFIX"),
+                )
                 handler_manager.db_model = model
                 application.bot_data["db_model"] = model
                 logger.info("✅ MongoDB model initialized for logging conversions")
