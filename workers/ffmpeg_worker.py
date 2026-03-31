@@ -266,18 +266,29 @@ async def handle_job(job: dict):
                         if chat_id and bot_token:
                             try:
                                 bot = Bot(token=bot_token)
-                                if out and str(out).lower().endswith(".zip"):
-                                    with open(out, "rb") as fh:
-                                        bot.send_document(chat_id=chat_id, document=fh, caption=caption)
-                                elif out and str(out).lower().endswith((".mp4", ".mov", ".mkv")):
-                                    with open(out, "rb") as fh:
-                                        bot.send_video(chat_id=chat_id, video=fh, caption=caption, supports_streaming=True)
-                                else:
-                                    with open(out, "rb") as fh:
-                                        bot.send_document(chat_id=chat_id, document=fh, caption=caption)
-                                sent = True
+
+                                # Run blocking Bot API calls off the event loop to avoid blocking
+                                def _send_sync(kind: str, file_path: str, caption_text: str):
+                                    if kind == "zip":
+                                        with open(file_path, "rb") as fh:
+                                            bot.send_document(chat_id=chat_id, document=fh, caption=caption_text)
+                                    elif kind == "video":
+                                        with open(file_path, "rb") as fh:
+                                            bot.send_video(chat_id=chat_id, video=fh, caption=caption_text, supports_streaming=True)
+                                    else:
+                                        with open(file_path, "rb") as fh:
+                                            bot.send_document(chat_id=chat_id, document=fh, caption=caption_text)
+
+                                kind = "zip" if out and str(out).lower().endswith(".zip") else ("video" if out and str(out).lower().endswith((".mp4", ".mov", ".mkv")) else "doc")
+                                try:
+                                    await asyncio.to_thread(_send_sync, kind, out, caption)
+                                    sent = True
+                                except Exception as e:
+                                    logger.warning("Bot API send failed for job %s: %s", job_id, e)
+                                    sent = False
                             except Exception as e:
-                                logger.warning("Bot API send failed for job %s: %s", job_id, e)
+                                logger.warning("Bot init failed for job %s: %s", job_id, e)
+                                sent = False
 
                         # Fallback: use Telethon userbot if enabled and Bot API failed/not present
                         if not sent and chat_id and enable_userbot:
