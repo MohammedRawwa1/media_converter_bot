@@ -1082,6 +1082,42 @@ try:
 
                 return FileResponse(path, filename=safe_name)
 
+            @app.get("/get_output")
+            async def root_get_output(request: Request, name: str | None = None):
+                """Serve output files from the server for short-term debugging.
+                Protection: require `DIAG_TOKEN` or fallback to `UPLOAD_SECRET`.
+                """
+                DIAG_TOKEN = os.environ.get("DIAG_TOKEN")
+                UPLOAD_SECRET = os.environ.get("UPLOAD_SECRET")
+                incoming_diag = request.headers.get("X-DIAG-TOKEN") or request.query_params.get("token")
+                incoming_upload = request.headers.get("X-Upload-Token") or request.query_params.get("upload_token")
+
+                if DIAG_TOKEN:
+                    if incoming_diag != DIAG_TOKEN:
+                        raise HTTPException(status_code=401, detail="unauthorized")
+                else:
+                    if not UPLOAD_SECRET or incoming_upload != UPLOAD_SECRET:
+                        raise HTTPException(status_code=401, detail="unauthorized (no DIAG_TOKEN configured)")
+
+                if not name:
+                    raise HTTPException(status_code=400, detail="name required")
+
+                # sanitize
+                if ".." in name or name.startswith("/"):
+                    raise HTTPException(status_code=400, detail="invalid filename")
+
+                try:
+                    output_dir = getattr(cfg, "OUTPUT_PATH", os.path.join(os.getcwd(), "storage", "output"))
+                except Exception:
+                    output_dir = os.path.join(os.getcwd(), "storage", "output")
+
+                safe_name = os.path.basename(name)
+                path = os.path.join(output_dir, safe_name)
+                if not os.path.exists(path) or not os.path.isfile(path):
+                    raise HTTPException(status_code=404, detail="not found")
+
+                return FileResponse(path, filename=safe_name)
+
         except Exception as _e:
             logger.warning(f"Could not create root convenience endpoints: {_e}")
     except Exception as e:
