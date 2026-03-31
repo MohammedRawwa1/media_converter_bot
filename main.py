@@ -996,6 +996,15 @@ try:
             "error": getattr(app.state, "startup_error", None),
         }
 
+
+    @app.get("/")
+    async def root_index():
+        """Root endpoint for platform health checks."""
+        try:
+            return {"status": "ok", "bot_ready": bool(BOT_READY.is_set())}
+        except Exception:
+            return {"status": "ok"}
+
     @app.post("/telegram/webhook")
     async def telegram_webhook(request: Request):
         """PTB v20+ compatible webhook endpoint."""
