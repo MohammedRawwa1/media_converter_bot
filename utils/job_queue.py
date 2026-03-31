@@ -14,6 +14,7 @@ except Exception:
 # Do not hard-code localhost defaults. Require REDIS_URL to be set in environment
 DEFAULT_REDIS_URL = None
 JOB_LIST = "ffmpeg:jobs"
+DELAYED_SET = "ffmpeg:delayed"
 
 
 async def get_redis():
@@ -85,6 +86,25 @@ async def pop_job(timeout: int = 5) -> Optional[dict]:
     """Blocking pop a job from the Redis job list (BRPOP semantics)."""
     r = await get_redis()
     try:
+        # Move any due delayed jobs back onto the active job list (best-effort)
+        try:
+            now = int(time.time())
+            due = await r.zrangebyscore(DELAYED_SET, "-inf", now, 0, 50)
+            if due:
+                for item in due:
+                    raw = item.decode() if isinstance(item, bytes) else item
+                    try:
+                        # remove then push to front of queue so it will be picked in order
+                        await r.zrem(DELAYED_SET, raw)
+                    except Exception:
+                        pass
+                    try:
+                        await r.lpush(JOB_LIST, raw)
+                    except Exception:
+                        pass
+        except Exception:
+            # best-effort; don't fail pop if this step errors
+            pass
         item = await r.brpop(JOB_LIST, timeout=timeout)
         if not item:
             return None

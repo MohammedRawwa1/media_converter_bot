@@ -99,7 +99,14 @@ async def handle_job(job: dict):
         except Exception:
             pass
         try:
-            await redis_lock_client.lpush(JOB_LIST, json.dumps(job))
+            # Push into delayed set with a small backoff to avoid tight requeue loop
+            backoff = int(os.environ.get("JOB_LOCK_BACKOFF", "5"))
+            try:
+                # zadd mapping: {member: score}
+                await redis_lock_client.zadd("ffmpeg:delayed", {json.dumps(job): time.time() + backoff})
+            except Exception:
+                # fallback to lpush if zadd not supported
+                await redis_lock_client.lpush(JOB_LIST, json.dumps(job))
         except Exception:
             logger.warning("Failed to requeue locked job %s", job_id)
         try:
