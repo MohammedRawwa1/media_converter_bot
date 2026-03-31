@@ -728,8 +728,7 @@ class EnhancedMediaHandler:
                                         if q is not None:
                                             await self.safe_edit(q, f"✅ Fetched forwarded media and queued conversion (job {job_id}).")
                                             try:
-                                                loop = asyncio.get_event_loop()
-                                                loop.create_task(self._watch_job_progress(q, job_id))
+                                                asyncio.create_task(self._watch_job_progress(q, job_id))
                                             except Exception:
                                                 pass
                                         else:
@@ -984,8 +983,7 @@ class EnhancedMediaHandler:
             kb = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data=f"cancel_job:{job_id}")]])
             await self.safe_edit(query, f"✅ Job queued (ID: {job_id}). I'll send the file when ready.", reply_markup=kb)
             try:
-                loop = asyncio.get_event_loop()
-                loop.create_task(self._watch_job_progress(query, job_id))
+                asyncio.create_task(self._watch_job_progress(query, job_id))
             except Exception:
                 pass
         except Exception:
@@ -2958,8 +2956,7 @@ class EnhancedMediaHandler:
                 kb = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data=f"cancel_job:{job_id}")]])
                 await self.safe_edit(query, f"✅ Optimization job queued (ID: {job_id}). I'll update you with progress.", reply_markup=kb)
                 try:
-                    loop = asyncio.get_event_loop()
-                    loop.create_task(self._watch_job_progress(query, job_id))
+                    asyncio.create_task(self._watch_job_progress(query, job_id))
                 except Exception:
                     pass
             except Exception:
@@ -3027,8 +3024,7 @@ class EnhancedMediaHandler:
             await enqueue_job(job)
             await self.safe_edit(query, f"✅ Repair job queued (ID: {job_id}). I'll send the file when ready.")
             try:
-                loop = asyncio.get_event_loop()
-                loop.create_task(self._watch_job_progress(query, job_id))
+                asyncio.create_task(self._watch_job_progress(query, job_id))
             except Exception:
                 pass
         except Exception:
@@ -3235,8 +3231,10 @@ class EnhancedMediaHandler:
         await enqueue_job(job)
         kb = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data=f"cancel_job:{job_id}")]])
         await self.safe_edit(query, f"⏳ Job queued: {job_id} — extracting streams", reply_markup=kb)
-        loop = asyncio.get_event_loop()
-        loop.create_task(self._watch_job_progress(job_id))
+        try:
+            asyncio.create_task(self._watch_job_progress(query, job_id))
+        except Exception:
+            pass
         return
 
     async def convert_audio_format(
@@ -3608,8 +3606,10 @@ class EnhancedMediaHandler:
         await enqueue_job(job)
         kb = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data=f"cancel_job:{job_id}")]])
         await self.safe_edit(query, f"⏳ Job queued: {job_id} — creating archive", reply_markup=kb)
-        loop = asyncio.get_event_loop()
-        loop.create_task(self._watch_job_progress(query, job_id))
+        try:
+            asyncio.create_task(self._watch_job_progress(query, job_id))
+        except Exception:
+            pass
 
     async def generate_sample(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE, session: Dict
@@ -3657,8 +3657,10 @@ class EnhancedMediaHandler:
         await enqueue_job(job)
         kb = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data=f"cancel_job:{job_id}")]])
         await self.safe_edit(query, f"⏳ Job queued: {job_id} — generating sample", reply_markup=kb)
-        loop = asyncio.get_event_loop()
-        loop.create_task(self._watch_job_progress(query, job_id))
+        try:
+            asyncio.create_task(self._watch_job_progress(query, job_id))
+        except Exception:
+            pass
 
     async def show_media_info(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE, session: Dict
