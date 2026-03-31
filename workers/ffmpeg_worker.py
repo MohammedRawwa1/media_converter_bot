@@ -399,8 +399,10 @@ def main():
 
     # start prometheus metrics server in background thread
     try:
-        start_http_server(METRICS_PORT)
-        logger.info(f"Prometheus metrics available on :{METRICS_PORT}")
+        # bind metrics server to loopback so platform agents (e.g. Render)
+        # do not detect an additional open public port
+        start_http_server(METRICS_PORT, addr='127.0.0.1')
+        logger.info(f"Prometheus metrics available on 127.0.0.1:{METRICS_PORT}")
     except Exception:
         logger.exception("Failed to start Prometheus metrics server")
 
