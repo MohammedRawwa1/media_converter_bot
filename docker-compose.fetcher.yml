@@ -1,0 +1,29 @@
+version: '3.8'
+
+services:
+  redis:
+    image: redis:7
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+
+  fetcher:
+    build:
+      context: .
+      dockerfile: fetcher/Dockerfile
+    environment:
+      - REDIS_URL=redis://redis:6379/0
+      - UPLOAD_SECRET=${UPLOAD_SECRET}
+      - S3_BUCKET=${S3_BUCKET}
+      - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}
+      - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}
+      - AWS_REGION=${AWS_REGION}
+    ports:
+      - "8000:8000"
+    depends_on:
+      - redis
+
+volumes:
+  redis-data:
