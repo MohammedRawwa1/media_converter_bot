@@ -94,6 +94,39 @@ METRICS = {
 METRICS_LOCK = threading.Lock()
 
 
+async def _dispatch_update_task(u: Update) -> None:
+    """Dispatch an Update in a background task and maintain metrics."""
+    try:
+        disp = getattr(BOT_APPLICATION, "dispatcher", None)
+        if disp and hasattr(disp, "process_update"):
+            with METRICS_LOCK:
+                METRICS["dispatch_attempts"] += 1
+            await disp.process_update(u)
+            with METRICS_LOCK:
+                METRICS["updates_dispatched"] += 1
+            logger.debug(f"Dispatched update {getattr(u, 'update_id', None)} in background task")
+            return
+
+        if hasattr(BOT_APPLICATION, "process_update"):
+            with METRICS_LOCK:
+                METRICS["dispatch_attempts"] += 1
+            await BOT_APPLICATION.process_update(u)
+            with METRICS_LOCK:
+                METRICS["updates_dispatched"] += 1
+            logger.debug(f"Dispatched update {getattr(u, 'update_id', None)} via Application.process_update")
+            return
+
+        logger.warning("No dispatcher/application.process_update available to dispatch update")
+    except Exception:
+        try:
+            with METRICS_LOCK:
+                METRICS["dispatch_failures"] += 1
+        except Exception:
+            pass
+        logger.exception("Error dispatching update in background task")
+
+
+
 def check_ffmpeg_available() -> bool:
     """Return True if ffmpeg is callable from PATH or configured FFMPEG_PATH."""
     try:
@@ -1218,28 +1251,27 @@ try:
             logger.error(f"Background dispatch exhausted for update {getattr(u, 'update_id', 'unknown')}")
             return False
 
-        # Try immediate dispatch with a few attempts (fast path)
+        # Try immediate dispatch by scheduling a background dispatch task
         attempts = 6
         for i in range(attempts):
             dispatcher = getattr(BOT_APPLICATION, "dispatcher", None)
             if dispatcher and hasattr(dispatcher, "process_update"):
                 try:
-                    with METRICS_LOCK:
-                        METRICS["dispatch_attempts"] += 1
-                    await dispatcher.process_update(update)
-                    with METRICS_LOCK:
-                        METRICS["updates_dispatched"] += 1
-                    update_id = getattr(update, "update_id", "unknown")
+                    # Schedule non-blocking dispatch so webhook returns quickly
+                    asyncio.create_task(_dispatch_update_task(update))
                     logger.info(
-                        "Dispatched update %s via dispatcher.process_update on attempt %s",
-                        update_id,
+                        "Scheduled background dispatch task for update %s on attempt %s",
+                        getattr(update, "update_id", "unknown"),
                         i + 1,
                     )
                     return {"ok": True, "update_id": getattr(update, "update_id", None), "dispatched": True}
                 except Exception as e:
-                    logger.warning(f"Immediate dispatcher attempt {i+1} failed: {e}")
-                    with METRICS_LOCK:
-                        METRICS["dispatch_failures"] += 1
+                    logger.warning(f"Failed to schedule dispatch task (attempt {i+1}): {e}")
+                    try:
+                        with METRICS_LOCK:
+                            METRICS["dispatch_failures"] += 1
+                    except Exception:
+                        pass
             await asyncio.sleep(0.25)
 
         # Immediate dispatch not successful — try to enqueue
@@ -1374,23 +1406,15 @@ try:
                             await asyncio.sleep(0.1)
                             continue
                         try:
-                            disp = getattr(BOT_APPLICATION, "dispatcher", None)
-                            # Prefer dispatcher.process_update if present
-                            if disp and hasattr(disp, "process_update"):
-                                try:
-                                    await disp.process_update(update)
-                                except Exception:
-                                    logger.exception("Error in dispatcher.process_update")
-                            # Fallback to Application.process_update if exposed
-                            elif hasattr(BOT_APPLICATION, "process_update"):
-                                try:
-                                    await BOT_APPLICATION.process_update(update)
-                                except Exception:
-                                    logger.exception("Error in Application.process_update")
-                            else:
-                                logger.warning("No dispatcher available to process update; dropping")
+                            # Schedule dispatch in background so the consumer loop never
+                            # blocks waiting for handler completion. The helper
+                            # `_dispatch_update_task` updates metrics and logs errors.
+                            try:
+                                asyncio.create_task(_dispatch_update_task(update))
+                            except Exception:
+                                logger.exception("Failed to schedule dispatch task for update")
                         except Exception:
-                            logger.exception("Unhandled error while dispatching update")
+                            logger.exception("Unhandled error while scheduling dispatch task")
                 except asyncio.CancelledError:
                     logger.info("ASGI update consumer task cancelled")
                 finally:
