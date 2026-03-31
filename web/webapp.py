@@ -9,6 +9,9 @@ from flask_cors import CORS
 import config
 import redis as redis_sync
 import threading
+import subprocess
+import traceback
+import re
 try:
     import boto3
 except Exception:
@@ -480,6 +483,84 @@ def events(job_id):
                 pass
 
     return Response(stream_with_context(gen()), content_type='text/event-stream')
+
+
+@app.route("/internal/diag", methods=["GET", "POST"]) 
+def internal_diag():
+    """Token-protected diagnostic endpoint.
+    Set `DIAG_TOKEN` in the environment (random string). Call with header
+    `X-DIAG-TOKEN: <token>` or `?token=<token>`.
+    Returns masked env, Redis health, sample job list, optional job hash,
+    and last lines from app `logs/` directory.
+    """
+    token = os.environ.get("DIAG_TOKEN")
+    incoming = request.headers.get("X-DIAG-TOKEN") or request.args.get("token") or request.form.get("token")
+    if not token:
+        return jsonify({"error": "DIAG_TOKEN not configured on server"}), 403
+    if incoming != token:
+        return jsonify({"error": "unauthorized"}), 401
+
+    def mask_redis(u: str):
+        if not u:
+            return u
+        # mask password between : and @
+        return re.sub(r"(redis://[^:]*:)[^@]+@", r"\1****@", u)
+
+    result = {"env": {}, "redis": {}, "logs": {}, "ps": None}
+    # minimal env snapshot (mask secrets)
+    for k in ("REDIS_URL", "WEB_UPLOAD_URL", "UPLOAD_SECRET", "S3_BUCKET", "AWS_ACCESS_KEY_ID"):
+        v = os.environ.get(k)
+        result["env"][k] = mask_redis(v) if k == "REDIS_URL" else ("****" if k == "UPLOAD_SECRET" and v else v)
+
+    # Redis checks
+    red_url = os.environ.get("REDIS_URL")
+    if red_url:
+        try:
+            r = redis_sync.from_url(red_url, decode_responses=True)
+            result["redis"]["ping"] = r.ping()
+            try:
+                result["redis"]["ffmpeg_jobs"] = r.lrange("ffmpeg:jobs", 0, 50)
+            except Exception:
+                result["redis"]["ffmpeg_jobs"] = []
+            try:
+                keys = r.keys("ffmpeg:job:*")
+                result["redis"]["job_keys_count"] = len(keys)
+                result["redis"]["job_keys_sample"] = keys[:50]
+            except Exception:
+                result["redis"]["job_keys_count"] = 0
+            # optional job hash lookup
+            job = request.args.get("job_id") or request.form.get("job_id")
+            if job:
+                try:
+                    result["redis"]["job_hash"] = r.hgetall(f"ffmpeg:job:{job}")
+                except Exception:
+                    result["redis"]["job_hash"] = {}
+        except Exception as e:
+            result["redis"]["error"] = str(e)
+    else:
+        result["redis"]["error"] = "REDIS_URL not set"
+
+    # tail local logs (project logs/ folder)
+    try:
+        logs_dir = os.path.join(os.getcwd(), "logs")
+        if os.path.isdir(logs_dir):
+            for fname in sorted(os.listdir(logs_dir))[-10:]:
+                path = os.path.join(logs_dir, fname)
+                if os.path.isfile(path):
+                    with open(path, "r", encoding="utf-8", errors="replace") as fh:
+                        lines = fh.readlines()[-500:]
+                        result["logs"][fname] = "".join(lines)
+    except Exception:
+        result["logs"]["error"] = traceback.format_exc()
+
+    # process listing (best-effort)
+    try:
+        ps_out = subprocess.check_output(["ps", "aux"], stderr=subprocess.STDOUT, text=True)
+        result["ps"] = "\n".join(ps_out.splitlines()[:200])
+    except Exception:
+        result["ps"] = None
+
+    return jsonify(result)
 
 
 if __name__ == "__main__":
