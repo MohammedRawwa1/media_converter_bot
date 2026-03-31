@@ -10,6 +10,8 @@ import time
 import subprocess
 import threading
 import os
+import hashlib
+import json
 
 from telegram import Update
 from telegram.error import TelegramError
@@ -1056,6 +1058,117 @@ try:
                     except Exception as e:
                         raise HTTPException(status_code=500, detail=str(e))
                     out["logs"] = logs
+                    return out
+
+                # New admin/diagnostic actions: inspect and clear locks, remove queued job instances
+                if action == "inspect_locks":
+                    try:
+                        from utils.job_queue import get_redis
+
+                        r = await get_redis()
+                        try:
+                            keys = await r.keys("ffmpeg:lock:*")
+                            locks = {}
+                            for k in keys:
+                                kstr = k.decode() if isinstance(k, bytes) else k
+                                try:
+                                    v = await r.get(k)
+                                    vstr = v.decode() if isinstance(v, bytes) else v
+                                except Exception:
+                                    vstr = None
+                                locks[kstr] = vstr
+                        finally:
+                            try:
+                                await r.close()
+                            except Exception:
+                                pass
+                        out["locks"] = locks
+                    except Exception as e:
+                        out["locks_error"] = str(e)
+                    return out
+
+                if action == "clear_lock":
+                    # Accept either job_id or input path
+                    jid = payload.get("job_id") or job_id
+                    input_path_provided = payload.get("input") or payload.get("file")
+                    removed = []
+                    try:
+                        from utils.job_queue import get_redis
+
+                        r = await get_redis()
+                        try:
+                            # If job_id provided, remove any lock keys whose value == job_id
+                            if jid:
+                                keys = await r.keys("ffmpeg:lock:*")
+                                for k in keys:
+                                    try:
+                                        v = await r.get(k)
+                                        vstr = v.decode() if isinstance(v, bytes) else v
+                                    except Exception:
+                                        vstr = None
+                                    if vstr and str(vstr) == str(jid):
+                                        kstr = k.decode() if isinstance(k, bytes) else k
+                                        try:
+                                            await r.delete(k)
+                                            removed.append(kstr)
+                                        except Exception:
+                                            pass
+
+                            # If input path provided, compute expected lock key and remove it
+                            if input_path_provided:
+                                try:
+                                    lock_hash = hashlib.sha256(input_path_provided.encode()).hexdigest()
+                                    lock_key = f"ffmpeg:lock:{lock_hash}"
+                                    try:
+                                        await r.delete(lock_key)
+                                        removed.append(lock_key)
+                                    except Exception:
+                                        pass
+                                except Exception:
+                                    pass
+                        finally:
+                            try:
+                                await r.close()
+                            except Exception:
+                                pass
+                        out["removed"] = removed
+                        out["removed_count"] = len(removed)
+                    except Exception as e:
+                        out["error"] = str(e)
+                    return out
+
+                if action == "remove_job_instances":
+                    # Remove queued job list entries that match job_id
+                    jid = payload.get("job_id") or job_id
+                    if not jid:
+                        raise HTTPException(status_code=400, detail="job_id required")
+                    removed = 0
+                    try:
+                        from utils.job_queue import get_redis, JOB_LIST
+
+                        r = await get_redis()
+                        try:
+                            items = await r.lrange(JOB_LIST, 0, -1)
+                            for it in items:
+                                raw = it.decode() if isinstance(it, bytes) else it
+                                try:
+                                    j = json.loads(raw)
+                                except Exception:
+                                    continue
+                                if str(j.get("job_id")) == str(jid):
+                                    try:
+                                        await r.lrem(JOB_LIST, 0, raw)
+                                        removed += 1
+                                    except Exception:
+                                        pass
+                        finally:
+                            try:
+                                await r.close()
+                            except Exception:
+                                pass
+                        out["removed_job_instances"] = removed
+                    except Exception as e:
+                        out["error"] = str(e)
                     return out
 
                 if action == "job_info":
