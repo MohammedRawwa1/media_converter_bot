@@ -8,7 +8,7 @@ import logging
 import time
 from typing import Optional
 
-from utils.job_queue import pop_job, publish_update
+from utils.job_queue import pop_job, publish_update, get_redis, JOB_LIST
 from utils.ffmpeg_runner import run_ffmpeg
 from utils import job_store
 from utils import file_utils
@@ -16,6 +16,8 @@ from telegram import Bot
 import config
 import aiohttp
 import shutil
+import json
+import hashlib
 from media_converter import ExtendedMediaConverter
 from tasks import (
     create_archive,
@@ -76,13 +78,59 @@ async def handle_job(job: dict):
                 pass
             return
 
-    # persist start
+    # determine job type early (used to decide if we should lock the input)
+    job_type = job.get("type", "ffmpeg")
+
+    # Attempt to acquire a per-input Redis lock so multiple workers
+    # don't process the same `input_path` concurrently. If lock cannot
+    # be acquired, requeue the job at the tail and return.
+    redis_lock_client = None
+    lock_key = None
+    lock_acquired = True
+    try:
+        if job_type in ("ffmpeg", None) or job.get("ffmpeg_args"):
+            try:
+                redis_lock_client = await get_redis()
+                lock_name = (input_path or job.get("source_url") or job_id) or job_id
+                lock_hash = hashlib.sha256(str(lock_name).encode()).hexdigest()
+                lock_key = f"ffmpeg:lock:{lock_hash}"
+                lock_ttl = int(os.environ.get("JOB_LOCK_SECONDS", str(6 * 3600)))
+                # set nx with expiry
+                lock_acquired = await redis_lock_client.set(lock_key, job_id, nx=True, ex=lock_ttl)
+            except Exception:
+                # If Redis isn't available or set fails, conservatively proceed
+                lock_acquired = True
+    except Exception:
+        lock_acquired = True
+
+    if not lock_acquired:
+        logger.info("Input already locked for job %s, requeueing", job_id)
+        try:
+            await publish_update(progress_channel, {"job_id": job_id, "progress": 0, "message": "locked", "note": "input_locked"})
+        except Exception:
+            pass
+        # requeue at tail so other jobs may run
+        try:
+            # push back to left so other (older) jobs are processed first
+            await redis_lock_client.lpush(JOB_LIST, json.dumps(job))
+        except Exception:
+            logger.warning("Failed to requeue locked job %s", job_id)
+        try:
+            await redis_lock_client.close()
+        except Exception:
+            pass
+        return
+
+    # persist start (we only mark as processing after we hold the lock)
     try:
         await job_store.update_job(job_id, {"status": "processing", "started_at": time.time()})
     except Exception:
         pass
 
-    await publish_update(progress_channel, {"job_id": job_id, "progress": 0, "message": "started"})
+    try:
+        await publish_update(progress_channel, {"job_id": job_id, "progress": 0, "message": "started"})
+    except Exception:
+        pass
 
     # If an original filename was provided by the uploader, prefer that
     # base name for the output file (keep a .mp4 extension for ffmpeg jobs).
@@ -106,7 +154,8 @@ async def handle_job(job: dict):
 
     attempt = 0
     converter = ExtendedMediaConverter() if ExtendedMediaConverter else None
-    while True:
+    try:
+        while True:
         attempt += 1
         ACTIVE_JOBS.inc()
         try:
@@ -302,6 +351,28 @@ async def handle_job(job: dict):
                 return
         finally:
             ACTIVE_JOBS.dec()
+    finally:
+        # release the input lock if we acquired one
+        try:
+            if lock_key and redis_lock_client:
+                try:
+                    cur = await redis_lock_client.get(lock_key)
+                    if cur:
+                        try:
+                            if isinstance(cur, bytes):
+                                cur = cur.decode()
+                        except Exception:
+                            pass
+                        if cur == job_id:
+                            await redis_lock_client.delete(lock_key)
+                except Exception:
+                    pass
+        finally:
+            try:
+                if redis_lock_client:
+                    await redis_lock_client.close()
+            except Exception:
+                pass
 
 
 async def worker_loop(stop_event: Optional[asyncio.Event] = None):
