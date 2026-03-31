@@ -33,6 +33,16 @@ from prometheus_client import Counter, Histogram, Gauge, start_http_server
 
 logger = logging.getLogger(__name__)
 
+try:
+    from utils.storage import get_storage_backend
+except Exception:
+    get_storage_backend = None
+try:
+    from utils.rate_limiter import ConversionRateLimiterRedis
+    _conv_limiter = ConversionRateLimiterRedis(conversions_per_hour=int(os.environ.get("CONVERSIONS_PER_HOUR", "360")))
+except Exception:
+    _conv_limiter = None
+
 # Prometheus metrics
 METRICS_PORT = int(os.environ.get("PROMETHEUS_METRICS_PORT", "8000"))
 JOBS_TOTAL = Counter("media_jobs_total", "Total ffmpeg jobs processed")
@@ -45,6 +55,32 @@ ACTIVE_JOBS = Gauge("media_jobs_active", "Number of active ffmpeg jobs")
 async def handle_job(job: dict):
     job_id = job.get("job_id")
     input_path = job.get("input_path")
+    # If job references a remote storage key (S3/MinIO), download it to a temp file
+    input_key = job.get("input_key") or job.get("s3_key") or job.get("remote_key")
+    if input_key and not input_path:
+        try:
+            # prepare temp path
+            temp_dir = os.path.join(getattr(config, "TEMP_PATH", "storage/temp"))
+            os.makedirs(temp_dir, exist_ok=True)
+            _, ext = os.path.splitext(input_key)
+            if not ext:
+                ext = os.path.splitext(job.get("original_filename") or "")[1] or ""
+            temp_input_path = os.path.join(temp_dir, f"{job_id}_src{ext}")
+            if get_storage_backend is None:
+                raise RuntimeError("storage backend helper not available")
+            backend = await get_storage_backend()
+            await backend.download_file(input_key, temp_input_path)
+            if os.path.exists(temp_input_path):
+                input_path = temp_input_path
+                job["input_path"] = input_path
+                job["_input_from_remote"] = True
+        except Exception as e:
+            logger.exception("Failed to download input from storage for job %s: %s", job_id, e)
+            try:
+                await publish_update(progress_channel, {"job_id": job_id, "progress": 0, "message": "download_failed", "error": str(e)})
+            except Exception:
+                pass
+            return
     output_path = job.get("output_path")
     progress_channel = job.get("progress_channel") or f"ffmpeg:progress:{job_id}"
     retries = int(job.get("retries", 0))
@@ -160,6 +196,25 @@ async def handle_job(job: dict):
                     if job_type in ("ffmpeg", None) or job.get("ffmpeg_args"):
                         ffmpeg_args = job.get("ffmpeg_args") if isinstance(job.get("ffmpeg_args"), list) else None
                         redis_url = job.get("redis_url") or os.environ.get("REDIS_URL")
+                        # Enforce conversion rate limit at actual start of processing
+                        try:
+                            if _conv_limiter is not None:
+                                user_key = str(job.get("user_id") or job.get("chat_id") or "global")
+                                ok = await _conv_limiter.mark_conversion_started(user_key)
+                                if not ok:
+                                    # inform progress channel and mark job as errored due to rate limit
+                                    try:
+                                        await publish_update(progress_channel, {"job_id": job_id, "progress": 0, "message": "rate_limited", "error": "user rate limit reached"})
+                                    except Exception:
+                                        pass
+                                    try:
+                                        await job_store.update_job(job_id, {"status": "error", "error": "rate_limited"})
+                                    except Exception:
+                                        pass
+                                    return
+                        except Exception:
+                            # on limiter failures, allow processing to continue
+                            pass
                         coro = run_ffmpeg(input_path, output_path, job_id, ffmpeg_args=ffmpeg_args, redis_url=redis_url, progress_channel=progress_channel)
                         try:
                             success, info = await asyncio.wait_for(coro, timeout=max_runtime)
@@ -254,6 +309,53 @@ async def handle_job(job: dict):
                     await publish_update(progress_channel, {"job_id": job_id, "progress": 100, "message": "done", "output": out})
                     try:
                         await job_store.update_job(job_id, {"status": "done", "finished_at": time.time(), "output": out})
+                    except Exception:
+                        pass
+
+                    # Attempt to upload processed output to configured storage backend
+                    try:
+                        # Only attempt when a storage backend helper is available
+                        if get_storage_backend is not None:
+                            try:
+                                backend = await get_storage_backend()
+                            except Exception:
+                                backend = None
+                        else:
+                            backend = None
+
+                        if backend is not None and out and os.path.exists(out):
+                            try:
+                                # Choose a sensible destination key/path for outputs
+                                base = os.path.basename(out)
+                                dest_key = f"outputs/{job_id}/{base}"
+                                # Upload the file (local backend will copy to storage path)
+                                dest = await backend.upload_file(out, dest_key)
+                                # Try to produce a presigned GET URL when supported
+                                try:
+                                    get_url = await backend.generate_presigned_get(dest)
+                                except Exception:
+                                    get_url = None
+
+                                # Update Redis job hash with output metadata for the web UI
+                                try:
+                                    r = await get_redis()
+                                    mapping = {"output_key": dest}
+                                    if get_url:
+                                        mapping["output_get_url"] = get_url
+                                        # retain compatibility: set output to a reachable URL when possible
+                                        mapping["output"] = get_url
+                                    else:
+                                        mapping["output"] = dest
+                                    try:
+                                        mapping["out_bytes"] = str(os.path.getsize(out))
+                                    except Exception:
+                                        pass
+                                    await r.hset(f"ffmpeg:job:{job_id}", mapping=mapping)
+                                    await r.close()
+                                except Exception:
+                                    pass
+                            except Exception:
+                                logger.exception("Failed to upload output for job %s", job_id)
                     except Exception:
                         pass
 

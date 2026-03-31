@@ -18,6 +18,19 @@ OUTPUT_PATH = os.path.join(STORAGE_PATH, "output")
 TEMP_PATH = os.path.join(STORAGE_PATH, "temp")
 THUMBNAIL_PATH = os.path.join(STORAGE_PATH, "thumbnails")
 
+# Storage backend selection: 'local', 's3', or 'r2'
+STORAGE_BACKEND = os.getenv("STORAGE_BACKEND", "local")
+
+# S3 / S3-compatible (R2) configuration
+S3_BUCKET = os.getenv("S3_BUCKET", "")
+S3_ENDPOINT = os.getenv("S3_ENDPOINT", "")  # e.g. https://<account>.r2.cloudflarestorage.com
+S3_REGION = os.getenv("S3_REGION", "")
+AWS_ACCESS_KEY_ID = os.getenv("AWS_ACCESS_KEY_ID", "")
+AWS_SECRET_ACCESS_KEY = os.getenv("AWS_SECRET_ACCESS_KEY", "")
+S3_USE_SSL = os.getenv("S3_USE_SSL", "1") not in ("0", "false", "False", "no")
+# Default presign expiry (seconds)
+PRESIGN_EXPIRES = int(os.getenv("PRESIGN_EXPIRES", "3600"))
+
 MAX_FILE_SIZE = int(os.getenv("MAX_FILE_SIZE", "4")) * 1024 * 1024 * 1024
 MAX_CONCURRENT_TASKS = int(os.getenv("MAX_CONCURRENT_TASKS", "5"))
 

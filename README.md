@@ -152,6 +152,22 @@ curl -H "X-Upload-Token: $UPLOAD_SECRET" -F "file=@/path/to/video.mp4" $WEB_UPLO
 - `REDIS_URL` - Redis connection URL (optional) for job queue/worker integration.
 - `SENTRY_DSN` - Optional Sentry DSN for error monitoring.
 
+### S3 / MinIO / R2 (Optional remote storage)
+
+This project supports using an S3-compatible backend (AWS S3, MinIO, Cloudflare R2) for storing large files and forwarded metadata. To enable remote storage set `STORAGE_BACKEND=s3` (or `r2`) and provide the required credentials and bucket:
+
+- `STORAGE_BACKEND` - `local` (default) or `s3` / `r2` to enable S3-compatible storage.
+- `S3_BUCKET` - Target bucket name for uploads.
+- `S3_ENDPOINT` - Optional custom endpoint (required for MinIO or R2), e.g. `https://<account>.r2.cloudflarestorage.com` or `https://minio.example.com`.
+- `S3_REGION` - Optional region name.
+- `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` - Credentials for S3-compatible service.
+- `PRESIGN_EXPIRES` - Default presigned URL expiry in seconds (default `3600`).
+
+Notes:
+- MinIO is fully S3-compatible; set `S3_ENDPOINT` to your MinIO server URL and provide credentials. The app uses `aioboto3` for async uploads/downloads.
+- When remote storage is enabled, the web upload endpoint and the fetcher will upload incoming files to the bucket and provide an `input_key` to workers. Workers will download inputs from remote storage before processing.
+- Keep `KEEP_LOCAL_UPLOADS=1` if you want to retain local copies after upload (default is to remove local copy to save disk space).
+
 ### Example `.env`
 Copy `.env.example` and fill values appropriate for your deployment. A minimal example:
 

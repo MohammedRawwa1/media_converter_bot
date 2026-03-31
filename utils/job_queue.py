@@ -15,6 +15,9 @@ except Exception:
 DEFAULT_REDIS_URL = None
 JOB_LIST = "ffmpeg:jobs"
 DELAYED_SET = "ffmpeg:delayed"
+# Optional TTL (seconds) for job metadata hashes created at enqueue time.
+# Set JOB_METADATA_TTL=0 (default) to disable automatic expiry.
+JOB_METADATA_TTL = int(os.getenv("JOB_METADATA_TTL", "0"))
 
 
 async def get_redis():
@@ -55,6 +58,12 @@ async def enqueue_job(job: dict) -> None:
             }
             try:
                 await r.hset(f"ffmpeg:job:{job_id}", mapping=mapping)
+                # set optional TTL so job metadata does not live forever
+                try:
+                    if JOB_METADATA_TTL and JOB_METADATA_TTL > 0:
+                        await r.expire(f"ffmpeg:job:{job_id}", JOB_METADATA_TTL)
+                except Exception:
+                    pass
             except Exception:
                 # best-effort - do not fail enqueue if hset fails
                 pass

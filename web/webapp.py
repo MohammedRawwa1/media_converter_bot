@@ -17,6 +17,11 @@ try:
 except Exception:
     boto3 = None
 
+try:
+    from utils.storage import get_storage_backend_sync
+except Exception:
+    get_storage_backend_sync = None
+
 app = Flask(__name__, static_folder="static")
 CORS(app)
 
@@ -81,6 +86,28 @@ def upload():
         ext = os.path.splitext(filename)[1] or ".mp4"
         input_path = os.path.join(INPUT_DIR, f"{job_id}{ext}")
         f.save(input_path)
+        # If configured with remote storage (S3/R2/MinIO), upload the input and set an input_key
+        input_key = None
+        try:
+            backend_name = (os.getenv("STORAGE_BACKEND") or getattr(config, "STORAGE_BACKEND", "local")).lower()
+            if backend_name in ("s3", "r2") and get_storage_backend_sync is not None:
+                backend = get_storage_backend_sync()
+                key = f"uploads/{job_id}_{os.path.basename(input_path)}"
+                try:
+                    import asyncio
+
+                    asyncio.run(backend.upload_file(input_path, key))
+                    # remove local copy unless KEEP_LOCAL_UPLOADS is set
+                    if os.environ.get("KEEP_LOCAL_UPLOADS", "").lower() not in ("1", "true", "yes"):
+                        try:
+                            os.remove(input_path)
+                        except Exception:
+                            pass
+                    input_key = key
+                except Exception:
+                    input_key = None
+        except Exception:
+            input_key = None
     else:
         # Attempt to fetch forwarded message metadata persisted earlier
         try:
@@ -141,6 +168,8 @@ def upload():
     job = {
         "job_id": job_id,
         "input_path": input_path,
+        # when using remote storage the worker will download `input_key` before processing
+        **({"input_key": input_key} if input_key else {}),
         "output_path": output_path,
         "original_filename": original_filename,
         "output_filename": os.path.basename(output_path),
@@ -356,7 +385,38 @@ def status(job_id):
         except Exception:
             progress_by_size = None
 
+        # Prefer explicit output_get_url/output_key when available
+        output_key = job_hash.get("output_key")
+        output_get_url = job_hash.get("output_get_url")
+        out = job_hash.get("output")
+
+        output_url = None
+        if output_get_url:
+            output_url = output_get_url
+        elif output_key:
+            # Try to generate a presigned GET if backend helper available
+            try:
+                if get_storage_backend_sync is not None:
+                    backend = get_storage_backend_sync()
+                    try:
+                        output_url = asyncio.run(backend.generate_presigned_get(output_key))
+                    except Exception:
+                        output_url = None
+            except Exception:
+                output_url = None
+
+        # If we have an available URL, prefer that for the `output` field
+        if output_url:
+            out = output_url
+
         resp = {"job_id": job_id, "progress": progress, "message": message, "status": status, "output": out}
+        if output_key:
+            resp["output_key"] = output_key
+        if output_get_url:
+            resp["output_get_url"] = output_get_url
+        if output_url and not output_get_url:
+            resp["output_url"] = output_url
+
         if out_bytes is not None:
             resp["out_bytes"] = out_bytes
         if in_bytes is not None:
@@ -399,16 +459,44 @@ def download(job_id):
     except Exception:
         job_hash = None
 
-    if job_hash and job_hash.get("output") and os.path.exists(job_hash.get("output")):
-        # prefer the preserved output filename when provided
-        output_path = job_hash.get("output")
-        filename = job_hash.get("output_filename") or os.path.basename(output_path)
+    if job_hash:
+        # If a presigned URL exists return a redirect to it
         try:
-            # Flask >=2.0 uses `download_name`
-            return send_file(output_path, as_attachment=True, download_name=filename)
-        except TypeError:
-            # older Flask versions
-            return send_file(output_path, as_attachment=True, attachment_filename=filename)
+            url = job_hash.get("output_get_url")
+            if url:
+                from flask import redirect
+
+                return redirect(url)
+        except Exception:
+            pass
+
+        # If output is a local path we can send it directly
+        try:
+            output_val = job_hash.get("output")
+            if output_val and os.path.exists(output_val):
+                output_path = output_val
+                filename = job_hash.get("output_filename") or os.path.basename(output_path)
+                try:
+                    return send_file(output_path, as_attachment=True, download_name=filename)
+                except TypeError:
+                    return send_file(output_path, as_attachment=True, attachment_filename=filename)
+        except Exception:
+            pass
+
+        # If storage key present, attempt to generate presigned GET and redirect
+        try:
+            output_key = job_hash.get("output_key")
+            if output_key and get_storage_backend_sync is not None:
+                backend = get_storage_backend_sync()
+                try:
+                    url = asyncio.run(backend.generate_presigned_get(output_key))
+                    from flask import redirect
+
+                    return redirect(url)
+                except Exception:
+                    pass
+        except Exception:
+            pass
 
     # Check in-memory JOB_STORE for output path
     try:

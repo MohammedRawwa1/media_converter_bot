@@ -50,9 +50,13 @@ from utils.error_handler import (
     get_error_handler,
     setup_comprehensive_logging,
 )
-from utils.rate_limiter import ConversionRateLimiter, TelegramAPIRateLimiter
+from utils.rate_limiter import ConversionRateLimiter, TelegramAPIRateLimiter, ConversionRateLimiterRedis
 from utils.webhook_monitor import WebhookRecoveryManager
 from utils.job_queue import cancel_job
+try:
+    from utils.storage import get_storage_backend
+except Exception:
+    get_storage_backend = None
 
 # Configure comprehensive logging with rotation
 logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
@@ -526,11 +530,31 @@ async def main(background: bool = False) -> None:
     # Initialize rate limiters
     api_limiter = TelegramAPIRateLimiter()
     # Set conversions_per_hour to 360 => ~1 conversion per 10 seconds
-    conversion_limiter = ConversionRateLimiter(conversions_per_hour=360)
+    # Use Redis-backed limiter when REDIS is configured so limits are enforced
+    # across workers/processes. Otherwise fall back to in-memory limiter.
+    try:
+        if application.bot_data.get("redis_url"):
+            conversion_limiter = ConversionRateLimiterRedis(conversions_per_hour=int(os.environ.get("CONVERSIONS_PER_HOUR", "360")))
+        else:
+            conversion_limiter = ConversionRateLimiter(conversions_per_hour=int(os.environ.get("CONVERSIONS_PER_HOUR", "360")))
+    except Exception:
+        conversion_limiter = ConversionRateLimiter(conversions_per_hour=int(os.environ.get("CONVERSIONS_PER_HOUR", "360")))
 
     # Attach rate limiters to application context
     application.bot_data["api_rate_limiter"] = api_limiter
     application.bot_data["conversion_rate_limiter"] = conversion_limiter
+
+    # Optionally pre-initialize storage backend (fail-fast / diagnostics)
+    try:
+        if get_storage_backend is not None:
+            try:
+                storage_backend = await get_storage_backend()
+                application.bot_data["storage_backend"] = storage_backend
+                logger.info("Storage backend initialized: %s", (os.getenv("STORAGE_BACKEND") or getattr(cfg, "STORAGE_BACKEND", "local")))
+            except Exception as e:
+                logger.warning("Storage backend initialization failed: %s", e)
+    except Exception:
+        pass
 
     logger.info("Rate limiters initialized")
     logger.info(f"  - API limit: {TelegramAPIRateLimiter.GENERAL_LIMIT} calls/sec globally")

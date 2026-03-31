@@ -19,6 +19,11 @@ except Exception:
     download_forward_via_userbot = None
     enqueue_job = None
 
+try:
+    from utils.storage import get_storage_backend
+except Exception:
+    get_storage_backend = None
+
 logger = logging.getLogger(__name__)
 
 
@@ -54,6 +59,27 @@ async def process_forward_hash(forward_hash: str):
         logger.exception("fetcher: exception during download for %s", forward_hash)
         return False
 
+    # Optionally upload the fetched input to remote storage (S3/R2/MinIO)
+    input_key = None
+    try:
+        backend_name = (os.getenv("STORAGE_BACKEND") or getattr(__import__("config"), "STORAGE_BACKEND", "local")).lower()
+        if backend_name in ("s3", "r2") and get_storage_backend is not None:
+            try:
+                backend = await get_storage_backend()
+                key = f"uploads/{job_uuid}_{os.path.basename(input_path)}"
+                await backend.upload_file(input_path, key)
+                # remove local copy unless KEEP_LOCAL_UPLOADS set
+                if os.environ.get("KEEP_LOCAL_UPLOADS", "").lower() not in ("1", "true", "yes"):
+                    try:
+                        os.remove(input_path)
+                    except Exception:
+                        pass
+                input_key = key
+            except Exception:
+                logger.exception("fetcher: failed to upload fetched input to storage for %s", forward_hash)
+    except Exception:
+        pass
+
     # build job and enqueue
     try:
         job_id = job_uuid
@@ -64,6 +90,7 @@ async def process_forward_hash(forward_hash: str):
         job = {
             "job_id": job_id,
             "input_path": input_path,
+            **({"input_key": input_key} if input_key else {}),
             "output_path": output_path,
             "original_filename": meta.get("name") or os.path.basename(input_path),
             "output_filename": os.path.basename(output_path),

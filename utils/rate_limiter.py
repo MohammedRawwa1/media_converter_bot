@@ -8,6 +8,13 @@ import logging
 import time
 from collections import defaultdict
 from typing import Dict, Tuple
+import os
+
+try:
+    # optional redis usage for distributed rate limiting
+    from utils.job_queue import get_redis
+except Exception:
+    get_redis = None
 
 logger = logging.getLogger(__name__)
 
@@ -223,23 +230,35 @@ class ConversionRateLimiter:
         Returns:
             Tuple of (allowed: bool, message: str)
         """
-        allowed = await self.limiter.acquire(user_id=user_id, tokens=1)
+        # Non-consuming check: only inspect recent conversion history
+        now = time.time()
+        cutoff = now - 3600
+        history = self.conversion_history.get(user_id, [])
+        recent = [t for t in history if t > cutoff]
+        if len(recent) < self.conversions_per_hour:
+            return True, "Conversion allowed"
+        # compute approximate wait using oldest timestamp in window
+        earliest = min(recent) if recent else now
+        wait_time = max(0.0, (earliest + 3600) - now)
+        return False, (
+            f"❌ Rate limit reached ({len(recent)}/{self.conversions_per_hour} per hour)\n"
+            f"Please wait {wait_time:.1f} seconds before next conversion"
+        )
 
+    async def mark_conversion_started(self, user_id: str) -> bool:
+        """Consume quota and record that a conversion has actually started.
+
+        Returns True if allowed and recorded, False if rate limited.
+        """
+        allowed = await self.limiter.acquire(user_id=user_id, tokens=1)
         if allowed:
-            # Record conversion
-            self.conversion_history[user_id].append(time.time())
+            # Record conversion start
+            self.conversion_history.setdefault(user_id, []).append(time.time())
             # Keep only last hour of history
             cutoff = time.time() - 3600
             self.conversion_history[user_id] = [t for t in self.conversion_history[user_id] if t > cutoff]
-            return True, "Conversion allowed"
-        else:
-            stats = self.limiter.get_stats(user_id)
-            wait_time = stats[user_id]["seconds_until_refill"]
-            conversions_used = len(self.conversion_history[user_id])
-            return False, (
-                f"❌ Rate limit reached ({conversions_used}/{self.conversions_per_hour} per hour)\n"
-                f"Please wait {wait_time:.1f} seconds before next conversion"
-            )
+            return True
+        return False
 
     def get_user_conversion_count(self, user_id: str) -> int:
         """Get number of conversions for user in last hour."""
@@ -247,3 +266,107 @@ class ConversionRateLimiter:
         cutoff = now - 3600
         count = sum(1 for t in self.conversion_history.get(user_id, []) if t > cutoff)
         return count
+
+
+class ConversionRateLimiterRedis:
+    """Redis-backed conversion rate limiter suitable for multi-process deployments.
+
+    Uses a sorted set per user to store timestamps of started conversions. Methods
+    match the interface used in handlers: `can_convert(user_id)` and
+    `mark_conversion_started(user_id)`.
+    """
+
+    def __init__(self, conversions_per_hour: int = 100, redis_key_prefix: str = "rl:conv:"):
+        self.conversions_per_hour = int(conversions_per_hour)
+        self.window = 3600
+        self.prefix = redis_key_prefix
+
+    def _key(self, user_id: str) -> str:
+        return f"{self.prefix}{user_id}"
+
+    async def can_convert(self, user_id: str) -> Tuple[bool, str]:
+        """Non-consuming check whether user may convert (does not reserve).
+
+        Returns (allowed: bool, message: str)
+        """
+        if get_redis is None:
+            # fallback to permissive policy when redis not available
+            return True, "Conversion allowed"
+
+        try:
+            r = await get_redis()
+            key = self._key(user_id)
+            now = int(time.time())
+            cutoff = now - self.window
+            try:
+                # remove old entries for accurate count
+                await r.zremrangebyscore(key, 0, cutoff)
+            except Exception:
+                pass
+            cnt = await r.zcard(key)
+            await r.close()
+            if cnt < self.conversions_per_hour:
+                return True, "Conversion allowed"
+            # compute wait time until earliest entry expires
+            try:
+                r = await get_redis()
+                vals = await r.zrange(key, 0, 0, withscores=True)
+                await r.close()
+                if vals and len(vals) > 0:
+                    earliest_score = vals[0][1]
+                    wait = max(0.0, (earliest_score + self.window) - now)
+                else:
+                    wait = 3600.0
+            except Exception:
+                wait = 3600.0
+
+            return False, (
+                f"❌ Rate limit reached (max {self.conversions_per_hour} per hour). "
+                f"Please wait {wait:.1f} seconds before starting a conversion."
+            )
+        except Exception:
+            return True, "Conversion allowed"
+
+    async def mark_conversion_started(self, user_id: str) -> bool:
+        """Attempt to record a started conversion for `user_id`.
+
+        Returns True if recorded (allowed), False if rate limit prevents starting.
+        This operation is atomic via a small Lua script that prunes old entries,
+        checks the current count, and inserts the new timestamp if under limit.
+        """
+        if get_redis is None:
+            return True
+
+        try:
+            r = await get_redis()
+        except Exception:
+            return True
+
+        key = self._key(user_id)
+        now = int(time.time())
+        cutoff = now - self.window
+        # Lua script: remove old, count, add if allowed, set expire
+        script = (
+            "redis.call('ZREMRANGEBYSCORE', KEYS[1], 0, ARGV[1]);"
+            "local cnt = redis.call('ZCARD', KEYS[1]);"
+            "if tonumber(cnt) < tonumber(ARGV[2]) then "
+            "redis.call('ZADD', KEYS[1], ARGV[3], ARGV[3]);"
+            "redis.call('EXPIRE', KEYS[1], ARGV[4]);"
+            "return 1;"
+            "end;"
+            "return 0;"
+        )
+
+        try:
+            # expire slightly longer than window to ensure records persist long enough
+            expire_seconds = self.window + 60
+            res = await r.eval(script, 1, key, cutoff, self.conversions_per_hour, now, expire_seconds)
+            await r.close()
+            return bool(res)
+        except Exception:
+            try:
+                await r.close()
+            except Exception:
+                pass
+            return True
+
