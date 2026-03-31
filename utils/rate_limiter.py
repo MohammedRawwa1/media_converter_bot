@@ -82,7 +82,23 @@ class RateLimiter:
         while not await self.acquire(user_id, tokens):
             await asyncio.sleep(0.01)  # Small delay before retry
 
-        return time.time() - start_time
+        waited = time.time() - start_time
+        # Diagnostic log when wait exceeds a small threshold (helps find long rate-limit stalls)
+        try:
+            if waited > 2.0:
+                logger.warning(
+                    "RateLimiter.wait_if_needed waited %.2fs for key=%s (tokens=%s, capacity=%s, cps=%s)",
+                    waited,
+                    user_id,
+                    tokens,
+                    getattr(self, "capacity", "unknown"),
+                    getattr(self, "calls_per_second", "unknown"),
+                )
+        except Exception:
+            # Avoid raising from logging diagnostics
+            pass
+
+        return waited
 
     def get_stats(self, user_id: str = None) -> Dict:
         """Get rate limiter statistics."""
@@ -159,6 +175,18 @@ class TelegramAPIRateLimiter:
         """
         global_wait = await self.global_limiter.wait_if_needed(tokens=1)
         per_user_wait = await self.per_user_limiter.wait_if_needed(user_id=user_id, tokens=1)
+
+        # Diagnostic log when either wait is noticeable (>2s)
+        try:
+            if global_wait > 2.0 or per_user_wait > 2.0:
+                logger.warning(
+                    "TelegramAPIRateLimiter.wait_if_needed: user=%s global_wait=%.2fs per_user_wait=%.2fs",
+                    user_id,
+                    global_wait,
+                    per_user_wait,
+                )
+        except Exception:
+            pass
 
         return (global_wait, per_user_wait)
 
