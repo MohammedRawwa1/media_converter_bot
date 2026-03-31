@@ -916,6 +916,15 @@ try:
                                     with open(path, "r", encoding="utf-8", errors="replace") as fh:
                                         lines = fh.readlines()[-500:]
                                         result["logs"][fname] = "".join(lines)
+                        # Also include worker log if present for quick debugging
+                        try:
+                            worker_log = "/tmp/worker.log"
+                            if os.path.isfile(worker_log):
+                                with open(worker_log, "r", encoding="utf-8", errors="replace") as fh:
+                                    lines = fh.readlines()[-1000:]
+                                    result["logs"]["worker.log"] = "".join(lines)
+                        except Exception:
+                            pass
                     except Exception:
                         result["logs"]["error"] = traceback.format_exc()
 
