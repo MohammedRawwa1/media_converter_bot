@@ -705,7 +705,7 @@ if __name__ == "__main__":
 # FastAPI app for webhook handling - PTB v20+ compatible
 try:
     from fastapi import FastAPI, HTTPException, Request
-    from fastapi.responses import Response
+    from fastapi.responses import Response, FileResponse
     from telegram import Update as TgUpdate
 
     app = FastAPI(title="Media Conversion Bot - PTB v20+")
@@ -737,132 +737,232 @@ try:
 
             @app.get("/status/{job_id}")
             async def root_status(job_id: str):
-                try:
-                    job_hash = None
-                    if getattr(flask_webapp, "aioredis_available", False):
-                        # call the Flask module's async helper
                         try:
-                            job_hash = await flask_webapp._get_job_hash(job_id)
-                        except Exception:
                             job_hash = None
 
-                    if job_hash:
-                        progress = float(job_hash.get("progress") or 0.0)
-                        message = job_hash.get("message") or "queued"
-                        status = job_hash.get("status") or ("done" if job_hash.get("output") else "processing")
-                        out = job_hash.get("output")
-                        resp = {"job_id": job_id, "progress": progress, "message": message, "status": status, "output": out}
-                        try:
-                            if job_hash.get("out_bytes") is not None:
-                                resp["out_bytes"] = int(job_hash.get("out_bytes"))
-                        except Exception:
-                            pass
-                        try:
-                            if job_hash.get("in_bytes") is not None:
-                                resp["in_bytes"] = int(job_hash.get("in_bytes"))
-                        except Exception:
-                            pass
-                        try:
-                            if job_hash.get("progress_by_size") is not None:
-                                resp["progress_by_size"] = float(job_hash.get("progress_by_size"))
-                        except Exception:
-                            pass
-                        return resp
+                            # 1) Try Flask helper if available
+                            try:
+                                if getattr(flask_webapp, "aioredis_available", False):
+                                    try:
+                                        job_hash = await flask_webapp._get_job_hash(job_id)
+                                    except Exception:
+                                        job_hash = None
+                            except Exception:
+                                job_hash = None
 
-                    # Fallback to the in-memory JOB_STORE from the Flask app
-                    try:
-                        local = flask_webapp.JOB_STORE.get(job_id)
-                    except Exception:
-                        local = None
-                    if local:
-                        return {
-                            "job_id": job_id,
-                            "progress": float(local.get("progress", 0.0)),
-                            "message": local.get("message", "processing" if local.get("status") != "done" else "done"),
-                            "status": local.get("status", "processing"),
-                            "output": local.get("output"),
-                        }
+                            # 2) Fallback: try to read directly from Redis using job_queue.get_redis
+                            if not job_hash:
+                                try:
+                                    from utils.job_queue import get_redis
 
-                    # Check for a stored output file
-                    out_path = os.path.join(flask_webapp.OUTPUT_DIR, f"{job_id}.mp4")
-                    if os.path.exists(out_path):
-                        return {"job_id": job_id, "progress": 100.0, "message": "done", "status": "done", "output": out_path}
+                                    r = await get_redis()
+                                    try:
+                                        raw = await r.hgetall(f"ffmpeg:job:{job_id}")
+                                    finally:
+                                        try:
+                                            await r.close()
+                                        except Exception:
+                                            pass
+                                    if raw:
+                                        # aioredis returns a dict possibly with bytes; decode keys/values
+                                        decoded = {}
+                                        for k, v in raw.items():
+                                            key = k.decode() if isinstance(k, bytes) else k
+                                            val = v.decode() if isinstance(v, bytes) else v
+                                            decoded[key] = val
+                                        job_hash = decoded
+                                except Exception:
+                                    job_hash = None
 
-                    return {"job_id": job_id, "progress": 0.0, "message": "queued", "status": "queued"}
-                except Exception as e:
-                    return {"error": str(e)}
+                            # 3) If we have a job hash, normalize and return
+                            if job_hash:
+                                progress = float(job_hash.get("progress") or 0.0)
+                                message = job_hash.get("message") or "queued"
+                                status = job_hash.get("status") or ("done" if job_hash.get("output") else "processing")
+                                out = job_hash.get("output")
+                                resp = {"job_id": job_id, "progress": progress, "message": message, "status": status, "output": out}
+                                try:
+                                    if job_hash.get("out_bytes") is not None:
+                                        resp["out_bytes"] = int(job_hash.get("out_bytes"))
+                                except Exception:
+                                    pass
+                                try:
+                                    if job_hash.get("in_bytes") is not None:
+                                        resp["in_bytes"] = int(job_hash.get("in_bytes"))
+                                except Exception:
+                                    pass
+                                try:
+                                    if job_hash.get("progress_by_size") is not None:
+                                        resp["progress_by_size"] = float(job_hash.get("progress_by_size"))
+                                except Exception:
+                                    pass
+                                return resp
+
+                            # 4) Fallback to the in-memory JOB_STORE from the Flask app
+                            try:
+                                local = flask_webapp.JOB_STORE.get(job_id)
+                            except Exception:
+                                local = None
+                            if local:
+                                return {
+                                    "job_id": job_id,
+                                    "progress": float(local.get("progress", 0.0)),
+                                    "message": local.get("message", "processing" if local.get("status") != "done" else "done"),
+                                    "status": local.get("status", "processing"),
+                                    "output": local.get("output"),
+                                }
+
+                            # 5) Check for a stored output file in Flask's OUTPUT_DIR if available
+                            try:
+                                out_dir = getattr(flask_webapp, "OUTPUT_DIR", None)
+                            except Exception:
+                                out_dir = None
+                            if out_dir:
+                                out_path = os.path.join(out_dir, f"{job_id}.mp4")
+                                if os.path.exists(out_path):
+                                    return {"job_id": job_id, "progress": 100.0, "message": "done", "status": "done", "output": out_path}
+
+                            # 6) Default queued response
+                            return {"job_id": job_id, "progress": 0.0, "message": "queued", "status": "queued"}
+                        except Exception as e:
+                            return {"error": str(e)}
 
             @app.get("/internal/diag")
             async def root_diag(request: Request, job_id: str | None = None, token: str | None = None):
-                # Token validation mirrors the Flask endpoint behavior
-                DIAG_TOKEN = os.environ.get("DIAG_TOKEN")
-                incoming = request.headers.get("X-DIAG-TOKEN") or token
-                if not DIAG_TOKEN:
-                    raise HTTPException(status_code=403, detail="DIAG_TOKEN not configured on server")
-                if incoming != DIAG_TOKEN:
-                    raise HTTPException(status_code=401, detail="unauthorized")
+                    # Token validation mirrors the Flask endpoint behavior
+                    DIAG_TOKEN = os.environ.get("DIAG_TOKEN")
+                    incoming = request.headers.get("X-DIAG-TOKEN") or token
+                    if not DIAG_TOKEN:
+                        raise HTTPException(status_code=403, detail="DIAG_TOKEN not configured on server")
+                    if incoming != DIAG_TOKEN:
+                        raise HTTPException(status_code=401, detail="unauthorized")
 
-                result = {"env": {}, "redis": {}, "logs": {}, "ps": None}
-                # Minimal masked env snapshot
-                for k in ("REDIS_URL", "WEB_UPLOAD_URL", "UPLOAD_SECRET", "S3_BUCKET", "AWS_ACCESS_KEY_ID"):
-                    v = os.environ.get(k)
-                    if k == "REDIS_URL" and v:
-                        result["env"][k] = re.sub(r"(redis://[^:]*:)[^@]+@", r"\1****@", v)
-                    elif k == "UPLOAD_SECRET":
-                        result["env"][k] = "****" if v else None
-                    else:
-                        result["env"][k] = v
+                    result = {"env": {}, "redis": {}, "logs": {}, "ps": None}
+                    # Minimal masked env snapshot
+                    for k in ("REDIS_URL", "WEB_UPLOAD_URL", "UPLOAD_SECRET", "S3_BUCKET", "AWS_ACCESS_KEY_ID"):
+                        v = os.environ.get(k)
+                        if k == "REDIS_URL" and v:
+                            result["env"][k] = re.sub(r"(redis://[^:]*:)[^@]+@", r"\1****@", v)
+                        elif k == "UPLOAD_SECRET":
+                            result["env"][k] = "****" if v else None
+                        else:
+                            result["env"][k] = v
 
-                # Redis diagnostics (best-effort)
-                try:
-                    red_url = os.environ.get("REDIS_URL")
-                    if red_url:
-                        r = flask_webapp.redis_sync.from_url(red_url, decode_responses=True)
-                        try:
-                            result["redis"]["ping"] = r.ping()
-                        except Exception as e:
-                            result["redis"]["ping_error"] = str(e)
-                        try:
-                            result["redis"]["ffmpeg_jobs"] = r.lrange("ffmpeg:jobs", 0, 50)
-                        except Exception:
-                            result["redis"]["ffmpeg_jobs"] = []
-                        try:
-                            keys = r.keys("ffmpeg:job:*")
-                            result["redis"]["job_keys_count"] = len(keys)
-                            result["redis"]["job_keys_sample"] = keys[:50]
-                        except Exception:
-                            result["redis"]["job_keys_count"] = 0
-                        if job_id:
+                    # Redis diagnostics (best-effort) - try async first, then sync fallback
+                    try:
+                        red_url = os.environ.get("REDIS_URL")
+                        if red_url:
+                            # try async redis helper
                             try:
-                                result["redis"]["job_hash"] = r.hgetall(f"ffmpeg:job:{job_id}")
+                                from utils.job_queue import get_redis
+
+                                r = await get_redis()
+                                try:
+                                    result["redis"]["ping"] = await r.ping()
+                                    try:
+                                        result["redis"]["ffmpeg_jobs"] = await r.lrange("ffmpeg:jobs", 0, 50)
+                                    except Exception:
+                                        result["redis"]["ffmpeg_jobs"] = []
+                                    try:
+                                        keys = await r.keys("ffmpeg:job:*")
+                                        result["redis"]["job_keys_count"] = len(keys)
+                                        result["redis"]["job_keys_sample"] = keys[:50]
+                                    except Exception:
+                                        result["redis"]["job_keys_count"] = 0
+                                    if job_id:
+                                        try:
+                                            result["redis"]["job_hash"] = await r.hgetall(f"ffmpeg:job:{job_id}")
+                                        except Exception:
+                                            result["redis"]["job_hash"] = {}
+                                finally:
+                                    try:
+                                        await r.close()
+                                    except Exception:
+                                        pass
                             except Exception:
-                                result["redis"]["job_hash"] = {}
-                    else:
-                        result["redis"]["error"] = "REDIS_URL not set"
-                except Exception as e:
-                    result["redis"]["error"] = str(e)
+                                # sync fallback
+                                try:
+                                    r2 = flask_webapp.redis_sync.from_url(red_url, decode_responses=True)
+                                    result["redis"]["ping"] = r2.ping()
+                                    try:
+                                        result["redis"]["ffmpeg_jobs"] = r2.lrange("ffmpeg:jobs", 0, 50)
+                                    except Exception:
+                                        result["redis"]["ffmpeg_jobs"] = []
+                                    try:
+                                        keys = r2.keys("ffmpeg:job:*")
+                                        result["redis"]["job_keys_count"] = len(keys)
+                                        result["redis"]["job_keys_sample"] = keys[:50]
+                                    except Exception:
+                                        result["redis"]["job_keys_count"] = 0
+                                    if job_id:
+                                        try:
+                                            result["redis"]["job_hash"] = r2.hgetall(f"ffmpeg:job:{job_id}")
+                                        except Exception:
+                                            result["redis"]["job_hash"] = {}
+                                except Exception as e:
+                                    result["redis"]["error"] = str(e)
+                        else:
+                            result["redis"]["error"] = "REDIS_URL not set"
+                    except Exception as e:
+                        result["redis"]["error"] = str(e)
 
-                # Tail project logs
+                    # Tail project logs
+                    try:
+                        logs_dir = os.path.join(os.getcwd(), "logs")
+                        if os.path.isdir(logs_dir):
+                            for fname in sorted(os.listdir(logs_dir))[-10:]:
+                                path = os.path.join(logs_dir, fname)
+                                if os.path.isfile(path):
+                                    with open(path, "r", encoding="utf-8", errors="replace") as fh:
+                                        lines = fh.readlines()[-500:]
+                                        result["logs"][fname] = "".join(lines)
+                    except Exception:
+                        result["logs"]["error"] = traceback.format_exc()
+
+                    # Basic process list snapshot
+                    try:
+                        ps_out = subprocess.check_output(["ps", "aux"], stderr=subprocess.STDOUT, text=True)
+                        result["ps"] = "\n".join(ps_out.splitlines()[:200])
+                    except Exception:
+                        result["ps"] = None
+
+                    return result
+
+            @app.get("/get_input")
+            async def root_get_input(request: Request, name: str | None = None):
+                """Serve input files from the server for short-term debugging.
+                Protection: require `DIAG_TOKEN` or fallback to `UPLOAD_SECRET`.
+                """
+                DIAG_TOKEN = os.environ.get("DIAG_TOKEN")
+                UPLOAD_SECRET = os.environ.get("UPLOAD_SECRET")
+                incoming_diag = request.headers.get("X-DIAG-TOKEN") or request.query_params.get("token")
+                incoming_upload = request.headers.get("X-Upload-Token") or request.query_params.get("upload_token")
+
+                if DIAG_TOKEN:
+                    if incoming_diag != DIAG_TOKEN:
+                        raise HTTPException(status_code=401, detail="unauthorized")
+                else:
+                    if not UPLOAD_SECRET or incoming_upload != UPLOAD_SECRET:
+                        raise HTTPException(status_code=401, detail="unauthorized (no DIAG_TOKEN configured)")
+
+                if not name:
+                    raise HTTPException(status_code=400, detail="name required")
+
+                # sanitize
+                if ".." in name or name.startswith("/"):
+                    raise HTTPException(status_code=400, detail="invalid filename")
+
                 try:
-                    logs_dir = os.path.join(os.getcwd(), "logs")
-                    if os.path.isdir(logs_dir):
-                        for fname in sorted(os.listdir(logs_dir))[-10:]:
-                            path = os.path.join(logs_dir, fname)
-                            if os.path.isfile(path):
-                                with open(path, "r", encoding="utf-8", errors="replace") as fh:
-                                    lines = fh.readlines()[-500:]
-                                    result["logs"][fname] = "".join(lines)
+                    input_dir = getattr(cfg, "INPUT_PATH", os.path.join(os.getcwd(), "storage", "input"))
                 except Exception:
-                    result["logs"]["error"] = traceback.format_exc()
+                    input_dir = os.path.join(os.getcwd(), "storage", "input")
 
-                # Basic process list snapshot
-                try:
-                    ps_out = subprocess.check_output(["ps", "aux"], stderr=subprocess.STDOUT, text=True)
-                    result["ps"] = "\n".join(ps_out.splitlines()[:200])
-                except Exception:
-                    result["ps"] = None
+                safe_name = os.path.basename(name)
+                path = os.path.join(input_dir, safe_name)
+                if not os.path.exists(path) or not os.path.isfile(path):
+                    raise HTTPException(status_code=404, detail="not found")
 
-                return result
+                return FileResponse(path, filename=safe_name)
 
         except Exception as _e:
             logger.warning(f"Could not create root convenience endpoints: {_e}")

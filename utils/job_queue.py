@@ -2,6 +2,7 @@ import json
 import os
 import asyncio
 import logging
+import time
 from typing import Optional
 from urllib.parse import urlparse
 
@@ -39,6 +40,25 @@ async def enqueue_job(job: dict) -> None:
     """Push a job dict to the Redis job list."""
     r = await get_redis()
     await r.lpush(JOB_LIST, json.dumps(job))
+    # Initialize a Redis job hash so status endpoints see the job immediately.
+    try:
+        job_id = job.get("job_id")
+        if job_id:
+            mapping = {
+                "status": "queued",
+                "progress": 0,
+                "message": "queued",
+                "input": job.get("input_path") or job.get("source_url") or "",
+                "output": job.get("output_path") or job.get("output") or "",
+                "created_at": str(time.time()),
+            }
+            try:
+                await r.hset(f"ffmpeg:job:{job_id}", mapping=mapping)
+            except Exception:
+                # best-effort - do not fail enqueue if hset fails
+                pass
+    except Exception:
+        pass
     # persist to Mongo if available (best-effort)
     try:
         from .job_store import init as _init_store, save_job

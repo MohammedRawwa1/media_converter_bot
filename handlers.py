@@ -2964,7 +2964,7 @@ class EnhancedMediaHandler:
                 "progress_channel": f"ffmpeg:progress:{job_id}",
                 "chat_id": update.effective_chat.id if update and update.effective_chat else None,
                 "caption": f"✅ Optimized for {preset}",
-                "cleanup_input": False,
+                "cleanup_input": True,
                 "cleanup_output": True,
             }
             try:
@@ -3039,7 +3039,7 @@ class EnhancedMediaHandler:
             "progress_channel": f"ffmpeg:progress:{job_id}",
             "chat_id": update.effective_chat.id if update and update.effective_chat else None,
             "caption": "✅ Video repaired (if possible)",
-            "cleanup_input": False,
+            "cleanup_input": True,
             "cleanup_output": True,
         }
 
@@ -3248,7 +3248,7 @@ class EnhancedMediaHandler:
             "archive_path": archive_path,
             "progress_channel": f"ffmpeg:progress:{job_id}",
             "chat_id": update.effective_chat.id if update and update.effective_chat else None,
-            "cleanup_input": False,
+            "cleanup_input": True,
         }
 
         await enqueue_job(job)
