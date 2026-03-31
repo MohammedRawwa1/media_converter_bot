@@ -258,20 +258,43 @@ async def handle_job(job: dict):
                     try:
                         chat_id = job.get("chat_id")
                         caption = job.get("caption")
-                        if chat_id and getattr(config, "BOT_TOKEN", None):
-                            bot = Bot(token=getattr(config, "BOT_TOKEN"))
-                            if out and str(out).lower().endswith(".zip"):
-                                with open(out, "rb") as fh:
-                                    bot.send_document(chat_id=chat_id, document=fh, caption=caption)
-                            elif out and str(out).lower().endswith(('.mp4', '.mov', '.mkv')):
-                                with open(out, "rb") as fh:
-                                    bot.send_video(chat_id=chat_id, video=fh, caption=caption, supports_streaming=True)
-                            else:
-                                try:
+                        sent = False
+                        enable_userbot = os.environ.get("ENABLE_USERBOT", "").lower() in ("1", "true", "yes")
+                        bot_token = getattr(config, "BOT_TOKEN", None)
+
+                        # Try Bot API first if configured
+                        if chat_id and bot_token:
+                            try:
+                                bot = Bot(token=bot_token)
+                                if out and str(out).lower().endswith(".zip"):
                                     with open(out, "rb") as fh:
                                         bot.send_document(chat_id=chat_id, document=fh, caption=caption)
-                                except Exception:
-                                    pass
+                                elif out and str(out).lower().endswith((".mp4", ".mov", ".mkv")):
+                                    with open(out, "rb") as fh:
+                                        bot.send_video(chat_id=chat_id, video=fh, caption=caption, supports_streaming=True)
+                                else:
+                                    with open(out, "rb") as fh:
+                                        bot.send_document(chat_id=chat_id, document=fh, caption=caption)
+                                sent = True
+                            except Exception as e:
+                                logger.warning("Bot API send failed for job %s: %s", job_id, e)
+
+                        # Fallback: use Telethon userbot if enabled and Bot API failed/not present
+                        if not sent and chat_id and enable_userbot:
+                            try:
+                                from utils.userbot_uploader import send_file_via_userbot
+
+                                ok = await send_file_via_userbot(chat_id, out, caption=caption)
+                                if ok:
+                                    logger.info("Sent output via Telethon userbot fallback for job %s", job_id)
+                                    sent = True
+                                else:
+                                    logger.error("Userbot fallback failed for job %s", job_id)
+                            except Exception:
+                                logger.exception("Userbot fallback raised exception for job %s", job_id)
+
+                        if not sent and chat_id:
+                            logger.warning("Could not deliver output for job %s — neither Bot API nor userbot succeeded", job_id)
                     except Exception:
                         logger.exception("Failed to send result via Telegram")
 
