@@ -49,7 +49,7 @@ async def handle_job(job: dict):
     retries = int(job.get("retries", 0))
     max_runtime = int(os.environ.get("JOB_MAX_SECONDS", str(6 * 3600)))
 
-    # If job specifies a source_url, download it first to a temporary file
+    # download source_url into temp_input if provided
     temp_input = None
     source_url = job.get("source_url")
     if source_url:
@@ -57,7 +57,6 @@ async def handle_job(job: dict):
             temp_dir = os.path.join(getattr(config, "TEMP_PATH", "storage/temp"))
             os.makedirs(temp_dir, exist_ok=True)
             temp_input = os.path.join(temp_dir, f"{job_id}_src")
-            # stream download via aiohttp
             async with aiohttp.ClientSession() as session:
                 async with session.get(source_url, timeout=60) as resp:
                     if resp.status != 200:
@@ -65,10 +64,8 @@ async def handle_job(job: dict):
                     with open(temp_input, "wb") as fh:
                         async for chunk in resp.content.iter_chunked(1024 * 64):
                             fh.write(chunk)
-            # replace input_path for ffmpeg
             if not job.get("input_path"):
                 job["input_path"] = temp_input
-            # ensure local variable updated as well
             input_path = job.get("input_path")
         except Exception as e:
             logger.exception("Failed to download source URL for job %s: %s", job_id, e)
@@ -78,30 +75,21 @@ async def handle_job(job: dict):
                 pass
             return
 
-    # determine job type early (used to decide if we should lock the input)
-    job_type = job.get("type", "ffmpeg")
-
-    # Attempt to acquire a per-input Redis lock so multiple workers
-    # don't process the same `input_path` concurrently. If lock cannot
-    # be acquired, requeue the job at the tail and return.
+    # Acquire per-input lock to avoid duplicate processing
     redis_lock_client = None
     lock_key = None
     lock_acquired = True
-    try:
-        if job_type in ("ffmpeg", None) or job.get("ffmpeg_args"):
-            try:
-                redis_lock_client = await get_redis()
-                lock_name = (input_path or job.get("source_url") or job_id) or job_id
-                lock_hash = hashlib.sha256(str(lock_name).encode()).hexdigest()
-                lock_key = f"ffmpeg:lock:{lock_hash}"
-                lock_ttl = int(os.environ.get("JOB_LOCK_SECONDS", str(6 * 3600)))
-                # set nx with expiry
-                lock_acquired = await redis_lock_client.set(lock_key, job_id, nx=True, ex=lock_ttl)
-            except Exception:
-                # If Redis isn't available or set fails, conservatively proceed
-                lock_acquired = True
-    except Exception:
-        lock_acquired = True
+    job_type = job.get("type", "ffmpeg")
+    if job_type in ("ffmpeg", None) or job.get("ffmpeg_args"):
+        try:
+            redis_lock_client = await get_redis()
+            lock_name = (input_path or job.get("source_url") or job_id) or job_id
+            lock_hash = hashlib.sha256(str(lock_name).encode()).hexdigest()
+            lock_key = f"ffmpeg:lock:{lock_hash}"
+            lock_ttl = int(os.environ.get("JOB_LOCK_SECONDS", str(6 * 3600)))
+            lock_acquired = await redis_lock_client.set(lock_key, job_id, nx=True, ex=lock_ttl)
+        except Exception:
+            lock_acquired = True
 
     if not lock_acquired:
         logger.info("Input already locked for job %s, requeueing", job_id)
@@ -109,9 +97,7 @@ async def handle_job(job: dict):
             await publish_update(progress_channel, {"job_id": job_id, "progress": 0, "message": "locked", "note": "input_locked"})
         except Exception:
             pass
-        # requeue at tail so other jobs may run
         try:
-            # push back to left so other (older) jobs are processed first
             await redis_lock_client.lpush(JOB_LIST, json.dumps(job))
         except Exception:
             logger.warning("Failed to requeue locked job %s", job_id)
@@ -121,19 +107,17 @@ async def handle_job(job: dict):
             pass
         return
 
-    # persist start (we only mark as processing after we hold the lock)
+    # mark processing start
     try:
         await job_store.update_job(job_id, {"status": "processing", "started_at": time.time()})
     except Exception:
         pass
-
     try:
         await publish_update(progress_channel, {"job_id": job_id, "progress": 0, "message": "started"})
     except Exception:
         pass
 
-    # If an original filename was provided by the uploader, prefer that
-    # base name for the output file (keep a .mp4 extension for ffmpeg jobs).
+    # prefer original filename for output if provided
     try:
         orig = job.get("original_filename") or job.get("original_name")
         if orig:
@@ -154,15 +138,17 @@ async def handle_job(job: dict):
 
     attempt = 0
     converter = ExtendedMediaConverter() if ExtendedMediaConverter else None
+
     try:
         while True:
             attempt += 1
             ACTIVE_JOBS.inc()
             try:
                 with JOB_DURATION.time():
+                    success = False
+                    info = None
                     job_type = job.get("type", "ffmpeg")
 
-                    # FFmpeg-backed job (default)
                     if job_type in ("ffmpeg", None) or job.get("ffmpeg_args"):
                         ffmpeg_args = job.get("ffmpeg_args") if isinstance(job.get("ffmpeg_args"), list) else None
                         redis_url = job.get("redis_url") or os.environ.get("REDIS_URL")
@@ -172,7 +158,6 @@ async def handle_job(job: dict):
                         except asyncio.TimeoutError:
                             success, info = False, "timeout"
 
-                    # Create archive (Python ZIP)
                     elif job_type in ("create_archive", "archive"):
                         await publish_update(progress_channel, {"job_id": job_id, "progress": 5, "message": "creating archive"})
                         files = job.get("files") or []
@@ -181,7 +166,6 @@ async def handle_job(job: dict):
                         info = output_path if ok else msg
                         await publish_update(progress_channel, {"job_id": job_id, "progress": 100 if ok else 0, "message": "done" if ok else "error", "output": output_path if ok else None})
 
-                    # Merge videos
                     elif job_type == "merge_videos":
                         await publish_update(progress_channel, {"job_id": job_id, "progress": 5, "message": "merging videos"})
                         files = job.get("files") or []
@@ -190,7 +174,6 @@ async def handle_job(job: dict):
                         info = output_path if ok else msg
                         await publish_update(progress_channel, {"job_id": job_id, "progress": 100 if ok else 0, "message": "done" if ok else "error", "output": output_path if ok else None})
 
-                    # Merge audios
                     elif job_type == "merge_audios":
                         await publish_update(progress_channel, {"job_id": job_id, "progress": 5, "message": "merging audios"})
                         files = job.get("files") or []
@@ -199,7 +182,6 @@ async def handle_job(job: dict):
                         info = output_path if ok else msg
                         await publish_update(progress_channel, {"job_id": job_id, "progress": 100 if ok else 0, "message": "done" if ok else "error", "output": output_path if ok else None})
 
-                    # Extract streams and optionally archive them
                     elif job_type == "extract_streams":
                         await publish_update(progress_channel, {"job_id": job_id, "progress": 5, "message": "extracting streams"})
                         out_dir = job.get("output_dir") or f"storage/output/{job_id}_streams"
@@ -216,7 +198,6 @@ async def handle_job(job: dict):
                             info = "no_streams" if ok else "extract_failed"
                             await publish_update(progress_channel, {"job_id": job_id, "progress": 0, "message": "error", "error": info})
 
-                    # Generate sample/preview
                     elif job_type == "generate_sample":
                         await publish_update(progress_channel, {"job_id": job_id, "progress": 5, "message": "generating sample"})
                         dur = int(job.get("duration", 30))
@@ -225,7 +206,6 @@ async def handle_job(job: dict):
                         info = output_path if ok else msg
                         await publish_update(progress_channel, {"job_id": job_id, "progress": 100 if ok else 0, "message": "done" if ok else "error", "output": output_path if ok else None})
 
-                    # Trim (start/end)
                     elif job_type == "trim":
                         await publish_update(progress_channel, {"job_id": job_id, "progress": 5, "message": "trimming"})
                         start_time = job.get("start_time")
@@ -235,7 +215,6 @@ async def handle_job(job: dict):
                         info = output_path if ok else msg
                         await publish_update(progress_channel, {"job_id": job_id, "progress": 100 if ok else 0, "message": "done" if ok else "error", "output": output_path if ok else None})
 
-                    # Rename file on disk
                     elif job_type == "rename":
                         new_name = job.get("new_name")
                         try:
@@ -249,7 +228,6 @@ async def handle_job(job: dict):
                             info = str(e)
                             await publish_update(progress_channel, {"job_id": job_id, "progress": 0, "message": "error", "error": info})
 
-                    # Fallback: try running as ffmpeg
                     else:
                         ffmpeg_args = job.get("ffmpeg_args") if isinstance(job.get("ffmpeg_args"), list) else None
                         redis_url = job.get("redis_url") or os.environ.get("REDIS_URL")
@@ -258,99 +236,96 @@ async def handle_job(job: dict):
                         except asyncio.TimeoutError:
                             success, info = False, "timeout"
 
-            JOBS_TOTAL.inc()
+                # end with JOB_DURATION
 
-            if success:
-                JOBS_SUCCEEDED.inc()
-                out = info if isinstance(info, str) else output_path
-                await publish_update(progress_channel, {"job_id": job_id, "progress": 100, "message": "done", "output": out})
-                try:
-                    await job_store.update_job(job_id, {"status": "done", "finished_at": time.time(), "output": out})
-                except Exception:
-                    pass
+                JOBS_TOTAL.inc()
 
-                # optional cleanup of input file
-                try:
-                    if job.get("cleanup_input", True) and input_path and os.path.exists(input_path):
-                        os.remove(input_path)
-                except Exception as e:
-                    logger.warning(f"Failed to cleanup input file: {e}")
+                if success:
+                    JOBS_SUCCEEDED.inc()
+                    out = info if isinstance(info, str) else output_path
+                    await publish_update(progress_channel, {"job_id": job_id, "progress": 100, "message": "done", "output": out})
+                    try:
+                        await job_store.update_job(job_id, {"status": "done", "finished_at": time.time(), "output": out})
+                    except Exception:
+                        pass
 
-                # send via Telegram if requested
-                try:
-                    chat_id = job.get("chat_id")
-                    caption = job.get("caption")
-                    if chat_id and getattr(config, "BOT_TOKEN", None):
-                        bot = Bot(token=getattr(config, "BOT_TOKEN"))
-                        # choose send method based on file extension
-                        if out and str(out).lower().endswith(".zip"):
-                            with open(out, "rb") as fh:
-                                bot.send_document(chat_id=chat_id, document=fh, caption=caption)
-                        elif out and str(out).lower().endswith(('.mp4', '.mov', '.mkv')):
-                            with open(out, "rb") as fh:
-                                bot.send_video(chat_id=chat_id, video=fh, caption=caption, supports_streaming=True)
-                        else:
-                            try:
+                    try:
+                        if job.get("cleanup_input", True) and input_path and os.path.exists(input_path):
+                            os.remove(input_path)
+                    except Exception as e:
+                        logger.warning(f"Failed to cleanup input file: {e}")
+
+                    try:
+                        chat_id = job.get("chat_id")
+                        caption = job.get("caption")
+                        if chat_id and getattr(config, "BOT_TOKEN", None):
+                            bot = Bot(token=getattr(config, "BOT_TOKEN"))
+                            if out and str(out).lower().endswith(".zip"):
                                 with open(out, "rb") as fh:
                                     bot.send_document(chat_id=chat_id, document=fh, caption=caption)
-                            except Exception:
-                                pass
-                except Exception:
-                    logger.exception("Failed to send result via Telegram")
+                            elif out and str(out).lower().endswith(('.mp4', '.mov', '.mkv')):
+                                with open(out, "rb") as fh:
+                                    bot.send_video(chat_id=chat_id, video=fh, caption=caption, supports_streaming=True)
+                            else:
+                                try:
+                                    with open(out, "rb") as fh:
+                                        bot.send_document(chat_id=chat_id, document=fh, caption=caption)
+                                except Exception:
+                                    pass
+                    except Exception:
+                        logger.exception("Failed to send result via Telegram")
 
-                # cleanup output if requested
+                    try:
+                        if job.get("cleanup_output", False) and out and os.path.exists(out):
+                            os.remove(out)
+                    except Exception:
+                        pass
+
+                    try:
+                        if temp_input and os.path.exists(temp_input):
+                            os.remove(temp_input)
+                    except Exception:
+                        pass
+
+                    return
+
+                else:
+                    JOBS_FAILED.inc()
+                    await publish_update(progress_channel, {"job_id": job_id, "progress": 0, "message": "error", "error": info})
+                    try:
+                        await job_store.update_job(job_id, {"status": "error", "error": info, "attempt": attempt})
+                    except Exception:
+                        pass
+
+                    if attempt <= retries:
+                        backoff = min(30, 2 ** attempt)
+                        logger.info(f"Retrying job {job_id} in {backoff}s (attempt {attempt})")
+                        await asyncio.sleep(backoff)
+                        continue
+                    else:
+                        return
+
+            except asyncio.CancelledError:
+                logger.info("Job cancelled via worker shutdown")
                 try:
-                    if job.get("cleanup_output", False) and out and os.path.exists(out):
-                        os.remove(out)
+                    await job_store.update_job(job_id, {"status": "cancelled", "message": "shutdown"})
                 except Exception:
                     pass
-
-                # remove downloaded temp input if we created one
-                try:
-                    if temp_input and os.path.exists(temp_input):
-                        os.remove(temp_input)
-                except Exception:
-                    pass
-
-                return
-
-            else:
+                raise
+            except Exception as e:
                 JOBS_FAILED.inc()
-                await publish_update(progress_channel, {"job_id": job_id, "progress": 0, "message": "error", "error": info})
+                logger.exception("Unhandled exception while processing job")
                 try:
-                    await job_store.update_job(job_id, {"status": "error", "error": info, "attempt": attempt})
+                    await job_store.update_job(job_id, {"status": "error", "error": str(e), "attempt": attempt})
                 except Exception:
                     pass
-
                 if attempt <= retries:
-                    backoff = min(30, 2 ** attempt)
-                    logger.info(f"Retrying job {job_id} in {backoff}s (attempt {attempt})")
-                    await asyncio.sleep(backoff)
+                    await asyncio.sleep(2 ** attempt)
                     continue
                 else:
                     return
-
-        except asyncio.CancelledError:
-            logger.info("Job cancelled via worker shutdown")
-            try:
-                await job_store.update_job(job_id, {"status": "cancelled", "message": "shutdown"})
-            except Exception:
-                pass
-            raise
-        except Exception as e:
-            JOBS_FAILED.inc()
-            logger.exception("Unhandled exception while processing job")
-            try:
-                await job_store.update_job(job_id, {"status": "error", "error": str(e), "attempt": attempt})
-            except Exception:
-                pass
-            if attempt <= retries:
-                await asyncio.sleep(2 ** attempt)
-                continue
-            else:
-                return
-        finally:
-            ACTIVE_JOBS.dec()
+            finally:
+                ACTIVE_JOBS.dec()
     finally:
         # release the input lock if we acquired one
         try:
