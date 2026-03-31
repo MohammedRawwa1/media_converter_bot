@@ -1211,6 +1211,17 @@ try:
                     except Exception as e:
                         raise HTTPException(status_code=500, detail=str(e))
 
+                if action == "cancel_job":
+                    # Set the cancel flag for a job so running ffmpeg will terminate
+                    if not job_id:
+                        raise HTTPException(status_code=400, detail="job_id required for cancel_job")
+                    try:
+                        await cancel_job(job_id)
+                        out["cancelled"] = True
+                    except Exception as e:
+                        out["error"] = str(e)
+                    return out
+
                 raise HTTPException(status_code=400, detail="unknown action")
 
             @app.get("/get_input")
