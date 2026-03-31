@@ -485,6 +485,52 @@ def events(job_id):
     return Response(stream_with_context(gen()), content_type='text/event-stream')
 
 
+@app.route("/get_input", methods=["GET"]) 
+def get_input():
+    """Temporary token-protected endpoint to download files from the input folder.
+    Protection: prefer `DIAG_TOKEN` (header `X-DIAG-TOKEN` or `?token=`),
+    fallback to `UPLOAD_SECRET` (header `X-Upload-Token` or `?upload_token=`).
+    Use only for short-term debugging; remove after use.
+    Query params: `name` (filename in input dir).
+    """
+    diag_token = os.environ.get("DIAG_TOKEN")
+    upload_secret = os.environ.get("UPLOAD_SECRET")
+
+    incoming_diag = request.headers.get("X-DIAG-TOKEN") or request.args.get("token") or request.form.get("token")
+    incoming_upload = request.headers.get("X-Upload-Token") or request.args.get("upload_token") or request.form.get("upload_token")
+
+    # Validate token
+    if diag_token:
+        if incoming_diag != diag_token:
+            return jsonify({"error": "unauthorized"}), 401
+    else:
+        # if DIAG_TOKEN not set, require upload secret as fallback
+        if not upload_secret or incoming_upload != upload_secret:
+            return jsonify({"error": "unauthorized (no DIAG_TOKEN configured)"}), 401
+
+    name = request.args.get("name") or request.args.get("filename") or request.form.get("name")
+    if not name:
+        return jsonify({"error": "name required"}), 400
+
+    # simple sanitization: no path traversal
+    if ".." in name or name.startswith("/"):
+        return jsonify({"error": "invalid filename"}), 400
+
+    safe_name = os.path.basename(name)
+    path = os.path.join(INPUT_DIR, safe_name)
+    if not os.path.exists(path) or not os.path.isfile(path):
+        return jsonify({"error": "not found"}), 404
+
+    try:
+        # send file as attachment
+        try:
+            return send_file(path, as_attachment=True, download_name=safe_name)
+        except TypeError:
+            return send_file(path, as_attachment=True, attachment_filename=safe_name)
+    except Exception as e:
+        return jsonify({"error": "failed to send file", "detail": str(e)}), 500
+
+
 @app.route("/internal/diag", methods=["GET", "POST"]) 
 def internal_diag():
     """Token-protected diagnostic endpoint.
