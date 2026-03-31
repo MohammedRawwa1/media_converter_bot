@@ -11,6 +11,8 @@ from typing import Dict
 from email.utils import parsedate_to_datetime
 
 import aiohttp
+import os
+from urllib.parse import urlparse
 
 logger = logging.getLogger(__name__)
 
@@ -50,6 +52,32 @@ class WebhookMonitor:
             True if webhook is healthy, False otherwise
         """
         try:
+            # First try a local loopback probe to avoid external DNS/network timeouts
+            try:
+                parsed = urlparse(self.webhook_url)
+                local_port = int(os.environ.get("PORT", "10000"))
+                local_path = parsed.path or "/"
+                local_url = f"http://127.0.0.1:{local_port}{local_path}"
+                async with aiohttp.ClientSession() as session:
+                    async with session.head(local_url, timeout=aiohttp.ClientTimeout(total=3)) as resp:
+                        status = resp.status
+                        self.check_count += 1
+                        self.last_check = datetime.now()
+                        self.last_status_code = status
+                        if status in (200, 404, 405):
+                            self.is_healthy = True
+                            self.consecutive_failures = 0
+                            if getattr(self, "_current_interval", None) is not None:
+                                self._current_interval = self.check_interval
+                            logger.debug(f"✅ Local webhook loopback check passed (status: {status})")
+                            return True
+                        # If local returns non-healthy, fall through to external check
+                        logger.debug(f"Local loopback check returned {status}; falling back to external check")
+            except Exception:
+                # Local check failed; continue to external check below
+                logger.debug("Local loopback check failed; trying external webhook URL")
+
+            # External public check (original behavior)
             async with aiohttp.ClientSession() as session:
                 async with session.head(self.webhook_url, timeout=aiohttp.ClientTimeout(total=10)) as response:
                     status = response.status
