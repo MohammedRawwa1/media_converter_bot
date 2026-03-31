@@ -937,6 +937,115 @@ try:
 
                     return result
 
+            @app.post("/internal/diag/run")
+            async def run_diag_action(request: Request):
+                """Execute limited diagnostics actions (ffprobe/remux/reencode/tail_logs/job_info).
+
+                Protected by `DIAG_TOKEN` header (X-DIAG-TOKEN). Intended for short-lived diagnostics
+                on the running Render instance; commands have timeouts to avoid long blocking.
+                """
+                DIAG_TOKEN = os.environ.get("DIAG_TOKEN")
+                incoming = request.headers.get("X-DIAG-TOKEN")
+                if not DIAG_TOKEN:
+                    raise HTTPException(status_code=403, detail="DIAG_TOKEN not configured on server")
+                if incoming != DIAG_TOKEN:
+                    raise HTTPException(status_code=401, detail="unauthorized")
+
+                try:
+                    payload = await request.json()
+                except Exception:
+                    raise HTTPException(status_code=400, detail="invalid json")
+
+                action = payload.get("action")
+                filename = payload.get("file")
+                job_id = payload.get("job_id")
+                out = {"action": action}
+
+                # Resolve ffmpeg/ffprobe paths
+                ffprobe = getattr(cfg, "FFPROBE_PATH", None) or (FFMPEG_PATH.replace("ffmpeg", "ffprobe") if "ffmpeg" in FFMPEG_PATH else "ffprobe")
+                ffmpeg = FFMPEG_PATH
+
+                # Helper to run commands without blocking the ASGI loop
+                async def _run(cmd, timeout=600):
+                    try:
+                        proc = await asyncio.to_thread(subprocess.run, cmd, capture_output=True, text=True, timeout=timeout)
+                        return {"returncode": proc.returncode, "stdout": proc.stdout, "stderr": proc.stderr}
+                    except Exception as e:
+                        return {"error": str(e)}
+
+                # Sanitize file -> only allow basename under storage/input
+                input_dir = getattr(cfg, "INPUT_PATH", os.path.join(os.getcwd(), "storage", "input"))
+                if filename:
+                    safe_name = os.path.basename(filename)
+                    target_path = os.path.join(input_dir, safe_name)
+                    if not os.path.isfile(target_path):
+                        raise HTTPException(status_code=404, detail=f"file not found: {safe_name}")
+
+                if action == "ffprobe":
+                    cmd = [ffprobe, "-v", "error", "-print_format", "json", "-show_format", "-show_streams", target_path]
+                    out["result"] = await _run(cmd, timeout=60)
+                    return out
+
+                if action == "remux":
+                    dst = payload.get("out") or os.path.join(os.getcwd(), "storage", "temp", os.path.splitext(os.path.basename(target_path))[0] + ".mkv")
+                    os.makedirs(os.path.dirname(dst), exist_ok=True)
+                    cmd = [ffmpeg, "-y", "-hide_banner", "-loglevel", "error", "-i", target_path, "-c", "copy", dst]
+                    out["dst"] = dst
+                    out["result"] = await _run(cmd, timeout=600)
+                    return out
+
+                if action == "reencode":
+                    dst = payload.get("out") or os.path.join(os.getcwd(), "storage", "output", os.path.splitext(os.path.basename(target_path))[0] + "_reencoded.mp4")
+                    os.makedirs(os.path.dirname(dst), exist_ok=True)
+                    cmd = [ffmpeg, "-y", "-hide_banner", "-loglevel", "error", "-fflags", "+genpts", "-i", target_path, "-c:v", "libx264", "-preset", "fast", "-crf", "23", "-c:a", "aac", "-b:a", "128k", dst]
+                    out["dst"] = dst
+                    out["result"] = await _run(cmd, timeout=1800)
+                    return out
+
+                if action == "tail_logs":
+                    try:
+                        lines = int(payload.get("lines", 200))
+                    except Exception:
+                        lines = 200
+                    logs = {}
+                    logs_dir = os.path.join(os.getcwd(), "logs")
+                    try:
+                        if os.path.isdir(logs_dir):
+                            for fname in sorted(os.listdir(logs_dir))[-10:]:
+                                path = os.path.join(logs_dir, fname)
+                                if os.path.isfile(path):
+                                    with open(path, "r", encoding="utf-8", errors="replace") as fh:
+                                        logs[fname] = "".join(fh.readlines()[-lines:])
+                        worker_log = "/tmp/worker.log"
+                        if os.path.isfile(worker_log):
+                            with open(worker_log, "r", encoding="utf-8", errors="replace") as fh:
+                                logs[os.path.basename(worker_log)] = "".join(fh.readlines()[-(lines * 5):])
+                    except Exception as e:
+                        raise HTTPException(status_code=500, detail=str(e))
+                    out["logs"] = logs
+                    return out
+
+                if action == "job_info":
+                    if not job_id:
+                        raise HTTPException(status_code=400, detail="job_id required for job_info")
+                    try:
+                        from utils.job_queue import get_redis
+
+                        r = await get_redis()
+                        try:
+                            job_hash = await r.hgetall(f"ffmpeg:job:{job_id}")
+                            out["job_hash"] = job_hash
+                        finally:
+                            try:
+                                await r.close()
+                            except Exception:
+                                pass
+                        return out
+                    except Exception as e:
+                        raise HTTPException(status_code=500, detail=str(e))
+
+                raise HTTPException(status_code=400, detail="unknown action")
+
             @app.get("/get_input")
             async def root_get_input(request: Request, name: str | None = None):
                 """Serve input files from the server for short-term debugging.
