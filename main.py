@@ -725,8 +725,147 @@ try:
         @app.get("/upload")
         async def _upload_redirect():
             return RedirectResponse(url="/flask/upload")
-
         logger.info("Mounted Flask web UI at /flask and redirect /upload -> /flask/upload")
+
+        # Expose a couple of convenient root-level endpoints that mirror the
+        # Flask web UI's status and internal diag routes so external callers
+        # don't need to include the /flask prefix. These are best-effort and
+        # only created when the Flask app was successfully imported.
+        try:
+            import re
+            import traceback
+
+            @app.get("/status/{job_id}")
+            async def root_status(job_id: str):
+                try:
+                    job_hash = None
+                    if getattr(flask_webapp, "aioredis_available", False):
+                        # call the Flask module's async helper
+                        try:
+                            job_hash = await flask_webapp._get_job_hash(job_id)
+                        except Exception:
+                            job_hash = None
+
+                    if job_hash:
+                        progress = float(job_hash.get("progress") or 0.0)
+                        message = job_hash.get("message") or "queued"
+                        status = job_hash.get("status") or ("done" if job_hash.get("output") else "processing")
+                        out = job_hash.get("output")
+                        resp = {"job_id": job_id, "progress": progress, "message": message, "status": status, "output": out}
+                        try:
+                            if job_hash.get("out_bytes") is not None:
+                                resp["out_bytes"] = int(job_hash.get("out_bytes"))
+                        except Exception:
+                            pass
+                        try:
+                            if job_hash.get("in_bytes") is not None:
+                                resp["in_bytes"] = int(job_hash.get("in_bytes"))
+                        except Exception:
+                            pass
+                        try:
+                            if job_hash.get("progress_by_size") is not None:
+                                resp["progress_by_size"] = float(job_hash.get("progress_by_size"))
+                        except Exception:
+                            pass
+                        return resp
+
+                    # Fallback to the in-memory JOB_STORE from the Flask app
+                    try:
+                        local = flask_webapp.JOB_STORE.get(job_id)
+                    except Exception:
+                        local = None
+                    if local:
+                        return {
+                            "job_id": job_id,
+                            "progress": float(local.get("progress", 0.0)),
+                            "message": local.get("message", "processing" if local.get("status") != "done" else "done"),
+                            "status": local.get("status", "processing"),
+                            "output": local.get("output"),
+                        }
+
+                    # Check for a stored output file
+                    out_path = os.path.join(flask_webapp.OUTPUT_DIR, f"{job_id}.mp4")
+                    if os.path.exists(out_path):
+                        return {"job_id": job_id, "progress": 100.0, "message": "done", "status": "done", "output": out_path}
+
+                    return {"job_id": job_id, "progress": 0.0, "message": "queued", "status": "queued"}
+                except Exception as e:
+                    return {"error": str(e)}
+
+            @app.get("/internal/diag")
+            async def root_diag(request: Request, job_id: str | None = None, token: str | None = None):
+                # Token validation mirrors the Flask endpoint behavior
+                DIAG_TOKEN = os.environ.get("DIAG_TOKEN")
+                incoming = request.headers.get("X-DIAG-TOKEN") or token
+                if not DIAG_TOKEN:
+                    raise HTTPException(status_code=403, detail="DIAG_TOKEN not configured on server")
+                if incoming != DIAG_TOKEN:
+                    raise HTTPException(status_code=401, detail="unauthorized")
+
+                result = {"env": {}, "redis": {}, "logs": {}, "ps": None}
+                # Minimal masked env snapshot
+                for k in ("REDIS_URL", "WEB_UPLOAD_URL", "UPLOAD_SECRET", "S3_BUCKET", "AWS_ACCESS_KEY_ID"):
+                    v = os.environ.get(k)
+                    if k == "REDIS_URL" and v:
+                        result["env"][k] = re.sub(r"(redis://[^:]*:)[^@]+@", r"\1****@", v)
+                    elif k == "UPLOAD_SECRET":
+                        result["env"][k] = "****" if v else None
+                    else:
+                        result["env"][k] = v
+
+                # Redis diagnostics (best-effort)
+                try:
+                    red_url = os.environ.get("REDIS_URL")
+                    if red_url:
+                        r = flask_webapp.redis_sync.from_url(red_url, decode_responses=True)
+                        try:
+                            result["redis"]["ping"] = r.ping()
+                        except Exception as e:
+                            result["redis"]["ping_error"] = str(e)
+                        try:
+                            result["redis"]["ffmpeg_jobs"] = r.lrange("ffmpeg:jobs", 0, 50)
+                        except Exception:
+                            result["redis"]["ffmpeg_jobs"] = []
+                        try:
+                            keys = r.keys("ffmpeg:job:*")
+                            result["redis"]["job_keys_count"] = len(keys)
+                            result["redis"]["job_keys_sample"] = keys[:50]
+                        except Exception:
+                            result["redis"]["job_keys_count"] = 0
+                        if job_id:
+                            try:
+                                result["redis"]["job_hash"] = r.hgetall(f"ffmpeg:job:{job_id}")
+                            except Exception:
+                                result["redis"]["job_hash"] = {}
+                    else:
+                        result["redis"]["error"] = "REDIS_URL not set"
+                except Exception as e:
+                    result["redis"]["error"] = str(e)
+
+                # Tail project logs
+                try:
+                    logs_dir = os.path.join(os.getcwd(), "logs")
+                    if os.path.isdir(logs_dir):
+                        for fname in sorted(os.listdir(logs_dir))[-10:]:
+                            path = os.path.join(logs_dir, fname)
+                            if os.path.isfile(path):
+                                with open(path, "r", encoding="utf-8", errors="replace") as fh:
+                                    lines = fh.readlines()[-500:]
+                                    result["logs"][fname] = "".join(lines)
+                except Exception:
+                    result["logs"]["error"] = traceback.format_exc()
+
+                # Basic process list snapshot
+                try:
+                    ps_out = subprocess.check_output(["ps", "aux"], stderr=subprocess.STDOUT, text=True)
+                    result["ps"] = "\n".join(ps_out.splitlines()[:200])
+                except Exception:
+                    result["ps"] = None
+
+                return result
+
+        except Exception as _e:
+            logger.warning(f"Could not create root convenience endpoints: {_e}")
     except Exception as e:
         logger.warning(f"Could not mount Flask web UI: {e}")
 
