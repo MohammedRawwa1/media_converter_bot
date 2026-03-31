@@ -324,6 +324,133 @@ async def handle_job(job: dict):
                     return
 
                 else:
+                    # Detect likely truncated/corrupt input errors and attempt a re-download
+                    lower_err = (str(info) or "").lower()
+                    corruption_indicators = (
+                        "moov atom not found",
+                        "invalid data found",
+                        "error opening input",
+                        "truncated",
+                        "premature eof",
+                        "could not find codec parameters",
+                    )
+
+                    attempted_redownload = False
+                    try:
+                        if any(k in lower_err for k in corruption_indicators) and input_path:
+                            try:
+                                r = await get_redis()
+                            except Exception:
+                                r = None
+
+                            redownload_attempts = 0
+                            try:
+                                if r:
+                                    cur = await r.hget(f"ffmpeg:job:{job_id}", "redownload_attempts")
+                                    if cur:
+                                        try:
+                                            if isinstance(cur, bytes):
+                                                cur = cur.decode()
+                                            redownload_attempts = int(cur or 0)
+                                        except Exception:
+                                            redownload_attempts = 0
+                            except Exception:
+                                redownload_attempts = 0
+
+                            max_redownload = int(os.environ.get("MAX_REDOWNLOAD_ATTEMPTS", "1"))
+                            if redownload_attempts < max_redownload:
+                                # Remove possibly-corrupt file and attempt to re-fetch using available metadata
+                                try:
+                                    if os.path.exists(input_path):
+                                        try:
+                                            os.remove(input_path)
+                                        except Exception:
+                                            pass
+                                except Exception:
+                                    pass
+
+                                ok = False
+                                tried = False
+                                # Try forward_hash if present
+                                try:
+                                    fh = job.get("forward_hash") or job.get("fh")
+                                    if fh:
+                                        try:
+                                            from utils.forward_store import load_forward_metadata
+
+                                            meta = load_forward_metadata(fh)
+                                            if meta:
+                                                try:
+                                                    from utils.userbot_downloader import download_forward_via_userbot
+
+                                                    tried = True
+                                                    ok = await download_forward_via_userbot(
+                                                        meta.get("chat_id"), meta.get("message_id") or meta.get("msg_id"), input_path, msg_date=meta.get("registered_at") or meta.get("created_at"), file_unique_id=meta.get("file_unique_id")
+                                                    )
+                                                except Exception:
+                                                    ok = False
+                                        except Exception:
+                                            pass
+                                except Exception:
+                                    pass
+
+                                # Try direct chat/message metadata if available
+                                if not tried and job.get("chat_id") and (job.get("message_id") or job.get("msg_id")):
+                                    try:
+                                        from utils.userbot_downloader import download_forward_via_userbot
+
+                                        tried = True
+                                        ok = await download_forward_via_userbot(job.get("chat_id"), job.get("message_id") or job.get("msg_id"), input_path)
+                                    except Exception:
+                                        ok = False
+
+                                # Try HTTP source_url if available
+                                if not tried and job.get("source_url"):
+                                    try:
+                                        tried = True
+                                        async with aiohttp.ClientSession() as session:
+                                            async with session.get(job.get("source_url"), timeout=aiohttp.ClientTimeout(total=60)) as resp:
+                                                if resp.status == 200:
+                                                    with open(input_path, "wb") as fh:
+                                                        async for chunk in resp.content.iter_chunked(1024 * 64):
+                                                            fh.write(chunk)
+                                                    ok = os.path.exists(input_path) and os.path.getsize(input_path) > 0
+                                                else:
+                                                    ok = False
+                                    except Exception:
+                                        ok = False
+
+                                # Persist redownload attempts
+                                try:
+                                    if r:
+                                        await r.hset(f"ffmpeg:job:{job_id}", mapping={"redownload_attempts": str(redownload_attempts + 1)})
+                                except Exception:
+                                    pass
+                                try:
+                                    if r:
+                                        await r.close()
+                                except Exception:
+                                    pass
+
+                                attempted_redownload = True
+                                if ok:
+                                    try:
+                                        await publish_update(progress_channel, {"job_id": job_id, "progress": 0, "message": "redownloaded", "note": "re-download succeeded; retrying"})
+                                    except Exception:
+                                        pass
+                                    logger.info("Redownload succeeded for job %s, retrying ffmpeg", job_id)
+                                    # Retry immediately
+                                    continue
+                                else:
+                                    try:
+                                        await publish_update(progress_channel, {"job_id": job_id, "progress": 0, "message": "redownload_failed", "note": "re-download attempted and failed"})
+                                    except Exception:
+                                        pass
+
+                    except Exception:
+                        logger.exception("Error during re-download attempt for job %s", job_id)
+
+                    # If we attempted re-download and it failed, fall through to normal failure handling
                     JOBS_FAILED.inc()
                     await publish_update(progress_channel, {"job_id": job_id, "progress": 0, "message": "error", "error": info})
                     try:
