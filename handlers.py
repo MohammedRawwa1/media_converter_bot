@@ -619,174 +619,16 @@ class EnhancedMediaHandler:
                     except Exception:
                         logger.exception("Userbot download fallback failed (bot chat)")
 
-            # If it's clearly a size issue, persist metadata and provide a web uploader hash
-            if "file is too big" in err_text.lower() or "too big" in err_text.lower():
-                try:
-                    from utils.forward_store import save_forward_metadata
-
-                    metadata = {
-                        "chat_id": current_file.get("chat_id"),
-                        "message_id": current_file.get("msg_id") or current_file.get("message_id"),
-                        "file_id": file_id,
-                        "file_unique_id": current_file.get("file_unique_id"),
-                        "name": current_file.get("name"),
-                        "size": current_file.get("size"),
-                        "type": current_file.get("type"),
-                        "registered_at": datetime.utcnow().isoformat(),
-                    }
-                    fh = save_forward_metadata(metadata)
-                    # Optionally attempt automatic server-side fetch + enqueue
-                    auto_fetch = os.environ.get("AUTO_FETCH_FORWARDS", "").lower() in ("1", "true", "yes")
-                    web_upload_url = os.environ.get("WEB_UPLOAD_URL") or os.environ.get("WEBAPP_URL")
-
-                    if auto_fetch:
-                        # Prepare local paths
+                    # If it's clearly a size issue, delegate to helper to persist metadata,
+                    # optionally auto-fetch and enqueue, or raise a user-facing exception.
+                    if "file is too big" in err_text.lower() or "too big" in err_text.lower():
                         try:
-                            import uuid as _uuid
-                            jid = str(_uuid.uuid4())
+                            await self._handle_large_forward(update, current_file, err_text, upload_url)
                         except Exception:
-                            jid = None
-
-                        input_dir = getattr(config, "INPUT_PATH", "storage/input") if config else "storage/input"
-                        try:
-                            os.makedirs(input_dir, exist_ok=True)
-                        except Exception:
-                            pass
-
-                        ext = os.path.splitext(metadata.get("name") or "")[1] or ".mp4"
-                        input_path = os.path.join(input_dir, f"{jid}{ext}") if jid else os.path.join(input_dir, f"{fh}{ext}")
-
-                        fetched = False
-
-                        # Try local userbot downloader first when enabled
-                        try:
-                            if os.environ.get("ENABLE_USERBOT", "").lower() in ("1", "true", "yes"):
-                                try:
-                                    from utils.userbot_downloader import download_forward_via_userbot
-                                except Exception:
-                                    download_forward_via_userbot = None
-
-                                if download_forward_via_userbot is not None:
-                                    try:
-                                        ok = await download_forward_via_userbot(
-                                            metadata.get("chat_id"), metadata.get("message_id") or metadata.get("msg_id"), input_path, msg_date=metadata.get("registered_at") or metadata.get("created_at"), file_unique_id=metadata.get("file_unique_id")
-                                        )
-                                        if ok and os.path.exists(input_path):
-                                            fetched = True
-                                    except Exception:
-                                        logger.exception("auto-fetch via userbot failed for %s", fh)
-                        except Exception:
-                            logger.exception("auto-fetch userbot path error for %s", fh)
-
-                        # If local fetch failed and web upload endpoint is configured, ask webapp to fetch
-                        if not fetched and web_upload_url:
-                            try:
-                                def _post_fetch():
-                                    try:
-                                        import requests
-                                    except Exception:
-                                        return None
-                                    headers = {}
-                                    upload_secret = os.environ.get("UPLOAD_SECRET")
-                                    if upload_secret:
-                                        headers["X-Upload-Token"] = upload_secret
-                                    try:
-                                        resp = requests.post(web_upload_url, data={"forward_hash": fh}, headers=headers, timeout=60)
-                                        return resp
-                                    except Exception:
-                                        return None
-
-                                resp = await asyncio.get_event_loop().run_in_executor(None, _post_fetch)
-                                if resp is not None and resp.status_code == 200:
-                                    try:
-                                        j = resp.json()
-                                        queued_job = j.get("job_id")
-                                        await (update.message.reply_text if getattr(update, 'message', None) else update.callback_query.message.reply_text)(
-                                            f"✅ Server fetched and queued conversion (job {queued_job})."
-                                        )
-                                        # delete saved forward metadata to avoid duplicates
-                                        try:
-                                            from utils.forward_store import delete_forward_metadata
-
-                                            delete_forward_metadata(fh)
-                                        except Exception:
-                                            pass
-                                        return
-                                    except Exception:
-                                        logger.exception("Failed to parse webapp enqueue response for %s", fh)
-                            except Exception:
-                                logger.exception("Webapp fetch request failed for %s", fh)
-
-                        # If we successfully fetched locally, enqueue the job directly
-                        if fetched:
-                            try:
-                                import uuid as _uuid
-                                job_id = str(_uuid.uuid4())
-                                output_dir = getattr(config, "OUTPUT_PATH", "storage/output") if config else "storage/output"
-                                try:
-                                    os.makedirs(output_dir, exist_ok=True)
-                                except Exception:
-                                    pass
-                                base_name = os.path.splitext(metadata.get("name") or os.path.basename(input_path))[0]
-                                output_path = os.path.join(output_dir, f"{base_name}_{job_id}.mp4")
-                                job = {
-                                    "job_id": job_id,
-                                    "input_path": input_path,
-                                    "output_path": output_path,
-                                    "original_filename": metadata.get("name") or os.path.basename(input_path),
-                                    "output_filename": os.path.basename(output_path),
-                                    "ffmpeg_args": ["-c:v", "libx264", "-preset", "fast", "-crf", "23", "-c:a", "aac", "-b:a", "128k"],
-                                    "progress_channel": f"ffmpeg:progress:{job_id}",
-                                    "chat_id": update.effective_chat.id if update and getattr(update, 'effective_chat', None) else None,
-                                    "cleanup_input": True,
-                                    "cleanup_output": False,
-                                }
-                                try:
-                                    from utils.job_queue import enqueue_job as _enqueue
-
-                                    await _enqueue(job)
-                                    # notify user (prefer editing the callback message when available)
-                                    try:
-                                        q = getattr(update, "callback_query", None)
-                                        if q is not None:
-                                            await self.safe_edit(q, f"✅ Fetched forwarded media and queued conversion (job {job_id}).")
-                                            try:
-                                                asyncio.create_task(self._watch_job_progress(q, job_id))
-                                            except Exception:
-                                                pass
-                                        else:
-                                            # fallback to replying in chat when no callback_query
-                                            if getattr(update, "message", None):
-                                                try:
-                                                    await update.message.reply_text(f"✅ Fetched forwarded media and queued conversion (job {job_id}).")
-                                                except Exception:
-                                                    pass
-                                    except Exception:
-                                        logger.exception("Failed to notify user after enqueue for %s", fh)
-                                    # cleanup saved forward metadata
-                                    try:
-                                        from utils.forward_store import delete_forward_metadata
-
-                                        delete_forward_metadata(fh)
-                                    except Exception:
-                                        pass
-                                    return
-                                except Exception:
-                                    logger.exception("Failed to enqueue job after fetch for %s", fh)
-                            except Exception:
-                                logger.exception("Failed to create job after fetch for %s", fh)
-
-                    # Fallback: return instruction to user with forward-hash and web upload link
-                    raise Exception(
-                        "Telegram reports the file is too big to download via the bot. "
-                        f"You can either upload the file via the web uploader, or use this forward-hash to let the server fetch it via an opt-in userbot: {fh} -- visit {upload_url}?forward_hash={fh}"
-                    )
-                except Exception:
-                    # Fallback message if persisting failed
-                    raise Exception(
-                        "Telegram reports the file is too big to download via the bot. "
-                        f"Please either upload the file via the web uploader (POST to {upload_url}) or provide a direct public URL to the file."
-                    )
+                            raise Exception(
+                                "Telegram reports the file is too big to download via the bot. "
+                                f"Please either upload the file via the web uploader (POST to {upload_url}) or provide a direct public URL to the file."
+                            )
 
             # Other get_file errors: re-raise
             raise
@@ -808,6 +650,180 @@ class EnhancedMediaHandler:
             self._persist_session(user_id)
         except Exception:
             logger.debug("Could not persist session after download")
+
+    async def _handle_large_forward(self, update: Update, current_file: Dict, err_text: str, upload_url: str):
+        """Persist forward metadata, optionally auto-fetch and enqueue, or raise an instruction.
+
+        This centralizes the previous inline logic for handling "file is too big" errors
+        so handlers can call it non-blockingly and keep the download flow readable.
+        """
+        try:
+            from utils.forward_store import save_forward_metadata, delete_forward_metadata
+
+            metadata = {
+                "chat_id": current_file.get("chat_id"),
+                "message_id": current_file.get("msg_id") or current_file.get("message_id"),
+                "file_id": current_file.get("id") or current_file.get("file_id"),
+                "file_unique_id": current_file.get("file_unique_id"),
+                "name": current_file.get("name"),
+                "size": current_file.get("size"),
+                "type": current_file.get("type"),
+                "registered_at": datetime.utcnow().isoformat(),
+            }
+            fh = save_forward_metadata(metadata)
+
+            auto_fetch = os.environ.get("AUTO_FETCH_FORWARDS", "").lower() in ("1", "true", "yes")
+            web_upload_url = os.environ.get("WEB_UPLOAD_URL") or os.environ.get("WEBAPP_URL")
+
+            if auto_fetch:
+                # Prepare local paths
+                try:
+                    import uuid as _uuid
+
+                    jid = str(_uuid.uuid4())
+                except Exception:
+                    jid = None
+
+                input_dir = getattr(config, "INPUT_PATH", "storage/input") if config else "storage/input"
+                try:
+                    os.makedirs(input_dir, exist_ok=True)
+                except Exception:
+                    pass
+
+                ext = os.path.splitext(metadata.get("name") or "")[1] or ".mp4"
+                input_path = os.path.join(input_dir, f"{jid}{ext}") if jid else os.path.join(input_dir, f"{fh}{ext}")
+
+                fetched = False
+
+                # Try local userbot downloader first when enabled
+                try:
+                    if os.environ.get("ENABLE_USERBOT", "").lower() in ("1", "true", "yes"):
+                        try:
+                            from utils.userbot_downloader import download_forward_via_userbot
+                        except Exception:
+                            download_forward_via_userbot = None
+
+                        if download_forward_via_userbot is not None:
+                            try:
+                                ok = await download_forward_via_userbot(
+                                    metadata.get("chat_id"), metadata.get("message_id") or metadata.get("msg_id"), input_path, msg_date=metadata.get("registered_at") or metadata.get("created_at"), file_unique_id=metadata.get("file_unique_id")
+                                )
+                                if ok and os.path.exists(input_path):
+                                    fetched = True
+                            except Exception:
+                                logger.exception("auto-fetch via userbot failed for %s", fh)
+                except Exception:
+                    logger.exception("auto-fetch userbot path error for %s", fh)
+
+                # If local fetch failed and web upload endpoint is configured, ask webapp to fetch
+                if not fetched and web_upload_url:
+                    try:
+                        def _post_fetch():
+                            try:
+                                import requests
+                            except Exception:
+                                return None
+                            headers = {}
+                            upload_secret = os.environ.get("UPLOAD_SECRET")
+                            if upload_secret:
+                                headers["X-Upload-Token"] = upload_secret
+                            try:
+                                resp = requests.post(web_upload_url, data={"forward_hash": fh}, headers=headers, timeout=60)
+                                return resp
+                            except Exception:
+                                return None
+
+                        resp = await asyncio.get_event_loop().run_in_executor(None, _post_fetch)
+                        if resp is not None and getattr(resp, "status_code", None) == 200:
+                            try:
+                                j = resp.json()
+                                queued_job = j.get("job_id")
+                                # notify user
+                                try:
+                                    if getattr(update, "callback_query", None):
+                                        await self.safe_edit(update.callback_query, f"✅ Server fetched and queued conversion (job {queued_job}).")
+                                    elif getattr(update, "message", None):
+                                        await update.message.reply_text(f"✅ Server fetched and queued conversion (job {queued_job}).")
+                                except Exception:
+                                    pass
+
+                                # delete saved forward metadata to avoid duplicates
+                                try:
+                                    delete_forward_metadata(fh)
+                                except Exception:
+                                    pass
+                                return
+                            except Exception:
+                                logger.exception("Failed to parse webapp enqueue response for %s", fh)
+                    except Exception:
+                        logger.exception("Webapp fetch request failed for %s", fh)
+
+                # If we successfully fetched locally, enqueue the job directly
+                if fetched:
+                    try:
+                        import uuid as _uuid
+
+                        job_id = str(_uuid.uuid4())
+                        output_dir = getattr(config, "OUTPUT_PATH", "storage/output") if config else "storage/output"
+                        try:
+                            os.makedirs(output_dir, exist_ok=True)
+                        except Exception:
+                            pass
+                        base_name = os.path.splitext(metadata.get("name") or os.path.basename(input_path))[0]
+                        output_path = os.path.join(output_dir, f"{base_name}_{job_id}.mp4")
+                        job = {
+                            "job_id": job_id,
+                            "input_path": input_path,
+                            "output_path": output_path,
+                            "original_filename": metadata.get("name") or os.path.basename(input_path),
+                            "output_filename": os.path.basename(output_path),
+                            "ffmpeg_args": ["-c:v", "libx264", "-preset", "fast", "-crf", "23", "-c:a", "aac", "-b:a", "128k"],
+                            "progress_channel": f"ffmpeg:progress:{job_id}",
+                            "chat_id": update.effective_chat.id if update and getattr(update, 'effective_chat', None) else None,
+                            "cleanup_input": True,
+                            "cleanup_output": False,
+                        }
+                        try:
+                            from utils.job_queue import enqueue_job as _enqueue
+
+                            await _enqueue(job)
+                            # notify user (prefer editing the callback message when available)
+                            try:
+                                q = getattr(update, "callback_query", None)
+                                if q is not None:
+                                    await self.safe_edit(q, f"✅ Fetched forwarded media and queued conversion (job {job_id}).")
+                                    try:
+                                        asyncio.create_task(self._watch_job_progress(q, job_id))
+                                    except Exception:
+                                        pass
+                                else:
+                                    # fallback to replying in chat when no callback_query
+                                    if getattr(update, "message", None):
+                                        try:
+                                            await update.message.reply_text(f"✅ Fetched forwarded media and queued conversion (job {job_id}).")
+                                        except Exception:
+                                            pass
+                            except Exception:
+                                logger.exception("Failed to notify user after enqueue for %s", fh)
+                            # cleanup saved forward metadata
+                            try:
+                                delete_forward_metadata(fh)
+                            except Exception:
+                                pass
+                            return
+                        except Exception:
+                            logger.exception("Failed to enqueue job after fetch for %s", fh)
+                    except Exception:
+                        logger.exception("Failed to create job after fetch for %s", fh)
+
+            # Fallback: return instruction to user with forward-hash and web upload link
+            raise Exception(
+                "Telegram reports the file is too big to download via the bot. "
+                f"You can either upload the file via the web uploader, or use this forward-hash to let the server fetch it via an opt-in userbot: {fh} -- visit {upload_url}?forward_hash={fh}"
+            )
+        except Exception:
+            # Re-raise to allow caller to provide a simpler fallback message
+            raise
 
     async def show_settings(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Display and start interactive settings flow for the user."""
