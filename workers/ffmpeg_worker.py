@@ -156,107 +156,107 @@ async def handle_job(job: dict):
     converter = ExtendedMediaConverter() if ExtendedMediaConverter else None
     try:
         while True:
-        attempt += 1
-        ACTIVE_JOBS.inc()
-        try:
-            with JOB_DURATION.time():
-                job_type = job.get("type", "ffmpeg")
+            attempt += 1
+            ACTIVE_JOBS.inc()
+            try:
+                with JOB_DURATION.time():
+                    job_type = job.get("type", "ffmpeg")
 
-                # FFmpeg-backed job (default)
-                if job_type in ("ffmpeg", None) or job.get("ffmpeg_args"):
-                    ffmpeg_args = job.get("ffmpeg_args") if isinstance(job.get("ffmpeg_args"), list) else None
-                    redis_url = job.get("redis_url") or os.environ.get("REDIS_URL")
-                    coro = run_ffmpeg(input_path, output_path, job_id, ffmpeg_args=ffmpeg_args, redis_url=redis_url, progress_channel=progress_channel)
-                    try:
-                        success, info = await asyncio.wait_for(coro, timeout=max_runtime)
-                    except asyncio.TimeoutError:
-                        success, info = False, "timeout"
+                    # FFmpeg-backed job (default)
+                    if job_type in ("ffmpeg", None) or job.get("ffmpeg_args"):
+                        ffmpeg_args = job.get("ffmpeg_args") if isinstance(job.get("ffmpeg_args"), list) else None
+                        redis_url = job.get("redis_url") or os.environ.get("REDIS_URL")
+                        coro = run_ffmpeg(input_path, output_path, job_id, ffmpeg_args=ffmpeg_args, redis_url=redis_url, progress_channel=progress_channel)
+                        try:
+                            success, info = await asyncio.wait_for(coro, timeout=max_runtime)
+                        except asyncio.TimeoutError:
+                            success, info = False, "timeout"
 
-                # Create archive (Python ZIP)
-                elif job_type in ("create_archive", "archive"):
-                    await publish_update(progress_channel, {"job_id": job_id, "progress": 5, "message": "creating archive"})
-                    files = job.get("files") or []
-                    ok, msg = await create_archive(files, output_path)
-                    success = ok
-                    info = output_path if ok else msg
-                    await publish_update(progress_channel, {"job_id": job_id, "progress": 100 if ok else 0, "message": "done" if ok else "error", "output": output_path if ok else None})
+                    # Create archive (Python ZIP)
+                    elif job_type in ("create_archive", "archive"):
+                        await publish_update(progress_channel, {"job_id": job_id, "progress": 5, "message": "creating archive"})
+                        files = job.get("files") or []
+                        ok, msg = await create_archive(files, output_path)
+                        success = ok
+                        info = output_path if ok else msg
+                        await publish_update(progress_channel, {"job_id": job_id, "progress": 100 if ok else 0, "message": "done" if ok else "error", "output": output_path if ok else None})
 
-                # Merge videos
-                elif job_type == "merge_videos":
-                    await publish_update(progress_channel, {"job_id": job_id, "progress": 5, "message": "merging videos"})
-                    files = job.get("files") or []
-                    ok, msg = await merge_videos(files, output_path)
-                    success = ok
-                    info = output_path if ok else msg
-                    await publish_update(progress_channel, {"job_id": job_id, "progress": 100 if ok else 0, "message": "done" if ok else "error", "output": output_path if ok else None})
+                    # Merge videos
+                    elif job_type == "merge_videos":
+                        await publish_update(progress_channel, {"job_id": job_id, "progress": 5, "message": "merging videos"})
+                        files = job.get("files") or []
+                        ok, msg = await merge_videos(files, output_path)
+                        success = ok
+                        info = output_path if ok else msg
+                        await publish_update(progress_channel, {"job_id": job_id, "progress": 100 if ok else 0, "message": "done" if ok else "error", "output": output_path if ok else None})
 
-                # Merge audios
-                elif job_type == "merge_audios":
-                    await publish_update(progress_channel, {"job_id": job_id, "progress": 5, "message": "merging audios"})
-                    files = job.get("files") or []
-                    ok, msg = await merge_audios(files, output_path)
-                    success = ok
-                    info = output_path if ok else msg
-                    await publish_update(progress_channel, {"job_id": job_id, "progress": 100 if ok else 0, "message": "done" if ok else "error", "output": output_path if ok else None})
+                    # Merge audios
+                    elif job_type == "merge_audios":
+                        await publish_update(progress_channel, {"job_id": job_id, "progress": 5, "message": "merging audios"})
+                        files = job.get("files") or []
+                        ok, msg = await merge_audios(files, output_path)
+                        success = ok
+                        info = output_path if ok else msg
+                        await publish_update(progress_channel, {"job_id": job_id, "progress": 100 if ok else 0, "message": "done" if ok else "error", "output": output_path if ok else None})
 
-                # Extract streams and optionally archive them
-                elif job_type == "extract_streams":
-                    await publish_update(progress_channel, {"job_id": job_id, "progress": 5, "message": "extracting streams"})
-                    out_dir = job.get("output_dir") or f"storage/output/{job_id}_streams"
-                    os.makedirs(out_dir, exist_ok=True)
-                    ok, extracted = await extract_streams(input_path, out_dir)
-                    if ok and extracted:
-                        archive_path = job.get("archive_path") or f"{out_dir}.zip"
-                        ok2, msg2 = await create_archive(list(extracted.values()), archive_path)
-                        success = ok2
-                        info = archive_path if ok2 else msg2
-                        await publish_update(progress_channel, {"job_id": job_id, "progress": 100 if ok2 else 0, "message": "done" if ok2 else "error", "output": archive_path if ok2 else None})
+                    # Extract streams and optionally archive them
+                    elif job_type == "extract_streams":
+                        await publish_update(progress_channel, {"job_id": job_id, "progress": 5, "message": "extracting streams"})
+                        out_dir = job.get("output_dir") or f"storage/output/{job_id}_streams"
+                        os.makedirs(out_dir, exist_ok=True)
+                        ok, extracted = await extract_streams(input_path, out_dir)
+                        if ok and extracted:
+                            archive_path = job.get("archive_path") or f"{out_dir}.zip"
+                            ok2, msg2 = await create_archive(list(extracted.values()), archive_path)
+                            success = ok2
+                            info = archive_path if ok2 else msg2
+                            await publish_update(progress_channel, {"job_id": job_id, "progress": 100 if ok2 else 0, "message": "done" if ok2 else "error", "output": archive_path if ok2 else None})
+                        else:
+                            success = False
+                            info = "no_streams" if ok else "extract_failed"
+                            await publish_update(progress_channel, {"job_id": job_id, "progress": 0, "message": "error", "error": info})
+
+                    # Generate sample/preview
+                    elif job_type == "generate_sample":
+                        await publish_update(progress_channel, {"job_id": job_id, "progress": 5, "message": "generating sample"})
+                        dur = int(job.get("duration", 30))
+                        ok, msg = await generate_sample(input_path, output_path, dur)
+                        success = ok
+                        info = output_path if ok else msg
+                        await publish_update(progress_channel, {"job_id": job_id, "progress": 100 if ok else 0, "message": "done" if ok else "error", "output": output_path if ok else None})
+
+                    # Trim (start/end)
+                    elif job_type == "trim":
+                        await publish_update(progress_channel, {"job_id": job_id, "progress": 5, "message": "trimming"})
+                        start_time = job.get("start_time")
+                        end_time = job.get("end_time")
+                        ok, msg = await trim_media(input_path, output_path, start_time, end_time)
+                        success = ok
+                        info = output_path if ok else msg
+                        await publish_update(progress_channel, {"job_id": job_id, "progress": 100 if ok else 0, "message": "done" if ok else "error", "output": output_path if ok else None})
+
+                    # Rename file on disk
+                    elif job_type == "rename":
+                        new_name = job.get("new_name")
+                        try:
+                            new_path = job.get("output_path") or os.path.join(os.path.dirname(input_path), new_name)
+                            os.rename(input_path, new_path)
+                            success = True
+                            info = new_path
+                            await publish_update(progress_channel, {"job_id": job_id, "progress": 100, "message": "renamed", "output": new_path})
+                        except Exception as e:
+                            success = False
+                            info = str(e)
+                            await publish_update(progress_channel, {"job_id": job_id, "progress": 0, "message": "error", "error": info})
+
+                    # Fallback: try running as ffmpeg
                     else:
-                        success = False
-                        info = "no_streams" if ok else "extract_failed"
-                        await publish_update(progress_channel, {"job_id": job_id, "progress": 0, "message": "error", "error": info})
-
-                # Generate sample/preview
-                elif job_type == "generate_sample":
-                    await publish_update(progress_channel, {"job_id": job_id, "progress": 5, "message": "generating sample"})
-                    dur = int(job.get("duration", 30))
-                    ok, msg = await generate_sample(input_path, output_path, dur)
-                    success = ok
-                    info = output_path if ok else msg
-                    await publish_update(progress_channel, {"job_id": job_id, "progress": 100 if ok else 0, "message": "done" if ok else "error", "output": output_path if ok else None})
-
-                # Trim (start/end)
-                elif job_type == "trim":
-                    await publish_update(progress_channel, {"job_id": job_id, "progress": 5, "message": "trimming"})
-                    start_time = job.get("start_time")
-                    end_time = job.get("end_time")
-                    ok, msg = await trim_media(input_path, output_path, start_time, end_time)
-                    success = ok
-                    info = output_path if ok else msg
-                    await publish_update(progress_channel, {"job_id": job_id, "progress": 100 if ok else 0, "message": "done" if ok else "error", "output": output_path if ok else None})
-
-                # Rename file on disk
-                elif job_type == "rename":
-                    new_name = job.get("new_name")
-                    try:
-                        new_path = job.get("output_path") or os.path.join(os.path.dirname(input_path), new_name)
-                        os.rename(input_path, new_path)
-                        success = True
-                        info = new_path
-                        await publish_update(progress_channel, {"job_id": job_id, "progress": 100, "message": "renamed", "output": new_path})
-                    except Exception as e:
-                        success = False
-                        info = str(e)
-                        await publish_update(progress_channel, {"job_id": job_id, "progress": 0, "message": "error", "error": info})
-
-                # Fallback: try running as ffmpeg
-                else:
-                    ffmpeg_args = job.get("ffmpeg_args") if isinstance(job.get("ffmpeg_args"), list) else None
-                    redis_url = job.get("redis_url") or os.environ.get("REDIS_URL")
-                    try:
-                        success, info = await asyncio.wait_for(run_ffmpeg(input_path, output_path, job_id, ffmpeg_args=ffmpeg_args, redis_url=redis_url, progress_channel=progress_channel), timeout=max_runtime)
-                    except asyncio.TimeoutError:
-                        success, info = False, "timeout"
+                        ffmpeg_args = job.get("ffmpeg_args") if isinstance(job.get("ffmpeg_args"), list) else None
+                        redis_url = job.get("redis_url") or os.environ.get("REDIS_URL")
+                        try:
+                            success, info = await asyncio.wait_for(run_ffmpeg(input_path, output_path, job_id, ffmpeg_args=ffmpeg_args, redis_url=redis_url, progress_channel=progress_channel), timeout=max_runtime)
+                        except asyncio.TimeoutError:
+                            success, info = False, "timeout"
 
             JOBS_TOTAL.inc()
 
