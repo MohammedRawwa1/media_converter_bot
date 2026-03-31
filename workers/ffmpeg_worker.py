@@ -6,6 +6,7 @@ import os
 import signal
 import logging
 import time
+import subprocess
 from typing import Optional
 
 from utils.job_queue import pop_job, publish_update, get_redis, JOB_LIST
@@ -326,6 +327,16 @@ async def handle_job(job: dict):
                 else:
                     # Detect likely truncated/corrupt input errors and attempt a re-download
                     lower_err = (str(info) or "").lower()
+                    # Detect container/codec related errors that can often be worked
+                    # around by remuxing into a more permissive container (MKV)
+                    container_indicators = (
+                        "could not find tag for codec",
+                        "codec not currently supported in container",
+                        "could not write header",
+                        "incorrect codec parameters",
+                        "nothing was written into output file",
+                        "error sending frames to consumers",
+                    )
                     corruption_indicators = (
                         "moov atom not found",
                         "invalid data found",
@@ -337,6 +348,82 @@ async def handle_job(job: dict):
 
                     attempted_redownload = False
                     try:
+                        # 1) Container/codec mismatch -> try remuxing to MKV and retry
+                        if any(k in lower_err for k in container_indicators) and input_path:
+                            try:
+                                r = await get_redis()
+                            except Exception:
+                                r = None
+
+                            remux_attempts = 0
+                            try:
+                                if r:
+                                    cur = await r.hget(f"ffmpeg:job:{job_id}", "remux_attempts")
+                                    if cur:
+                                        try:
+                                            if isinstance(cur, bytes):
+                                                cur = cur.decode()
+                                            remux_attempts = int(cur or 0)
+                                        except Exception:
+                                            remux_attempts = 0
+                            except Exception:
+                                remux_attempts = 0
+
+                            max_remux = int(os.environ.get("MAX_REMUX_ATTEMPTS", "1"))
+                            if remux_attempts < max_remux:
+                                try:
+                                    temp_dir = os.path.join(getattr(config, "TEMP_PATH", "storage/temp"))
+                                    os.makedirs(temp_dir, exist_ok=True)
+                                    remux_path = os.path.join(temp_dir, f"{job_id}_remux.mkv")
+                                    ffmpeg_bin = getattr(config, "FFMPEG_PATH", "ffmpeg")
+                                    cmd = [ffmpeg_bin, "-y", "-hide_banner", "-loglevel", "error", "-i", input_path, "-c", "copy", remux_path]
+                                    try:
+                                        proc = await asyncio.to_thread(subprocess.run, cmd, capture_output=True, text=True, timeout=600)
+                                    except Exception as e:
+                                        proc = None
+
+                                    ok = False
+                                    if proc and getattr(proc, "returncode", 1) == 0 and os.path.exists(remux_path) and os.path.getsize(remux_path) > 0:
+                                        ok = True
+
+                                    # Persist attempt count
+                                    try:
+                                        if r:
+                                            await r.hset(f"ffmpeg:job:{job_id}", mapping={"remux_attempts": str(remux_attempts + 1)})
+                                    except Exception:
+                                        pass
+
+                                    if ok:
+                                        try:
+                                            await publish_update(progress_channel, {"job_id": job_id, "progress": 0, "message": "remuxed", "note": "remux succeeded; retrying"})
+                                        except Exception:
+                                            pass
+                                        logger.info("Remux succeeded for job %s, retrying ffmpeg against %s", job_id, remux_path)
+                                        # Switch to remuxed input and retry
+                                        input_path = remux_path
+                                        job["input_path"] = remux_path
+                                        # close redis client if opened
+                                        try:
+                                            if r:
+                                                await r.close()
+                                        except Exception:
+                                            pass
+                                        continue
+                                    else:
+                                        try:
+                                            await publish_update(progress_channel, {"job_id": job_id, "progress": 0, "message": "remux_failed", "note": "remux attempted and failed"})
+                                        except Exception:
+                                            pass
+                                except Exception:
+                                    logger.exception("Remux attempt failed for job %s", job_id)
+
+                            try:
+                                if r:
+                                    await r.close()
+                            except Exception:
+                                pass
+
+                        # 2) Truncated/corrupt input -> try re-download (existing logic)
                         if any(k in lower_err for k in corruption_indicators) and input_path:
                             try:
                                 r = await get_redis()
