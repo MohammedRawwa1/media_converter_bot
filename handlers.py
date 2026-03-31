@@ -257,7 +257,30 @@ class EnhancedMediaHandler:
                     message = info.get("message") or ""
 
                     text = f"🔄 Job {job_id} — {status or 'processing'}\nProgress: {progress or '0'}%\n{message}"
-                    kb = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data=f"cancel_job:{job_id}")]])
+                    # Build an inline keyboard with Cancel and an optional Progress (web) link
+                    status_url = None
+                    try:
+                        web_base = os.environ.get("WEB_UPLOAD_URL") or os.environ.get("WEBAPP_URL")
+                        if web_base:
+                            # strip common upload suffixes if present
+                            for suf in ("/upload", "/upload/", "/flask/upload", "/flask/upload/"):
+                                if web_base.endswith(suf):
+                                    web_base = web_base[: -len(suf)]
+                                    break
+                            web_base = web_base.rstrip("/")
+                            status_url = f"{web_base}/status/{job_id}"
+                    except Exception:
+                        status_url = None
+
+                    if status_url:
+                        kb = InlineKeyboardMarkup([
+                            [
+                                InlineKeyboardButton("📊 Progress", url=status_url),
+                                InlineKeyboardButton("❌ Cancel", callback_data=f"cancel_job:{job_id}"),
+                            ]
+                        ])
+                    else:
+                        kb = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data=f"cancel_job:{job_id}")]])
                     if text != last_text:
                         await self.safe_edit(query, text, reply_markup=kb)
                         last_text = text
