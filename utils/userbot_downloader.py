@@ -2,6 +2,9 @@ import os
 import logging
 from typing import Union, Optional
 from datetime import datetime
+import asyncio
+import subprocess
+import json
 
 try:
     from telethon import TelegramClient
@@ -83,6 +86,27 @@ async def download_forward_via_userbot(
     try:
         target = await _normalize_target(chat_id, client)
 
+        async def _ffprobe_ok(path: str) -> bool:
+            """Run ffprobe (in a thread) to verify the media file appears valid."""
+            cmd = [os.getenv("FFPROBE_PATH", "ffprobe"), "-v", "error", "-show_entries", "format=size", "-of", "json", path]
+            try:
+                proc = await asyncio.to_thread(subprocess.run, cmd, capture_output=True, text=True, timeout=15)
+            except Exception:
+                return False
+            if proc.returncode != 0:
+                return False
+            try:
+                out = json.loads(proc.stdout)
+                if out and out.get("format") and out["format"].get("size"):
+                    try:
+                        size = int(out["format"]["size"])
+                        return size > 0
+                    except Exception:
+                        return False
+            except Exception:
+                return False
+            return False
+
         # Try direct fetch by id first
         try:
             msgs = await client.get_messages(target, ids=message_id)
@@ -94,8 +118,22 @@ async def download_forward_via_userbot(
             msg = msgs[0] if isinstance(msgs, (list, tuple)) else msgs
             if getattr(msg, "media", None):
                 logger.info("userbot: message found; downloading %s/%s to %s", target, message_id, dest_path)
-                await client.download_media(msg, file=dest_path)
-                return os.path.exists(dest_path)
+                # Attempt download with basic retry and verification
+                for attempt in range(3):
+                    try:
+                        await client.download_media(msg, file=dest_path)
+                        if os.path.exists(dest_path) and os.path.getsize(dest_path) > 0:
+                            ok = await _ffprobe_ok(dest_path)
+                            if ok:
+                                return True
+                        logger.warning("userbot: downloaded file failed validation (attempt %s) %s", attempt + 1, dest_path)
+                        try:
+                            os.remove(dest_path)
+                        except Exception:
+                            pass
+                    except Exception as e:
+                        logger.debug("userbot: download attempt %s failed: %s", attempt + 1, e)
+                logger.debug("userbot: message found but downloads failed validation: %s/%s", target, message_id)
             else:
                 logger.debug("userbot: message found but no media: %s/%s", target, message_id)
 
@@ -111,14 +149,21 @@ async def download_forward_via_userbot(
                 try:
                     async for m in client.iter_messages(target, limit=100, offset_date=dt):
                         if getattr(m, "media", None):
-                            # If file_unique_id provided, try to match by size or attributes
-                            try:
-                                await client.download_media(m, file=dest_path)
-                                if os.path.exists(dest_path):
-                                    logger.info("userbot: downloaded via date search to %s", dest_path)
-                                    return True
-                            except Exception:
-                                logger.debug("userbot: failed download during date search for msg %s", getattr(m, 'id', None))
+                            for attempt in range(3):
+                                try:
+                                    await client.download_media(m, file=dest_path)
+                                    if os.path.exists(dest_path) and os.path.getsize(dest_path) > 0:
+                                        ok = await _ffprobe_ok(dest_path)
+                                        if ok:
+                                            logger.info("userbot: downloaded via date search to %s", dest_path)
+                                            return True
+                                    logger.debug("userbot: failed validation during date search download (attempt %s)", attempt + 1)
+                                    try:
+                                        os.remove(dest_path)
+                                    except Exception:
+                                        pass
+                                except Exception:
+                                    logger.debug("userbot: failed download during date search for msg %s", getattr(m, 'id', None))
                     search_done = True
                 except Exception:
                     logger.debug("userbot: date-based search failed for %s", target)
@@ -129,17 +174,25 @@ async def download_forward_via_userbot(
                 logger.debug("userbot: scanning recent messages in %s for media", target)
                 async for m in client.iter_messages(target, limit=200):
                     if getattr(m, "media", None):
-                        try:
-                            await client.download_media(m, file=dest_path)
-                            if os.path.exists(dest_path):
-                                logger.info("userbot: downloaded during recent-scan to %s", dest_path)
-                                return True
-                        except Exception:
-                            logger.debug("userbot: download failed for recent message %s", getattr(m, 'id', None))
+                        for attempt in range(3):
+                            try:
+                                await client.download_media(m, file=dest_path)
+                                if os.path.exists(dest_path) and os.path.getsize(dest_path) > 0:
+                                    ok = await _ffprobe_ok(dest_path)
+                                    if ok:
+                                        logger.info("userbot: downloaded during recent-scan to %s", dest_path)
+                                        return True
+                                logger.debug("userbot: download failed validation for recent message %s (attempt %s)", getattr(m, 'id', None), attempt + 1)
+                                try:
+                                    os.remove(dest_path)
+                                except Exception:
+                                    pass
+                            except Exception:
+                                logger.debug("userbot: download failed for recent message %s", getattr(m, 'id', None))
             except Exception:
                 logger.debug("userbot: recent-scan failed for %s", target)
 
-        logger.debug("userbot: no media found for %s/%s", target, message_id)
+        logger.debug("userbot: no media found or valid download for %s/%s", target, message_id)
         return False
     finally:
         try:
