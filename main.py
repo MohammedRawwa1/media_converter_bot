@@ -1060,26 +1060,26 @@ try:
                     except Exception as e:
                         raise HTTPException(status_code=500, detail=str(e))
                     out["logs"] = logs
-                        return out
+                    return out
 
-                    # Probe the local webhook loopback to help diagnose webhook timeouts
-                    if action == "probe_local_webhook":
-                        try:
-                            parsed = urlparse(WEBHOOK_URL or "")
-                            local_port = int(os.environ.get("PORT", "10000"))
-                            local_path = parsed.path or "/"
-                            local_url = f"http://127.0.0.1:{local_port}{local_path}"
-                            async with aiohttp.ClientSession() as session:
-                                try:
-                                    async with session.head(local_url, timeout=aiohttp.ClientTimeout(total=3)) as resp:
-                                        out["local_url"] = local_url
-                                        out["status"] = resp.status
-                                        out["headers"] = dict(resp.headers)
-                                except Exception as e:
-                                    out["error"] = str(e)
-                        except Exception as e:
-                            out["error"] = str(e)
-                        return out
+                # Probe the local webhook loopback to help diagnose webhook timeouts
+                if action == "probe_local_webhook":
+                    try:
+                        parsed = urlparse(WEBHOOK_URL or "")
+                        local_port = int(os.environ.get("PORT", "10000"))
+                        local_path = parsed.path or "/"
+                        local_url = f"http://127.0.0.1:{local_port}{local_path}"
+                        async with aiohttp.ClientSession() as session:
+                            try:
+                                async with session.head(local_url, timeout=aiohttp.ClientTimeout(total=3)) as resp:
+                                    out["local_url"] = local_url
+                                    out["status"] = resp.status
+                                    out["headers"] = dict(resp.headers)
+                            except Exception as e:
+                                out["error"] = str(e)
+                    except Exception as e:
+                        out["error"] = str(e)
+                    return out
 
                 # New admin/diagnostic actions: inspect and clear locks, remove queued job instances
                 if action == "inspect_locks":
