@@ -1360,6 +1360,46 @@ try:
                 logger.info("Bot signalled ready within startup window")
             except asyncio.TimeoutError:
                 logger.warning("Bot did not become ready within 15s startup window")
+            # Start a lightweight update consumer to ensure updates placed on
+            # Application.update_queue are dispatched even if the internal
+            # dispatcher task is not present in this ASGI-hosted environment.
+            async def _update_consumer():
+                logger.info("Starting ASGI update consumer task")
+                app.state.update_consumer_running = True
+                try:
+                    while True:
+                        try:
+                            update = await BOT_APPLICATION.update_queue.get()
+                        except Exception:
+                            await asyncio.sleep(0.1)
+                            continue
+                        try:
+                            disp = getattr(BOT_APPLICATION, "dispatcher", None)
+                            # Prefer dispatcher.process_update if present
+                            if disp and hasattr(disp, "process_update"):
+                                try:
+                                    await disp.process_update(update)
+                                except Exception:
+                                    logger.exception("Error in dispatcher.process_update")
+                            # Fallback to Application.process_update if exposed
+                            elif hasattr(BOT_APPLICATION, "process_update"):
+                                try:
+                                    await BOT_APPLICATION.process_update(update)
+                                except Exception:
+                                    logger.exception("Error in Application.process_update")
+                            else:
+                                logger.warning("No dispatcher available to process update; dropping")
+                        except Exception:
+                            logger.exception("Unhandled error while dispatching update")
+                except asyncio.CancelledError:
+                    logger.info("ASGI update consumer task cancelled")
+                finally:
+                    app.state.update_consumer_running = False
+
+            try:
+                app.state.update_consumer = asyncio.create_task(_update_consumer())
+            except Exception:
+                logger.exception("Failed to start ASGI update consumer task")
         except Exception as e:
             logger.error(f"Failed to start bot in background: {e}")
 
