@@ -22,6 +22,11 @@ CREATE_NEW_PROCESS_GROUP = 0x00000200 if os.name == "nt" else 0
 
 async def probe_duration(path: str) -> Optional[float]:
     """Probe media duration using ffprobe (sync subprocess wrapped)."""
+    # Defensive checks: ensure caller provided a valid path
+    if not path:
+        raise ValueError("Input path missing before ffprobe")
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"Input file missing before ffprobe: {path}")
     ffprobe = getattr(config, "FFMPEG_PATH", "ffmpeg")
     ffprobe = ffprobe.replace("ffmpeg", "ffprobe") if "ffmpeg" in ffprobe else "ffprobe"
     try:
@@ -93,6 +98,14 @@ async def run_ffmpeg(
     """
     ffmpeg_bin = getattr(config, "FFMPEG_PATH", "ffmpeg") or "ffmpeg"
     ffmpeg_args = ffmpeg_args or ["-c:v", "libx264", "-preset", "fast", "-crf", "23", "-c:a", "aac", "-b:a", "128k"]
+
+    # Validate input path before probing/starting ffmpeg
+    if not input_path:
+        logger.error("Input file missing before ffmpeg for job %s", job_id)
+        return False, "input file missing"
+    if not os.path.exists(input_path):
+        logger.error("Input file not found before ffmpeg for job %s: %s", job_id, input_path)
+        return False, "input file missing"
 
     duration = await probe_duration(input_path)
 
