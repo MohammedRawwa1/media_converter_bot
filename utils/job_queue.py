@@ -57,6 +57,11 @@ async def enqueue_job(job: dict) -> None:
                 "output": job.get("output_path") or job.get("output") or "",
                 "created_at": str(time.time()),
             }
+            # carry optional request_id for tracing (may be None)
+            try:
+                mapping["request_id"] = job.get("request_id") or ""
+            except Exception:
+                mapping["request_id"] = ""
             try:
                 await r.hset(f"ffmpeg:job:{job_id}", mapping=mapping)
                 # set optional TTL so job metadata does not live forever
@@ -67,6 +72,10 @@ async def enqueue_job(job: dict) -> None:
                     pass
             except Exception:
                 # best-effort - do not fail enqueue if hset fails
+                pass
+            try:
+                logging.getLogger(__name__).info("Enqueued job %s request_id=%s", job_id, job.get("request_id"))
+            except Exception:
                 pass
     except Exception:
         pass

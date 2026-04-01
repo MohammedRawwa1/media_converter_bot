@@ -1009,6 +1009,11 @@ class EnhancedMediaHandler:
                 "cleanup_input": True,
             }
             try:
+                # Propagate per-update request_id (if present) for end-to-end tracing
+                try:
+                    job["request_id"] = getattr(update, "request_id", None)
+                except Exception:
+                    job["request_id"] = None
                 await enqueue_job(job)
                 enqueued += 1
             except Exception:
@@ -1066,6 +1071,10 @@ class EnhancedMediaHandler:
         }
 
         try:
+            try:
+                job["request_id"] = getattr(update, "request_id", None)
+            except Exception:
+                job["request_id"] = None
             await enqueue_job(job)
         except Exception as e:
             logger.exception("Failed to enqueue job")
@@ -1321,6 +1330,10 @@ class EnhancedMediaHandler:
                         "cleanup_output": False,
                     }
                     try:
+                        try:
+                            job["request_id"] = getattr(update, "request_id", None)
+                        except Exception:
+                            job["request_id"] = None
                         await enqueue_job(job)
                         queued += 1
                     except Exception:
@@ -2259,6 +2272,10 @@ class EnhancedMediaHandler:
 
                             if enqueue_job:
                                 try:
+                                    try:
+                                        job["request_id"] = getattr(update, "request_id", None)
+                                    except Exception:
+                                        job["request_id"] = None
                                     await enqueue_job(job)
                                     enqueued += 1
                                 except Exception:
@@ -3039,6 +3056,10 @@ class EnhancedMediaHandler:
                 "cleanup_output": True,
             }
             try:
+                try:
+                    job["request_id"] = getattr(update, "request_id", None)
+                except Exception:
+                    job["request_id"] = None
                 await enqueue_job(job)
             except Exception:
                 logger.exception("Failed to enqueue optimization job")
@@ -3115,6 +3136,10 @@ class EnhancedMediaHandler:
         }
 
         try:
+            try:
+                job["request_id"] = getattr(update, "request_id", None)
+            except Exception:
+                job["request_id"] = None
             await enqueue_job(job)
             await self.safe_edit(query, f"✅ Repair job queued (ID: {job_id}). I'll send the file when ready.")
             try:
@@ -3322,6 +3347,14 @@ class EnhancedMediaHandler:
             "cleanup_input": True,
         }
 
+        try:
+            job["request_id"] = getattr(update, "request_id", None)
+        except Exception:
+            job["request_id"] = None
+        try:
+            job["request_id"] = getattr(update, "request_id", None)
+        except Exception:
+            job["request_id"] = None
         await enqueue_job(job)
         kb = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data=f"cancel_job:{job_id}")]])
         await self.safe_edit(query, f"⏳ Job queued: {job_id} — extracting streams", reply_markup=kb)
@@ -3697,6 +3730,10 @@ class EnhancedMediaHandler:
             "chat_id": update.effective_chat.id if update and update.effective_chat else None,
         }
 
+        try:
+            job["request_id"] = getattr(update, "request_id", None)
+        except Exception:
+            job["request_id"] = None
         await enqueue_job(job)
         kb = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data=f"cancel_job:{job_id}")]])
         await self.safe_edit(query, f"⏳ Job queued: {job_id} — creating archive", reply_markup=kb)

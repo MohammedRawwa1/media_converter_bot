@@ -414,29 +414,39 @@ async def detect_filename(input_path: str, message=None) -> str:
             if m:
                 return await sanitize_filename(m.group(1))
 
-        # 2) probe file for tags
+        # 2) probe file for tags (offload blocking probe to thread)
+        probe = None
         try:
             import ffmpeg
 
-            probe = ffmpeg.probe(input_path)
+            try:
+                probe = await asyncio.to_thread(ffmpeg.probe, input_path)
+            except Exception:
+                probe = None
         except Exception:
-            # fallback to ffprobe CLI
+            probe = None
+
+        if probe is None:
+            # fallback to ffprobe CLI executed in a thread to avoid blocking
             try:
                 import subprocess
                 import json
 
-                p = subprocess.run(
-                    [
-                        "ffprobe",
-                        "-v",
-                        "quiet",
-                        "-print_format",
-                        "json",
-                        "-show_format",
-                        input_path,
-                    ],
-                    capture_output=True,
-                )
+                def _run_probe():
+                    return subprocess.run(
+                        [
+                            "ffprobe",
+                            "-v",
+                            "quiet",
+                            "-print_format",
+                            "json",
+                            "-show_format",
+                            input_path,
+                        ],
+                        capture_output=True,
+                    )
+
+                p = await asyncio.to_thread(_run_probe)
                 probe = json.loads(p.stdout.decode() or "{}")
             except Exception:
                 probe = {}

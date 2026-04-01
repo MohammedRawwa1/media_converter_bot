@@ -14,6 +14,8 @@ import hashlib
 import json
 import aiohttp
 from urllib.parse import urlparse
+import functools
+import inspect
 
 from telegram import Update
 from telegram.error import TelegramError
@@ -103,7 +105,26 @@ METRICS_LOCK = threading.Lock()
 
 
 async def _dispatch_update_task(u: Update) -> None:
-    """Dispatch an Update in a background task and maintain metrics."""
+    """Dispatch an Update in a background task and maintain metrics.
+
+    Adds structured per-update logging (update_id, user) and measures dispatch duration.
+    """
+    update_id = getattr(u, "update_id", None)
+    user_id = None
+    username = None
+    try:
+        if getattr(u, "effective_user", None):
+            user_id = getattr(u.effective_user, "id", None)
+            username = getattr(u.effective_user, "username", None) or getattr(u.effective_user, "first_name", None)
+    except Exception:
+        pass
+
+    start = time.time()
+    try:
+        logger.info(json.dumps({"event": "dispatch.start", "update_id": update_id, "user_id": user_id, "username": username, "type": type(u).__name__}))
+    except Exception:
+        logger.debug("dispatch.start (could not serialize structured log)")
+
     try:
         disp = getattr(BOT_APPLICATION, "dispatcher", None)
         if disp and hasattr(disp, "process_update"):
@@ -112,7 +133,6 @@ async def _dispatch_update_task(u: Update) -> None:
             await disp.process_update(u)
             with METRICS_LOCK:
                 METRICS["updates_dispatched"] += 1
-            logger.debug(f"Dispatched update {getattr(u, 'update_id', None)} in background task")
             return
 
         if hasattr(BOT_APPLICATION, "process_update"):
@@ -121,25 +141,42 @@ async def _dispatch_update_task(u: Update) -> None:
             await BOT_APPLICATION.process_update(u)
             with METRICS_LOCK:
                 METRICS["updates_dispatched"] += 1
-            logger.debug(f"Dispatched update {getattr(u, 'update_id', None)} via Application.process_update")
             return
 
         logger.warning("No dispatcher/application.process_update available to dispatch update")
-    except Exception:
+    except Exception as exc:
         try:
             with METRICS_LOCK:
                 METRICS["dispatch_failures"] += 1
         except Exception:
             pass
-        logger.exception("Error dispatching update in background task")
+        try:
+            logger.exception("Error dispatching update %s (user=%s): %s", update_id, user_id, exc)
+        except Exception:
+            logger.exception("Error dispatching update (exception logging failed)")
+    finally:
+        duration = time.time() - start
+        try:
+            logger.info(json.dumps({"event": "dispatch.end", "update_id": update_id, "user_id": user_id, "username": username, "duration_s": round(duration, 3)}))
+        except Exception:
+            logger.debug("dispatch.end (could not serialize structured log)")
 
 
 
-def check_ffmpeg_available() -> bool:
-    """Return True if ffmpeg is callable from PATH or configured FFMPEG_PATH."""
+async def check_ffmpeg_available() -> bool:
+    """Return True if ffmpeg is callable from PATH or configured FFMPEG_PATH.
+
+    This runs the check in a thread to avoid blocking the event loop.
+    """
+    def _probe():
+        try:
+            proc = subprocess.run([FFMPEG_PATH, "-version"], capture_output=True, text=True, timeout=5)
+            return proc.returncode == 0
+        except Exception:
+            return False
+
     try:
-        proc = subprocess.run([FFMPEG_PATH, "-version"], capture_output=True, text=True, timeout=5)
-        return proc.returncode == 0
+        return await asyncio.to_thread(_probe)
     except Exception:
         return False
 
@@ -323,6 +360,46 @@ def setup_handlers(application: Application) -> None:
     # Initialize handler manager
     handler_manager = EnhancedMediaHandler()
 
+    # Helper: wrap handler callbacks to measure latency and log slow handlers.
+    def latency_wrapper(fn, label: str | None = None):
+        if label is None:
+            try:
+                label = fn.__name__
+            except Exception:
+                label = str(fn)
+
+        threshold = float(os.getenv("HANDLER_LATENCY_THRESHOLD", "1.0"))
+
+        if inspect.iscoroutinefunction(fn):
+            @functools.wraps(fn)
+            async def _wrapped(*args, **kwargs):
+                start = time.time()
+                try:
+                    return await fn(*args, **kwargs)
+                finally:
+                    dur = time.time() - start
+                    if dur > threshold:
+                        logger.warning("Handler '%s' slow: %.3fs", label, dur)
+                    else:
+                        logger.debug("Handler '%s' finished: %.3fs", label, dur)
+
+            return _wrapped
+
+        # Sync function fallback: run in executor to avoid blocking loop
+        @functools.wraps(fn)
+        async def _wrapped_sync(*args, **kwargs):
+            start = time.time()
+            try:
+                return await asyncio.to_thread(functools.partial(fn, *args, **kwargs))
+            finally:
+                dur = time.time() - start
+                if dur > threshold:
+                    logger.warning("Sync handler '%s' slow: %.3fs", label, dur)
+                else:
+                    logger.debug("Sync handler '%s' finished: %.3fs", label, dur)
+
+        return _wrapped_sync
+
     # Initialize MongoDB model if MONGO_URI provided
     try:
         import os
@@ -394,10 +471,10 @@ def setup_handlers(application: Application) -> None:
     except Exception:
         logger.debug("MONGO_URI check skipped")
 
-    # Command handlers
-    application.add_handler(CommandHandler("start", start_command))
-    application.add_handler(CommandHandler("help", help_command))
-    application.add_handler(CommandHandler("cancel", cancel_command))
+    # Command handlers (wrapped for latency tracing)
+    application.add_handler(CommandHandler("start", latency_wrapper(start_command, "start_command")))
+    application.add_handler(CommandHandler("help", latency_wrapper(help_command, "help_command")))
+    application.add_handler(CommandHandler("cancel", latency_wrapper(cancel_command, "cancel_command")))
 
     # Media file handlers (videos, audio, documents)
     # Build the media filter defensively to support multiple PTB versions.
@@ -413,7 +490,7 @@ def setup_handlers(application: Application) -> None:
         # In case the helper isn't available for any reason, fall back to ALL
         media_filter = filters.ALL
 
-    application.add_handler(MessageHandler(media_filter, handler_manager.handle_media_message))
+    application.add_handler(MessageHandler(media_filter, latency_wrapper(handler_manager.handle_media_message, "handle_media_message")))
 
     # Ensure a fallback handler is present for non-command messages. Some
     # environments or PTB build variants may not provide the expected media
@@ -421,20 +498,20 @@ def setup_handlers(application: Application) -> None:
     # still reach `handle_media_message`.
     try:
         fallback_filter = filters.ALL & ~filters.COMMAND
-        application.add_handler(MessageHandler(fallback_filter, handler_manager.handle_media_message))
+        application.add_handler(MessageHandler(fallback_filter, latency_wrapper(handler_manager.handle_media_message, "handle_media_message_fallback")))
         logger.info("Fallback media handler registered for non-command messages")
     except Exception:
         logger.debug("Fallback media handler not registered")
 
     # Callback query handler for menu interactions
-    application.add_handler(CallbackQueryHandler(handler_manager.callback_handler))
+    application.add_handler(CallbackQueryHandler(latency_wrapper(handler_manager.callback_handler, "callback_handler")))
 
     # Register custom thumbnail commands if module available
     try:
         from custom_thumbnail import add_thumb, del_thumb
 
-        application.add_handler(CommandHandler("addthumb", add_thumb))
-        application.add_handler(CommandHandler("delthumb", del_thumb))
+        application.add_handler(CommandHandler("addthumb", latency_wrapper(add_thumb, "add_thumb")))
+        application.add_handler(CommandHandler("delthumb", latency_wrapper(del_thumb, "del_thumb")))
         logger.info("Registered custom thumbnail commands (/addthumb, /delthumb)")
     except Exception:
         logger.debug("custom_thumbnail handlers not registered")
@@ -481,7 +558,7 @@ def setup_handlers(application: Application) -> None:
 
         await update.message.reply_text("Unknown admin command")
 
-    application.add_handler(CommandHandler("admin", admin_command))
+    application.add_handler(CommandHandler("admin", latency_wrapper(admin_command, "admin_command")))
 
     # Admin: cancel a queued/running job by id
     async def canceljob_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -504,7 +581,7 @@ def setup_handlers(application: Application) -> None:
             logger.exception("Failed to request cancel for job %s: %s", job_id, e)
             await update.message.reply_text(f"Failed to cancel job {job_id}: {e}")
 
-    application.add_handler(CommandHandler("canceljob", canceljob_command))
+    application.add_handler(CommandHandler("canceljob", latency_wrapper(canceljob_command, "canceljob_command")))
 
     # Settings command - forward to handler manager's show_settings
     async def settings_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -513,9 +590,9 @@ def setup_handlers(application: Application) -> None:
         except Exception:
             await update.message.reply_text("⚠️ Failed to open settings.")
 
-    application.add_handler(CommandHandler("settings", settings_command))
-    application.add_handler(CommandHandler("usettings", settings_command))
-    application.add_handler(CommandHandler("usersettings", settings_command))
+    application.add_handler(CommandHandler("settings", latency_wrapper(settings_command, "settings_command")))
+    application.add_handler(CommandHandler("usettings", latency_wrapper(settings_command, "settings_command")))
+    application.add_handler(CommandHandler("usersettings", latency_wrapper(settings_command, "settings_command")))
 
     async def bulk_url_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
@@ -523,7 +600,7 @@ def setup_handlers(application: Application) -> None:
         except Exception:
             await update.message.reply_text("⚠️ Failed to enqueue bulk URLs.")
 
-    application.add_handler(CommandHandler("bulk_url", bulk_url_command))
+    application.add_handler(CommandHandler("bulk_url", latency_wrapper(bulk_url_command, "bulk_url_command")))
 
     async def bulk_menu_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
@@ -531,7 +608,7 @@ def setup_handlers(application: Application) -> None:
         except Exception:
             await update.message.reply_text("⚠️ Failed to open bulk menu.")
 
-    application.add_handler(CommandHandler("bulkmenu", bulk_menu_command))
+    application.add_handler(CommandHandler("bulkmenu", latency_wrapper(bulk_menu_command, "bulk_menu_command")))
 
     # Store handler manager in bot_data for access in other handlers
     application.bot_data["handler_manager"] = handler_manager
@@ -625,10 +702,14 @@ async def main(background: bool = False) -> None:
         logger.error(f"Failed to start cleanup manager: {e}")
 
     # Check FFmpeg (binary) availability and ffmpeg-python binding; warn if missing
-    if not check_ffmpeg_available():
-        logger.info("FFmpeg binary not found or not executable; falling back to CLI checks at runtime.")
-    else:
-        logger.info("FFmpeg binary is available")
+    try:
+        available = await check_ffmpeg_available()
+        if not available:
+            logger.info("FFmpeg binary not found or not executable; falling back to CLI checks at runtime.")
+        else:
+            logger.info("FFmpeg binary is available")
+    except Exception:
+        logger.info("FFmpeg availability check failed; continuing")
 
     # Check ffmpeg-python binding availability (best-effort)
     try:
