@@ -357,6 +357,7 @@ async def handle_job(job: dict):
                         pass
 
                     # Attempt to upload processed output to configured storage backend
+                    upload_success = False
                     try:
                         # Only attempt when a storage backend helper is available
                         if get_storage_backend is not None:
@@ -395,6 +396,7 @@ async def handle_job(job: dict):
                                     except Exception:
                                         pass
                                     await r.hset(f"ffmpeg:job:{job_id}", mapping=mapping)
+                                    upload_success = True
                                     await r.close()
                                 except Exception:
                                     pass
@@ -404,8 +406,33 @@ async def handle_job(job: dict):
                         pass
 
                     try:
-                        if job.get("cleanup_input", True) and input_path and os.path.exists(input_path):
-                            os.remove(input_path)
+                        # Only remove the input when:
+                        # - cleanup_input is requested, AND
+                        # - an input_path exists on disk, AND
+                        # - either there is no remote backend (local-only) OR the output upload succeeded.
+                        # Respect global override via KEEP_LOCAL_UPLOADS: when set to 1/true/yes,
+                        # preserve local uploads regardless of per-job flags.
+                        keep_local_uploads = os.environ.get("KEEP_LOCAL_UPLOADS", "").lower() in ("1", "true", "yes")
+                        if input_path and os.path.exists(input_path):
+                            if keep_local_uploads:
+                                # user requested to keep local uploads — do not delete
+                                pass
+                            else:
+                                if job.get("cleanup_input", True):
+                                    should_delete = False
+                                    try:
+                                        if backend is not None:
+                                            if upload_success:
+                                                should_delete = True
+                                        else:
+                                            # no remote backend configured; safe to delete local input after processing
+                                            should_delete = True
+                                    except Exception:
+                                        # conservative default: don't delete if uncertain
+                                        should_delete = False
+
+                                    if should_delete:
+                                        os.remove(input_path)
                     except Exception as e:
                         logger.warning(f"Failed to cleanup input file: {e}")
 

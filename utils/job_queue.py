@@ -53,7 +53,10 @@ async def enqueue_job(job: dict) -> None:
                 "status": "queued",
                 "progress": 0,
                 "message": "queued",
-                "input": job.get("input_path") or job.get("source_url") or "",
+                # Prefer an explicit remote key when available so web UIs show where
+                # the input lives even when local temp files are removed.
+                "input": job.get("input_path") or job.get("input_key") or job.get("source_url") or "",
+                "input_key": job.get("input_key") or "",
                 "output": job.get("output_path") or job.get("output") or "",
                 "created_at": str(time.time()),
             }
