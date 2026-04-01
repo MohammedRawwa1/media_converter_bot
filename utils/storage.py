@@ -133,7 +133,17 @@ class S3AsyncBackend(AsyncStorageBackend):
         self._boto_config = None
         if BotoConfig is not None:
             try:
-                self._boto_config = BotoConfig(signature_version="s3v4")
+                # Allow forcing path-style addressing for S3-compatible endpoints
+                force_path = str(os.getenv("S3_FORCE_PATH_STYLE", "")).lower() in ("1", "true", "yes")
+                if force_path:
+                    try:
+                        # prefer explicit addressing style when requested
+                        self._boto_config = BotoConfig(signature_version="s3v4", s3={"addressing_style": "path"})
+                    except Exception:
+                        # fallback to default config object
+                        self._boto_config = BotoConfig(signature_version="s3v4")
+                else:
+                    self._boto_config = BotoConfig(signature_version="s3v4")
             except Exception:
                 self._boto_config = None
 

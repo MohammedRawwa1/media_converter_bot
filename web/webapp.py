@@ -97,13 +97,228 @@ def upload():
     else:
         # Attempt to fetch forwarded message metadata persisted earlier
         try:
-            from utils.forward_store import load_forward_metadata
-
-            meta = load_forward_metadata(forward_hash)
-            if not meta:
-                return jsonify({"error": "invalid forward_hash"}), 400
+            from utils.forward_store import load_forward_metadata, delete_forward_metadata
         except Exception as e:
             return jsonify({"error": "failed to load forward metadata", "detail": str(e)}), 500
+
+        # Try to load persisted forward metadata. If it's not yet available
+        # (e.g. upload to S3 is still in progress), schedule a background
+        # poll that will retry fetching the metadata and then perform the
+        # same fetch+enqueue flow once metadata becomes available. Return
+        # HTTP 202 Accepted to indicate the request was accepted for
+        # processing but is not complete yet.
+        try:
+            meta = load_forward_metadata(forward_hash)
+        except Exception as e:
+            return jsonify({"error": "failed to load forward metadata", "detail": str(e)}), 500
+
+        if not meta:
+            # default extension while we wait for metadata to appear
+            ext = ".mp4"
+            input_path = os.path.join(INPUT_DIR, f"{job_id}{ext}")
+
+            def _poll_and_fetch(fid, inp_path, j_id, req_id, attempts=6, initial_delay=2):
+                import time
+                import asyncio as _asyncio
+                try:
+                    from utils.forward_store import load_forward_metadata as _load_forward, delete_forward_metadata as _delete_forward
+                except Exception:
+                    logger.exception("Background poll: forward_store helpers unavailable")
+                    return
+
+                # Attempt to locate the forward metadata with exponential backoff
+                for attempt in range(attempts):
+                    try:
+                        m = _load_forward(fid)
+                    except Exception:
+                        m = None
+
+                    if m:
+                        # import userbot downloader lazily inside thread
+                        try:
+                            from utils.userbot_downloader import download_forward_via_userbot
+                        except Exception:
+                            logger.exception("Background poll: userbot_downloader not available for %s", fid)
+                            return
+
+                        try:
+                            ok_loc = _asyncio.run(
+                                download_forward_via_userbot(
+                                    m.get("chat_id"),
+                                    m.get("message_id") or m.get("msg_id"),
+                                    inp_path,
+                                    msg_date=m.get("registered_at") or m.get("created_at"),
+                                    file_unique_id=m.get("file_unique_id"),
+                                )
+                            )
+                        except Exception:
+                            logger.exception("Background userbot download failed for forward %s", m.get("chat_id"))
+                            return
+
+                        if not ok_loc or not os.path.exists(inp_path):
+                            logger.error("Background userbot download did not produce file: %s", inp_path)
+                            return
+
+                        # Upload to remote storage if configured, else enqueue using local path
+                        backend_name_loc = (os.getenv("STORAGE_BACKEND") or getattr(config, "STORAGE_BACKEND", "local")).lower()
+                        use_remote_loc = backend_name_loc in ("s3", "r2") and get_storage_backend_sync is not None
+                        key_loc = f"uploads/{j_id}_{os.path.basename(inp_path)}" if use_remote_loc else None
+                        job_loc = None
+                        if use_remote_loc and key_loc:
+                            try:
+                                b = get_storage_backend_sync()
+                                _asyncio.run(b.upload_file(inp_path, key_loc))
+                                if os.environ.get("KEEP_LOCAL_UPLOADS", "").lower() not in ("1", "true", "yes"):
+                                    try:
+                                        os.remove(inp_path)
+                                    except Exception:
+                                        pass
+                                job_loc = {
+                                    "job_id": j_id,
+                                    "input_key": key_loc,
+                                    "output_path": os.path.join(OUTPUT_DIR, f"{j_id}.mp4"),
+                                    "original_filename": m.get("name") or os.path.basename(inp_path),
+                                    "output_filename": f"{j_id}.mp4",
+                                    "ffmpeg_args": ["-c:v", "libx264", "-preset", "fast", "-crf", "23", "-c:a", "aac", "-b:a", "128k"],
+                                    "progress_channel": f"ffmpeg:progress:{j_id}",
+                                    "cleanup_input": True,
+                                }
+                            except Exception:
+                                logger.exception("Background upload failed for fetched forward %s", inp_path)
+
+                        if job_loc is None:
+                            job_loc = {
+                                "job_id": j_id,
+                                "input_path": inp_path,
+                                "output_path": os.path.join(OUTPUT_DIR, f"{j_id}.mp4"),
+                                "original_filename": m.get("name") or os.path.basename(inp_path),
+                                "output_filename": f"{j_id}.mp4",
+                                "ffmpeg_args": ["-c:v", "libx264", "-preset", "fast", "-crf", "23", "-c:a", "aac", "-b:a", "128k"],
+                                "progress_channel": f"ffmpeg:progress:{j_id}",
+                                "cleanup_input": True,
+                            }
+
+                        job_loc["request_id"] = req_id
+                        try:
+                            _asyncio.run(enqueue_job(job_loc))
+                        except Exception:
+                            logger.exception("Failed to enqueue background fetched job %s", j_id)
+
+                        # cleanup forward metadata to avoid duplicates
+                        try:
+                            _delete_forward(fid)
+                        except Exception:
+                            pass
+
+                        return
+
+                    # not found yet: backoff then retry
+                    try:
+                        time.sleep(initial_delay * (2 ** attempt))
+                    except Exception:
+                        pass
+
+                logger.warning("Forward metadata still not found after %s attempts for %s", attempts, fid)
+
+            t = threading.Thread(target=_poll_and_fetch, args=(forward_hash, input_path, job_id, request_id), daemon=True)
+            t.start()
+            return jsonify({"status": "accepted", "detail": "forward metadata not yet available; background fetch scheduled"}), 202
+
+        # Determine extension from original metadata or fallback to .mp4
+        filename = meta.get("name") or ""
+        ext = os.path.splitext(filename)[1] or ".mp4"
+        input_path = os.path.join(INPUT_DIR, f"{job_id}{ext}")
+
+        # Try to download using an opt-in userbot (Telethon) if available
+        try:
+            from utils.userbot_downloader import download_forward_via_userbot
+        except Exception:
+            return jsonify({"error": "userbot_downloader not available on server"}), 500
+
+        # Schedule a background thread to download the forwarded media via
+        # the opt-in userbot and then enqueue a metadata-only job. Keep this
+        # implementation simple to avoid deep nested try/except blocks which
+        # previously caused indentation/syntax issues.
+        def _bg_fetch_and_enqueue(meta_obj, inp_path, j_id, req_id):
+            import asyncio as _asyncio
+            try:
+                ok_loc = False
+                try:
+                    ok_loc = _asyncio.run(
+                        download_forward_via_userbot(
+                            meta_obj.get("chat_id"),
+                            meta_obj.get("message_id") or meta_obj.get("msg_id"),
+                            inp_path,
+                            msg_date=meta_obj.get("registered_at") or meta_obj.get("created_at"),
+                            file_unique_id=meta_obj.get("file_unique_id"),
+                        )
+                    )
+                except Exception:
+                    logger.exception("Background userbot download failed for forward %s", meta_obj.get("chat_id"))
+                    return
+
+                if not ok_loc or not os.path.exists(inp_path):
+                    logger.error("Background userbot download did not produce file: %s", inp_path)
+                    return
+
+                # If configured, upload the input to remote storage and enqueue
+                backend_name_loc = (os.getenv("STORAGE_BACKEND") or getattr(config, "STORAGE_BACKEND", "local")).lower()
+                use_remote_loc = backend_name_loc in ("s3", "r2") and get_storage_backend_sync is not None
+                key_loc = f"uploads/{j_id}_{os.path.basename(inp_path)}" if use_remote_loc else None
+                if use_remote_loc and key_loc:
+                    try:
+                        b = get_storage_backend_sync()
+                        _asyncio.run(b.upload_file(inp_path, key_loc))
+                        if os.environ.get("KEEP_LOCAL_UPLOADS", "").lower() not in ("1", "true", "yes"):
+                            try:
+                                os.remove(inp_path)
+                            except Exception:
+                                pass
+                        job_loc = {
+                            "job_id": j_id,
+                            "input_key": key_loc,
+                            "output_path": os.path.join(OUTPUT_DIR, f"{j_id}.mp4"),
+                            "original_filename": meta_obj.get("name") or os.path.basename(inp_path),
+                            "output_filename": f"{j_id}.mp4",
+                            "ffmpeg_args": ["-c:v", "libx264", "-preset", "fast", "-crf", "23", "-c:a", "aac", "-b:a", "128k"],
+                            "progress_channel": f"ffmpeg:progress:{j_id}",
+                            "cleanup_input": True,
+                        }
+                    except Exception:
+                        logger.exception("Background upload failed for fetched forward %s", inp_path)
+                        job_loc = {
+                            "job_id": j_id,
+                            "input_path": inp_path,
+                            "output_path": os.path.join(OUTPUT_DIR, f"{j_id}.mp4"),
+                            "original_filename": meta_obj.get("name") or os.path.basename(inp_path),
+                            "output_filename": f"{j_id}.mp4",
+                            "ffmpeg_args": ["-c:v", "libx264", "-preset", "fast", "-crf", "23", "-c:a", "aac", "-b:a", "128k"],
+                            "progress_channel": f"ffmpeg:progress:{j_id}",
+                            "cleanup_input": True,
+                        }
+                else:
+                    job_loc = {
+                        "job_id": j_id,
+                        "input_path": inp_path,
+                        "output_path": os.path.join(OUTPUT_DIR, f"{j_id}.mp4"),
+                        "original_filename": meta_obj.get("name") or os.path.basename(inp_path),
+                        "output_filename": f"{j_id}.mp4",
+                        "ffmpeg_args": ["-c:v", "libx264", "-preset", "fast", "-crf", "23", "-c:a", "aac", "-b:a", "128k"],
+                        "progress_channel": f"ffmpeg:progress:{j_id}",
+                        "cleanup_input": True,
+                    }
+
+                job_loc["request_id"] = req_id
+                try:
+                    _asyncio.run(enqueue_job(job_loc))
+                except Exception:
+                    logger.exception("Failed to enqueue background fetched job %s", j_id)
+            except Exception:
+                logger.exception("Unexpected error in background fetch/enqueue for forward %s", meta_obj.get("chat_id"))
+
+        t = threading.Thread(target=_bg_fetch_and_enqueue, args=(meta, input_path, job_id, request_id), daemon=True)
+        t.start()
+        return jsonify({"job_id": job_id})
 
         # Determine extension from original metadata or fallback to .mp4
         filename = meta.get("name") or ""
@@ -361,14 +576,26 @@ def presign():
     key = f"uploads/{uuid.uuid4().hex}_{os.path.basename(filename)}"
 
     try:
-        s3 = boto3.client(
-            "s3",
-            region_name=os.environ.get("S3_REGION") or None,
-            endpoint_url=os.environ.get("S3_ENDPOINT") or None,
-            aws_access_key_id=os.environ.get("AWS_ACCESS_KEY_ID"),
-            aws_secret_access_key=os.environ.get("AWS_SECRET_ACCESS_KEY"),
-            aws_session_token=os.environ.get("AWS_SESSION_TOKEN") or None,
-        )
+        # Build boto3 client kwargs and optional botocore Config for path-style addressing
+        client_kwargs = {
+            "region_name": os.environ.get("S3_REGION") or None,
+            "endpoint_url": os.environ.get("S3_ENDPOINT") or None,
+            "aws_access_key_id": os.environ.get("AWS_ACCESS_KEY_ID"),
+            "aws_secret_access_key": os.environ.get("AWS_SECRET_ACCESS_KEY"),
+            "aws_session_token": os.environ.get("AWS_SESSION_TOKEN") or None,
+        }
+        try:
+            from botocore.config import Config as BotoConfig
+            force_path = str(os.getenv("S3_FORCE_PATH_STYLE", "")).lower() in ("1", "true", "yes")
+            if force_path:
+                client_kwargs["config"] = BotoConfig(signature_version="s3v4", s3={"addressing_style": "path"})
+            else:
+                client_kwargs["config"] = BotoConfig(signature_version="s3v4")
+        except Exception:
+            # botocore not available or config creation failed — proceed without explicit config
+            pass
+
+        s3 = boto3.client("s3", **client_kwargs)
         # prefer a POST form upload (fields + url)
         post = s3.generate_presigned_post(Bucket=bucket, Key=key, ExpiresIn=3600)
         # also provide a presigned GET url for later worker download reference
