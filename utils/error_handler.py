@@ -329,4 +329,25 @@ def setup_comprehensive_logging(
     except Exception:
         logger.debug("CloudWatch check skipped")
 
-    logger.info("✅ Comprehensive logging initialized")
+        # Optional: also log to stdout for platforms that capture stdout/stderr
+        try:
+            import os as _os
+            import sys as _sys
+
+            if _os.environ.get("LOG_TO_STDOUT", "").lower() in ("1", "true", "yes"):
+                try:
+                    stream_handler = logging.StreamHandler(_sys.stdout)
+                    stream_handler.setLevel(level)
+                    stream_handler.setFormatter(formatter)
+                    # Avoid adding duplicate stdout handlers
+                    has_stdout = any(isinstance(h, logging.StreamHandler) and getattr(h, "stream", None) is _sys.stdout for h in root_logger.handlers)
+                    if not has_stdout:
+                        root_logger.addHandler(stream_handler)
+                    logger.info("✅ Stdout logging enabled (LOG_TO_STDOUT=1)")
+                except Exception:
+                    logger.exception("Failed to attach stdout logging handler")
+        except Exception:
+            # Fallback: do nothing if env inspection fails
+            pass
+
+        logger.info("✅ Comprehensive logging initialized")
