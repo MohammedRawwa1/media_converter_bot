@@ -21,5 +21,4 @@ telethon>=1.40.0,<2.0.0
 Flask>=2.2.5
 Flask-Cors>=3.0.10
 gunicorn==20.1.*
-aiobotocore>=2.6.0
 minio>=7.1.0
