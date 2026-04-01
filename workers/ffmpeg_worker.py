@@ -246,6 +246,19 @@ async def handle_job(job: dict):
                         except Exception:
                             # on limiter failures, allow processing to continue
                             pass
+                        # Ensure there is some form of input before starting ffmpeg: a local path, a remote storage key, or a source URL.
+                        if not input_path and not job.get("input_key") and not job.get("source_url"):
+                            logger.error("No input available for job %s; marking as error", job_id)
+                            try:
+                                await publish_update(progress_channel, {"job_id": job_id, "progress": 0, "message": "error", "error": "no_input_provided"})
+                            except Exception:
+                                pass
+                            try:
+                                await job_store.update_job(job_id, {"status": "error", "error": "no_input_provided"})
+                            except Exception:
+                                pass
+                            return
+
                         coro = run_ffmpeg(input_path, output_path, job_id, ffmpeg_args=ffmpeg_args, redis_url=redis_url, progress_channel=progress_channel)
                         try:
                             success, info = await asyncio.wait_for(coro, timeout=max_runtime)
