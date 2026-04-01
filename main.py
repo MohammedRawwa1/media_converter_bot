@@ -332,7 +332,23 @@ def setup_handlers(application: Application) -> None:
                 from motor.motor_asyncio import AsyncIOMotorClient
                 from models import MediaConversionModel
 
-                client = AsyncIOMotorClient(mongo_uri)
+                # Allow short server-selection/connect timeouts to fail fast
+                # when MongoDB is unreachable. Values are in milliseconds.
+                try:
+                    srv_timeout = int(os.environ.get("MONGO_SERVER_SELECTION_TIMEOUT_MS", os.environ.get("MONGO_SERVER_TIMEOUT_MS", "5000")))
+                except Exception:
+                    srv_timeout = 5000
+                try:
+                    conn_timeout = int(os.environ.get("MONGO_CONNECT_TIMEOUT_MS", "5000"))
+                except Exception:
+                    conn_timeout = 5000
+
+                try:
+                    client = AsyncIOMotorClient(mongo_uri, serverSelectionTimeoutMS=srv_timeout, connectTimeoutMS=conn_timeout)
+                    logger.info("Mongo client created with serverSelectionTimeoutMS=%sms connectTimeoutMS=%sms", srv_timeout, conn_timeout)
+                except Exception:
+                    # Fallback to default constructor when custom kwargs cause issues
+                    client = AsyncIOMotorClient(mongo_uri)
                 # Determine bot_id from environment if provided (BOT_ID or BOT_USERNAME)
                 bot_id = os.environ.get("BOT_ID") or os.environ.get("BOT_USERNAME") or os.environ.get("BOT_NAME")
                 model = MediaConversionModel(
