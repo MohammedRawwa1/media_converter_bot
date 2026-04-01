@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import shutil
 from abc import ABC, abstractmethod
@@ -35,6 +36,8 @@ except Exception:
     BotoConfig = None
 
 import config
+
+logger = logging.getLogger(__name__)
 
 
 class AsyncStorageBackend(ABC):
@@ -136,7 +139,14 @@ class S3AsyncBackend(AsyncStorageBackend):
         if self.region:
             kw["region_name"] = self.region
         if self.endpoint_url:
-            kw["endpoint_url"] = self.endpoint_url
+            # Ensure endpoint_url has a scheme (boto3 requires https:// or http://)
+            ep = str(self.endpoint_url).strip()
+            if ep and not ep.startswith("http://") and not ep.startswith("https://"):
+                scheme = "https" if self.use_ssl else "http"
+                ep = f"{scheme}://{ep}"
+            # Strip any trailing slash
+            ep = ep.rstrip("/")
+            kw["endpoint_url"] = ep
         if self.aws_access_key_id:
             kw["aws_access_key_id"] = self.aws_access_key_id
         if self.aws_secret_access_key:
@@ -146,34 +156,73 @@ class S3AsyncBackend(AsyncStorageBackend):
         return kw
 
     async def upload_file(self, src_path: str, dest_key: str) -> str:
-        if self._use_aioboto3:
-            async with self._session.client("s3", **self._client_kwargs()) as client:
-                # aioboto3 exposes upload_file as an awaitable wrapper
-                await client.upload_file(src_path, self.bucket, dest_key)
-            return dest_key
+        # Retry/backoff parameters
+        retries = int(os.getenv("S3_OP_RETRIES", "3"))
+        backoff_base = float(os.getenv("S3_OP_BACKOFF_BASE", "1"))
+        max_backoff = float(os.getenv("S3_OP_BACKOFF_MAX", "60"))
 
-        # Fallback: use synchronous boto3 client executed in threadpool
-        if boto3 is None:
-            raise RuntimeError("boto3 is required for S3 operations when aioboto3 is not installed")
-        def _sync_upload():
-            client = boto3.client("s3", **self._client_kwargs())
-            client.upload_file(src_path, self.bucket, dest_key)
-        await asyncio.to_thread(_sync_upload)
-        return dest_key
+        import random
+
+        for attempt in range(1, retries + 1):
+            try:
+                if self._use_aioboto3:
+                    async with self._session.client("s3", **self._client_kwargs()) as client:
+                        # aioboto3 exposes upload_file as an awaitable wrapper
+                        await client.upload_file(src_path, self.bucket, dest_key)
+                    return dest_key
+
+                # Fallback: use synchronous boto3 client executed in threadpool
+                if boto3 is None:
+                    raise RuntimeError("boto3 is required for S3 operations when aioboto3 is not installed")
+
+                def _sync_upload():
+                    client = boto3.client("s3", **self._client_kwargs())
+                    client.upload_file(src_path, self.bucket, dest_key)
+
+                await asyncio.to_thread(_sync_upload)
+                return dest_key
+
+            except Exception as e:
+                logger.warning("S3 upload attempt %s/%s failed: %s", attempt, retries, e)
+                if attempt == retries:
+                    logger.exception("S3 upload failed after %s attempts", retries)
+                    raise
+                # exponential backoff with jitter
+                backoff = min(max_backoff, backoff_base * (2 ** (attempt - 1)))
+                await asyncio.sleep(backoff + random.random())
 
     async def download_file(self, key: str, dest_path: str) -> bool:
-        if self._use_aioboto3:
-            async with self._session.client("s3", **self._client_kwargs()) as client:
-                await client.download_file(self.bucket, key, dest_path)
-            return True
+        # Retry/backoff parameters
+        retries = int(os.getenv("S3_OP_RETRIES", "3"))
+        backoff_base = float(os.getenv("S3_OP_BACKOFF_BASE", "1"))
+        max_backoff = float(os.getenv("S3_OP_BACKOFF_MAX", "60"))
 
-        if boto3 is None:
-            raise RuntimeError("boto3 is required for S3 operations when aioboto3 is not installed")
-        def _sync_download():
-            client = boto3.client("s3", **self._client_kwargs())
-            client.download_file(self.bucket, key, dest_path)
-        await asyncio.to_thread(_sync_download)
-        return True
+        import random
+
+        for attempt in range(1, retries + 1):
+            try:
+                if self._use_aioboto3:
+                    async with self._session.client("s3", **self._client_kwargs()) as client:
+                        await client.download_file(self.bucket, key, dest_path)
+                    return True
+
+                if boto3 is None:
+                    raise RuntimeError("boto3 is required for S3 operations when aioboto3 is not installed")
+
+                def _sync_download():
+                    client = boto3.client("s3", **self._client_kwargs())
+                    client.download_file(self.bucket, key, dest_path)
+
+                await asyncio.to_thread(_sync_download)
+                return True
+
+            except Exception as e:
+                logger.warning("S3 download attempt %s/%s failed for key %s: %s", attempt, retries, key, e)
+                if attempt == retries:
+                    logger.exception("S3 download failed after %s attempts for key %s", retries, key)
+                    raise
+                backoff = min(max_backoff, backoff_base * (2 ** (attempt - 1)))
+                await asyncio.sleep(backoff + random.random())
 
     async def generate_presigned_post(self, key: str, expires: Optional[int] = None) -> Dict[str, Any]:
         expires = expires or config.PRESIGN_EXPIRES
@@ -208,18 +257,39 @@ class S3AsyncBackend(AsyncStorageBackend):
         return await asyncio.to_thread(_sync_get)
 
     async def delete(self, key: str) -> bool:
-        if self._use_aioboto3:
-            async with self._session.client("s3", **self._client_kwargs()) as client:
-                await client.delete_object(Bucket=self.bucket, Key=key)
-            return True
+        # Retry/backoff for deletes, but do not raise to avoid unhandled
+        # exceptions when deletes are scheduled as fire-and-forget.
+        retries = int(os.getenv("S3_OP_RETRIES", "3"))
+        backoff_base = float(os.getenv("S3_OP_BACKOFF_BASE", "1"))
+        max_backoff = float(os.getenv("S3_OP_BACKOFF_MAX", "60"))
 
-        if boto3 is None:
-            raise RuntimeError("boto3 is required for S3 operations when aioboto3 is not installed")
-        def _sync_delete():
-            client = boto3.client("s3", **self._client_kwargs())
-            client.delete_object(Bucket=self.bucket, Key=key)
-        await asyncio.to_thread(_sync_delete)
-        return True
+        import random
+
+        for attempt in range(1, retries + 1):
+            try:
+                if self._use_aioboto3:
+                    async with self._session.client("s3", **self._client_kwargs()) as client:
+                        await client.delete_object(Bucket=self.bucket, Key=key)
+                    return True
+
+                if boto3 is None:
+                    logger.error("boto3 is required for S3 operations when aioboto3 is not installed")
+                    return False
+
+                def _sync_delete():
+                    client = boto3.client("s3", **self._client_kwargs())
+                    client.delete_object(Bucket=self.bucket, Key=key)
+
+                await asyncio.to_thread(_sync_delete)
+                return True
+
+            except Exception as e:
+                logger.warning("S3 delete attempt %s/%s failed for key %s: %s", attempt, retries, key, e)
+                if attempt == retries:
+                    logger.exception("S3 delete failed after %s attempts for key %s", retries, key)
+                    return False
+                backoff = min(max_backoff, backoff_base * (2 ** (attempt - 1)))
+                await asyncio.sleep(backoff + random.random())
 
 
 _STORAGE_SINGLETON: Optional[AsyncStorageBackend] = None

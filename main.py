@@ -326,11 +326,31 @@ def setup_handlers(application: Application) -> None:
     # Initialize MongoDB model if MONGO_URI provided
     try:
         import os
-        mongo_uri = os.environ.get("MONGO_URI")
+
+        # Resolve which canonical env var (if any) provides the Mongo URI.
+        mongo_uri = None
+        mongo_env_key = None
+        for _key in ("MONGO_URI", "MONGODB_URL", "MONGODB_URI", "MONGO_URL"):
+            _val = os.environ.get(_key)
+            if _val:
+                mongo_uri = _val
+                mongo_env_key = _key
+                break
+
         if mongo_uri:
             try:
                 from motor.motor_asyncio import AsyncIOMotorClient
                 from models import MediaConversionModel
+
+                # Log which env var was used (only show host, never secrets)
+                try:
+                    from urllib.parse import urlparse
+
+                    parsed = urlparse(mongo_uri)
+                    host_display = parsed.hostname or mongo_uri.split("@")[-1].split("/")[0]
+                except Exception:
+                    host_display = "unknown-host"
+                logger.info("Using Mongo env var %s (host=%s)", mongo_env_key, host_display)
 
                 # Allow short server-selection/connect timeouts to fail fast
                 # when MongoDB is unreachable. Values are in milliseconds.
@@ -349,6 +369,7 @@ def setup_handlers(application: Application) -> None:
                 except Exception:
                     # Fallback to default constructor when custom kwargs cause issues
                     client = AsyncIOMotorClient(mongo_uri)
+
                 # Determine bot_id from environment if provided (BOT_ID or BOT_USERNAME)
                 bot_id = os.environ.get("BOT_ID") or os.environ.get("BOT_USERNAME") or os.environ.get("BOT_NAME")
                 model = MediaConversionModel(

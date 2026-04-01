@@ -50,13 +50,32 @@ def check_ffmpeg_python():
 
 
 def check_mongodb():
-    url = os.getenv('MONGODB_URL')
-    if url:
-        print('[OK] MONGODB_URL set')
-        return True
-    else:
-        print('[INFO] MONGODB_URL not set; DB logging disabled')
-        return False
+    # Check a set of canonical env names so the script matches runtime
+    # normalization performed by `config.py`.
+    for key in ("MONGO_URI", "MONGODB_URL", "MONGODB_URI", "MONGO_URL"):
+        val = os.getenv(key)
+        if val:
+            # Try to extract hostname for diagnostic output without
+            # revealing credentials; fall back to a generic OK message.
+            host = None
+            try:
+                from urllib.parse import urlparse
+
+                parsed = urlparse(val)
+                host = parsed.hostname
+                if not host:
+                    host = val.split("@")[-1].split("/")[0]
+            except Exception:
+                host = None
+
+            if host:
+                print(f'[OK] {key} set (host: {host})')
+            else:
+                print(f'[OK] {key} set')
+            return True
+
+    print('[INFO] No MongoDB env var set (MONGO_URI/MONGODB_URL/MONGODB_URI/MONGO_URL); DB logging disabled')
+    return False
 
 
 def main():
