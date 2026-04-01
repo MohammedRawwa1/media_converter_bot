@@ -55,6 +55,10 @@ ACTIVE_JOBS = Gauge("media_jobs_active", "Number of active ffmpeg jobs")
 async def handle_job(job: dict):
     job_id = job.get("job_id")
     input_path = job.get("input_path")
+    # Early resolve commonly-used fields so error handlers can report progress
+    output_path = job.get("output_path")
+    progress_channel = job.get("progress_channel") or f"ffmpeg:progress:{job_id}"
+
     # If job references a remote storage key (S3/MinIO), download it to a temp file
     input_key = job.get("input_key") or job.get("s3_key") or job.get("remote_key")
     if input_key and not input_path:
@@ -69,8 +73,25 @@ async def handle_job(job: dict):
             if get_storage_backend is None:
                 raise RuntimeError("storage backend helper not available")
             backend = await get_storage_backend()
-            await backend.download_file(input_key, temp_input_path)
-            if os.path.exists(temp_input_path):
+            # retry/backoff for transient storage/download issues
+            download_retries = int(os.environ.get("DOWNLOAD_RETRIES", "3"))
+            backoff_base = float(os.environ.get("DOWNLOAD_BACKOFF_BASE", "1"))
+            download_success = False
+            last_exc = None
+            for attempt in range(1, download_retries + 1):
+                try:
+                    await backend.download_file(input_key, temp_input_path)
+                    # confirm file exists and has data
+                    if os.path.exists(temp_input_path) and (os.path.getsize(temp_input_path) > 0):
+                        download_success = True
+                        break
+                except Exception as e:
+                    last_exc = e
+                # backoff before next attempt
+                if attempt < download_retries:
+                    await asyncio.sleep(backoff_base * (2 ** (attempt - 1)))
+
+            if download_success:
                 input_path = temp_input_path
                 job["input_path"] = input_path
                 job["_input_from_remote"] = True
@@ -92,8 +113,7 @@ async def handle_job(job: dict):
             except Exception:
                 pass
             return
-    output_path = job.get("output_path")
-    progress_channel = job.get("progress_channel") or f"ffmpeg:progress:{job_id}"
+    # (re)use any job-provided retry count
     retries = int(job.get("retries", 0))
     max_runtime = int(os.environ.get("JOB_MAX_SECONDS", str(6 * 3600)))
 

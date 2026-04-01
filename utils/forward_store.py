@@ -168,7 +168,22 @@ def load_forward_metadata(fid: str) -> Optional[dict]:
 async def _download_file_async(key: str, dest: str) -> None:
     try:
         backend = await get_storage_backend()
-        await backend.download_file(key, dest)
+        # Retry/backoff for transient download errors
+        import asyncio
+
+        retries = int(os.getenv("DOWNLOAD_RETRIES", "3"))
+        backoff = float(os.getenv("DOWNLOAD_BACKOFF_BASE", "1"))
+        for attempt in range(1, retries + 1):
+            try:
+                await backend.download_file(key, dest)
+                # verify file exists and has size
+                if os.path.exists(dest) and (os.path.getsize(dest) > 0):
+                    return
+            except Exception:
+                pass
+
+            if attempt < retries:
+                await asyncio.sleep(backoff * (2 ** (attempt - 1)))
     except Exception:
         pass
 
