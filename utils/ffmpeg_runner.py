@@ -24,18 +24,37 @@ async def probe_duration(path: str) -> Optional[float]:
     """Probe media duration using ffprobe (sync subprocess wrapped)."""
     ffprobe = getattr(config, "FFMPEG_PATH", "ffmpeg")
     ffprobe = ffprobe.replace("ffmpeg", "ffprobe") if "ffmpeg" in ffprobe else "ffprobe"
-    proc = await asyncio.create_subprocess_exec(
-        ffprobe,
-        "-v",
-        "error",
-        "-show_entries",
-        "format=duration",
-        "-of",
-        "default=noprint_wrappers=1:nokey=1",
-        path,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
+    try:
+        from utils.process_utils import create_checked_subprocess_exec
+    except Exception:
+        create_checked_subprocess_exec = None
+
+    if create_checked_subprocess_exec is not None:
+        proc = await create_checked_subprocess_exec(
+            ffprobe,
+            "-v",
+            "error",
+            "-show_entries",
+            "format=duration",
+            "-of",
+            "default=noprint_wrappers=1:nokey=1",
+            path,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+    else:
+        proc = await asyncio.create_subprocess_exec(
+            ffprobe,
+            "-v",
+            "error",
+            "-show_entries",
+            "format=duration",
+            "-of",
+            "default=noprint_wrappers=1:nokey=1",
+            path,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
     out, _ = await proc.communicate()
     try:
         return float(out.decode().strip())
@@ -98,7 +117,15 @@ async def run_ffmpeg(
         kwargs["preexec_fn"] = os.setsid
 
     # start process
-    proc = await asyncio.create_subprocess_exec(*cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE, **kwargs)
+    try:
+        from utils.process_utils import create_checked_subprocess_exec
+    except Exception:
+        create_checked_subprocess_exec = None
+
+    if create_checked_subprocess_exec is not None:
+        proc = await create_checked_subprocess_exec(*cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE, **kwargs)
+    else:
+        proc = await asyncio.create_subprocess_exec(*cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE, **kwargs)
 
     redis_client = None
     if aioredis and (redis_url or os.environ.get("REDIS_URL")):

@@ -69,13 +69,30 @@ async def run_subprocess_with_timeout(
     """
     process = None
     try:
+        # Basic sanity check: ensure command arguments are valid (no None values)
+        for a in cmd:
+            if a is None:
+                raise ValueError(f"Invalid subprocess command contains None: {cmd}")
         # Start the subprocess
-        process = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            preexec_fn=None,  # Set process group for better cleanup if on Unix
-        )
+        try:
+            from utils.process_utils import create_checked_subprocess_exec
+        except Exception:
+            create_checked_subprocess_exec = None
+
+        if create_checked_subprocess_exec is not None:
+            process = await create_checked_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                preexec_fn=None,  # Set process group for better cleanup if on Unix
+            )
+        else:
+            process = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                preexec_fn=None,  # Set process group for better cleanup if on Unix
+            )
 
         logger.debug(f"{operation_name} started (PID: {process.pid})")
 

@@ -16,9 +16,10 @@ try:
 except ImportError:
     # Fallback if module not available
     async def run_subprocess_with_timeout(cmd, timeout_seconds=18000, operation_name="Operation"):
-        process = await asyncio.create_subprocess_exec(
-            *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
-        )
+        if create_checked_subprocess_exec is not None:
+            process = await create_checked_subprocess_exec(*cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+        else:
+            process = await asyncio.create_subprocess_exec(*cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
         try:
             stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=timeout_seconds)
             return stdout, stderr, process.returncode
@@ -27,6 +28,12 @@ except ImportError:
             raise
 
     DEFAULT_FFMPEG_TIMEOUT = 18000
+    
+    # Optional safe subprocess helper
+    try:
+        from utils.process_utils import create_checked_subprocess_exec
+    except Exception:
+        create_checked_subprocess_exec = None
 
 
 def _validate_input_file(input_path: str) -> Tuple[bool, str]:
@@ -94,9 +101,10 @@ async def convert_video_to_mp3(
             output_path,
         ]
 
-        process = await asyncio.create_subprocess_exec(
-            *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
-        )
+        if create_checked_subprocess_exec is not None:
+            process = await create_checked_subprocess_exec(*cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+        else:
+            process = await asyncio.create_subprocess_exec(*cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
 
         try:
             # Timeout protection - FFmpeg can hang if ffprobe crashes
@@ -169,9 +177,10 @@ async def compress_video(
             output_path,
         ]
 
-        process = await asyncio.create_subprocess_exec(
-            *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
-        )
+        if create_checked_subprocess_exec is not None:
+            process = await create_checked_subprocess_exec(*cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+        else:
+            process = await asyncio.create_subprocess_exec(*cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
 
         try:
             # Timeout protection
@@ -379,9 +388,10 @@ async def take_screenshot(input_path: str, output_path: str, time: str = "00:00:
     try:
         cmd = ["ffmpeg", "-y", "-ss", time, "-i", input_path, "-vframes", "1", "-q:v", "2", output_path]
 
-        process = await asyncio.create_subprocess_exec(
-            *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
-        )
+        if create_checked_subprocess_exec is not None:
+            process = await create_checked_subprocess_exec(*cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+        else:
+            process = await asyncio.create_subprocess_exec(*cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
 
         stdout, stderr = await process.communicate()
 
@@ -422,9 +432,10 @@ async def change_resolution(input_path: str, output_path: str, width: int, heigh
     try:
         cmd = ["ffmpeg", "-y", "-i", input_path, "-filter:v", f"scale={width}:{height}", "-c:a", "copy", output_path]
 
-        process = await asyncio.create_subprocess_exec(
-            *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
-        )
+        if create_checked_subprocess_exec is not None:
+            process = await create_checked_subprocess_exec(*cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+        else:
+            process = await asyncio.create_subprocess_exec(*cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
 
         stdout, stderr = await process.communicate()
 
@@ -451,9 +462,10 @@ async def trim_media(input_path: str, output_path: str, start_time: str, end_tim
 
         cmd = ["ffmpeg", "-y", "-ss", start_time, "-i", input_path, "-t", str(duration), "-c", "copy", output_path]
 
-        process = await asyncio.create_subprocess_exec(
-            *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
-        )
+        if create_checked_subprocess_exec is not None:
+            process = await create_checked_subprocess_exec(*cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+        else:
+            process = await asyncio.create_subprocess_exec(*cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
 
         stdout, stderr = await process.communicate()
 
@@ -474,9 +486,10 @@ async def repair_video(input_path: str, output_path: str) -> Tuple[bool, str]:
     try:
         cmd = ["ffmpeg", "-y", "-i", input_path, "-c", "copy", output_path]
 
-        process = await asyncio.create_subprocess_exec(
-            *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
-        )
+        if create_checked_subprocess_exec is not None:
+            process = await create_checked_subprocess_exec(*cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+        else:
+            process = await asyncio.create_subprocess_exec(*cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
 
         stdout, stderr = await process.communicate()
 
@@ -515,9 +528,10 @@ async def optimize_video(input_path: str, output_path: str, preset: str = "slow"
             output_path,
         ]
 
-        process = await asyncio.create_subprocess_exec(
-            *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
-        )
+        if create_checked_subprocess_exec is not None:
+            process = await create_checked_subprocess_exec(*cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+        else:
+            process = await asyncio.create_subprocess_exec(*cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
 
         stdout, stderr = await process.communicate()
 
@@ -616,6 +630,12 @@ async def generate_sample(input_path: str, output_path: str, duration: int = 30)
 async def extract_streams(input_path: str, output_dir: str) -> Tuple[bool, Dict[str, str]]:
     """Extract all streams asynchronously."""
     try:
+        # Validate input path before probing
+        valid, error = _validate_input_file(input_path)
+        if not valid:
+            logger.error(error)
+            return False, {}
+
         # First get probe info
         cmd_probe = ["ffprobe", "-v", "quiet", "-print_format", "json", "-show_streams", input_path]
 

@@ -20,6 +20,11 @@ except ImportError:
     ffmpeg = None
 
 try:
+    from utils.process_utils import create_checked_subprocess_exec
+except Exception:
+    create_checked_subprocess_exec = None
+
+try:
     from PIL import Image  # noqa: F401
 except ImportError:
     Image = None
@@ -53,9 +58,14 @@ class ExtendedMediaConverter:
             logger.info(f"Executing: {' '.join(full_cmd)}")
 
             # Run process
-            process = await asyncio.create_subprocess_exec(
-                *full_cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
-            )
+            if create_checked_subprocess_exec is not None:
+                process = await create_checked_subprocess_exec(
+                    *full_cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+                )
+            else:
+                process = await asyncio.create_subprocess_exec(
+                    *full_cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+                )
 
             _, stderr = await process.communicate()
 
@@ -303,8 +313,15 @@ class ExtendedMediaConverter:
 
     async def extract_streams(self, input_path: str, output_dir: str) -> Dict[str, str]:
         """Extract all streams (video, audio, subtitles)."""
-        # First probe to get stream info
-        probe = ffmpeg.probe(input_path)
+        # Validate input and probe safely
+        try:
+            if not input_path or not os.path.exists(input_path):
+                logger.error("extract_streams: input file missing: %s", input_path)
+                return {}
+            probe = ffmpeg.probe(input_path)
+        except Exception as e:
+            logger.error("extract_streams: probe failed for %s: %s", input_path, e)
+            return {}
         streams = probe.get("streams", [])
 
         extracted = {}
