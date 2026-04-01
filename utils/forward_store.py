@@ -180,8 +180,33 @@ def delete_forward_metadata(fid: str) -> bool:
         try:
             b = get_storage_backend_sync()
             import asyncio
+            # If an event loop is currently running, schedule the async
+            # delete coroutine on that loop to avoid creating an
+            # un-awaited coroutine (which raises a RuntimeWarning).
+            try:
+                loop = asyncio.get_event_loop()
+            except RuntimeError:
+                loop = None
 
-            asyncio.run(b.delete(key))
+            if loop and loop.is_running():
+                try:
+                    # Schedule the coroutine to run on the loop thread-safely.
+                    loop.call_soon_threadsafe(lambda: asyncio.create_task(b.delete(key)))
+                except Exception:
+                    # Fallback: try creating the task directly (works when
+                    # called from the loop thread).
+                    try:
+                        loop.create_task(b.delete(key))
+                    except Exception:
+                        pass
+            else:
+                # No running loop — safe to run synchronously to completion.
+                try:
+                    asyncio.run(b.delete(key))
+                except Exception:
+                    # Best-effort: ignore delete failures
+                    pass
+
             return True
         except Exception:
             # fallback: attempt to delete local file if present
