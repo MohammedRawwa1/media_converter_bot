@@ -25,6 +25,11 @@ except Exception:  # pragma: no cover - aioboto3 may be optional
     aioboto3 = None
 
 try:
+    import boto3
+except Exception:
+    boto3 = None
+
+try:
     from botocore.config import Config as BotoConfig
 except Exception:
     BotoConfig = None
@@ -103,8 +108,10 @@ class S3AsyncBackend(AsyncStorageBackend):
         aws_secret_access_key: Optional[str] = None,
         use_ssl: bool = True,
     ):
-        if aioboto3 is None:
-            raise RuntimeError("aioboto3 is required for S3 backend but is not installed")
+        # Support both async aioboto3 (preferred) and sync boto3 (fallback).
+        # If aioboto3 is present we will use it for non-blocking IO. Otherwise
+        # we will call synchronous boto3 functions inside `asyncio.to_thread`.
+        self._use_aioboto3 = aioboto3 is not None
 
         self.bucket = bucket or config.S3_BUCKET
         self.endpoint_url = endpoint_url or (config.S3_ENDPOINT or None)
@@ -112,12 +119,13 @@ class S3AsyncBackend(AsyncStorageBackend):
         self.aws_access_key_id = aws_access_key_id or config.AWS_ACCESS_KEY_ID or None
         self.aws_secret_access_key = aws_secret_access_key or config.AWS_SECRET_ACCESS_KEY or None
         self.use_ssl = use_ssl
-        self._session = aioboto3.Session()
-        # optional botocore config
+
+        # async session only when aioboto3 is available
+        self._session = aioboto3.Session() if self._use_aioboto3 else None
+
+        # optional botocore config (used for both aioboto3 and boto3 clients)
         self._boto_config = None
         if BotoConfig is not None:
-            # prefer virtual hosted style by default; some S3-compatible services
-            # require path-style addressing — users can supply a custom endpoint.
             try:
                 self._boto_config = BotoConfig(signature_version="s3v4")
             except Exception:
@@ -138,33 +146,79 @@ class S3AsyncBackend(AsyncStorageBackend):
         return kw
 
     async def upload_file(self, src_path: str, dest_key: str) -> str:
-        async with self._session.client("s3", **self._client_kwargs()) as client:
-            # aioboto3 exposes upload_file as an awaitable wrapper
-            await client.upload_file(src_path, self.bucket, dest_key)
+        if self._use_aioboto3:
+            async with self._session.client("s3", **self._client_kwargs()) as client:
+                # aioboto3 exposes upload_file as an awaitable wrapper
+                await client.upload_file(src_path, self.bucket, dest_key)
+            return dest_key
+
+        # Fallback: use synchronous boto3 client executed in threadpool
+        if boto3 is None:
+            raise RuntimeError("boto3 is required for S3 operations when aioboto3 is not installed")
+        def _sync_upload():
+            client = boto3.client("s3", **self._client_kwargs())
+            client.upload_file(src_path, self.bucket, dest_key)
+        await asyncio.to_thread(_sync_upload)
         return dest_key
 
     async def download_file(self, key: str, dest_path: str) -> bool:
-        async with self._session.client("s3", **self._client_kwargs()) as client:
-            await client.download_file(self.bucket, key, dest_path)
+        if self._use_aioboto3:
+            async with self._session.client("s3", **self._client_kwargs()) as client:
+                await client.download_file(self.bucket, key, dest_path)
+            return True
+
+        if boto3 is None:
+            raise RuntimeError("boto3 is required for S3 operations when aioboto3 is not installed")
+        def _sync_download():
+            client = boto3.client("s3", **self._client_kwargs())
+            client.download_file(self.bucket, key, dest_path)
+        await asyncio.to_thread(_sync_download)
         return True
 
     async def generate_presigned_post(self, key: str, expires: Optional[int] = None) -> Dict[str, Any]:
         expires = expires or config.PRESIGN_EXPIRES
-        async with self._session.client("s3", **self._client_kwargs()) as client:
-            # generate_presigned_post is a local signing operation (no network)
+        if self._use_aioboto3:
+            async with self._session.client("s3", **self._client_kwargs()) as client:
+                # generate_presigned_post is a local signing operation (no network)
+                post = client.generate_presigned_post(Bucket=self.bucket, Key=key, ExpiresIn=expires)
+                get_url = client.generate_presigned_url("get_object", Params={"Bucket": self.bucket, "Key": key}, ExpiresIn=expires * 24)
+            return {"url": post["url"], "fields": post["fields"], "key": key, "get_url": get_url}
+
+        if boto3 is None:
+            raise RuntimeError("boto3 is required for S3 operations when aioboto3 is not installed")
+        def _sync_post():
+            client = boto3.client("s3", **self._client_kwargs())
             post = client.generate_presigned_post(Bucket=self.bucket, Key=key, ExpiresIn=expires)
             get_url = client.generate_presigned_url("get_object", Params={"Bucket": self.bucket, "Key": key}, ExpiresIn=expires * 24)
-        return {"url": post["url"], "fields": post["fields"], "key": key, "get_url": get_url}
+            return {"url": post["url"], "fields": post["fields"], "key": key, "get_url": get_url}
+        return await asyncio.to_thread(_sync_post)
 
     async def generate_presigned_get(self, key: str, expires: Optional[int] = None) -> str:
         expires = expires or config.PRESIGN_EXPIRES
-        async with self._session.client("s3", **self._client_kwargs()) as client:
-            url = client.generate_presigned_url("get_object", Params={"Bucket": self.bucket, "Key": key}, ExpiresIn=expires)
-        return url
+        if self._use_aioboto3:
+            async with self._session.client("s3", **self._client_kwargs()) as client:
+                url = client.generate_presigned_url("get_object", Params={"Bucket": self.bucket, "Key": key}, ExpiresIn=expires)
+            return url
+
+        if boto3 is None:
+            raise RuntimeError("boto3 is required for S3 operations when aioboto3 is not installed")
+        def _sync_get():
+            client = boto3.client("s3", **self._client_kwargs())
+            return client.generate_presigned_url("get_object", Params={"Bucket": self.bucket, "Key": key}, ExpiresIn=expires)
+        return await asyncio.to_thread(_sync_get)
 
     async def delete(self, key: str) -> bool:
-        async with self._session.client("s3", **self._client_kwargs()) as client:
-            await client.delete_object(Bucket=self.bucket, Key=key)
+        if self._use_aioboto3:
+            async with self._session.client("s3", **self._client_kwargs()) as client:
+                await client.delete_object(Bucket=self.bucket, Key=key)
+            return True
+
+        if boto3 is None:
+            raise RuntimeError("boto3 is required for S3 operations when aioboto3 is not installed")
+        def _sync_delete():
+            client = boto3.client("s3", **self._client_kwargs())
+            client.delete_object(Bucket=self.bucket, Key=key)
+        await asyncio.to_thread(_sync_delete)
         return True
 
 
