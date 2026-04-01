@@ -244,23 +244,22 @@ def upload():
             try:
                 # If remote backend is enabled, upload first then set input_key
                 if use_remote and key:
+                    b = get_storage_backend_sync()
+                    # run the async upload in this background thread
                     try:
-                        b = get_storage_backend_sync()
-                        # run the async upload in this background thread
-                        try:
-                            import asyncio as _asyncio
+                        import asyncio as _asyncio
 
-                            _asyncio.run(b.upload_file(input_path, key))
-                            if os.environ.get("KEEP_LOCAL_UPLOADS", "").lower() not in ("1", "true", "yes"):
-                                try:
-                                    os.remove(input_path)
-                                except Exception:
-                                    pass
-                        except Exception:
-                            logger.exception("Background upload failed for %s", input_path)
-                            # fallthrough; enqueue with local path as a fallback
-                        else:
-                            j["input_key"] = key
+                        _asyncio.run(b.upload_file(input_path, key))
+                        if os.environ.get("KEEP_LOCAL_UPLOADS", "").lower() not in ("1", "true", "yes"):
+                            try:
+                                os.remove(input_path)
+                            except Exception:
+                                pass
+                    except Exception:
+                        logger.exception("Background upload failed for %s", input_path)
+                        # fallthrough; enqueue with local path as a fallback
+                    else:
+                        j["input_key"] = key
 
                 # attach request id for tracing
                 try:
@@ -368,6 +367,7 @@ def presign():
             endpoint_url=os.environ.get("S3_ENDPOINT") or None,
             aws_access_key_id=os.environ.get("AWS_ACCESS_KEY_ID"),
             aws_secret_access_key=os.environ.get("AWS_SECRET_ACCESS_KEY"),
+            aws_session_token=os.environ.get("AWS_SESSION_TOKEN") or None,
         )
         # prefer a POST form upload (fields + url)
         post = s3.generate_presigned_post(Bucket=bucket, Key=key, ExpiresIn=3600)

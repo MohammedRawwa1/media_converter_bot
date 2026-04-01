@@ -109,6 +109,7 @@ class S3AsyncBackend(AsyncStorageBackend):
         region: Optional[str] = None,
         aws_access_key_id: Optional[str] = None,
         aws_secret_access_key: Optional[str] = None,
+        aws_session_token: Optional[str] = None,
         use_ssl: bool = True,
     ):
         # Support both async aioboto3 (preferred) and sync boto3 (fallback).
@@ -121,6 +122,8 @@ class S3AsyncBackend(AsyncStorageBackend):
         self.region = region or (config.S3_REGION or None)
         self.aws_access_key_id = aws_access_key_id or config.AWS_ACCESS_KEY_ID or None
         self.aws_secret_access_key = aws_secret_access_key or config.AWS_SECRET_ACCESS_KEY or None
+        # Support temporary session tokens (AWS STS / assumed-role / R2 variants)
+        self.aws_session_token = aws_session_token or os.getenv("AWS_SESSION_TOKEN") or None
         self.use_ssl = use_ssl
 
         # async session only when aioboto3 is available
@@ -153,6 +156,8 @@ class S3AsyncBackend(AsyncStorageBackend):
             kw["aws_secret_access_key"] = self.aws_secret_access_key
         if self._boto_config is not None:
             kw["config"] = self._boto_config
+        if self.aws_session_token:
+            kw["aws_session_token"] = self.aws_session_token
         return kw
 
     async def upload_file(self, src_path: str, dest_key: str) -> str:
@@ -178,12 +183,22 @@ class S3AsyncBackend(AsyncStorageBackend):
 
         for attempt in range(1, retries + 1):
             try:
+                # Masked diagnostics (do not log secrets). Show partial key and endpoint for debugging.
+                masked_key = None
+                if self.aws_access_key_id:
+                    ak = str(self.aws_access_key_id)
+                    masked_key = f"{ak[:4]}...{ak[-4:]}" if len(ak) > 8 else ak
+                else:
+                    masked_key = "(env)"
+
                 logger.info(
-                    "Uploading file → bucket=%s key=%s (attempt %s/%s)",
+                    "Uploading file → bucket=%s key=%s (attempt %s/%s) [ak=%s endpoint=%s]",
                     self.bucket,
                     dest_key,
                     attempt,
                     retries,
+                    masked_key,
+                    (self.endpoint_url or "default"),
                 )
 
                 # Async path (aioboto3)

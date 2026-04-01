@@ -101,7 +101,9 @@ def presign():
             "s3",
             aws_access_key_id=os.environ.get("AWS_ACCESS_KEY_ID"),
             aws_secret_access_key=os.environ.get("AWS_SECRET_ACCESS_KEY"),
+            aws_session_token=os.environ.get("AWS_SESSION_TOKEN") or None,
             region_name=os.environ.get("AWS_REGION"),
+            endpoint_url=os.environ.get("S3_ENDPOINT") or None,
         )
         post = s3.generate_presigned_post(Bucket=bucket, Key=key, ExpiresIn=expires)
         return jsonify({"url": post["url"], "fields": post["fields"], "key": key})
