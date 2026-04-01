@@ -1,7 +1,7 @@
 # models.py
 from datetime import datetime, timedelta
 import os
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, List
 import logging
 
 # Avoid importing pymongo at module import time; handle missing dependency
@@ -9,6 +9,11 @@ import logging
 IndexModel = None
 
 logger = logging.getLogger(__name__)
+
+try:
+    from bson import ObjectId
+except Exception:
+    ObjectId = None
 
 
 class MediaConversionModel:
@@ -27,6 +32,10 @@ class MediaConversionModel:
         self.conversions = self.db[f"{prefix}conversions"]
         self.users = self.db[f"{prefix}users"]
         self.stats = self.db[f"{prefix}stats"]
+        # Sessions collection for saving ephemeral user sessions and activity state
+        self.sessions = self.db[f"{prefix}sessions"]
+        # Scheduled activities (run_at: ISO datetime, status: pending|running|done)
+        self.schedules = self.db[f"{prefix}schedules"]
 
         # Index creation is performed asynchronously via `ensure_indexes()`
         # to avoid blocking or spawning background threads that raise
@@ -71,6 +80,18 @@ class MediaConversionModel:
             # Stats collection indexes
             try:
                 await self.stats.create_index("date", unique=True)
+            except Exception:
+                pass
+
+            # Sessions: index by user_id for fast lookup
+            try:
+                await self.sessions.create_index("user_id", unique=True)
+            except Exception:
+                pass
+
+            # Schedules: index by run_at and status for efficient queries
+            try:
+                await self.schedules.create_index([("run_at", 1), ("status", 1)])
             except Exception:
                 pass
 
@@ -243,6 +264,88 @@ class MediaConversionModel:
         except Exception as e:
             logger.error(f"Error getting top actions: {e}")
             return []
+
+    # -------- Session helpers --------
+    async def save_session(self, user_id: int, session_data: Dict[str, Any]) -> bool:
+        """Save a minimal session document for quick recovery across restarts."""
+        try:
+            doc = {"user_id": user_id, "session": session_data, "updated_at": datetime.utcnow()}
+            if self.bot_id is not None:
+                doc["bot_id"] = self.bot_id
+            await self.sessions.update_one({"user_id": user_id, **({"bot_id": self.bot_id} if self.bot_id is not None else {})}, {"$set": doc}, upsert=True)
+            return True
+        except Exception as e:
+            logger.error(f"Error saving session for %s: %s", user_id, e)
+            return False
+
+    async def load_session(self, user_id: int) -> Optional[Dict[str, Any]]:
+        """Load a previously saved session for a user_id."""
+        try:
+            query = {"user_id": user_id}
+            if self.bot_id is not None:
+                query["bot_id"] = self.bot_id
+            doc = await self.sessions.find_one(query, {"_id": 0, "session": 1})
+            if doc:
+                return doc.get("session")
+            return None
+        except Exception as e:
+            logger.error(f"Error loading session for %s: %s", user_id, e)
+            return None
+
+    async def delete_session(self, user_id: int) -> bool:
+        """Delete a persisted session for a user."""
+        try:
+            query = {"user_id": user_id}
+            if self.bot_id is not None:
+                query["bot_id"] = self.bot_id
+            await self.sessions.delete_one(query)
+            return True
+        except Exception as e:
+            logger.error(f"Error deleting session for %s: %s", user_id, e)
+            return False
+
+    # -------- Scheduled activities --------
+    async def schedule_activity(self, activity: Dict[str, Any]) -> Optional[str]:
+        """Insert a scheduled activity document. Required fields: run_at (datetime).
+
+        Returns inserted id string on success.
+        """
+        try:
+            activity = dict(activity)
+            activity.setdefault("created_at", datetime.utcnow())
+            activity.setdefault("status", "pending")
+            if self.bot_id is not None:
+                activity["bot_id"] = self.bot_id
+            res = await self.schedules.insert_one(activity)
+            return str(res.inserted_id)
+        except Exception as e:
+            logger.error(f"Error scheduling activity: %s", e)
+            return None
+
+    async def get_due_activities(self, upto: Optional[datetime] = None, limit: int = 100) -> List[Dict[str, Any]]:
+        """Return activities with run_at <= upto and status pending."""
+        try:
+            if upto is None:
+                upto = datetime.utcnow()
+            query = {"run_at": {"$lte": upto}, "status": "pending"}
+            if self.bot_id is not None:
+                query["bot_id"] = self.bot_id
+            cursor = self.schedules.find(query).sort("run_at", 1).limit(limit)
+            results = await cursor.to_list(length=limit)
+            return results
+        except Exception as e:
+            logger.error(f"Error fetching due activities: %s", e)
+            return []
+
+    async def mark_activity_done(self, activity_id: str) -> bool:
+        """Mark a scheduled activity as done (delete or set status=done)."""
+        try:
+            query = {"_id": ObjectId(activity_id)} if ObjectId is not None else {"_id": activity_id}
+            await self.schedules.update_one(query, {"$set": {"status": "done", "finished_at": datetime.utcnow()}})
+            return True
+        except Exception as e:
+            logger.error(f"Error marking activity done %s: %s", activity_id, e)
+            return False
 
     async def get_conversion_success_rate(self) -> Dict:
         """Get conversion success rate statistics."""

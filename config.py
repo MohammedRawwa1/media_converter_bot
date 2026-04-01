@@ -5,6 +5,7 @@ import json
 import logging
 from typing import Set, Optional
 from urllib.parse import urlparse
+import re
 
 ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -117,13 +118,43 @@ def is_user_allowed(user_id: int) -> bool:
     except Exception:
         return False
 # Normalize MongoDB environment variable names for compatibility.
-# Some deployments use MONGO_URI, others MONGODB_URL or MONGO_URL — accept any.
-_canonical_mongo = (
-    os.getenv("MONGO_URI")
-    or os.getenv("MONGODB_URL")
-    or os.getenv("MONGODB_URI")
-    or os.getenv("MONGO_URL")
-)
+# Some deployments (Render, Docker) may set variables using references
+# like "$MONGO_URI" which are not expanded by the platform. Resolve
+# simple $VAR or ${VAR} references so the canonical value is usable.
+
+def _resolve_env_reference(val: Optional[str]) -> Optional[str]:
+    if not val:
+        return val
+    v = val.strip()
+    # Exact single-var patterns: $VAR or ${VAR}
+    m = re.match(r"^\$(\w+)$", v) or re.match(r"^\$\{(\w+)\}$", v)
+    if m:
+        ref = m.group(1)
+        return os.getenv(ref) or None
+    # Replace embedded ${VAR} or $VAR occurrences with their env values (best-effort)
+    def _repl(m):
+        name = m.group(1)
+        return os.getenv(name, "")
+
+    try:
+        substituted = re.sub(r"\$\{?(\w+)\}?", _repl, v)
+    except Exception:
+        substituted = v
+    # If substitution produced an empty string, treat as unresolved
+    return substituted or None
+
+
+# Check a list of candidate env vars in order and resolve references.
+_canonical_mongo = None
+for _key in ("MONGO_URI", "MONGODB_URL", "MONGODB_URI", "MONGO_URL"):
+    _raw = os.getenv(_key)
+    if not _raw:
+        continue
+    _resolved = _resolve_env_reference(_raw)
+    if _resolved:
+        _canonical_mongo = _resolved
+        break
+
 if _canonical_mongo:
     # Ensure common names are present in os.environ so all modules find it.
     os.environ.setdefault("MONGO_URI", _canonical_mongo)

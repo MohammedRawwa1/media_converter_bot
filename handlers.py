@@ -330,13 +330,34 @@ class EnhancedMediaHandler:
                     except Exception:
                         pass
                 return
-
             minimal = {
                 "current_file": session.get("current_file"),
                 "merge_list": session.get("merge_list", []),
             }
-            with open(self._session_file(user_id), "w", encoding="utf-8") as fh:
-                json.dump(minimal, fh, ensure_ascii=False)
+            # Write locally for fast local recovery
+            try:
+                with open(self._session_file(user_id), "w", encoding="utf-8") as fh:
+                    json.dump(minimal, fh, ensure_ascii=False)
+            except Exception:
+                logger.exception("Failed to write local session file for %s", user_id)
+
+            # Persist to MongoDB asynchronously when available (best-effort)
+            try:
+                if getattr(self, "db_model", None):
+                    try:
+                        loop = asyncio.get_event_loop()
+                        if loop.is_running():
+                            asyncio.create_task(self.db_model.save_session(user_id, minimal))
+                        else:
+                            try:
+                                loop.run_until_complete(self.db_model.save_session(user_id, minimal))
+                            except Exception:
+                                # best-effort: ignore failures
+                                pass
+                    except Exception:
+                        logger.exception("Failed scheduling DB session save for %s", user_id)
+            except Exception:
+                logger.debug("No db_model available to persist session for %s", user_id)
         except Exception:
             logger.exception("Failed to persist session for user %s", user_id)
 
@@ -345,7 +366,32 @@ class EnhancedMediaHandler:
         try:
             path = self._session_file(user_id)
             if not os.path.exists(path):
-                return None
+                # Try loading from MongoDB when available (best-effort)
+                try:
+                    if getattr(self, "db_model", None):
+                        try:
+                            import asyncio as _asyncio, threading, queue
+
+                            q = queue.Queue()
+
+                            def _runner():
+                                try:
+                                    res = _asyncio.run(self.db_model.load_session(user_id))
+                                    q.put(res)
+                                except Exception:
+                                    q.put(None)
+
+                            t = threading.Thread(target=_runner, daemon=True)
+                            t.start()
+                            try:
+                                res = q.get(timeout=2)
+                            except Exception:
+                                res = None
+                            return res
+                        except Exception:
+                            return None
+                except Exception:
+                    return None
             with open(path, "r", encoding="utf-8") as fh:
                 data = json.load(fh)
             # Ensure merge_list present
