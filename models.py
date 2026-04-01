@@ -28,28 +28,54 @@ class MediaConversionModel:
         self.users = self.db[f"{prefix}users"]
         self.stats = self.db[f"{prefix}stats"]
 
-        # Create indexes (best-effort)
-        self._create_indexes()
+        # Index creation is performed asynchronously via `ensure_indexes()`
+        # to avoid blocking or spawning background threads that raise
+        # exceptions during synchronous init when Mongo is unreachable.
 
-    def _create_indexes(self):
-        """Create necessary indexes for collections."""
-        # Conversions collection indexes
+    async def ensure_indexes(self):
+        """Asynchronously create necessary indexes for collections.
+
+        This should be scheduled from an async context so failures are
+        logged instead of occurring in background threads that produce
+        uncaught exceptions when the DB is unreachable.
+        """
         try:
             # Index by bot_id + user_id + timestamp for efficient per-bot queries
             if self.bot_id is not None:
-                self.conversions.create_index([("bot_id", 1), ("user_id", 1), ("timestamp", -1)])
-            self.conversions.create_index([("user_id", 1), ("timestamp", -1)])
-            self.conversions.create_index([("action", 1), ("success", 1)])
-            self.conversions.create_index([("timestamp", -1)], expireAfterSeconds=30 * 24 * 60 * 60)
-        except Exception:
-            # best-effort: ignore index creation failures
-            pass
+                try:
+                    await self.conversions.create_index([("bot_id", 1), ("user_id", 1), ("timestamp", -1)])
+                except Exception:
+                    pass
 
-        # Users collection indexes
-        self.users.create_index("user_id", unique=True)
+            try:
+                await self.conversions.create_index([("user_id", 1), ("timestamp", -1)])
+            except Exception:
+                pass
 
-        # Stats collection indexes
-        self.stats.create_index("date", unique=True)
+            try:
+                await self.conversions.create_index([("action", 1), ("success", 1)])
+            except Exception:
+                pass
+
+            try:
+                await self.conversions.create_index([("timestamp", -1)], expireAfterSeconds=30 * 24 * 60 * 60)
+            except Exception:
+                pass
+
+            # Users collection indexes
+            try:
+                await self.users.create_index("user_id", unique=True)
+            except Exception:
+                pass
+
+            # Stats collection indexes
+            try:
+                await self.stats.create_index("date", unique=True)
+            except Exception:
+                pass
+
+        except Exception as e:
+            logger.warning("Failed to ensure indexes: %s", e)
 
     async def log_conversion(self, conversion_data: Dict[str, Any]) -> str:
         """Log a media conversion event."""

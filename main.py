@@ -341,6 +341,14 @@ def setup_handlers(application: Application) -> None:
                     bot_id=bot_id,
                     collection_prefix=os.environ.get("MONGODB_COLLECTION_PREFIX"),
                 )
+                # Schedule asynchronous index creation so failures are handled
+                # inside the event loop rather than in background threads.
+                try:
+                    import asyncio
+
+                    asyncio.create_task(model.ensure_indexes())
+                except Exception:
+                    logger.debug("Could not schedule async index creation for Mongo model")
                 handler_manager.db_model = model
                 application.bot_data["db_model"] = model
                 logger.info("✅ MongoDB model initialized for logging conversions")
