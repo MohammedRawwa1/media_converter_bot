@@ -81,6 +81,17 @@ async def handle_job(job: dict):
             except Exception:
                 pass
             return
+        # If download completed but file wasn't created, treat as failure
+        if not input_path:
+            try:
+                await publish_update(progress_channel, {"job_id": job_id, "progress": 0, "message": "download_failed", "error": "remote_download_no_file"})
+            except Exception:
+                pass
+            try:
+                await job_store.update_job(job_id, {"status": "error", "error": "remote_download_no_file"})
+            except Exception:
+                pass
+            return
     output_path = job.get("output_path")
     progress_channel = job.get("progress_channel") or f"ffmpeg:progress:{job_id}"
     retries = int(job.get("retries", 0))
