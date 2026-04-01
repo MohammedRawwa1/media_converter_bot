@@ -3767,40 +3767,70 @@ class EnhancedMediaHandler:
     async def log_media_to_db(self, user_id: int, file_info: Dict):
         """Log media processing to MongoDB."""
         try:
-            if MediaConversionModel is None:
-                logger.info("MongoDB model not available; skipping DB logging")
-                return
+            # Prefer an existing, cached model created during application startup
+            if getattr(self, "db_model", None) is not None:
+                model = self.db_model
+            else:
+                # If the optional top-level model class isn't available, skip
+                if MediaConversionModel is None:
+                    logger.info("MongoDB model class not available; skipping DB logging")
+                    return
 
-            # If a MongoDB URL is not configured, skip logging
-            import os
+                # Resolve canonical Mongo URI (prefer config if imported)
+                mongo_uri = None
+                try:
+                    if "config" in globals() and config is not None:
+                        mongo_uri = getattr(config, "MONGO_URI", None) or os.environ.get("MONGO_URI") or os.environ.get("MONGODB_URL")
+                    else:
+                        mongo_uri = os.environ.get("MONGO_URI") or os.environ.get("MONGODB_URL")
+                except Exception:
+                    mongo_uri = os.environ.get("MONGO_URI") or os.environ.get("MONGODB_URL")
 
-            mongo_url = os.environ.get("MONGODB_URL")
-            if not mongo_url:
-                logger.info("MONGODB_URL not set; skipping DB logging")
-                return
+                if not mongo_uri:
+                    logger.info("No MongoDB URI configured; skipping DB logging")
+                    return
 
-            # Lazy-import motor and initialize model
+                # Create and cache a Motor client + model for reuse
+                try:
+                    from motor.motor_asyncio import AsyncIOMotorClient
+
+                    client = AsyncIOMotorClient(mongo_uri)
+                    model = MediaConversionModel(
+                        client,
+                        db_name=os.environ.get("MONGODB_NAME", None) or "media_conversion_bot",
+                    )
+                    # Cache on the handler so subsequent calls reuse the same model
+                    try:
+                        self.db_model = model
+                    except Exception:
+                        pass
+
+                    # Ensure indexes asynchronously (best-effort)
+                    try:
+                        import asyncio as _asyncio
+
+                        if _asyncio.get_event_loop().is_running():
+                            _asyncio.create_task(model.ensure_indexes())
+                    except Exception:
+                        logger.debug("Could not schedule async index creation for Mongo model")
+
+                except Exception as e:
+                    logger.error(f"Failed to initialize MongoDB client/model: {e}")
+                    return
+
+            # Build log entry and persist via the model
             try:
-                from motor.motor_asyncio import AsyncIOMotorClient
-
-                client = AsyncIOMotorClient(mongo_url)
-                db_model = MediaConversionModel(
-                    client,
-                    db_name=os.environ.get("MONGODB_NAME", None)
-                    or "media_conversion_bot",
-                )
-
                 log_entry = {
                     "user_id": user_id,
-                    "file_name": file_info["name"],
-                    "file_type": file_info["type"],
-                    "file_size": file_info["size"],
-                    "timestamp": datetime.now(),
+                    "file_name": file_info.get("name"),
+                    "file_type": file_info.get("type"),
+                    "file_size": file_info.get("size"),
+                    "timestamp": datetime.utcnow(),
                     "action": "upload",
                 }
 
-                await db_model.log_conversion(log_entry)
-                logger.info(f"Logged media upload for user {user_id}")
+                await model.log_conversion(log_entry)
+                logger.info("Logged media upload for user %s", user_id)
             except Exception as e:
                 logger.error(f"Failed to log to MongoDB: {e}")
         except Exception as e:
