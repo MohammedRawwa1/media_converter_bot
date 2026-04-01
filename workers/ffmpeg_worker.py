@@ -416,35 +416,62 @@ async def handle_job(job: dict):
                         enable_userbot = os.environ.get("ENABLE_USERBOT", "").lower() in ("1", "true", "yes")
                         bot_token = getattr(config, "BOT_TOKEN", None)
 
-                        # Try Bot API first if configured
-                        if chat_id and bot_token:
+                        # Determine file size and Bot API threshold (MB)
+                        file_size = 0
+                        try:
+                            if out and os.path.exists(out):
+                                file_size = os.path.getsize(out)
+                        except Exception:
+                            file_size = 0
+
+                        bot_api_max_mb = int(os.environ.get("BOT_API_MAX_SIZE_MB", "50"))
+                        bot_api_max_bytes = bot_api_max_mb * 1024 * 1024
+
+                        # If output is large and userbot is enabled, prefer userbot for delivery
+                        if chat_id and file_size > bot_api_max_bytes and enable_userbot:
                             try:
-                                bot = Bot(token=bot_token)
+                                from utils.userbot_uploader import send_file_via_userbot
 
-                                # Run blocking Bot API calls off the event loop to avoid blocking
-                                def _send_sync(kind: str, file_path: str, caption_text: str):
-                                    if kind == "zip":
-                                        with open(file_path, "rb") as fh:
-                                            bot.send_document(chat_id=chat_id, document=fh, caption=caption_text)
-                                    elif kind == "video":
-                                        with open(file_path, "rb") as fh:
-                                            bot.send_video(chat_id=chat_id, video=fh, caption=caption_text, supports_streaming=True)
-                                    else:
-                                        with open(file_path, "rb") as fh:
-                                            bot.send_document(chat_id=chat_id, document=fh, caption=caption_text)
-
-                                kind = "zip" if out and str(out).lower().endswith(".zip") else ("video" if out and str(out).lower().endswith((".mp4", ".mov", ".mkv")) else "doc")
-                                try:
-                                    await asyncio.to_thread(_send_sync, kind, out, caption)
+                                ok = await send_file_via_userbot(chat_id, out, caption=caption)
+                                if ok:
+                                    logger.info("Sent output via Telethon userbot (preferred) for job %s", job_id)
                                     sent = True
-                                except Exception as e:
-                                    logger.warning("Bot API send failed for job %s: %s", job_id, e)
+                                else:
+                                    logger.error("Preferred userbot send failed for job %s", job_id)
                                     sent = False
-                            except Exception as e:
-                                logger.warning("Bot init failed for job %s: %s", job_id, e)
+                            except Exception:
+                                logger.exception("Preferred userbot send raised exception for job %s", job_id)
                                 sent = False
+                        else:
+                            # Try Bot API first if configured
+                            if chat_id and bot_token:
+                                try:
+                                    bot = Bot(token=bot_token)
 
-                        # Fallback: use Telethon userbot if enabled and Bot API failed/not present
+                                    # Run blocking Bot API calls off the event loop to avoid blocking
+                                    def _send_sync(kind: str, file_path: str, caption_text: str):
+                                        if kind == "zip":
+                                            with open(file_path, "rb") as fh:
+                                                bot.send_document(chat_id=chat_id, document=fh, caption=caption_text)
+                                        elif kind == "video":
+                                            with open(file_path, "rb") as fh:
+                                                bot.send_video(chat_id=chat_id, video=fh, caption=caption_text, supports_streaming=True)
+                                        else:
+                                            with open(file_path, "rb") as fh:
+                                                bot.send_document(chat_id=chat_id, document=fh, caption=caption_text)
+
+                                    kind = "zip" if out and str(out).lower().endswith(".zip") else ("video" if out and str(out).lower().endswith((".mp4", ".mov", ".mkv")) else "doc")
+                                    try:
+                                        await asyncio.to_thread(_send_sync, kind, out, caption)
+                                        sent = True
+                                    except Exception as e:
+                                        logger.warning("Bot API send failed for job %s: %s", job_id, e)
+                                        sent = False
+                                except Exception as e:
+                                    logger.warning("Bot init failed for job %s: %s", job_id, e)
+                                    sent = False
+
+                        # Fallback: if not sent and Telethon userbot is enabled, attempt userbot
                         if not sent and chat_id and enable_userbot:
                             try:
                                 from utils.userbot_uploader import send_file_via_userbot

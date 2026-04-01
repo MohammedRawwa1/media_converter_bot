@@ -2577,10 +2577,16 @@ class EnhancedMediaHandler:
             output_path = f"storage/output/{current_file['id']}_audio.mp3"
 
             if AsyncFileLock:
-                lock = await AsyncFileLock.acquire(current_file["path"])
+                # Defensive: ensure we have a concrete file path before attempting locks
+                path = current_file.get("path")
+                if not path:
+                    await self.safe_edit(query, "❌ Local file missing. Try re-downloading or use the web uploader.")
+                    return
+
+                lock = await AsyncFileLock.acquire(path)
                 async with lock:
                     success = await self.converter.extract_audio_from_video(
-                        current_file["path"], output_path, "mp3", "192k"
+                        path, output_path, "mp3", "192k"
                     )
 
                     if success and os.path.exists(output_path):
@@ -2598,7 +2604,7 @@ class EnhancedMediaHandler:
                                     chat_id=update.effective_chat.id,
                                     audio=audio_file,
                                     caption="✅ Converted to MP3",
-                                    title=current_file["name"].replace(
+                                    title=current_file.get("name", "file").replace(
                                         ".mp4", ".mp3"
                                     ),
                                     performer="Media Bot",
@@ -2607,7 +2613,7 @@ class EnhancedMediaHandler:
                     else:
                         await self.safe_edit(query, "❌ Conversion failed.")
 
-                    await AsyncFileLock.release(current_file["path"])
+                await AsyncFileLock.release(path)
             else:
                 # Fallback without locking
                 success = await self.converter.extract_audio_from_video(
