@@ -523,6 +523,11 @@ def setup_handlers(application: Application) -> None:
 
 async def main(background: bool = False) -> None:
     """Start the bot."""
+    # Run quick env validation (logs missing keys but never prints secrets)
+    try:
+        cfg.validate_env()
+    except Exception:
+        logger.debug("Env validation helper failed (non-fatal)")
     # Validate BOT_TOKEN
     if not BOT_TOKEN:
         logger.error("BOT_TOKEN not set in environment variables!")

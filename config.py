@@ -2,7 +2,9 @@
 
 import os
 import json
+import logging
 from typing import Set, Optional
+from urllib.parse import urlparse
 
 ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -131,3 +133,47 @@ if _canonical_mongo:
 
 # Expose a canonical variable for other modules to import if desired.
 MONGO_URI = os.getenv("MONGO_URI", "")
+
+
+def validate_env() -> None:
+    """Validate critical environment variables without printing secrets.
+
+    Logs missing or malformed settings (names only) and warns on suspicious
+    values. This helper never logs raw secret values.
+    """
+    logger = logging.getLogger(__name__)
+    missing = []
+
+    # Required for normal operation
+    if not os.getenv("BOT_TOKEN"):
+        missing.append("BOT_TOKEN")
+
+    # Storage backend requirements
+    backend = os.getenv("STORAGE_BACKEND", STORAGE_BACKEND).lower() if "STORAGE_BACKEND" in globals() else os.getenv("STORAGE_BACKEND", "local")
+    if backend in ("s3", "r2"):
+        if not os.getenv("S3_BUCKET") or not os.getenv("S3_ENDPOINT"):
+            missing.append("S3_BUCKET/S3_ENDPOINT")
+
+    # Quick Redis URL sanity check
+    red = os.getenv("REDIS_URL")
+    if red:
+        try:
+            parsed = urlparse(red)
+            if parsed.scheme not in ("redis", "rediss"):
+                logger.warning("REDIS_URL scheme looks unusual (expected redis:// or rediss://)")
+        except Exception:
+            logger.warning("Failed to parse REDIS_URL for basic validation")
+
+    # Numeric env sanity checks (warn but do not fail)
+    for key in ("PRESIGN_EXPIRES", "JOB_METADATA_TTL", "CONVERSIONS_PER_HOUR", "PROMETHEUS_METRICS_PORT"):
+        v = os.getenv(key)
+        if v:
+            try:
+                int(v)
+            except Exception:
+                logger.warning("%s should be an integer (current value not logged)", key)
+
+    if missing:
+        logger.error("Missing required env vars: %s (values are NOT shown here)", ", ".join(missing))
+    else:
+        logger.info("Env validation: required variables present (values not displayed)")

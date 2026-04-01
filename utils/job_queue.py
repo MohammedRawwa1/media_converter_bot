@@ -16,8 +16,9 @@ DEFAULT_REDIS_URL = None
 JOB_LIST = "ffmpeg:jobs"
 DELAYED_SET = "ffmpeg:delayed"
 # Optional TTL (seconds) for job metadata hashes created at enqueue time.
-# Set JOB_METADATA_TTL=0 (default) to disable automatic expiry.
-JOB_METADATA_TTL = int(os.getenv("JOB_METADATA_TTL", "0"))
+# Default to 1 day (86400 seconds) so job metadata does not persist indefinitely.
+# Set JOB_METADATA_TTL=0 to disable automatic expiry.
+JOB_METADATA_TTL = int(os.getenv("JOB_METADATA_TTL", "86400"))
 
 
 async def get_redis():

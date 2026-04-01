@@ -556,6 +556,22 @@ class EnhancedMediaHandler:
             err_text = str(e) or ""
             upload_url = os.environ.get("WEB_UPLOAD_URL") or os.environ.get("WEBAPP_URL") or "<your-server>/upload"
 
+            # If the error indicates the file is too large for the Bot API, handle
+            # it centrally (persist forward metadata / trigger web fetch / user guidance)
+            # regardless of whether a userbot is configured. This ensures forwards
+            # are saved to S3/R2 when configured instead of failing silently.
+            if "file is too big" in err_text.lower() or "too big" in err_text.lower():
+                try:
+                    await self._handle_large_forward(update, current_file, err_text, upload_url)
+                    return
+                except Exception:
+                    # If handling the large forward fails, propagate a user-friendly
+                    # error so callers can inform the user.
+                    raise Exception(
+                        "Telegram reports the file is too big to download via the bot. "
+                        f"Please either upload the file via the web uploader (POST to {upload_url}) or provide a direct public URL to the file."
+                    )
+
             # Opt-in userbot fallback: try origin-of-forward first (if present),
             # then fall back to downloading the forwarded message as it appears
             # in the bot chat (useful when forward metadata lacks origin IDs).
@@ -619,17 +635,6 @@ class EnhancedMediaHandler:
                     except Exception:
                         logger.exception("Userbot download fallback failed (bot chat)")
 
-                    # If it's clearly a size issue, delegate to helper to persist metadata,
-                    # optionally auto-fetch and enqueue, or raise a user-facing exception.
-                    if "file is too big" in err_text.lower() or "too big" in err_text.lower():
-                        try:
-                            await self._handle_large_forward(update, current_file, err_text, upload_url)
-                        except Exception:
-                            raise Exception(
-                                "Telegram reports the file is too big to download via the bot. "
-                                f"Please either upload the file via the web uploader (POST to {upload_url}) or provide a direct public URL to the file."
-                            )
-
             # Other get_file errors: re-raise
             raise
 
@@ -671,6 +676,10 @@ class EnhancedMediaHandler:
                 "registered_at": datetime.utcnow().isoformat(),
             }
             fh = save_forward_metadata(metadata)
+            try:
+                logger.info("Saved forward metadata id=%s for file_id=%s", fh, metadata.get("file_id"))
+            except Exception:
+                pass
 
             auto_fetch = os.environ.get("AUTO_FETCH_FORWARDS", "").lower() in ("1", "true", "yes")
             web_upload_url = os.environ.get("WEB_UPLOAD_URL") or os.environ.get("WEBAPP_URL")
