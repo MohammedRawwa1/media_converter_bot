@@ -189,8 +189,116 @@ async def _download_file_async(key: str, dest: str) -> None:
 
 
 def delete_forward_metadata(fid: str) -> bool:
+    # When debugging it may be useful to keep forward metadata in storage
+    # for investigation. Honor `KEEP_FORWARD_METADATA=1|true|yes` to skip
+    # removing the saved forward JSON.
+    if os.environ.get("KEEP_FORWARD_METADATA", "").lower() in ("1", "true", "yes"):
+        try:
+            logger.info("KEEP_FORWARD_METADATA set; not deleting forward metadata %s", fid)
+        except Exception:
+            pass
+        return True
+
+    # Provide caller context in logs to help root-cause analysis when
+    # forwards are deleted unexpectedly.
+    try:
+        import traceback as _trace
+
+        stack = _trace.format_stack(limit=6)
+        logger.info("delete_forward_metadata called for %s; caller stack:\n%s", fid, "".join(stack))
+    except Exception:
+        pass
+
     backend_name = (os.getenv("STORAGE_BACKEND") or (config.STORAGE_BACKEND if config else "local")).lower()
     key = f"forwards/{fid}.json"
+
+    # Optional archival/move behavior: if `FORWARDS_ARCHIVE_PREFIX` is set
+    # we will attempt to copy the forward JSON to that prefix (e.g.
+    # "forwards/archived") and then delete the original. This preserves
+    # the metadata for later inspection while keeping the original key
+    # namespace clean.
+    archive_prefix = os.environ.get("FORWARDS_ARCHIVE_PREFIX") or os.environ.get("FORWARD_ARCHIVE_PREFIX")
+    if archive_prefix:
+        archive_key = archive_prefix.rstrip("/") + "/" + f"{fid}.json"
+        if backend_name in ("s3", "r2"):
+            try:
+                b = get_storage_backend_sync()
+                # Prefer server-side copy via boto3 when available
+                try:
+                    import boto3 as _boto3
+
+                    client = _boto3.client("s3", **b._client_kwargs())
+                    copy_source = {"Bucket": b.bucket, "Key": key}
+                    client.copy_object(CopySource=copy_source, Bucket=b.bucket, Key=archive_key)
+                    logger.info("Archived forward object %s -> %s", key, archive_key)
+                    # delete original via backend helper (preserve async-safe behavior)
+                    try:
+                        import asyncio
+
+                        try:
+                            loop = asyncio.get_event_loop()
+                        except RuntimeError:
+                            loop = None
+
+                        if loop and loop.is_running():
+                            try:
+                                loop.call_soon_threadsafe(lambda: asyncio.create_task(b.delete(key)))
+                            except Exception:
+                                try:
+                                    loop.create_task(b.delete(key))
+                                except Exception:
+                                    pass
+                        else:
+                            try:
+                                asyncio.run(b.delete(key))
+                            except Exception:
+                                pass
+                    except Exception:
+                        pass
+                    return True
+                except Exception:
+                    logger.exception("Archive copy via boto3 failed for %s -> %s; falling back to download/reupload", key, archive_key)
+                    # Fallback: download then reupload
+                    try:
+                        import asyncio
+                        import tempfile
+
+                        tmp = tempfile.mktemp(suffix=".json")
+                        try:
+                            asyncio.run(b.download_file(key, tmp))
+                            asyncio.run(b.upload_file(tmp, archive_key))
+                        finally:
+                            try:
+                                os.remove(tmp)
+                            except Exception:
+                                pass
+                        # delete original
+                        try:
+                            loop = asyncio.get_event_loop()
+                        except RuntimeError:
+                            loop = None
+                        if loop and loop.is_running():
+                            try:
+                                loop.call_soon_threadsafe(lambda: asyncio.create_task(b.delete(key)))
+                            except Exception:
+                                try:
+                                    loop.create_task(b.delete(key))
+                                except Exception:
+                                    pass
+                        else:
+                            try:
+                                asyncio.run(b.delete(key))
+                            except Exception:
+                                pass
+                        return True
+                    except Exception:
+                        logger.exception("Archive fallback (download/reupload) failed for %s", key)
+                        # fall through to regular delete below
+            except Exception:
+                logger.exception("Failed to archive forward %s", fid)
+
+    # Default deletion behavior: attempt backend delete (async-safe),
+    # otherwise remove local copy.
     if backend_name in ("s3", "r2"):
         try:
             b = get_storage_backend_sync()
