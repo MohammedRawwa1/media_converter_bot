@@ -62,8 +62,14 @@ async def _upload_and_enqueue(local_path: str, original_name: str, chat_id: Opti
         await backend.upload_file(local_path, key)
         input_key = key
         logger.info("Uploaded %s -> %s", local_path, input_key)
-        # cleanup local copy unless configured to keep
-        if os.environ.get("KEEP_LOCAL_UPLOADS", "").lower() not in ("1", "true", "yes"):
+        # Only remove local temp copy if operator did NOT request to keep uploads.
+        # Prefer leaving cleanup responsibility to the worker which also respects
+        # KEEP_LOCAL_UPLOADS (we patched worker to honor this global flag).
+        try:
+            keep_local = os.environ.get("KEEP_LOCAL_UPLOADS", "").lower() in ("1", "true", "yes")
+        except Exception:
+            keep_local = False
+        if not keep_local:
             try:
                 os.remove(local_path)
             except Exception:
@@ -71,7 +77,17 @@ async def _upload_and_enqueue(local_path: str, original_name: str, chat_id: Opti
     except Exception:
         logger.exception("Failed to upload to storage for %s", local_path)
 
+    # If upload failed (no input_key), do not enqueue an empty job.
+    if not input_key:
+        logger.error("Upload did not produce an input_key for %s; not enqueuing job %s", local_path, job_id)
+        return
+
     # Build job metadata and enqueue to Redis (metadata-only)
+    try:
+        keep_local = os.environ.get("KEEP_LOCAL_UPLOADS", "").lower() in ("1", "true", "yes")
+    except Exception:
+        keep_local = False
+
     job = {
         "job_id": job_id,
         "input_key": input_key,
@@ -80,7 +96,9 @@ async def _upload_and_enqueue(local_path: str, original_name: str, chat_id: Opti
         "chat_id": chat_id,
         "message_id": message_id,
         "progress_channel": f"ffmpeg:progress:{job_id}",
-        "cleanup_input": True,
+        # Let the worker decide whether to delete local input; here we
+        # indicate whether the job should cleanup the input after processing.
+        "cleanup_input": not keep_local,
     }
 
     if enqueue_job is None:

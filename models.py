@@ -275,7 +275,17 @@ class MediaConversionModel:
             await self.sessions.update_one({"user_id": user_id, **({"bot_id": self.bot_id} if self.bot_id is not None else {})}, {"$set": doc}, upsert=True)
             return True
         except Exception as e:
-            logger.error(f"Error saving session for %s: %s", user_id, e)
+            # Allow quieter logging during Mongo outages. Set QUIET_MONGO_SESSION_ERRORS=1
+            # in the environment to avoid noisy ERROR-level logs while connectivity
+            # is being repaired. Debug mode still records the traceback.
+            try:
+                quiet = os.environ.get("QUIET_MONGO_SESSION_ERRORS", "").lower() in ("1", "true", "yes")
+            except Exception:
+                quiet = False
+            if quiet:
+                logger.debug("Error saving session for %s: %s", user_id, e, exc_info=True)
+            else:
+                logger.error("Error saving session for %s: %s", user_id, e, exc_info=True)
             return False
 
     async def load_session(self, user_id: int) -> Optional[Dict[str, Any]]:
