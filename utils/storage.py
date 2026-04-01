@@ -156,6 +156,19 @@ class S3AsyncBackend(AsyncStorageBackend):
         return kw
 
     async def upload_file(self, src_path: str, dest_key: str) -> str:
+        if not src_path or not os.path.exists(src_path):
+            raise ValueError(f"Invalid src_path: {src_path}")
+
+        if not dest_key:
+            raise ValueError("dest_key must not be empty")
+
+        if not self.bucket:
+            raise ValueError(f"Invalid S3 bucket name: {self.bucket}")
+
+        # Ensure the configured S3 bucket is a bucket name, not a URL
+        if "http://" in str(self.bucket) or "https://" in str(self.bucket):
+            raise ValueError(f"S3_BUCKET must be a bucket name, not a URL: {self.bucket}")
+
         # Retry/backoff parameters
         retries = int(os.getenv("S3_OP_RETRIES", "3"))
         backoff_base = float(os.getenv("S3_OP_BACKOFF_BASE", "1"))
@@ -165,15 +178,23 @@ class S3AsyncBackend(AsyncStorageBackend):
 
         for attempt in range(1, retries + 1):
             try:
+                logger.info(
+                    "Uploading file → bucket=%s key=%s (attempt %s/%s)",
+                    self.bucket,
+                    dest_key,
+                    attempt,
+                    retries,
+                )
+
+                # Async path (aioboto3)
                 if self._use_aioboto3:
                     async with self._session.client("s3", **self._client_kwargs()) as client:
-                        # aioboto3 exposes upload_file as an awaitable wrapper
                         await client.upload_file(src_path, self.bucket, dest_key)
                     return dest_key
 
-                # Fallback: use synchronous boto3 client executed in threadpool
+                # Sync fallback (boto3)
                 if boto3 is None:
-                    raise RuntimeError("boto3 is required for S3 operations when aioboto3 is not installed")
+                    raise RuntimeError("boto3 is required when aioboto3 is not installed")
 
                 def _sync_upload():
                     client = boto3.client("s3", **self._client_kwargs())
@@ -183,13 +204,46 @@ class S3AsyncBackend(AsyncStorageBackend):
                 return dest_key
 
             except Exception as e:
-                logger.warning("S3 upload attempt %s/%s failed: %s", attempt, retries, e)
+                logger.warning(
+                    "S3 upload failed (attempt %s/%s): %s",
+                    attempt,
+                    retries,
+                    e,
+                )
+
                 if attempt == retries:
-                    logger.exception("S3 upload failed after %s attempts", retries)
+                    logger.exception("S3 upload failed permanently for key=%s", dest_key)
                     raise
-                # exponential backoff with jitter
+
                 backoff = min(max_backoff, backoff_base * (2 ** (attempt - 1)))
                 await asyncio.sleep(backoff + random.random())
+
+    async def upload_file_streaming(self, src_path: str, dest_key: str) -> str:
+        if not os.path.exists(src_path):
+            raise ValueError(f"File not found: {src_path}")
+
+        # Async path (aioboto3)
+        if self._use_aioboto3:
+            async with self._session.client("s3", **self._client_kwargs()) as client:
+                with open(src_path, "rb") as f:
+                    await client.put_object(
+                        Bucket=self.bucket,
+                        Key=dest_key,
+                        Body=f,
+                    )
+            return dest_key
+
+        # Sync fallback
+        if boto3 is None:
+            raise RuntimeError("boto3 is required when aioboto3 is not installed")
+
+        def _sync():
+            client = boto3.client("s3", **self._client_kwargs())
+            with open(src_path, "rb") as f:
+                client.put_object(Bucket=self.bucket, Key=dest_key, Body=f)
+
+        await asyncio.to_thread(_sync)
+        return dest_key
 
     async def download_file(self, key: str, dest_path: str) -> bool:
         # Retry/backoff parameters
