@@ -23,12 +23,27 @@ JOB_METADATA_TTL = int(os.getenv("JOB_METADATA_TTL", "86400"))
 
 
 async def get_redis():
+    # Use a shared aioredis client for the process to avoid exhausting
+    # Redis server client slots. We return a lightweight proxy whose
+    # `close()` is a no-op so existing call sites that `await r.close()`
+    # remain safe; call `close_redis()` at shutdown to close the real
+    # client.
+    global _redis_client, _redis_proxy
     if not aioredis:
         raise RuntimeError("redis.asyncio is required for job queue")
     # read the env var at call-time so runtime env changes or late injection work
     redis_url = os.environ.get("REDIS_URL")
     if not redis_url:
         raise RuntimeError("REDIS_URL environment variable is not set")
+
+    # If already created, return proxy
+    try:
+        if _redis_proxy is not None:
+            return _redis_proxy
+    except NameError:
+        # fall through to create
+        pass
+
     # Log a masked host:port for diagnostics (do not print credentials)
     try:
         parsed = urlparse(redis_url)
@@ -39,7 +54,37 @@ async def get_redis():
     except Exception:
         pass
 
-    return aioredis.from_url(redis_url)
+    # module-level storage for the real client and proxy
+    _redis_client = aioredis.from_url(redis_url, decode_responses=True, max_connections=int(os.getenv("REDIS_MAX_CONNECTIONS", "50")))
+
+    class _RedisProxy:
+        def __init__(self, client):
+            self._client = client
+
+        def __getattr__(self, name):
+            return getattr(self._client, name)
+
+        async def close(self):
+            # no-op: callers may `await r.close()` safely; call close_redis()
+            # at shutdown to close the real client.
+            return
+
+    _redis_proxy = _RedisProxy(_redis_client)
+    return _redis_proxy
+
+
+async def close_redis():
+    """Close the shared Redis client (call at process shutdown)."""
+    global _redis_client, _redis_proxy
+    try:
+        if _redis_client is not None:
+            try:
+                await _redis_client.close()
+            except Exception:
+                pass
+    finally:
+        _redis_client = None
+        _redis_proxy = None
 
 
 async def enqueue_job(job: dict) -> None:

@@ -9,7 +9,7 @@ import time
 import subprocess
 from typing import Optional
 
-from utils.job_queue import pop_job, publish_update, get_redis, JOB_LIST
+from utils.job_queue import pop_job, publish_update, get_redis, JOB_LIST, close_redis
 from utils.ffmpeg_runner import run_ffmpeg
 from utils import job_store
 from utils import file_utils
@@ -982,7 +982,13 @@ def main():
         loop.run_until_complete(worker_loop(stop_event))
     finally:
         try:
+            # Close job store (Mongo) if used
             loop.run_until_complete(job_store.close())
+        except Exception:
+            pass
+        try:
+            # Close shared Redis client used across utils
+            loop.run_until_complete(close_redis())
         except Exception:
             pass
         loop.close()
