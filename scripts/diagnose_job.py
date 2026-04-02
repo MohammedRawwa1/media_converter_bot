@@ -113,9 +113,28 @@ def job_info(job_id: str) -> Dict[str, Any]:
         return {"error": str(e)}
 
 
+def ps_top(n: int = 20) -> Dict[str, Any]:
+    cmd = ["ps", "aux", "--sort=-rss"]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+        out = proc.stdout.splitlines()[:n]
+        return {"ps": out}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+def dump_env() -> Dict[str, Any]:
+    try:
+        env = dict(os.environ)
+        # return only keys to avoid leaking large/secret values unnecessarily
+        return {"env_keys": list(env.keys())}
+    except Exception as e:
+        return {"error": str(e)}
+
+
 def main(argv=None):
     p = argparse.ArgumentParser()
-    p.add_argument("--action", required=True, choices=["ffprobe", "remux", "reencode", "tail_logs", "job_info"]) 
+    p.add_argument("--action", required=True, choices=["ffprobe", "remux", "reencode", "tail_logs", "job_info", "ps", "env"]) 
     p.add_argument("--file", help="Path or basename of file in storage/input")
     p.add_argument("--out", help="Output path for remux/reencode (optional)")
     p.add_argument("--lines", type=int, default=200, help="Number of tail lines for logs")
@@ -166,6 +185,16 @@ def main(argv=None):
             print(json.dumps({"error": "--job_id required for job_info"}))
             sys.exit(2)
         res = job_info(args.job_id)
+        print(json.dumps(res))
+        return
+
+    if args.action == "ps":
+        res = ps_top()
+        print(json.dumps(res))
+        return
+
+    if args.action == "env":
+        res = dump_env()
         print(json.dumps(res))
         return
 

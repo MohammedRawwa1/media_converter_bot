@@ -33,6 +33,14 @@ OUTPUT_DIR = getattr(config, "OUTPUT_PATH", "storage/output")
 os.makedirs(INPUT_DIR, exist_ok=True)
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
+# Optional upload size cap (bytes) to protect memory from huge multipart uploads.
+try:
+    max_bytes = int(os.environ.get("MAX_CONTENT_LENGTH_BYTES", "0") or 0)
+    if max_bytes and max_bytes > 0:
+        app.config["MAX_CONTENT_LENGTH"] = max_bytes
+except Exception:
+    pass
+
 # In-memory fallback job store when Redis is not available (best-effort)
 JOB_STORE = {}
 
@@ -1040,4 +1048,5 @@ if __name__ == "__main__":
     except Exception:
         logger.debug("WebSocket server module not available")
 
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", "5000")), debug=True)
+    debug_mode = os.environ.get("FLASK_DEBUG", "0").lower() in ("1", "true", "yes")
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", "5000")), debug=debug_mode)

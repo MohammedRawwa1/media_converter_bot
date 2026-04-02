@@ -72,9 +72,10 @@ async def handle_job(job: dict):
     except Exception:
         pass
 
-    # If job references a remote storage key (S3/MinIO), download it to a temp file
+    # If job references a remote storage key (S3/MinIO), prefer to download it
+    # when the local `input_path` is missing or the file is not present on disk.
     input_key = job.get("input_key") or job.get("s3_key") or job.get("remote_key")
-    if input_key and not input_path:
+    if input_key and (not input_path or not os.path.exists(input_path)):
         try:
             # prepare temp path
             temp_dir = os.path.join(getattr(config, "TEMP_PATH", "storage/temp"))
@@ -116,7 +117,7 @@ async def handle_job(job: dict):
                 pass
             return
         # If download completed but file wasn't created, treat as failure
-        if not input_path:
+        if not input_path or not os.path.exists(input_path):
             try:
                 await publish_update(progress_channel, {"job_id": job_id, "progress": 0, "message": "download_failed", "error": "remote_download_no_file"})
             except Exception:
@@ -226,6 +227,33 @@ async def handle_job(job: dict):
 
     attempt = 0
     converter = ExtendedMediaConverter() if ExtendedMediaConverter else None
+    # optional memory sampler task (helpful for remote debugging)
+    memory_sampler_task = None
+
+    async def _get_rss_bytes() -> int:
+        try:
+            import psutil
+
+            p = psutil.Process(os.getpid())
+            return int(getattr(p.memory_info(), "rss", 0))
+        except Exception:
+            try:
+                out = subprocess.check_output(["ps", "-o", "rss=", "-p", str(os.getpid())], text=True)
+                return int(out.strip()) * 1024
+            except Exception:
+                return 0
+
+    async def _memory_sampler(channel: str, interval: float = 5.0):
+        while True:
+            try:
+                rss = await _get_rss_bytes()
+                try:
+                    await publish_update(channel, {"job_id": job_id, "memory_rss": rss})
+                except Exception:
+                    pass
+            except Exception:
+                pass
+            await asyncio.sleep(interval)
 
     try:
         while True:
@@ -259,8 +287,10 @@ async def handle_job(job: dict):
                         except Exception:
                             # on limiter failures, allow processing to continue
                             pass
-                        # Ensure there is some form of input before starting ffmpeg: a local path, a remote storage key, or a source URL.
-                        if not input_path and not job.get("input_key") and not job.get("source_url"):
+                        # Ensure there is some form of input before starting ffmpeg: a local path (that exists),
+                        # a remote storage key, or a source URL. Prefer remote key download when present.
+                        has_local_file = bool(input_path and os.path.exists(input_path))
+                        if not has_local_file and not job.get("input_key") and not job.get("source_url"):
                             logger.error("No input available for job %s; marking as error", job_id)
                             try:
                                 await publish_update(progress_channel, {"job_id": job_id, "progress": 0, "message": "error", "error": "no_input_provided"})
@@ -273,6 +303,12 @@ async def handle_job(job: dict):
                             return
 
                         coro = run_ffmpeg(input_path, output_path, job_id, ffmpeg_args=ffmpeg_args, redis_url=redis_url, progress_channel=progress_channel)
+                        # Start optional memory sampler
+                        try:
+                            if os.environ.get("ENABLE_MEMORY_SAMPLER", "").lower() in ("1", "true", "yes"):
+                                memory_sampler_task = asyncio.create_task(_memory_sampler(progress_channel, float(os.environ.get("MEMORY_SAMPLER_INTERVAL", "5.0"))))
+                        except Exception:
+                            memory_sampler_task = None
                         try:
                             success, info = await asyncio.wait_for(coro, timeout=max_runtime)
                         except asyncio.TimeoutError:
@@ -539,6 +575,17 @@ async def handle_job(job: dict):
                             os.remove(temp_input)
                     except Exception:
                         pass
+
+                        # cancel memory sampler if running
+                        try:
+                            if memory_sampler_task:
+                                memory_sampler_task.cancel()
+                                try:
+                                    await memory_sampler_task
+                                except Exception:
+                                    pass
+                        except Exception:
+                            pass
 
                     return
 
