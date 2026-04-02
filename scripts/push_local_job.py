@@ -92,7 +92,6 @@ def main():
     }
 
     try:
-        r.lpush("ffmpeg:jobs", json.dumps(job))
         mapping = {
             "status": "queued",
             "progress": "0",
@@ -102,7 +101,12 @@ def main():
             "output": job.get("output_path") or "",
             "created_at": str(time.time()),
         }
-        r.hset(f"ffmpeg:job:{job_id}", mapping=mapping)
+        # write metadata first to avoid race where worker pops before hash exists
+        try:
+            r.hset(f"ffmpeg:job:{job_id}", mapping=mapping)
+        except Exception:
+            pass
+        r.lpush("ffmpeg:jobs", json.dumps(job))
         print("Enqueued job:", job_id)
         print("Input:", input_path)
         print("Output:", output_path)

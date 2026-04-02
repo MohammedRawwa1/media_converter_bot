@@ -72,6 +72,48 @@ async def handle_job(job: dict):
     except Exception:
         pass
 
+    # Enrich job payload from Redis-stored job hash when fields are missing.
+    # Some producers write extra metadata into the job hash (hset) but push
+    # a minimal JSON onto the queue; read the hash to fill any missing fields
+    # before we decide there is "no input".
+    try:
+        try:
+            r = await get_redis()
+        except Exception:
+            r = None
+        if r is not None and job_id:
+            try:
+                stored = await r.hgetall(f"ffmpeg:job:{job_id}")
+                if stored:
+                    # stored values may be bytes or str depending on client
+                    def _sval(key):
+                        v = stored.get(key)
+                        if isinstance(v, bytes):
+                            try:
+                                return v.decode()
+                            except Exception:
+                                return v
+                        return v
+
+                    # fill missing fields conservatively
+                    if not job.get("input_path") and _sval("input"):
+                        job["input_path"] = _sval("input")
+                        input_path = job["input_path"]
+                    if not job.get("input_key") and _sval("input_key"):
+                        job["input_key"] = _sval("input_key")
+                    if not job.get("source_url") and _sval("source_url"):
+                        job["source_url"] = _sval("source_url")
+                    if not job.get("output_path") and _sval("output"):
+                        job["output_path"] = _sval("output")
+            except Exception:
+                pass
+            try:
+                await r.close()
+            except Exception:
+                pass
+    except Exception:
+        pass
+
     # If job references a remote storage key (S3/MinIO), prefer to download it
     # when the local `input_path` is missing or the file is not present on disk.
     input_key = job.get("input_key") or job.get("s3_key") or job.get("remote_key")
@@ -109,6 +151,23 @@ async def handle_job(job: dict):
                 input_path = temp_input_path
                 job["input_path"] = input_path
                 job["_input_from_remote"] = True
+                # persist indicator into Redis job hash for observability
+                try:
+                    try:
+                        r2 = await get_redis()
+                    except Exception:
+                        r2 = None
+                    if r2 is not None:
+                        try:
+                            await r2.hset(f"ffmpeg:job:{job_id}", mapping={"input": str(job.get("input_path") or ""), "input_from_remote": "1"})
+                        except Exception:
+                            pass
+                        try:
+                            await r2.close()
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
         except Exception as e:
             logger.exception("Failed to download input from storage for job %s: %s", job_id, e)
             try:

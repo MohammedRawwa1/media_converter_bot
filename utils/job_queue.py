@@ -74,8 +74,9 @@ async def enqueue_job(job: dict) -> None:
     except Exception:
         pass
 
-    await r.lpush(JOB_LIST, json.dumps(job))
     # Initialize a Redis job hash so status endpoints see the job immediately.
+    # Write the job hash before pushing to the list to avoid a race where a
+    # worker pops the job before the metadata has been created.
     try:
         job_id = job.get("job_id")
         if job_id:
@@ -91,28 +92,37 @@ async def enqueue_job(job: dict) -> None:
                 "created_at": str(time.time()),
                 "request_id": job.get("request_id") or "",
             }
-            # carry optional request_id for tracing (may be None)
-            try:
-                mapping["request_id"] = job.get("request_id") or ""
-            except Exception:
-                mapping["request_id"] = ""
+            # Attempt to set the hash first
             try:
                 await r.hset(f"ffmpeg:job:{job_id}", mapping=mapping)
-                # set optional TTL so job metadata does not live forever
-                try:
-                    if JOB_METADATA_TTL and JOB_METADATA_TTL > 0:
+                if JOB_METADATA_TTL and JOB_METADATA_TTL > 0:
+                    try:
                         await r.expire(f"ffmpeg:job:{job_id}", JOB_METADATA_TTL)
-                except Exception:
-                    pass
+                    except Exception:
+                        pass
             except Exception:
-                # best-effort - do not fail enqueue if hset fails
+                # best-effort - proceed to push the job even if hset fails
                 pass
+
             try:
                 src = mapping.get("input")
                 out = mapping.get("output")
-                logging.getLogger(__name__).info("Enqueued job %s request_id=%s input=%s output=%s", job_id, mapping.get("request_id"), src, out)
+                logging.getLogger(__name__).info("Prepared job %s request_id=%s input=%s output=%s", job_id, mapping.get("request_id"), src, out)
             except Exception:
                 pass
+
+    except Exception:
+        pass
+
+    # Finally push the job into the queue
+    try:
+        await r.lpush(JOB_LIST, json.dumps(job))
+    except Exception:
+        # If push fails, there's not much we can do here - leave the hash as-is
+        try:
+            logging.getLogger(__name__).exception("Failed to push job onto Redis list for job %s", job.get("job_id"))
+        except Exception:
+            pass
     except Exception:
         pass
     # persist to Mongo if available (best-effort)
