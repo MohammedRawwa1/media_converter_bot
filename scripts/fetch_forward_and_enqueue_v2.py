@@ -54,7 +54,11 @@ def download_forward_json_from_s3(key: str, bucket: str, endpoint: str, region: 
         kwargs['aws_secret_access_key'] = secret
 
     client = boto3.client('s3', **kwargs)
-    local_dir = os.path.join(os.path.dirname(__file__), '..', 'storage', 'forwards')
+    try:
+        import config
+    except Exception:
+        config = None
+    local_dir = os.path.join(os.path.dirname(__file__), '..', getattr(config, 'STORAGE_PATH', 'storage'), 'forwards')
     os.makedirs(local_dir, exist_ok=True)
     fid = None
     if key.startswith('forwards/') and key.endswith('.json'):

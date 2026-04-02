@@ -5,6 +5,7 @@ import logging
 import time
 from typing import Optional
 from urllib.parse import urlparse
+import uuid
 
 try:
     import redis.asyncio as aioredis
@@ -66,6 +67,13 @@ async def enqueue_job(job: dict) -> None:
                 job["output_path"] = job["output_path"].replace("\\", "/")
         except Exception:
             pass
+    # If no request_id provided, generate one for end-to-end tracing
+    try:
+        if not job.get("request_id"):
+            job["request_id"] = str(uuid.uuid4())
+    except Exception:
+        pass
+
     await r.lpush(JOB_LIST, json.dumps(job))
     # Initialize a Redis job hash so status endpoints see the job immediately.
     try:
@@ -81,6 +89,7 @@ async def enqueue_job(job: dict) -> None:
                 "input_key": job.get("input_key") or "",
                 "output": job.get("output_path") or job.get("output") or "",
                 "created_at": str(time.time()),
+                "request_id": job.get("request_id") or "",
             }
             # carry optional request_id for tracing (may be None)
             try:
@@ -99,7 +108,9 @@ async def enqueue_job(job: dict) -> None:
                 # best-effort - do not fail enqueue if hset fails
                 pass
             try:
-                logging.getLogger(__name__).info("Enqueued job %s request_id=%s", job_id, job.get("request_id"))
+                src = mapping.get("input")
+                out = mapping.get("output")
+                logging.getLogger(__name__).info("Enqueued job %s request_id=%s input=%s output=%s", job_id, mapping.get("request_id"), src, out)
             except Exception:
                 pass
     except Exception:

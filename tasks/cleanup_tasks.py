@@ -3,6 +3,10 @@ import asyncio
 import logging
 import os
 import time
+try:
+    import config
+except Exception:
+    config = None
 
 logger = logging.getLogger(__name__)
 
@@ -52,19 +56,19 @@ class CleanupManager:
 
     async def cleanup_input_files(self) -> int:
         """Clean up old input files."""
-        return await self._cleanup_directory("storage/input", self.max_file_age)
+        return await self._cleanup_directory(getattr(config, "INPUT_PATH", "storage/input"), self.max_file_age)
 
     async def cleanup_output_files(self) -> int:
         """Clean up old output files."""
-        return await self._cleanup_directory("storage/output", self.max_file_age)
+        return await self._cleanup_directory(getattr(config, "OUTPUT_PATH", "storage/output"), self.max_file_age)
 
     async def cleanup_temp_files(self) -> int:
         """Clean up temporary files."""
-        return await self._cleanup_directory("storage/temp", self.max_temp_age)
+        return await self._cleanup_directory(getattr(config, "TEMP_PATH", "storage/temp"), self.max_temp_age)
 
     async def cleanup_thumbnails(self) -> int:
         """Clean up old thumbnails."""
-        return await self._cleanup_directory("storage/thumbnails", self.max_file_age)
+        return await self._cleanup_directory(getattr(config, "THUMBNAIL_PATH", "storage/thumbnails"), self.max_file_age)
 
     async def _cleanup_directory(self, directory: str, max_age: int) -> int:
         """Clean up files in a directory older than max_age."""
@@ -101,7 +105,12 @@ class CleanupManager:
 
     async def cleanup_empty_directories(self) -> int:
         """Remove empty directories."""
-        directories = ["storage/input", "storage/output", "storage/temp", "storage/thumbnails"]
+        directories = [
+            getattr(config, "INPUT_PATH", "storage/input"),
+            getattr(config, "OUTPUT_PATH", "storage/output"),
+            getattr(config, "TEMP_PATH", "storage/temp"),
+            getattr(config, "THUMBNAIL_PATH", "storage/thumbnails"),
+        ]
 
         removed_count = 0
 
@@ -134,7 +143,12 @@ class CleanupManager:
     async def get_storage_stats(self) -> dict:
         """Get storage usage statistics."""
         stats = {}
-        directories = ["storage/input", "storage/output", "storage/temp", "storage/thumbnails"]
+        directories = [
+            getattr(config, "INPUT_PATH", "storage/input"),
+            getattr(config, "OUTPUT_PATH", "storage/output"),
+            getattr(config, "TEMP_PATH", "storage/temp"),
+            getattr(config, "THUMBNAIL_PATH", "storage/thumbnails"),
+        ]
 
         for directory in directories:
             size_bytes = 0

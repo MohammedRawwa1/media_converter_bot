@@ -691,8 +691,15 @@ async def main(background: bool = False) -> None:
     # Setup handlers
     setup_handlers(application)
 
-    # Create directories
-    await ensure_directories("storage", "storage/input", "storage/output", "storage/temp", "storage/thumbnails", "logs")
+    # Create directories (use configured storage paths when available)
+    await ensure_directories(
+        getattr(cfg, "STORAGE_PATH", "storage"),
+        getattr(cfg, "INPUT_PATH", "storage/input"),
+        getattr(cfg, "OUTPUT_PATH", "storage/output"),
+        getattr(cfg, "TEMP_PATH", "storage/temp"),
+        getattr(cfg, "THUMBNAIL_PATH", "storage/thumbnails"),
+        "logs",
+    )
 
     # Start cleanup manager
     try:
