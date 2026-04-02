@@ -1056,7 +1056,12 @@ class EnhancedMediaHandler:
         # Enqueue conversion job to Redis so a worker handles heavy lifting
         input_path = current_file["path"]
         output_ext = f".{target_format}"
-        output_path = f"storage/output/{current_file['id']}_converted{output_ext}"
+        output_dir = getattr(config, "OUTPUT_PATH", "storage/output") if config else "storage/output"
+        try:
+            os.makedirs(output_dir, exist_ok=True)
+        except Exception:
+            pass
+        output_path = os.path.join(output_dir, f"{current_file['id']}_converted{output_ext}")
         job_id = str(uuid.uuid4())
         job = {
             "job_id": job_id,
@@ -1317,7 +1322,12 @@ class EnhancedMediaHandler:
                 queued = 0
                 for url in urls:
                     job_id = str(uuid.uuid4())
-                    output_path = f"storage/output/{job_id}.mp4"
+                    output_dir = getattr(config, "OUTPUT_PATH", "storage/output") if config else "storage/output"
+                    try:
+                        os.makedirs(output_dir, exist_ok=True)
+                    except Exception:
+                        pass
+                    output_path = os.path.join(output_dir, f"{job_id}.mp4")
                     job = {
                         "job_id": job_id,
                         "source_url": url,
@@ -1537,7 +1547,12 @@ class EnhancedMediaHandler:
         if (awaiting_sub or awaiting_burn) and file_ext in subtitle_exts:
             await update.message.reply_text("📥 Downloading subtitle file...")
             file = await context.bot.get_file(document.file_id)
-            subtitle_path = f"storage/input/{user_id}_{document.file_id}{file_ext}"
+            input_dir = getattr(config, "INPUT_PATH", "storage/input") if config else "storage/input"
+            try:
+                os.makedirs(input_dir, exist_ok=True)
+            except Exception:
+                pass
+            subtitle_path = os.path.join(input_dir, f"{user_id}_{document.file_id}{file_ext}")
             await file.download_to_drive(subtitle_path)
 
             # Ensure we have a current video for burning/adding
@@ -1547,7 +1562,12 @@ class EnhancedMediaHandler:
                 return
 
             video_path = current["path"]
-            out_path = f"storage/output/{user_id}_subtitled_{os.path.basename(video_path)}"
+            output_dir = getattr(config, "OUTPUT_PATH", "storage/output") if config else "storage/output"
+            try:
+                os.makedirs(output_dir, exist_ok=True)
+            except Exception:
+                pass
+            out_path = os.path.join(output_dir, f"{user_id}_subtitled_{os.path.basename(video_path)}")
 
             if awaiting_burn:
                 await update.message.reply_text("🔧 Burning subtitles into video (this may take a while)...")
@@ -2257,7 +2277,12 @@ class EnhancedMediaHandler:
                                 continue
 
                             job_id = str(uuid.uuid4()) if uuid else None
-                            out_path = f"storage/output/{f.get('id')}_bulk.mp4"
+                            output_dir = getattr(config, "OUTPUT_PATH", "storage/output") if config else "storage/output"
+                            try:
+                                os.makedirs(output_dir, exist_ok=True)
+                            except Exception:
+                                pass
+                            out_path = os.path.join(output_dir, f"{f.get('id')}_bulk.mp4")
                             job = {
                                 "job_id": job_id,
                                 "input_path": f.get("path"),
@@ -2574,7 +2599,12 @@ class EnhancedMediaHandler:
 
         async def do_conversion():
             # Lock the input file to prevent concurrent access
-            output_path = f"storage/output/{current_file['id']}_audio.mp3"
+            output_dir = getattr(config, "OUTPUT_PATH", "storage/output") if config else "storage/output"
+            try:
+                os.makedirs(output_dir, exist_ok=True)
+            except Exception:
+                pass
+            output_path = os.path.join(output_dir, f"{current_file['id']}_audio.mp3")
 
             if AsyncFileLock:
                 # Defensive: ensure we have a concrete file path before attempting locks
@@ -2702,7 +2732,12 @@ class EnhancedMediaHandler:
             await self.safe_edit(query, f"📉 Compressing with CRF {crf}...")
 
         async def do_compression():
-            output_path = f"storage/output/{current_file['id']}_compressed.mp4"
+            output_dir = getattr(config, "OUTPUT_PATH", "storage/output") if config else "storage/output"
+            try:
+                os.makedirs(output_dir, exist_ok=True)
+            except Exception:
+                pass
+            output_path = os.path.join(output_dir, f"{current_file['id']}_compressed.mp4")
 
             # Map resolution presets
             resolution_map = {
@@ -2781,9 +2816,12 @@ class EnhancedMediaHandler:
             query, f"🔀 Merging {len(session['merge_list'])} videos..."
         )
 
-        output_path = (
-            f"storage/output/merged_{int(datetime.now().timestamp())}.mp4"
-        )
+        output_dir = getattr(config, "OUTPUT_PATH", "storage/output") if config else "storage/output"
+        try:
+            os.makedirs(output_dir, exist_ok=True)
+        except Exception:
+            pass
+        output_path = os.path.join(output_dir, f"merged_{int(datetime.now().timestamp())}.mp4")
         success = await self.converter.merge_videos(
             session["merge_list"], output_path
         )
@@ -2829,9 +2867,12 @@ class EnhancedMediaHandler:
             query, f"🔀 Merging {len(session['merge_list'])} audio files..."
         )
 
-        output_path = (
-            f"storage/output/merged_{int(datetime.now().timestamp())}.mp3"
-        )
+        output_dir = getattr(config, "OUTPUT_PATH", "storage/output") if config else "storage/output"
+        try:
+            os.makedirs(output_dir, exist_ok=True)
+        except Exception:
+            pass
+        output_path = os.path.join(output_dir, f"merged_{int(datetime.now().timestamp())}.mp3")
         success = await self.converter.merge_audios(
             session["merge_list"], output_path
         )
@@ -2881,7 +2922,12 @@ class EnhancedMediaHandler:
                 await self.safe_edit(query, f"❌ Failed to download file: {e}")
                 return
 
-        output_path = f"storage/output/{current_file['id']}_no_audio.mp4"
+        output_dir = getattr(config, "OUTPUT_PATH", "storage/output") if config else "storage/output"
+        try:
+            os.makedirs(output_dir, exist_ok=True)
+        except Exception:
+            pass
+        output_path = os.path.join(output_dir, f"{current_file['id']}_no_audio.mp4")
         success = await self.converter.remove_audio(
             current_file["path"], output_path
         )
@@ -2956,9 +3002,12 @@ class EnhancedMediaHandler:
                 await self.safe_edit(query, f"❌ Failed to download file: {e}")
                 return
 
-        output_path = (
-            f"storage/output/{current_file['id']}_{width}x{height}.mp4"
-        )
+        output_dir = getattr(config, "OUTPUT_PATH", "storage/output") if config else "storage/output"
+        try:
+            os.makedirs(output_dir, exist_ok=True)
+        except Exception:
+            pass
+        output_path = os.path.join(output_dir, f"{current_file['id']}_{width}x{height}.mp4")
         success = await self.converter.change_resolution(
             current_file["path"], output_path, width, height
         )
@@ -3029,7 +3078,12 @@ class EnhancedMediaHandler:
                 await self.safe_edit(query, f"❌ Failed to download file: {e}")
                 return
 
-        output_path = f"storage/output/{current_file['id']}_optimized.mp4"
+        output_dir = getattr(config, "OUTPUT_PATH", "storage/output") if config else "storage/output"
+        try:
+            os.makedirs(output_dir, exist_ok=True)
+        except Exception:
+            pass
+        output_path = os.path.join(output_dir, f"{current_file['id']}_optimized.mp4")
 
         # Use FFmpeg command for optimization
         cmd = [
@@ -3128,7 +3182,12 @@ class EnhancedMediaHandler:
 
         # enqueue repair job
         job_id = str(uuid.uuid4())
-        output_path = f"storage/output/{current_file['id']}_repaired.mp4"
+        output_dir = getattr(config, "OUTPUT_PATH", "storage/output") if config else "storage/output"
+        try:
+            os.makedirs(output_dir, exist_ok=True)
+        except Exception:
+            pass
+        output_path = os.path.join(output_dir, f"{current_file['id']}_repaired.mp4")
         job = {
             "job_id": job_id,
             "input_path": current_file["path"],
@@ -3254,7 +3313,12 @@ class EnhancedMediaHandler:
         time_str = time_map.get(option, "00:00:01")
         await self.safe_edit(query, f"🖼️ Taking screenshot at {time_str}...")
 
-        output_path = f"storage/output/{current_file['id']}_screenshot.jpg"
+        output_dir = getattr(config, "OUTPUT_PATH", "storage/output") if config else "storage/output"
+        try:
+            os.makedirs(output_dir, exist_ok=True)
+        except Exception:
+            pass
+        output_path = os.path.join(output_dir, f"{current_file['id']}_screenshot.jpg")
         success = await self.converter.take_screenshot_at_time(
             current_file["path"], output_path, time_str
         )
@@ -3294,7 +3358,12 @@ class EnhancedMediaHandler:
 
         await self.safe_edit(query, "🖼️ Creating thumbnail grid...")
 
-        output_path = f"storage/output/{current_file['id']}_grid.jpg"
+        output_dir = getattr(config, "OUTPUT_PATH", "storage/output") if config else "storage/output"
+        try:
+            os.makedirs(output_dir, exist_ok=True)
+        except Exception:
+            pass
+        output_path = os.path.join(output_dir, f"{current_file['id']}_grid.jpg")
         success = await self.converter.extract_thumbnail_grid(
             current_file["path"], output_path, 3, 3
         )
@@ -3340,7 +3409,12 @@ class EnhancedMediaHandler:
 
         # enqueue extract_streams job to worker for progress/cancel support
         job_id = str(uuid.uuid4())
-        out_dir = f"storage/output/{current_file['id']}_streams"
+        out_base = getattr(config, "OUTPUT_PATH", "storage/output") if config else "storage/output"
+        out_dir = os.path.join(out_base, f"{current_file['id']}_streams")
+        try:
+            os.makedirs(out_dir, exist_ok=True)
+        except Exception:
+            pass
         archive_path = f"{out_dir}.zip"
         job = {
             "job_id": job_id,
@@ -3403,9 +3477,12 @@ class EnhancedMediaHandler:
                 await self.safe_edit(query, f"❌ Failed to download file: {e}")
                 return
 
-        output_path = (
-            f"storage/output/{current_file['id']}_converted.{format_type}"
-        )
+        output_base = getattr(config, "OUTPUT_PATH", "storage/output") if config else "storage/output"
+        try:
+            os.makedirs(output_base, exist_ok=True)
+        except Exception:
+            pass
+        output_path = os.path.join(output_base, f"{current_file['id']}_converted.{format_type}")
         success = await self.converter.convert_audio_format(
             current_file["path"], output_path, format_type
         )
@@ -3463,7 +3540,12 @@ class EnhancedMediaHandler:
 
         await self.safe_edit(query, f"🎚️ Setting bitrate to {bitrate}...")
 
-        output_path = f"storage/output/{current_file['id']}_{bitrate}.mp3"
+        output_base = getattr(config, "OUTPUT_PATH", "storage/output") if config else "storage/output"
+        try:
+            os.makedirs(output_base, exist_ok=True)
+        except Exception:
+            pass
+        output_path = os.path.join(output_base, f"{current_file['id']}_{bitrate}.mp3")
 
         # Convert with specific bitrate
         cmd = ["-c:a", "libmp3lame", "-b:a", bitrate]
@@ -3511,7 +3593,12 @@ class EnhancedMediaHandler:
 
         await self.safe_edit(query, "🔊 Normalizing audio...")
 
-        output_path = f"storage/output/{current_file['id']}_normalized.mp3"
+        output_base = getattr(config, "OUTPUT_PATH", "storage/output") if config else "storage/output"
+        try:
+            os.makedirs(output_base, exist_ok=True)
+        except Exception:
+            pass
+        output_path = os.path.join(output_base, f"{current_file['id']}_normalized.mp3")
 
         # Use loudnorm filter for normalization
         cmd = [
@@ -3580,7 +3667,12 @@ class EnhancedMediaHandler:
                 await self.safe_edit(query, f"❌ Failed to download file: {e}")
                 return
 
-        output_path = f"storage/output/{current_file['id']}_subtitles.srt"
+        output_base = getattr(config, "OUTPUT_PATH", "storage/output") if config else "storage/output"
+        try:
+            os.makedirs(output_base, exist_ok=True)
+        except Exception:
+            pass
+        output_path = os.path.join(output_base, f"{current_file['id']}_subtitles.srt")
         success = await self.converter.extract_subtitles(
             current_file["path"], output_path
         )
@@ -3712,10 +3804,12 @@ class EnhancedMediaHandler:
 
         # Get all files in output directory for this user
         user_id = update.effective_user.id
-        output_dir = "storage/output"
-        user_files = [
-            f for f in os.listdir(output_dir) if f.startswith(str(user_id))
-        ]
+        output_dir = getattr(config, "OUTPUT_PATH", "storage/output") if config else "storage/output"
+        try:
+            os.makedirs(output_dir, exist_ok=True)
+        except Exception:
+            pass
+        user_files = [f for f in os.listdir(output_dir) if f.startswith(str(user_id))]
 
         if not user_files:
             await self.safe_edit(query, "❌ No files to archive.")
@@ -3725,7 +3819,7 @@ class EnhancedMediaHandler:
 
         # enqueue create_archive job so worker handles packaging and progress
         file_paths = [os.path.join(output_dir, f) for f in user_files]
-        archive_path = f"storage/output/{user_id}_archive.zip"
+        archive_path = os.path.join(output_dir, f"{user_id}_archive.zip")
         job_id = str(uuid.uuid4())
         job = {
             "job_id": job_id,
@@ -3775,7 +3869,12 @@ class EnhancedMediaHandler:
                 return
 
         job_id = str(uuid.uuid4())
-        output_path = f"storage/output/{current_file['id']}_sample"
+        output_base = getattr(config, "OUTPUT_PATH", "storage/output") if config else "storage/output"
+        try:
+            os.makedirs(output_base, exist_ok=True)
+        except Exception:
+            pass
+        output_path = os.path.join(output_base, f"{current_file['id']}_sample")
         if current_file["type"] == "video":
             output_path += ".mp4"
         else:
@@ -3927,7 +4026,12 @@ class EnhancedMediaHandler:
 
                     # Perform trim
                     await update.message.reply_text(f"✂️ Trimming from {start} to {user_input}...")
-                    output_path = f"storage/output/{current_file['id']}_trim_{int(start_s)}_{int(end_s)}.mp4"
+                    output_base = getattr(config, "OUTPUT_PATH", "storage/output") if config else "storage/output"
+                    try:
+                        os.makedirs(output_base, exist_ok=True)
+                    except Exception:
+                        pass
+                    output_path = os.path.join(output_base, f"{current_file['id']}_trim_{int(start_s)}_{int(end_s)}.mp4")
                     success = await self.converter.trim_video(current_file["path"], output_path, start, user_input.strip())
 
                     if success and os.path.exists(output_path):
@@ -3977,7 +4081,12 @@ class EnhancedMediaHandler:
                         return
 
                     await update.message.reply_text(f"✂️ Trimming from {start} for duration {user_input} (to {end_str})...")
-                    output_path = f"storage/output/{current_file['id']}_trim_{int(start_s)}_{int(end_s)}.mp4"
+                    output_base = getattr(config, "OUTPUT_PATH", "storage/output") if config else "storage/output"
+                    try:
+                        os.makedirs(output_base, exist_ok=True)
+                    except Exception:
+                        pass
+                    output_path = os.path.join(output_base, f"{current_file['id']}_trim_{int(start_s)}_{int(end_s)}.mp4")
                     success = await self.converter.trim_video(current_file["path"], output_path, start, end_str)
 
                     if success and os.path.exists(output_path):
@@ -4090,7 +4199,12 @@ class EnhancedMediaHandler:
                         f"📐 Changing resolution to {width}x{height}..."
                     )
 
-                    output_path = f"storage/output/{current_file['id']}_{width}x{height}.mp4"
+                    output_base = getattr(config, "OUTPUT_PATH", "storage/output") if config else "storage/output"
+                    try:
+                        os.makedirs(output_base, exist_ok=True)
+                    except Exception:
+                        pass
+                    output_path = os.path.join(output_base, f"{current_file['id']}_{width}x{height}.mp4")
                     success = await self.converter.change_resolution(
                         current_file["path"], output_path, width, height
                     )
@@ -4161,7 +4275,12 @@ class EnhancedMediaHandler:
                         )
                         # Try to call converter.split if available
                         try:
-                            out = f"storage/output/{current_file['id']}_split_{int(start)}_{int(end)}.mp4"
+                            output_base = getattr(config, "OUTPUT_PATH", "storage/output") if config else "storage/output"
+                            try:
+                                os.makedirs(output_base, exist_ok=True)
+                            except Exception:
+                                pass
+                            out = os.path.join(output_base, f"{current_file['id']}_split_{int(start)}_{int(end)}.mp4")
                             if hasattr(self.converter, "split_video"):
                                 success = await self.converter.split_video(current_file["path"], start, end, out)
                                 if success and os.path.exists(out):
@@ -4289,9 +4408,12 @@ class EnhancedMediaHandler:
                 if not await self._check_conversion_quota(update, context):
                     return
 
-                output_path = (
-                    f"storage/output/{current_file['id']}_trimmed.mp4"
-                )
+                output_base = getattr(config, "OUTPUT_PATH", "storage/output") if config else "storage/output"
+                try:
+                    os.makedirs(output_base, exist_ok=True)
+                except Exception:
+                    pass
+                output_path = os.path.join(output_base, f"{current_file['id']}_trimmed.mp4")
                 success = await self.converter.trim_video(
                     current_file["path"], output_path, start_time, end_time
                 )
@@ -4314,7 +4436,12 @@ class EnhancedMediaHandler:
                 f"🖼️ Taking screenshot at {user_input}..."
             )
 
-            output_path = f"storage/output/{current_file['id']}_screenshot.jpg"
+            output_base = getattr(config, "OUTPUT_PATH", "storage/output") if config else "storage/output"
+            try:
+                os.makedirs(output_base, exist_ok=True)
+            except Exception:
+                pass
+            output_path = os.path.join(output_base, f"{current_file['id']}_screenshot.jpg")
             success = await self.converter.take_screenshot_at_time(
                 current_file["path"], output_path, user_input
             )
@@ -4342,7 +4469,7 @@ class EnhancedMediaHandler:
 
                 screenshots = await self.converter.take_screenshot_grid(
                     current_file["path"],
-                    f"storage/output/{current_file['id']}_grid",
+                    os.path.join(output_base, f"{current_file['id']}_grid"),
                     count,
                 )
 
@@ -4385,9 +4512,12 @@ class EnhancedMediaHandler:
                 await update.message.reply_text(
                     f"⏱️ Changing framerate to {fps} fps..."
                 )
-                output_path = (
-                    f"storage/output/{current_file['id']}_fr_{int(fps)}.mp4"
-                )
+                output_base = getattr(config, "OUTPUT_PATH", "storage/output") if config else "storage/output"
+                try:
+                    os.makedirs(output_base, exist_ok=True)
+                except Exception:
+                    pass
+                output_path = os.path.join(output_base, f"{current_file['id']}_fr_{int(fps)}.mp4")
                 success = await self.converter.change_framerate(
                     current_file["path"], output_path, fps
                 )
@@ -4433,9 +4563,12 @@ class EnhancedMediaHandler:
                     f"⚡ Optimizing with preset={preset}, crf={crf}, bitrate={bitrate}..."
                 )
 
-                output_path = (
-                    f"storage/output/{current_file['id']}_optimized.mp4"
-                )
+                output_base = getattr(config, "OUTPUT_PATH", "storage/output") if config else "storage/output"
+                try:
+                    os.makedirs(output_base, exist_ok=True)
+                except Exception:
+                    pass
+                output_path = os.path.join(output_base, f"{current_file['id']}_optimized.mp4")
                 cmd = [
                     "-c:v",
                     "libx264",
@@ -4481,9 +4614,12 @@ class EnhancedMediaHandler:
             # Handle metadata JSON
             try:
                 metadata = json.loads(user_input)
-                output_path = (
-                    f"storage/output/{current_file['id']}_with_metadata.mp4"
-                )
+                output_base = getattr(config, "OUTPUT_PATH", "storage/output") if config else "storage/output"
+                try:
+                    os.makedirs(output_base, exist_ok=True)
+                except Exception:
+                    pass
+                output_path = os.path.join(output_base, f"{current_file['id']}_with_metadata.mp4")
 
                 success = await self.converter.edit_metadata(
                     current_file["path"], output_path, metadata

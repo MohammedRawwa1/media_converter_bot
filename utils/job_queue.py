@@ -44,6 +44,28 @@ async def get_redis():
 async def enqueue_job(job: dict) -> None:
     """Push a job dict to the Redis job list."""
     r = await get_redis()
+    # Normalize path separators for any local paths to a portable POSIX style
+    try:
+        import pathlib
+        if job.get("input_path"):
+            try:
+                job["input_path"] = pathlib.PurePath(job["input_path"]).as_posix()
+            except Exception:
+                job["input_path"] = job["input_path"].replace("\\", "/")
+        if job.get("output_path"):
+            try:
+                job["output_path"] = pathlib.PurePath(job["output_path"]).as_posix()
+            except Exception:
+                job["output_path"] = job["output_path"].replace("\\", "/")
+    except Exception:
+        # best-effort normalization; ignore failures
+        try:
+            if job.get("input_path"):
+                job["input_path"] = job["input_path"].replace("\\", "/")
+            if job.get("output_path"):
+                job["output_path"] = job["output_path"].replace("\\", "/")
+        except Exception:
+            pass
     await r.lpush(JOB_LIST, json.dumps(job))
     # Initialize a Redis job hash so status endpoints see the job immediately.
     try:

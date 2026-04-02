@@ -59,6 +59,19 @@ async def handle_job(job: dict):
     output_path = job.get("output_path")
     progress_channel = job.get("progress_channel") or f"ffmpeg:progress:{job_id}"
 
+    # Normalize path separators in incoming job payloads (handle Windows-origin paths)
+    try:
+        if isinstance(input_path, str) and input_path:
+            input_path = input_path.replace("\\", os.sep)
+            input_path = os.path.normpath(input_path)
+            job["input_path"] = input_path
+        if isinstance(output_path, str) and output_path:
+            output_path = output_path.replace("\\", os.sep)
+            output_path = os.path.normpath(output_path)
+            job["output_path"] = output_path
+    except Exception:
+        pass
+
     # If job references a remote storage key (S3/MinIO), download it to a temp file
     input_key = job.get("input_key") or job.get("s3_key") or job.get("remote_key")
     if input_key and not input_path:
@@ -291,7 +304,7 @@ async def handle_job(job: dict):
 
                     elif job_type == "extract_streams":
                         await publish_update(progress_channel, {"job_id": job_id, "progress": 5, "message": "extracting streams"})
-                        out_dir = job.get("output_dir") or f"storage/output/{job_id}_streams"
+                        out_dir = job.get("output_dir") or os.path.join(getattr(config, "OUTPUT_PATH", "storage/output"), f"{job_id}_streams")
                         os.makedirs(out_dir, exist_ok=True)
                         ok, extracted = await extract_streams(input_path, out_dir)
                         if ok and extracted:
