@@ -61,6 +61,10 @@ class AsyncStorageBackend(ABC):
     async def delete(self, key: str) -> bool:
         """Delete object at `key` from storage. Return True if deleted or not found."""
 
+    @abstractmethod
+    async def exists(self, key: str) -> bool:
+        """Return True if object `key` exists in storage, False otherwise."""
+
 
 class LocalStorageBackend(AsyncStorageBackend):
     def __init__(self, base_path: Optional[str] = None):
@@ -97,6 +101,13 @@ class LocalStorageBackend(AsyncStorageBackend):
                 await asyncio.to_thread(os.remove, p)
                 return True
             return True
+        except Exception:
+            return False
+
+    async def exists(self, key: str) -> bool:
+        p = self._abs_path(key)
+        try:
+            return os.path.exists(p)
         except Exception:
             return False
 
@@ -366,6 +377,39 @@ class S3AsyncBackend(AsyncStorageBackend):
                 logger.warning("S3 delete attempt %s/%s failed for key %s: %s", attempt, retries, key, e)
                 if attempt == retries:
                     logger.exception("S3 delete failed after %s attempts for key %s", retries, key)
+                    return False
+                backoff = min(max_backoff, backoff_base * (2 ** (attempt - 1)))
+                await asyncio.sleep(backoff + random.random())
+
+    async def exists(self, key: str) -> bool:
+        # Use head_object on S3 to check existence with the same retry/backoff strategy
+        if not key:
+            return False
+
+        retries = int(os.getenv("S3_OP_RETRIES", "3"))
+        backoff_base = float(os.getenv("S3_OP_BACKOFF_BASE", "1"))
+        max_backoff = float(os.getenv("S3_OP_BACKOFF_MAX", "60"))
+        import random
+
+        for attempt in range(1, retries + 1):
+            try:
+                if self._use_aioboto3:
+                    async with self._session.client("s3", **self._client_kwargs()) as client:
+                        await client.head_object(Bucket=self.bucket, Key=key)
+                    return True
+
+                if boto3 is None:
+                    raise RuntimeError("boto3 is required for S3 operations when aioboto3 is not installed")
+
+                def _sync_head():
+                    client = boto3.client("s3", **self._client_kwargs())
+                    client.head_object(Bucket=self.bucket, Key=key)
+
+                await asyncio.to_thread(_sync_head)
+                return True
+            except Exception as e:
+                logger.debug("S3 head_object attempt %s/%s failed for key %s: %s", attempt, retries, key, e)
+                if attempt == retries:
                     return False
                 backoff = min(max_backoff, backoff_base * (2 ** (attempt - 1)))
                 await asyncio.sleep(backoff + random.random())

@@ -129,6 +129,91 @@ async def handle_job(job: dict):
             if get_storage_backend is None:
                 raise RuntimeError("storage backend helper not available")
             backend = await get_storage_backend()
+            # If backend supports existence checks, verify the remote key exists
+            try:
+                exists = True
+                if hasattr(backend, "exists") and job.get("input_key"):
+                    try:
+                        exists = await backend.exists(job.get("input_key"))
+                    except Exception:
+                        # conservatively assume it exists if the check fails
+                        exists = True
+
+                if not exists:
+                    # Requeue with exponential backoff for transient remote-key availability
+                    try:
+                        r2 = await get_redis()
+                    except Exception:
+                        r2 = None
+
+                    try:
+                        attempts = 0
+                        if r2 is not None:
+                            try:
+                                cur = await r2.hget(f"ffmpeg:job:{job_id}", "remote_missing_attempts")
+                                if cur:
+                                    try:
+                                        if isinstance(cur, bytes):
+                                            cur = cur.decode()
+                                        attempts = int(cur or 0)
+                                    except Exception:
+                                        attempts = 0
+                            except Exception:
+                                attempts = 0
+
+                        max_attempts = int(os.environ.get("MAX_REMOTE_MISSING_ATTEMPTS", "3"))
+                        attempts += 1
+                        if attempts <= max_attempts:
+                            backoff_base = float(os.environ.get("REMOTE_MISSING_BACKOFF_BASE", "30"))
+                            backoff = backoff_base * (2 ** (attempts - 1))
+                            # update job hash
+                            try:
+                                if r2 is not None:
+                                    await r2.hset(f"ffmpeg:job:{job_id}", mapping={"remote_missing_attempts": str(attempts)})
+                                    # schedule delayed requeue
+                                    try:
+                                        await r2.zadd("ffmpeg:delayed", {json.dumps(job): time.time() + backoff})
+                                    except Exception:
+                                        # fallback to lpush for older Redis versions
+                                        await r2.lpush(JOB_LIST, json.dumps(job))
+                            except Exception:
+                                pass
+
+                            try:
+                                await publish_update(progress_channel, {"job_id": job_id, "progress": 0, "message": "requeued_missing_input", "attempts": attempts, "backoff": backoff})
+                            except Exception:
+                                pass
+
+                            try:
+                                if r2 is not None:
+                                    await r2.close()
+                            except Exception:
+                                pass
+
+                            return
+                        else:
+                            # exhausted attempts — mark as failed
+                            try:
+                                await publish_update(progress_channel, {"job_id": job_id, "progress": 0, "message": "download_failed", "error": "remote_key_missing_permanent"})
+                            except Exception:
+                                pass
+                            try:
+                                await job_store.update_job(job_id, {"status": "error", "error": "remote_key_missing_permanent"})
+                            except Exception:
+                                pass
+                            try:
+                                if r2 is not None:
+                                    await r2.close()
+                            except Exception:
+                                pass
+                            return
+                    except Exception:
+                        # if requeue logic fails, fall back to attempting a download below
+                        try:
+                            if r2 is not None:
+                                await r2.close()
+                        except Exception:
+                            pass
             # retry/backoff for transient storage/download issues
             download_retries = int(os.environ.get("DOWNLOAD_RETRIES", "3"))
             backoff_base = float(os.environ.get("DOWNLOAD_BACKOFF_BASE", "1"))
@@ -349,17 +434,73 @@ async def handle_job(job: dict):
                         # Ensure there is some form of input before starting ffmpeg: a local path (that exists),
                         # a remote storage key, or a source URL. Prefer remote key download when present.
                         has_local_file = bool(input_path and os.path.exists(input_path))
+
+                        # If no local file and no remote key/source_url available, allow a short
+                        # grace period for producers to populate the job hash (input_key/input).
+                        # This avoids transient race conditions where a producer pushes a
+                        # minimal job JSON then writes the richer metadata into the hash.
                         if not has_local_file and not job.get("input_key") and not job.get("source_url"):
-                            logger.error("No input available for job %s; marking as error", job_id)
+                            wait_seconds = int(os.environ.get("JOB_WAIT_SECONDS", "10"))
+                            # notify once that we're waiting
                             try:
-                                await publish_update(progress_channel, {"job_id": job_id, "progress": 0, "message": "error", "error": "no_input_provided"})
+                                await publish_update(progress_channel, {"job_id": job_id, "progress": 0, "message": "waiting_for_input", "wait_seconds": wait_seconds})
                             except Exception:
                                 pass
+
                             try:
-                                await job_store.update_job(job_id, {"status": "error", "error": "no_input_provided"})
+                                rr = await get_redis()
                             except Exception:
-                                pass
-                            return
+                                rr = None
+
+                            if rr is not None and job_id:
+                                try:
+                                    for _ in range(wait_seconds):
+                                        try:
+                                            stored = await rr.hgetall(f"ffmpeg:job:{job_id}")
+                                            if stored:
+                                                def _sval(key):
+                                                    v = stored.get(key)
+                                                    if isinstance(v, bytes):
+                                                        try:
+                                                            return v.decode()
+                                                        except Exception:
+                                                            return v
+                                                    return v
+
+                                                if not job.get("input_key") and _sval("input_key"):
+                                                    job["input_key"] = _sval("input_key")
+                                                if not job.get("input_path") and _sval("input"):
+                                                    job["input_path"] = _sval("input")
+                                                if not job.get("source_url") and _sval("source_url"):
+                                                    job["source_url"] = _sval("source_url")
+
+                                                # recompute local-file presence
+                                                input_path = job.get("input_path")
+                                                has_local_file = bool(input_path and os.path.exists(input_path))
+                                                if has_local_file or job.get("input_key") or job.get("source_url"):
+                                                    break
+                                        except Exception:
+                                            # swallow per-iteration errors and continue waiting
+                                            pass
+                                        await asyncio.sleep(1)
+                                finally:
+                                    try:
+                                        await rr.close()
+                                    except Exception:
+                                        pass
+
+                            # final check after waiting
+                            if not has_local_file and not job.get("input_key") and not job.get("source_url"):
+                                logger.error("No input available for job %s after waiting; marking as error", job_id)
+                                try:
+                                    await publish_update(progress_channel, {"job_id": job_id, "progress": 0, "message": "error", "error": "no_input_provided"})
+                                except Exception:
+                                    pass
+                                try:
+                                    await job_store.update_job(job_id, {"status": "error", "error": "no_input_provided"})
+                                except Exception:
+                                    pass
+                                return
 
                         coro = run_ffmpeg(input_path, output_path, job_id, ffmpeg_args=ffmpeg_args, redis_url=redis_url, progress_channel=progress_channel)
                         # Start optional memory sampler
