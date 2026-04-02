@@ -118,156 +118,138 @@ async def handle_job(job: dict):
     # when the local `input_path` is missing or the file is not present on disk.
     input_key = job.get("input_key") or job.get("s3_key") or job.get("remote_key")
     if input_key and (not input_path or not os.path.exists(input_path)):
+        # prepare temp path
+        temp_dir = os.path.join(getattr(config, "TEMP_PATH", "storage/temp"))
+        os.makedirs(temp_dir, exist_ok=True)
+        _, ext = os.path.splitext(input_key)
+        if not ext:
+            ext = os.path.splitext(job.get("original_filename") or "")[1] or ""
+        temp_input_path = os.path.join(temp_dir, f"{job_id}_src{ext}")
+
+        if get_storage_backend is None:
+            raise RuntimeError("storage backend helper not available")
+
+        backend = await get_storage_backend()
+
+        # If backend supports existence checks, verify the remote key exists
+        exists_remote = True
         try:
-            # prepare temp path
-            temp_dir = os.path.join(getattr(config, "TEMP_PATH", "storage/temp"))
-            os.makedirs(temp_dir, exist_ok=True)
-            _, ext = os.path.splitext(input_key)
-            if not ext:
-                ext = os.path.splitext(job.get("original_filename") or "")[1] or ""
-            temp_input_path = os.path.join(temp_dir, f"{job_id}_src{ext}")
-            if get_storage_backend is None:
-                raise RuntimeError("storage backend helper not available")
-            backend = await get_storage_backend()
-            # If backend supports existence checks, verify the remote key exists
+            if hasattr(backend, "exists") and job.get("input_key"):
+                exists_remote = await backend.exists(job.get("input_key"))
+        except Exception:
+            # conservatively assume it exists if the check fails
+            exists_remote = True
+
+        if not exists_remote:
+            # Requeue with exponential backoff for transient remote-key availability
             try:
-                exists = True
-                if hasattr(backend, "exists") and job.get("input_key"):
-                    try:
-                        exists = await backend.exists(job.get("input_key"))
-                    except Exception:
-                        # conservatively assume it exists if the check fails
-                        exists = True
+                r2 = await get_redis()
+            except Exception:
+                r2 = None
 
-                if not exists:
-                    # Requeue with exponential backoff for transient remote-key availability
-                    try:
-                        r2 = await get_redis()
-                    except Exception:
-                        r2 = None
+            attempts = 0
+            try:
+                if r2 is not None:
+                    cur = await r2.hget(f"ffmpeg:job:{job_id}", "remote_missing_attempts")
+                    if cur:
+                        if isinstance(cur, bytes):
+                            cur = cur.decode()
+                        attempts = int(cur or 0)
+            except Exception:
+                attempts = 0
 
-                    try:
-                        attempts = 0
-                        if r2 is not None:
-                            try:
-                                cur = await r2.hget(f"ffmpeg:job:{job_id}", "remote_missing_attempts")
-                                if cur:
-                                    try:
-                                        if isinstance(cur, bytes):
-                                            cur = cur.decode()
-                                        attempts = int(cur or 0)
-                                    except Exception:
-                                        attempts = 0
-                            except Exception:
-                                attempts = 0
-
-                        max_attempts = int(os.environ.get("MAX_REMOTE_MISSING_ATTEMPTS", "3"))
-                        attempts += 1
-                        if attempts <= max_attempts:
-                            backoff_base = float(os.environ.get("REMOTE_MISSING_BACKOFF_BASE", "30"))
-                            backoff = backoff_base * (2 ** (attempts - 1))
-                            # update job hash
-                            try:
-                                if r2 is not None:
-                                    await r2.hset(f"ffmpeg:job:{job_id}", mapping={"remote_missing_attempts": str(attempts)})
-                                    # schedule delayed requeue
-                                    try:
-                                        await r2.zadd("ffmpeg:delayed", {json.dumps(job): time.time() + backoff})
-                                    except Exception:
-                                        # fallback to lpush for older Redis versions
-                                        await r2.lpush(JOB_LIST, json.dumps(job))
-                            except Exception:
-                                pass
-
-                            try:
-                                await publish_update(progress_channel, {"job_id": job_id, "progress": 0, "message": "requeued_missing_input", "attempts": attempts, "backoff": backoff})
-                            except Exception:
-                                pass
-
-                            try:
-                                if r2 is not None:
-                                    await r2.close()
-                            except Exception:
-                                pass
-
-                            return
-                        else:
-                            # exhausted attempts — mark as failed
-                            try:
-                                await publish_update(progress_channel, {"job_id": job_id, "progress": 0, "message": "download_failed", "error": "remote_key_missing_permanent"})
-                            except Exception:
-                                pass
-                            try:
-                                await job_store.update_job(job_id, {"status": "error", "error": "remote_key_missing_permanent"})
-                            except Exception:
-                                pass
-                            try:
-                                if r2 is not None:
-                                    await r2.close()
-                            except Exception:
-                                pass
-                            return
-                    except Exception:
-                        # if requeue logic fails, fall back to attempting a download below
-                        try:
-                            if r2 is not None:
-                                await r2.close()
-                        except Exception:
-                            pass
-            # retry/backoff for transient storage/download issues
-            download_retries = int(os.environ.get("DOWNLOAD_RETRIES", "3"))
-            backoff_base = float(os.environ.get("DOWNLOAD_BACKOFF_BASE", "1"))
-            download_success = False
-            last_exc = None
-            for attempt in range(1, download_retries + 1):
+            max_attempts = int(os.environ.get("MAX_REMOTE_MISSING_ATTEMPTS", "3"))
+            attempts += 1
+            if attempts <= max_attempts:
+                backoff_base = float(os.environ.get("REMOTE_MISSING_BACKOFF_BASE", "30"))
+                backoff = backoff_base * (2 ** (attempts - 1))
                 try:
-                    await backend.download_file(input_key, temp_input_path)
-                    # confirm file exists and has data
-                    if os.path.exists(temp_input_path) and (os.path.getsize(temp_input_path) > 0):
-                        download_success = True
-                        break
-                except Exception as e:
-                    last_exc = e
-                # backoff before next attempt
-                if attempt < download_retries:
-                    await asyncio.sleep(backoff_base * (2 ** (attempt - 1)))
-
-            if download_success:
-                input_path = temp_input_path
-                job["input_path"] = input_path
-                job["_input_from_remote"] = True
-                # persist indicator into Redis job hash for observability
-                try:
-                    try:
-                        r2 = await get_redis()
-                    except Exception:
-                        r2 = None
                     if r2 is not None:
+                        await r2.hset(f"ffmpeg:job:{job_id}", mapping={"remote_missing_attempts": str(attempts)})
                         try:
-                            await r2.hset(f"ffmpeg:job:{job_id}", mapping={"input": str(job.get("input_path") or ""), "input_from_remote": "1"})
+                            await r2.zadd("ffmpeg:delayed", {json.dumps(job): time.time() + backoff})
                         except Exception:
-                            pass
-                        try:
-                            await r2.close()
-                        except Exception:
-                            pass
+                            await r2.lpush(JOB_LIST, json.dumps(job))
                 except Exception:
                     pass
-        except Exception as e:
-            logger.exception("Failed to download input from storage for job %s: %s", job_id, e)
+
+                try:
+                    await publish_update(progress_channel, {"job_id": job_id, "progress": 0, "message": "requeued_missing_input", "attempts": attempts, "backoff": backoff})
+                except Exception:
+                    pass
+
+                if r2 is not None:
+                    try:
+                        await r2.close()
+                    except Exception:
+                        pass
+                return
+            else:
+                try:
+                    await publish_update(progress_channel, {"job_id": job_id, "progress": 0, "message": "download_failed", "error": "remote_key_missing_permanent"})
+                except Exception:
+                    pass
+                try:
+                    await job_store.update_job(job_id, {"status": "error", "error": "remote_key_missing_permanent"})
+                except Exception:
+                    pass
+                if r2 is not None:
+                    try:
+                        await r2.close()
+                    except Exception:
+                        pass
+                return
+
+        # retry/backoff for transient storage/download issues
+        download_retries = int(os.environ.get("DOWNLOAD_RETRIES", "3"))
+        backoff_base = float(os.environ.get("DOWNLOAD_BACKOFF_BASE", "1"))
+        download_success = False
+        last_exc = None
+        for attempt in range(1, download_retries + 1):
             try:
-                await publish_update(progress_channel, {"job_id": job_id, "progress": 0, "message": "download_failed", "error": str(e)})
+                await backend.download_file(input_key, temp_input_path)
+                # confirm file exists and has data
+                if os.path.exists(temp_input_path) and (os.path.getsize(temp_input_path) > 0):
+                    download_success = True
+                    break
+            except Exception as e:
+                last_exc = e
+            # backoff before next attempt
+            if attempt < download_retries:
+                await asyncio.sleep(backoff_base * (2 ** (attempt - 1)))
+
+        if download_success:
+            input_path = temp_input_path
+            job["input_path"] = input_path
+            job["_input_from_remote"] = True
+            # persist indicator into Redis job hash for observability
+            try:
+                r2 = None
+                try:
+                    r2 = await get_redis()
+                except Exception:
+                    r2 = None
+                if r2 is not None:
+                    try:
+                        await r2.hset(f"ffmpeg:job:{job_id}", mapping={"input": str(job.get("input_path") or ""), "input_from_remote": "1"})
+                    except Exception:
+                        pass
             except Exception:
                 pass
-            return
-        # If download completed but file wasn't created, treat as failure
-        if not input_path or not os.path.exists(input_path):
+            finally:
+                if r2 is not None:
+                    try:
+                        await r2.close()
+                    except Exception:
+                        pass
+        else:
+            logger.exception("Failed to download input from storage for job %s: %s", job_id, last_exc)
             try:
-                await publish_update(progress_channel, {"job_id": job_id, "progress": 0, "message": "download_failed", "error": "remote_download_no_file"})
+                await publish_update(progress_channel, {"job_id": job_id, "progress": 0, "message": "download_failed", "error": str(last_exc)})
             except Exception:
                 pass
             try:
-                await job_store.update_job(job_id, {"status": "error", "error": "remote_download_no_file"})
+                await job_store.update_job(job_id, {"status": "error", "error": "remote_download_failed"})
             except Exception:
                 pass
             return
