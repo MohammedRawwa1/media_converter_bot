@@ -37,6 +37,11 @@ async def process_forward_hash(forward_hash: str):
         logger.error("fetcher: no metadata for forward_hash %s", forward_hash)
         return False
 
+    try:
+        logger.info("fetcher: processing forward %s meta_chat=%s meta_msg=%s", forward_hash, meta.get("chat_id"), meta.get("message_id") or meta.get("msg_id"))
+    except Exception:
+        pass
+
     input_dir = os.environ.get("INPUT_PATH") or os.path.join(os.path.dirname(os.path.dirname(__file__)), "storage", "input")
     os.makedirs(input_dir, exist_ok=True)
 
@@ -49,9 +54,11 @@ async def process_forward_hash(forward_hash: str):
         return False
 
     try:
+        logger.info("fetcher: attempting userbot download for forward %s to %s", forward_hash, input_path)
         ok = await download_forward_via_userbot(
             meta.get("chat_id"), meta.get("message_id") or meta.get("msg_id"), input_path, msg_date=meta.get("registered_at") or meta.get("created_at"), file_unique_id=meta.get("file_unique_id")
         )
+        logger.info("fetcher: userbot download for %s returned ok=%s exists=%s", forward_hash, bool(ok), os.path.exists(input_path))
         if not ok or not os.path.exists(input_path):
             logger.error("fetcher: download failed for %s", forward_hash)
             return False

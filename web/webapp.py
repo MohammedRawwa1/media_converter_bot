@@ -105,6 +105,10 @@ def upload():
     else:
         # Attempt to fetch forwarded message metadata persisted earlier
         try:
+            logger.info("webapp.upload: received forward_hash=%s", forward_hash)
+        except Exception:
+            pass
+        try:
             from utils.forward_store import load_forward_metadata, delete_forward_metadata
         except Exception as e:
             return jsonify({"error": "failed to load forward metadata", "detail": str(e)}), 500
@@ -120,7 +124,7 @@ def upload():
         except Exception as e:
             return jsonify({"error": "failed to load forward metadata", "detail": str(e)}), 500
 
-        if not meta:
+            if not meta:
             # default extension while we wait for metadata to appear
             ext = ".mp4"
             input_path = os.path.join(INPUT_DIR, f"{job_id}{ext}")
@@ -229,6 +233,10 @@ def upload():
                 logger.warning("Forward metadata still not found after %s attempts for %s", attempts, fid)
 
             t = threading.Thread(target=_poll_and_fetch, args=(forward_hash, input_path, job_id, request_id), daemon=True)
+            try:
+                logger.info("webapp.upload: starting background poll thread for forward %s -> %s", forward_hash, input_path)
+            except Exception:
+                pass
             t.start()
             return jsonify({"status": "accepted", "detail": "forward metadata not yet available; background fetch scheduled"}), 202
 

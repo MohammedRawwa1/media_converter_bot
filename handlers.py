@@ -749,6 +749,12 @@ class EnhancedMediaHandler:
             auto_fetch = os.environ.get("AUTO_FETCH_FORWARDS", "").lower() in ("1", "true", "yes")
             web_upload_url = os.environ.get("WEB_UPLOAD_URL") or os.environ.get("WEBAPP_URL")
 
+            # Diagnostic logging to help trace fallback behavior in production
+            try:
+                logger.info("_handle_large_forward: fh=%s auto_fetch=%s web_upload_url=%s", fh, auto_fetch, web_upload_url)
+            except Exception:
+                pass
+
             if auto_fetch:
                 # Prepare local paths
                 try:
@@ -771,17 +777,26 @@ class EnhancedMediaHandler:
 
                 # Try local userbot downloader first when enabled
                 try:
-                    if os.environ.get("ENABLE_USERBOT", "").lower() in ("1", "true", "yes"):
+                    enable_userbot = os.environ.get("ENABLE_USERBOT", "").lower() in ("1", "true", "yes")
+                    logger.info("_handle_large_forward: enable_userbot=%s for fh=%s", enable_userbot, fh)
+                except Exception:
+                    enable_userbot = False
+
+                try:
+                    if enable_userbot:
                         try:
                             from utils.userbot_downloader import download_forward_via_userbot
-                        except Exception:
+                        except Exception as e:
+                            logger.exception("Failed to import userbot_downloader: %s", e)
                             download_forward_via_userbot = None
 
                         if download_forward_via_userbot is not None:
                             try:
+                                logger.info("Attempting userbot download for fh=%s chat=%s msg=%s -> %s", fh, metadata.get("chat_id"), metadata.get("message_id") or metadata.get("msg_id"), input_path)
                                 ok = await download_forward_via_userbot(
                                     metadata.get("chat_id"), metadata.get("message_id") or metadata.get("msg_id"), input_path, msg_date=metadata.get("registered_at") or metadata.get("created_at"), file_unique_id=metadata.get("file_unique_id")
                                 )
+                                logger.info("userbot download result for fh=%s: ok=%s exists=%s", fh, bool(ok), os.path.exists(input_path))
                                 if ok and os.path.exists(input_path):
                                     fetched = True
                             except Exception:
@@ -792,6 +807,8 @@ class EnhancedMediaHandler:
                 # If local fetch failed and web upload endpoint is configured, ask webapp to fetch
                 if not fetched and web_upload_url:
                     try:
+                        logger.info("Attempting server fetch via web upload URL %s for fh=%s", web_upload_url, fh)
+
                         def _post_fetch():
                             try:
                                 import requests
@@ -804,10 +821,19 @@ class EnhancedMediaHandler:
                             try:
                                 resp = requests.post(web_upload_url, data={"forward_hash": fh}, headers=headers, timeout=60)
                                 return resp
-                            except Exception:
+                            except Exception as e:
+                                try:
+                                    logger.exception("Webapp fetch POST failed (thread): %s", e)
+                                except Exception:
+                                    pass
                                 return None
 
                         resp = await asyncio.get_event_loop().run_in_executor(None, _post_fetch)
+                        try:
+                            logger.info("Webapp fetch response for fh=%s: resp=%s", fh, getattr(resp, 'status_code', None))
+                        except Exception:
+                            pass
+
                         if resp is not None and getattr(resp, "status_code", None) == 200:
                             try:
                                 j = resp.json()
