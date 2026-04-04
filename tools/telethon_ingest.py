@@ -404,6 +404,21 @@ async def main():
             fh.write(f"started_at={time.time()}\nsession_env={session_env_used or ''}\n")
     except Exception:
         logger.exception("Failed to write telethon_ingest.started marker")
+    # Also attempt to upload the marker to the configured storage backend (S3/R2/local)
+    try:
+        try:
+            backend = await _get_backend_instance()
+        except Exception:
+            backend = None
+        if backend is not None:
+            try:
+                dest_key = f"telethon/telethon_ingest.started"
+                await backend.upload_file(marker, dest_key)
+                logger.info("Uploaded telethon_ingest.started to storage: %s", dest_key)
+            except Exception:
+                logger.exception("Failed to upload telethon_ingest.started to storage")
+    except Exception:
+        logger.exception("Error while attempting to publish telethon_ingest.started marker to storage")
 
     # Start Redis fetch listener (if available) so this single service can
     # both accept incoming messages and process published forward fetches
