@@ -1671,7 +1671,10 @@ try:
         """Return Prometheus-style metrics as plain text."""
         uptime = time.time() - (BOT_STARTED_AT or START_TIME)
         allowed_total = len(ALLOWED_USER_IDS) if ALLOWED_USER_IDS else 0
-        ffmpeg_ok = 1 if check_ffmpeg_available() else 0
+        try:
+            ffmpeg_ok = 1 if await check_ffmpeg_available() else 0
+        except Exception:
+            ffmpeg_ok = 0
         active_convs = 0
         try:
             if BOT_APPLICATION and BOT_APPLICATION.bot_data:
@@ -1830,6 +1833,52 @@ try:
                 app.state.update_consumer = asyncio.create_task(_update_consumer())
             except Exception:
                 logger.exception("Failed to start ASGI update consumer task")
+            # If dispatcher isn't available (some hosting variants), start a
+            # fallback long-poller that uses getUpdates and enqueues updates
+            # onto the Application.update_queue so handlers still run.
+            try:
+                force_polling_env = os.environ.get("FORCE_POLLING", "").lower() in ("1", "true", "yes")
+                dispatcher = getattr(BOT_APPLICATION, "dispatcher", None)
+                has_dispatcher_proc = bool(dispatcher and hasattr(dispatcher, "process_update"))
+                app_has_proc = hasattr(BOT_APPLICATION, "process_update")
+                if force_polling_env or (not has_dispatcher_proc and not app_has_proc):
+                    logger.warning("ASGI startup: starting fallback long-poller (FORCE_POLLING=%s, dispatcher_present=%s)", force_polling_env, has_dispatcher_proc)
+
+                    async def _asgi_longpoll_loop():
+                        offset = None
+                        bot = BOT_APPLICATION.bot
+                        try:
+                            while True:
+                                try:
+                                    updates = await bot.get_updates(offset=offset, timeout=30)
+                                    if updates:
+                                        for u in updates:
+                                            try:
+                                                if getattr(u, "update_id", None) is not None:
+                                                    offset = int(u.update_id) + 1
+                                            except Exception:
+                                                pass
+                                            try:
+                                                await BOT_APPLICATION.update_queue.put(u)
+                                            except Exception:
+                                                logger.exception("ASGI long-poller failed to enqueue update")
+                                    else:
+                                        await asyncio.sleep(0.1)
+                                except asyncio.CancelledError:
+                                    break
+                                except Exception as e:
+                                    logger.exception("ASGI long-poller error: %s", e)
+                                    await asyncio.sleep(1)
+                        except Exception:
+                            logger.exception("ASGI long-poller fatal error")
+
+                    try:
+                        app.state.longpoll = asyncio.create_task(_asgi_longpoll_loop())
+                        logger.info("ASGI long-poller started")
+                    except Exception:
+                        logger.exception("Failed to start ASGI long-poller")
+            except Exception:
+                logger.exception("Failed to evaluate ASGI long-poller fallback")
         except Exception as e:
             logger.error(f"Failed to start bot in background: {e}")
 
@@ -1846,6 +1895,28 @@ try:
                     logger.info("Background bot task cancelled on ASGI shutdown")
         except Exception as e:
             logger.error(f"Error stopping background bot task: {e}")
+        # Cancel ASGI long-poller if started
+        try:
+            lp = getattr(app.state, "longpoll", None)
+            if lp and not lp.done():
+                lp.cancel()
+                try:
+                    await lp
+                except asyncio.CancelledError:
+                    logger.info("ASGI long-poller cancelled on shutdown")
+        except Exception as e:
+            logger.error(f"Error stopping ASGI long-poller: {e}")
+        # Cancel update consumer if present
+        try:
+            uc = getattr(app.state, "update_consumer", None)
+            if uc and not uc.done():
+                uc.cancel()
+                try:
+                    await uc
+                except asyncio.CancelledError:
+                    logger.info("ASGI update consumer cancelled on shutdown")
+        except Exception as e:
+            logger.error(f"Error stopping ASGI update consumer: {e}")
 
 except Exception as e:
     logger.warning(f"FastAPI not available or import failed: {e}")
