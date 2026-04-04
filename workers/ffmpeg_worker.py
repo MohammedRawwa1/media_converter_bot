@@ -1161,27 +1161,27 @@ async def worker_loop(stop_event: Optional[asyncio.Event] = None):
 
     try:
         while True:
-        if stop_event and stop_event.is_set():
-            logger.info("Stop event set, exiting worker loop")
-            break
-        try:
-            job = await pop_job(timeout=5)
-            if not job:
-                await asyncio.sleep(0.2)
-                continue
-            logger.info(f"Picked job: {job.get('job_id')}")
-            # ensure persisted
+            if stop_event and stop_event.is_set():
+                logger.info("Stop event set, exiting worker loop")
+                break
             try:
-                await job_store.save_job(job)
+                job = await pop_job(timeout=5)
+                if not job:
+                    await asyncio.sleep(0.2)
+                    continue
+                logger.info(f"Picked job: {job.get('job_id')}")
+                # ensure persisted
+                try:
+                    await job_store.save_job(job)
+                except Exception:
+                    pass
+                await handle_job(job)
+            except asyncio.CancelledError:
+                logger.info("Worker cancelled, exiting")
+                break
             except Exception:
-                pass
-            await handle_job(job)
-        except asyncio.CancelledError:
-            logger.info("Worker cancelled, exiting")
-            break
-        except Exception:
-            logger.exception("Exception in worker loop")
-            await asyncio.sleep(1)
+                logger.exception("Exception in worker loop")
+                await asyncio.sleep(1)
     finally:
         # ensure forward listener is cancelled
         try:
