@@ -786,6 +786,23 @@ async def main(background: bool = False) -> None:
             except Exception:
                 pass
 
+            # Auto-fallback: when running under ASGI the PTB dispatcher may
+            # not be available in some hosting environments. If webhook mode
+            # is configured but no dispatcher exists after start, enable the
+            # FORCE_POLLING long-poller fallback so updates are still handled
+            # via getUpdates. This prevents the bot from becoming unresponsive
+            # when webhook dispatching can't be wired into the Application.
+            try:
+                if WEBHOOK_URL and not force_polling:
+                    dispatcher = getattr(application, "dispatcher", None)
+                    has_dispatcher_proc = bool(dispatcher and hasattr(dispatcher, "process_update"))
+                    app_has_proc = hasattr(application, "process_update")
+                    if not has_dispatcher_proc and not app_has_proc:
+                        logger.warning("Dispatcher not available after Application.start(); enabling FORCE_POLLING fallback")
+                        force_polling = True
+            except Exception:
+                logger.exception("Failed to evaluate dispatcher presence for FORCE_POLLING fallback")
+
             polling_task = None
             polling_task = None
             # Background ASGI mode: support either webhook mode or an opt-in
