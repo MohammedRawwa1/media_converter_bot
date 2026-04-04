@@ -833,21 +833,250 @@ async def handle_job(job: dict):
                             # Try Bot API first if configured
                             if chat_id and bot_token:
                                 try:
-                                    kind = "zip" if out and str(out).lower().endswith(".zip") else (
-                                        "video" if out and str(out).lower().endswith((".mp4", ".mov", ".mkv")) else "doc"
-                                    )
+                                    # Determine media kind. Prefer probing the output file for a video stream
+                                    kind = "doc"
+                                    try:
+                                        if out and os.path.exists(out):
+                                            # prefer ffprobe if available to detect real video streams
+                                            ffprobe_bin = getattr(config, "FFPROBE_PATH", None) or getattr(config, "FFMPEG_PATH", "ffmpeg").replace("ffmpeg", "ffprobe")
+
+                                            def _probe():
+                                                try:
+                                                    return subprocess.run([ffprobe_bin, "-v", "quiet", "-print_format", "json", "-show_streams", out], capture_output=True)
+                                                except Exception:
+                                                    return None
+
+                                            p = await asyncio.to_thread(_probe)
+                                            if p and getattr(p, "returncode", 1) == 0:
+                                                try:
+                                                    probe_info = json.loads(p.stdout.decode() or "{}")
+                                                    streams = probe_info.get("streams", [])
+                                                    if any(s.get("codec_type") == "video" for s in streams):
+                                                        kind = "video"
+                                                    else:
+                                                        # not a video stream; fall back to extension-based
+                                                        if str(out).lower().endswith(".zip"):
+                                                            kind = "zip"
+                                                        elif str(out).lower().endswith((".mp4", ".mov", ".mkv")):
+                                                            kind = "video"
+                                                        else:
+                                                            kind = "doc"
+                                                except Exception:
+                                                    # probe parse failed -> extension fallback
+                                                    if str(out).lower().endswith(".zip"):
+                                                        kind = "zip"
+                                                    elif str(out).lower().endswith((".mp4", ".mov", ".mkv")):
+                                                        kind = "video"
+                                                    else:
+                                                        kind = "doc"
+                                            else:
+                                                # probe failed -> extension fallback
+                                                if str(out).lower().endswith(".zip"):
+                                                    kind = "zip"
+                                                elif str(out).lower().endswith((".mp4", ".mov", ".mkv")):
+                                                    kind = "video"
+                                                else:
+                                                    kind = "doc"
+                                        else:
+                                            kind = "doc"
+                                    except Exception:
+                                        kind = "zip" if out and str(out).lower().endswith(".zip") else ("video" if out and str(out).lower().endswith((".mp4", ".mov", ".mkv")) else "doc")
                                     try:
                                         # Use async Bot API methods directly and close the client when done
                                         async with Bot(token=bot_token) as bot:
                                             if kind == "zip":
-                                                with open(out, "rb") as fh:
-                                                    await bot.send_document(chat_id=chat_id, document=fh, caption=caption)
+                                                # Attempt to attach a thumbnail when available
+                                                thumb_path = None
+                                                _temp_thumb = None
+                                                try:
+                                                    # Prefer explicit job field
+                                                    cand = job.get("thumbnail")
+                                                    if cand:
+                                                        if os.path.exists(cand):
+                                                            thumb_path = cand
+                                                        else:
+                                                            try:
+                                                                backend = await get_storage_backend() if get_storage_backend is not None else None
+                                                            except Exception:
+                                                                backend = None
+                                                            if backend:
+                                                                temp_dir = os.path.join(getattr(config, "TEMP_PATH", "storage/temp"))
+                                                                os.makedirs(temp_dir, exist_ok=True)
+                                                                _temp_thumb = os.path.join(temp_dir, f"{job_id}_thumb{os.path.splitext(cand)[1] or '.jpg'}")
+                                                                try:
+                                                                    ok = await backend.download_file(cand, _temp_thumb)
+                                                                    if ok:
+                                                                        thumb_path = _temp_thumb
+                                                                except Exception:
+                                                                    _temp_thumb = None
+                                                    # Fallback: check Redis-stored job hash for thumbnail
+                                                    if not thumb_path:
+                                                        try:
+                                                            r = await get_redis()
+                                                            stored = await r.hgetall(f"ffmpeg:job:{job_id}")
+                                                            sval = stored.get("thumbnail") or stored.get("thumb")
+                                                            if sval:
+                                                                cand = sval
+                                                                if os.path.exists(cand):
+                                                                    thumb_path = cand
+                                                                else:
+                                                                    try:
+                                                                        backend = await get_storage_backend() if get_storage_backend is not None else None
+                                                                    except Exception:
+                                                                        backend = None
+                                                                    if backend:
+                                                                        temp_dir = os.path.join(getattr(config, "TEMP_PATH", "storage/temp"))
+                                                                        os.makedirs(temp_dir, exist_ok=True)
+                                                                        _temp_thumb = os.path.join(temp_dir, f"{job_id}_thumb{os.path.splitext(cand)[1] or '.jpg'}")
+                                                                        try:
+                                                                            ok = await backend.download_file(cand, _temp_thumb)
+                                                                            if ok:
+                                                                                thumb_path = _temp_thumb
+                                                                        except Exception:
+                                                                            _temp_thumb = None
+                                                            aclose = getattr(r, "aclose", None)
+                                                            if aclose is not None:
+                                                                await aclose()
+                                                            else:
+                                                                await r.close()
+                                                        except Exception:
+                                                            pass
+
+                                                except Exception:
+                                                    thumb_path = None
+
+                                                try:
+                                                    with open(out, "rb") as fh:
+                                                        if thumb_path:
+                                                            try:
+                                                                with open(thumb_path, "rb") as tf:
+                                                                    await bot.send_document(chat_id=chat_id, document=fh, caption=caption, thumb=tf)
+                                                            except Exception:
+                                                                await bot.send_document(chat_id=chat_id, document=fh, caption=caption)
+                                                        else:
+                                                            await bot.send_document(chat_id=chat_id, document=fh, caption=caption)
+                                                finally:
+                                                    try:
+                                                        if _temp_thumb and os.path.exists(_temp_thumb):
+                                                            os.remove(_temp_thumb)
+                                                    except Exception:
+                                                        pass
                                             elif kind == "video":
-                                                with open(out, "rb") as fh:
-                                                    await bot.send_video(chat_id=chat_id, video=fh, caption=caption, supports_streaming=True)
+                                                # Try to attach thumbnail (thumb) when available
+                                                thumb_path = None
+                                                _temp_thumb = None
+                                                try:
+                                                    cand = job.get("thumbnail")
+                                                    if cand:
+                                                        if os.path.exists(cand):
+                                                            thumb_path = cand
+                                                        else:
+                                                            try:
+                                                                backend = await get_storage_backend() if get_storage_backend is not None else None
+                                                            except Exception:
+                                                                backend = None
+                                                            if backend:
+                                                                temp_dir = os.path.join(getattr(config, "TEMP_PATH", "storage/temp"))
+                                                                os.makedirs(temp_dir, exist_ok=True)
+                                                                _temp_thumb = os.path.join(temp_dir, f"{job_id}_thumb{os.path.splitext(cand)[1] or '.jpg'}")
+                                                                try:
+                                                                    ok = await backend.download_file(cand, _temp_thumb)
+                                                                    if ok:
+                                                                        thumb_path = _temp_thumb
+                                                                except Exception:
+                                                                    _temp_thumb = None
+                                                    if not thumb_path:
+                                                        try:
+                                                            r = await get_redis()
+                                                            stored = await r.hgetall(f"ffmpeg:job:{job_id}")
+                                                            sval = stored.get("thumbnail") or stored.get("thumb")
+                                                            if sval:
+                                                                cand = sval
+                                                                if os.path.exists(cand):
+                                                                    thumb_path = cand
+                                                                else:
+                                                                    try:
+                                                                        backend = await get_storage_backend() if get_storage_backend is not None else None
+                                                                    except Exception:
+                                                                        backend = None
+                                                                    if backend:
+                                                                        temp_dir = os.path.join(getattr(config, "TEMP_PATH", "storage/temp"))
+                                                                        os.makedirs(temp_dir, exist_ok=True)
+                                                                        _temp_thumb = os.path.join(temp_dir, f"{job_id}_thumb{os.path.splitext(cand)[1] or '.jpg'}")
+                                                                        try:
+                                                                            ok = await backend.download_file(cand, _temp_thumb)
+                                                                            if ok:
+                                                                                thumb_path = _temp_thumb
+                                                                        except Exception:
+                                                                            _temp_thumb = None
+                                                            aclose = getattr(r, "aclose", None)
+                                                            if aclose is not None:
+                                                                await aclose()
+                                                            else:
+                                                                await r.close()
+                                                        except Exception:
+                                                            pass
+                                                except Exception:
+                                                    thumb_path = None
+
+                                                try:
+                                                    with open(out, "rb") as fh:
+                                                        if thumb_path:
+                                                            try:
+                                                                with open(thumb_path, "rb") as tf:
+                                                                    await bot.send_video(chat_id=chat_id, video=fh, caption=caption, supports_streaming=True, thumb=tf)
+                                                            except Exception:
+                                                                await bot.send_video(chat_id=chat_id, video=fh, caption=caption, supports_streaming=True)
+                                                        else:
+                                                            await bot.send_video(chat_id=chat_id, video=fh, caption=caption, supports_streaming=True)
+                                                finally:
+                                                    try:
+                                                        if _temp_thumb and os.path.exists(_temp_thumb):
+                                                            os.remove(_temp_thumb)
+                                                    except Exception:
+                                                        pass
                                             else:
-                                                with open(out, "rb") as fh:
-                                                    await bot.send_document(chat_id=chat_id, document=fh, caption=caption)
+                                                # non-video non-zip fallback
+                                                thumb_path = None
+                                                _temp_thumb = None
+                                                try:
+                                                    cand = job.get("thumbnail")
+                                                    if cand and os.path.exists(cand):
+                                                        thumb_path = cand
+                                                    elif cand:
+                                                        try:
+                                                            backend = await get_storage_backend() if get_storage_backend is not None else None
+                                                        except Exception:
+                                                            backend = None
+                                                        if backend:
+                                                            temp_dir = os.path.join(getattr(config, "TEMP_PATH", "storage/temp"))
+                                                            os.makedirs(temp_dir, exist_ok=True)
+                                                            _temp_thumb = os.path.join(temp_dir, f"{job_id}_thumb{os.path.splitext(cand)[1] or '.jpg'}")
+                                                            try:
+                                                                ok = await backend.download_file(cand, _temp_thumb)
+                                                                if ok:
+                                                                    thumb_path = _temp_thumb
+                                                            except Exception:
+                                                                _temp_thumb = None
+                                                except Exception:
+                                                    thumb_path = None
+
+                                                try:
+                                                    with open(out, "rb") as fh:
+                                                        if thumb_path:
+                                                            try:
+                                                                with open(thumb_path, "rb") as tf:
+                                                                    await bot.send_document(chat_id=chat_id, document=fh, caption=caption, thumb=tf)
+                                                            except Exception:
+                                                                await bot.send_document(chat_id=chat_id, document=fh, caption=caption)
+                                                        else:
+                                                            await bot.send_document(chat_id=chat_id, document=fh, caption=caption)
+                                                finally:
+                                                    try:
+                                                        if _temp_thumb and os.path.exists(_temp_thumb):
+                                                            os.remove(_temp_thumb)
+                                                    except Exception:
+                                                        pass
                                         sent = True
                                     except Exception as e:
                                         logger.warning("Bot API send failed for job %s: %s", job_id, e)

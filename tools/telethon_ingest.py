@@ -130,6 +130,15 @@ async def _upload_and_enqueue(local_path: str, original_name: str, chat_id: Opti
 
         ts = time.gmtime()
         key = f"uploads/{ts.tm_year}/{ts.tm_mon:02d}/{job_id}_{os.path.basename(local_path)}"
+        # Debug: log absolute path and existence before attempting upload
+        try:
+            abs_path = os.path.abspath(local_path)
+            exists = os.path.exists(abs_path)
+            size = os.path.getsize(abs_path) if exists else None
+            logger.info("telethon_ingest: upload debug - local_path=%s abs_path=%s exists=%s size=%s", local_path, abs_path, exists, size)
+        except Exception:
+            logger.exception("telethon_ingest: failed to stat local_path %s", local_path)
+
         await backend.upload_file(local_path, key)
         input_key = key
         logger.info("Uploaded %s -> %s", local_path, input_key)
@@ -349,6 +358,21 @@ async def main():
     if TelegramClient is None:
         logger.error("Telethon not installed. Add telethon to requirements to enable ingestion.")
         return
+    # Log a concise summary of environment presence so remote deploy logs reveal
+    # why Telethon ingest may not start (missing creds, session, or feature flag).
+    try:
+        env_summary = {
+            "ENABLE_TELETHON_INGEST": os.getenv("ENABLE_TELETHON_INGEST") or "",
+            "API_ID_present": bool(os.getenv("API_ID") or os.getenv("USERBOT_API_ID")),
+            "API_HASH_present": bool(os.getenv("API_HASH") or os.getenv("USERBOT_API_HASH")),
+            "TELETHON_SESSION_present": bool(os.getenv("TELETHON_SESSION") or os.getenv("API_SESSION") or os.getenv("USERBOT_SESSION")),
+            "TELETHON_SESSION_NAME": os.getenv("TELETHON_SESSION_NAME") or os.getenv("API_SESSION_NAME") or "telethon_ingest",
+            "REDIS_URL_present": bool(os.getenv("REDIS_URL")),
+            "STORAGE_BACKEND": os.getenv("STORAGE_BACKEND") or config.STORAGE_BACKEND,
+        }
+        logger.info("telethon_ingest: env summary: %s", json.dumps(env_summary))
+    except Exception:
+        logger.exception("telethon_ingest: failed to compute env summary")
 
     api_id = os.getenv("API_ID") or os.getenv("USERBOT_API_ID")
     api_hash = os.getenv("API_HASH") or os.getenv("USERBOT_API_HASH")
@@ -386,6 +410,24 @@ async def main():
             logger.warning("Found session env %s but StringSession class not available; using session name %s", session_env_used, session_name)
         else:
             logger.info("No string session env present; using session name %s", session_name)
+
+    # Startup environment summary (safe): show which critical env vars/flags are present.
+    try:
+        env_summary = {
+            "API_ID_SET": bool(os.getenv("API_ID") or os.getenv("USERBOT_API_ID")),
+            "API_HASH_SET": bool(os.getenv("API_HASH") or os.getenv("USERBOT_API_HASH")),
+            "SESSION_ENV_USED": session_env_used or "",
+            "SESSION_NAME": session_name,
+            "TELETHON_SESSION_PROVIDED": bool(session_str),
+            "REDIS_URL_SET": bool(os.getenv("REDIS_URL")),
+            "STORAGE_BACKEND": (os.getenv("STORAGE_BACKEND") or config.STORAGE_BACKEND or "local"),
+            "S3_BUCKET_SET": bool(os.getenv("S3_BUCKET") or getattr(config, "S3_BUCKET", None)),
+            "ENABLE_TELETHON_INGEST": os.getenv("ENABLE_TELETHON_INGEST", ""),
+            "TELETHON_MONGO_BRIDGE": os.getenv("TELETHON_MONGO_BRIDGE", ""),
+        }
+        logger.info("telethon_ingest: startup env summary: %s", env_summary)
+    except Exception:
+        logger.exception("telethon_ingest: failed to emit startup env summary")
 
     client = TelegramClient(session, api_id, api_hash)
 

@@ -182,7 +182,10 @@ class S3AsyncBackend(AsyncStorageBackend):
         return kw
 
     async def upload_file(self, src_path: str, dest_key: str) -> str:
-        if not src_path or not os.path.exists(src_path):
+        if not src_path:
+            raise ValueError(f"Invalid src_path: {src_path}")
+        src_path = os.path.abspath(src_path)
+        if not os.path.exists(src_path):
             raise ValueError(f"Invalid src_path: {src_path}")
 
         if not dest_key:
@@ -255,6 +258,7 @@ class S3AsyncBackend(AsyncStorageBackend):
                 await asyncio.sleep(backoff + random.random())
 
     async def upload_file_streaming(self, src_path: str, dest_key: str) -> str:
+        src_path = os.path.abspath(src_path)
         if not os.path.exists(src_path):
             raise ValueError(f"File not found: {src_path}")
 

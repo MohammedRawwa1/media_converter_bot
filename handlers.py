@@ -880,6 +880,7 @@ class EnhancedMediaHandler:
                             "ffmpeg_args": ["-c:v", "libx264", "-preset", "fast", "-crf", "23", "-c:a", "aac", "-b:a", "128k"],
                             "progress_channel": f"ffmpeg:progress:{job_id}",
                             "chat_id": update.effective_chat.id if update and getattr(update, 'effective_chat', None) else None,
+                            "thumbnail": metadata.get("thumbnail"),
                             "cleanup_input": True,
                             "cleanup_output": False,
                         }
@@ -1115,6 +1116,7 @@ class EnhancedMediaHandler:
             "ffmpeg_args": None,  # let worker infer from extension or use default
             "progress_channel": f"ffmpeg:progress:{job_id}",
             "chat_id": update.effective_chat.id if update and update.effective_chat else None,
+            "thumbnail": current_file.get("thumbnail"),
             "caption": f"Conversion to {target_format.upper()} finished",
             "cleanup_input": True,
             "cleanup_output": False,
@@ -2335,6 +2337,7 @@ class EnhancedMediaHandler:
                                 "ffmpeg_args": None,
                                 "progress_channel": f"ffmpeg:progress:{job_id}",
                                 "chat_id": update.effective_chat.id if update and getattr(update, 'effective_chat', None) else None,
+                                "thumbnail": f.get("thumbnail"),
                                 "caption": f"Bulk conversion finished for {f.get('name') or f.get('id')}",
                                 "cleanup_input": True,
                                 "cleanup_output": False,
@@ -3156,6 +3159,7 @@ class EnhancedMediaHandler:
                 "ffmpeg_args": cmd,
                 "progress_channel": f"ffmpeg:progress:{job_id}",
                 "chat_id": update.effective_chat.id if update and update.effective_chat else None,
+                "thumbnail": current_file.get("thumbnail"),
                 "caption": f"✅ Optimized for {preset}",
                 "cleanup_input": True,
                 "cleanup_output": True,
@@ -3240,6 +3244,7 @@ class EnhancedMediaHandler:
             "ffmpeg_args": ["-c", "copy"],
             "progress_channel": f"ffmpeg:progress:{job_id}",
             "chat_id": update.effective_chat.id if update and update.effective_chat else None,
+            "thumbnail": current_file.get("thumbnail"),
             "caption": "✅ Video repaired (if possible)",
             "cleanup_input": True,
             "cleanup_output": True,
@@ -3469,6 +3474,7 @@ class EnhancedMediaHandler:
             "archive_path": archive_path,
             "progress_channel": f"ffmpeg:progress:{job_id}",
             "chat_id": update.effective_chat.id if update and update.effective_chat else None,
+            "thumbnail": current_file.get("thumbnail"),
             "cleanup_input": True,
         }
 
