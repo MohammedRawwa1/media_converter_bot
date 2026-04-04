@@ -959,11 +959,7 @@ try:
                                         raw = await r.hgetall(f"ffmpeg:job:{job_id}")
                                     finally:
                                         try:
-                                            aclose = getattr(r, "aclose", None)
-                                            if aclose is not None:
-                                                await aclose()
-                                            else:
-                                                await r.close()
+                                            await r.close()
                                         except Exception:
                                             pass
                                     if raw:
@@ -1061,29 +1057,25 @@ try:
 
                                 r = await get_redis()
                                 try:
-                                    result["redis"]["ping"] = await r.ping()
-                                    try:
-                                        result["redis"]["ffmpeg_jobs"] = await r.lrange("ffmpeg:jobs", 0, 50)
-                                    except Exception:
-                                        result["redis"]["ffmpeg_jobs"] = []
-                                    try:
-                                        keys = await r.keys("ffmpeg:job:*")
-                                        result["redis"]["job_keys_count"] = len(keys)
-                                        result["redis"]["job_keys_sample"] = keys[:50]
-                                    except Exception:
-                                        result["redis"]["job_keys_count"] = 0
-                                    if job_id:
+                                        result["redis"]["ping"] = await r.ping()
                                         try:
-                                            result["redis"]["job_hash"] = await r.hgetall(f"ffmpeg:job:{job_id}")
+                                            result["redis"]["ffmpeg_jobs"] = await r.lrange("ffmpeg:jobs", 0, 50)
                                         except Exception:
-                                            result["redis"]["job_hash"] = {}
+                                            result["redis"]["ffmpeg_jobs"] = []
+                                        try:
+                                            keys = await r.keys("ffmpeg:job:*")
+                                            result["redis"]["job_keys_count"] = len(keys)
+                                            result["redis"]["job_keys_sample"] = keys[:50]
+                                        except Exception:
+                                            result["redis"]["job_keys_count"] = 0
+                                        if job_id:
+                                            try:
+                                                result["redis"]["job_hash"] = await r.hgetall(f"ffmpeg:job:{job_id}")
+                                            except Exception:
+                                                result["redis"]["job_hash"] = {}
                                 finally:
                                     try:
-                                        aclose = getattr(r, "aclose", None)
-                                        if aclose is not None:
-                                            await aclose()
-                                        else:
-                                            await r.close()
+                                        await r.close()
                                     except Exception:
                                         pass
                             except Exception:
@@ -1270,11 +1262,7 @@ try:
                                 locks[kstr] = vstr
                         finally:
                             try:
-                                aclose = getattr(r, "aclose", None)
-                                if aclose is not None:
-                                    await aclose()
-                                else:
-                                    await r.close()
+                                await r.close()
                             except Exception:
                                 pass
                         out["locks"] = locks
@@ -1323,11 +1311,7 @@ try:
                                     pass
                         finally:
                             try:
-                                aclose = getattr(r, "aclose", None)
-                                if aclose is not None:
-                                    await aclose()
-                                else:
-                                    await r.close()
+                                await r.close()
                             except Exception:
                                 pass
                         out["removed"] = removed
