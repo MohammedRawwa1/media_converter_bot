@@ -13,6 +13,7 @@ from email.utils import parsedate_to_datetime
 import aiohttp
 import os
 from urllib.parse import urlparse
+import random
 
 logger = logging.getLogger(__name__)
 
@@ -38,8 +39,19 @@ class WebhookMonitor:
         self.monitor_task = None
         # Current sleep interval (supports exponential backoff on transient errors)
         self._current_interval = check_interval
-        # Upper bound for backoff (seconds)
-        self._max_backoff = max(check_interval * 8, 3600)
+        # Upper bound for backoff (seconds) (override via env WEBHOOK_MAX_BACKOFF)
+        max_backoff_env = os.environ.get("WEBHOOK_MAX_BACKOFF")
+        if max_backoff_env:
+            try:
+                self._max_backoff = int(max_backoff_env)
+            except Exception:
+                self._max_backoff = max(check_interval * 8, 3600)
+        else:
+            self._max_backoff = max(check_interval * 8, 3600)
+
+        # Per-check timeouts (override via env)
+        self.local_timeout = int(os.environ.get("WEBHOOK_LOCAL_TIMEOUT", "3"))
+        self.external_timeout = int(os.environ.get("WEBHOOK_EXTERNAL_TIMEOUT", "10"))
 
         # Last observed HTTP status code or exception message (for diagnostics)
         self.last_status_code = None
@@ -59,32 +71,51 @@ class WebhookMonitor:
                 local_path = parsed.path or "/"
                 local_url = f"http://127.0.0.1:{local_port}{local_path}"
                 async with aiohttp.ClientSession() as session:
-                    async with session.head(local_url, timeout=aiohttp.ClientTimeout(total=3)) as resp:
-                        status = resp.status
-                        self.check_count += 1
-                        self.last_check = datetime.now()
-                        self.last_status_code = status
-                        if status in (200, 404, 405):
-                            self.is_healthy = True
-                            self.consecutive_failures = 0
-                            if getattr(self, "_current_interval", None) is not None:
-                                self._current_interval = self.check_interval
-                            logger.debug(f"✅ Local webhook loopback check passed (status: {status})")
-                            return True
-                        # If local returns non-healthy, fall through to external check
-                        logger.debug(f"Local loopback check returned {status}; falling back to external check")
+                    try:
+                        async with session.head(local_url, timeout=aiohttp.ClientTimeout(total=self.local_timeout)) as resp:
+                            status = resp.status
+                    except Exception as e_head:
+                        # HEAD can be rejected or may time out; try GET as a fallback
+                        logger.debug("Local HEAD failed; attempting GET", exc_info=e_head)
+                        try:
+                            async with session.get(local_url, timeout=aiohttp.ClientTimeout(total=self.local_timeout + 2)) as resp:
+                                status = resp.status
+                        except Exception:
+                            logger.debug("Local GET also failed; falling back to external check")
+                            raise
+
+                    self.check_count += 1
+                    self.last_check = datetime.now()
+                    self.last_status_code = status
+                    if status in (200, 404, 405):
+                        self.is_healthy = True
+                        self.consecutive_failures = 0
+                        if getattr(self, "_current_interval", None) is not None:
+                            self._current_interval = self.check_interval
+                        logger.debug(f"✅ Local webhook loopback check passed (status: {status})")
+                        return True
+                    logger.debug(f"Local loopback check returned {status}; falling back to external check")
             except Exception:
                 # Local check failed; continue to external check below
                 logger.debug("Local loopback check failed; trying external webhook URL")
 
             # External public check (original behavior)
             async with aiohttp.ClientSession() as session:
-                async with session.head(self.webhook_url, timeout=aiohttp.ClientTimeout(total=10)) as response:
-                    status = response.status
+                try:
+                    try:
+                        async with session.head(self.webhook_url, timeout=aiohttp.ClientTimeout(total=self.external_timeout)) as response:
+                            status = response.status
+                    except Exception as e_head:
+                        logger.debug("External HEAD failed; attempting GET", exc_info=e_head)
+                        try:
+                            async with session.get(self.webhook_url, timeout=aiohttp.ClientTimeout(total=self.external_timeout + 5)) as response:
+                                status = response.status
+                        except Exception:
+                            logger.debug("External GET also failed")
+                            raise
 
                     self.check_count += 1
                     self.last_check = datetime.now()
-
                     self.last_status_code = status
                     # Healthy responses (allow 200/404/405 as acceptable for probes)
                     if status in (200, 404, 405):
@@ -101,11 +132,13 @@ class WebhookMonitor:
                         self.is_healthy = False
                         self.failed_checks += 1
                         self.consecutive_failures += 1
-                        # Increase backoff interval
+                        # Increase backoff interval with small jitter
                         old = getattr(self, "_current_interval", self.check_interval)
-                        self._current_interval = min(old * 2, self._max_backoff)
+                        new = min(old * 2, self._max_backoff)
+                        jitter = random.uniform(0, min(5, new * 0.1))
+                        self._current_interval = new + jitter
                         logger.warning(
-                            f"⚠️ Webhook health check rate-limited (status: 429). Backing off from {old}s to {self._current_interval}s"
+                            f"⚠️ Webhook health check rate-limited (status: 429). Backing off from {old}s to {self._current_interval:.1f}s"
                         )
                         return False
 
@@ -115,17 +148,25 @@ class WebhookMonitor:
                     self.consecutive_failures += 1
                     logger.warning(f"⚠️ Webhook health check failed (status: {status})")
                     return False
+                except Exception as e:
+                    # Surface exception details for debugging
+                    self.last_error = str(e)
+                    raise
 
-        except asyncio.TimeoutError:
+        except asyncio.TimeoutError as e:
             self.is_healthy = False
             self.failed_checks += 1
             self.consecutive_failures += 1
-            # Exponential backoff on timeout
+            # Exponential backoff on timeout with small jitter
             try:
-                self._current_interval = min(self._current_interval * 2, self._max_backoff)
+                old = getattr(self, "_current_interval", self.check_interval)
+                new = min(old * 2, self._max_backoff)
+                jitter = random.uniform(0, min(5, new * 0.2))
+                self._current_interval = new + jitter
             except Exception:
                 pass
-            logger.error("❌ Webhook health check timeout; increasing backoff")
+            self.last_error = str(e)
+            logger.error(f"❌ Webhook health check timeout for {self.webhook_url}; increasing backoff to {self._current_interval}s: {e}")
             return False
 
         except aiohttp.ClientConnectorError as e:
@@ -133,10 +174,14 @@ class WebhookMonitor:
             self.failed_checks += 1
             self.consecutive_failures += 1
             try:
-                self._current_interval = min(self._current_interval * 2, self._max_backoff)
+                old = getattr(self, "_current_interval", self.check_interval)
+                new = min(old * 2, self._max_backoff)
+                jitter = random.uniform(0, min(5, new * 0.2))
+                self._current_interval = new + jitter
             except Exception:
                 pass
-            logger.error(f"❌ Webhook connection error: {e}; increasing backoff")
+            self.last_error = str(e)
+            logger.error(f"❌ Webhook connection error for {self.webhook_url}: {e}; increasing backoff to {self._current_interval}s")
             return False
 
         except Exception as e:
@@ -144,10 +189,14 @@ class WebhookMonitor:
             self.failed_checks += 1
             self.consecutive_failures += 1
             try:
-                self._current_interval = min(self._current_interval * 2, self._max_backoff)
+                old = getattr(self, "_current_interval", self.check_interval)
+                new = min(old * 2, self._max_backoff)
+                jitter = random.uniform(0, min(5, new * 0.2))
+                self._current_interval = new + jitter
             except Exception:
                 pass
-            logger.error(f"❌ Webhook health check error: {e}; increasing backoff")
+            self.last_error = str(e)
+            logger.error(f"❌ Webhook health check error for {self.webhook_url}: {e}; increasing backoff to {self._current_interval}s")
             return False
 
     async def start_monitoring(self):
@@ -183,11 +232,14 @@ class WebhookMonitor:
                 self.failed_checks += 1
                 self.consecutive_failures += 1
                 try:
-                    self._current_interval = min(self._current_interval * 2, self._max_backoff)
+                    old = getattr(self, "_current_interval", self.check_interval)
+                    new = min(old * 2, self._max_backoff)
+                    jitter = random.uniform(0, min(5, new * 0.2))
+                    self._current_interval = new + jitter
                 except Exception:
                     pass
                 self.last_error = str(e)
-                logger.error(f"❌ Webhook client error: {e}; increasing backoff")
+                logger.error(f"❌ Webhook client error for {self.webhook_url}: {e}; increasing backoff to {self._current_interval}s")
                 # Sleep for the backoff interval before retrying
                 await asyncio.sleep(getattr(self, "_current_interval", self.check_interval))
 
