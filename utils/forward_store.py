@@ -28,6 +28,8 @@ def _publish_forward_notification(fid: str, extra: dict = None) -> None:
         fetch_channel = os.environ.get("FETCH_CHANNEL", "ffmpeg:fetch")
         do_auto_fetch = os.environ.get("AUTO_FETCH_FORWARDS", "").lower() in ("1", "true", "yes")
 
+        # (diagnostic logging intentionally minimal to avoid leaking secrets)
+
         redis_url = os.environ.get("REDIS_URL") or os.environ.get("REDIS_URI") or os.environ.get("REDIS")
         payload = {"fid": fid}
         if extra:
@@ -142,11 +144,11 @@ def save_forward_metadata(metadata: dict) -> str:
 
                 loop = asyncio.get_event_loop()
                 if loop.is_running():
-                        # schedule upload asynchronously
-                        asyncio.ensure_future(_upload_file_async(tmp, key))
-                    else:
-                        # run briefly
-                        loop.run_until_complete(_upload_file_async(tmp, key))
+                    # schedule upload asynchronously
+                    asyncio.ensure_future(_upload_file_async(tmp, key))
+                else:
+                    # run briefly
+                    loop.run_until_complete(_upload_file_async(tmp, key))
             except Exception:
                 # fallback: run synchronous attempt via sync backend helper
                 try:

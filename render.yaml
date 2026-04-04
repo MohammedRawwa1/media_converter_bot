@@ -6,16 +6,36 @@ services:
     name: media-conversion-web
     env: python
     runtime: python-3.11.7
+    # Ensure AUTO_FETCH_FORWARDS is enabled so the web process publishes
+    # lightweight fetch requests when forward metadata is saved. Sensitive
+    # secrets (REDIS_URL, S3 credentials, TELETHON_SESSION) should be set
+    # via Render dashboard environment variables / secrets rather than
+    # checked into source control.
+    envVars:
+      - key: AUTO_FETCH_FORWARDS
+        value: "1"
     startCommand: uvicorn main:app --host 0.0.0.0 --port 8000 --workers 4
 
   - type: worker
     name: fetcher
     env: python
     runtime: python-3.11.7
+    # Fetcher service should also be prepared to receive HTTP trigger
+    # requests that enqueue fetches. AUTO_FETCH_FORWARDS here helps in
+    # some deployment models where the fetcher republishes or reacts.
+    envVars:
+      - key: AUTO_FETCH_FORWARDS
+        value: "1"
     startCommand: python -u fetcher/service.py
 
   - type: worker
     name: telethon-ingest
     env: python
     runtime: python-3.11.7
+    # Telethon ingest worker: ensure remote deploy exposes TELETHON_SESSION
+    # or TELETHON_SESSION_NAME in the service env. Set TELETHON_SESSION
+    # (StringSession) as a secret in Render to allow the userbot to run.
+    envVars:
+      - key: ENABLE_TELETHON_INGEST
+        value: "1"
     startCommand: python -u tools/telethon_ingest.py
