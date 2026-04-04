@@ -23,6 +23,7 @@ import time
 from typing import Optional
 import sys
 from pathlib import Path
+import json
 
 try:
     from telethon import TelegramClient, events
@@ -39,21 +40,77 @@ try:
     if str(project_root) not in sys.path:
         sys.path.insert(0, str(project_root))
 
-    from utils.storage import get_storage_backend
+    # Prefer async factory but also import sync helper for robustness
+    from utils.storage import get_storage_backend, get_storage_backend_sync
 except Exception as e:
-    # Do not silently swallow import failures - surface them for diagnostics.
-    print("Failed to import get_storage_backend from utils.storage:", e)
+    # Surface import failures for diagnostics and fall back to None
+    print("Failed to import storage factories from utils.storage:", e)
     get_storage_backend = None
+    try:
+        from utils.storage import get_storage_backend_sync
+    except Exception:
+        get_storage_backend_sync = None
 
 try:
     from utils.job_queue import enqueue_job
 except Exception:
     enqueue_job = None
 
+# Optional Redis async client for triggered fetch handling
+try:
+    import redis.asyncio as aioredis
+except Exception:
+    aioredis = None
+
+# Optional helpers used when processing remote-forward fetch requests
+try:
+    from utils.forward_store import load_forward_metadata
+except Exception:
+    load_forward_metadata = None
+
+try:
+    from utils.userbot_downloader import download_forward_via_userbot
+except Exception:
+    download_forward_via_userbot = None
+
 import config
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("telethon_ingest")
+
+
+async def _get_backend_instance():
+    """Return an async-capable storage backend instance or None.
+
+    Tries the async factory first, then falls back to the synchronous helper.
+    """
+    global get_storage_backend, get_storage_backend_sync
+    if get_storage_backend:
+        try:
+            return await get_storage_backend()
+        except Exception:
+            pass
+    if get_storage_backend_sync:
+        try:
+            return get_storage_backend_sync()
+        except Exception:
+            pass
+    # Last-ditch: attempt on-the-fly import
+    try:
+        from utils.storage import get_storage_backend as _g, get_storage_backend_sync as _gs
+
+        get_storage_backend = _g
+        get_storage_backend_sync = _gs
+        if get_storage_backend:
+            try:
+                return await get_storage_backend()
+            except Exception:
+                pass
+        if get_storage_backend_sync:
+            return get_storage_backend_sync()
+    except Exception:
+        pass
+    return None
 
 
 async def _upload_and_enqueue(local_path: str, original_name: str, chat_id: Optional[int], message_id: Optional[int]):
@@ -66,11 +123,11 @@ async def _upload_and_enqueue(local_path: str, original_name: str, chat_id: Opti
 
     input_key = None
     try:
-        if get_storage_backend is None:
-            logger.error("Storage backend factory unavailable; cannot upload %s", local_path)
+        backend = await _get_backend_instance()
+        if backend is None:
+            logger.error("Storage backend unavailable; cannot upload %s", local_path)
             return
 
-        backend = await get_storage_backend()
         ts = time.gmtime()
         key = f"uploads/{ts.tm_year}/{ts.tm_mon:02d}/{job_id}_{os.path.basename(local_path)}"
         await backend.upload_file(local_path, key)
@@ -145,6 +202,98 @@ async def _upload_and_enqueue(local_path: str, original_name: str, chat_id: Opti
         logger.info("Enqueued job %s (input_key=%s)", job_id, input_key)
     except Exception:
         logger.exception("Failed to enqueue job %s", job_id)
+
+
+async def _process_forward_hash(forward_hash: str):
+    """Handle a published forward_hash: download via userbot and upload/enqueue."""
+    if not load_forward_metadata:
+        logger.error("telethon_ingest: forward_store not available; cannot process %s", forward_hash)
+        return False
+
+    meta = load_forward_metadata(forward_hash)
+    if not meta:
+        logger.error("telethon_ingest: no metadata for forward_hash %s", forward_hash)
+        return False
+
+    logger.info("telethon_ingest: processing forward %s meta_chat=%s meta_msg=%s", forward_hash, meta.get("chat_id"), meta.get("message_id") or meta.get("msg_id"))
+
+    tmp = _make_temp_path(forward_hash, os.path.splitext(meta.get("name") or "")[1] or "")
+
+    if not download_forward_via_userbot:
+        logger.error("telethon_ingest: userbot_downloader not available; cannot fetch %s", forward_hash)
+        return False
+
+    try:
+        ok = await download_forward_via_userbot(
+            meta.get("chat_id"), meta.get("message_id") or meta.get("msg_id"), tmp, msg_date=meta.get("registered_at") or meta.get("created_at"), file_unique_id=meta.get("file_unique_id")
+        )
+        logger.info("telethon_ingest: userbot download for %s returned ok=%s exists=%s", forward_hash, bool(ok), os.path.exists(tmp))
+        if not ok or not os.path.exists(tmp):
+            logger.error("telethon_ingest: download failed for %s", forward_hash)
+            return False
+    except Exception:
+        logger.exception("telethon_ingest: exception during download for %s", forward_hash)
+        return False
+
+    # Upload & enqueue using same helper
+    try:
+        await _upload_and_enqueue(tmp, meta.get("name"), meta.get("chat_id"), meta.get("message_id") or meta.get("msg_id"))
+    except Exception:
+        logger.exception("telethon_ingest: upload/enqueue failed for %s", forward_hash)
+        return False
+
+    # Optionally remove forward metadata (forward_store may handle this elsewhere)
+    try:
+        from utils.forward_store import delete_forward_metadata
+
+        try:
+            delete_forward_metadata(forward_hash)
+        except Exception:
+            pass
+    except Exception:
+        pass
+
+    return True
+
+
+async def redis_listener():
+    """Subscribe to the fetch channel and process forward_hash messages."""
+    if aioredis is None:
+        logger.info("telethon_ingest: redis.asyncio not installed; fetch listener disabled")
+        return
+
+    redis_url = os.environ.get("REDIS_URL")
+    if not redis_url:
+        logger.info("telethon_ingest: REDIS_URL not set; fetch listener disabled")
+        return
+
+    try:
+        r = aioredis.from_url(redis_url, decode_responses=True)
+        pub = r.pubsub()
+        fetch_channel = os.environ.get("FETCH_CHANNEL", "ffmpeg:fetch")
+        await pub.subscribe(fetch_channel)
+        logger.info("telethon_ingest: subscribed to %s", fetch_channel)
+
+        async for msg in pub.listen():
+            if not msg:
+                continue
+            if msg.get("type") != "message":
+                continue
+            data = msg.get("data")
+            if isinstance(data, bytes):
+                try:
+                    data = data.decode("utf-8")
+                except Exception:
+                    data = str(data)
+            try:
+                payload = json.loads(data)
+            except Exception:
+                payload = {"forward_hash": data}
+            fh = payload.get("forward_hash")
+            if fh:
+                asyncio.create_task(_process_forward_hash(fh))
+    except Exception:
+        logger.exception("telethon_ingest: redis listener failed")
 
 
 def _make_temp_path(msg_id: str, ext: str = "") -> str:
@@ -227,6 +376,14 @@ async def main():
     # start client
     await client.start()
     logger.info("Telethon ingestion client started, listening for incoming media...")
+
+    # Start Redis fetch listener (if available) so this single service can
+    # both accept incoming messages and process published forward fetches
+    try:
+        asyncio.create_task(redis_listener())
+    except Exception:
+        logger.exception("telethon_ingest: failed to start redis listener")
+
     try:
         await client.run_until_disconnected()
     finally:
