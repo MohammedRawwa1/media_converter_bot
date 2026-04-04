@@ -267,33 +267,73 @@ async def redis_listener():
         logger.info("telethon_ingest: REDIS_URL not set; fetch listener disabled")
         return
 
+    r = None
+    pub = None
+    fetch_channel = os.environ.get("FETCH_CHANNEL", "ffmpeg:fetch")
     try:
         r = aioredis.from_url(redis_url, decode_responses=True)
         pub = r.pubsub()
-        fetch_channel = os.environ.get("FETCH_CHANNEL", "ffmpeg:fetch")
         await pub.subscribe(fetch_channel)
         logger.info("telethon_ingest: subscribed to %s", fetch_channel)
 
-        async for msg in pub.listen():
-            if not msg:
-                continue
-            if msg.get("type") != "message":
-                continue
-            data = msg.get("data")
-            if isinstance(data, bytes):
-                try:
-                    data = data.decode("utf-8")
-                except Exception:
-                    data = str(data)
+        # Use get_message loop which is friendlier to cancellation and
+        # allows explicit timeout checks instead of relying on async generators
+        while True:
             try:
-                payload = json.loads(data)
+                # `get_message` is async in redis.asyncio; timeout in seconds
+                msg = await pub.get_message(ignore_subscribe_messages=True, timeout=1.0)
+                if not msg:
+                    await asyncio.sleep(0.1)
+                    continue
+
+                data = msg.get("data")
+                if isinstance(data, bytes):
+                    try:
+                        data = data.decode("utf-8")
+                    except Exception:
+                        data = str(data)
+                try:
+                    payload = json.loads(data)
+                except Exception:
+                    payload = {"forward_hash": data}
+                fh = payload.get("forward_hash")
+                if fh:
+                    asyncio.create_task(_process_forward_hash(fh))
+            except asyncio.CancelledError:
+                # Graceful cancellation requested
+                break
+            except RuntimeError as e:
+                # Sometimes the underlying async generator may raise when
+                # the connection is being closed; log and break so we can
+                # cleanup and optionally restart.
+                logger.exception("telethon_ingest: redis listener runtime error: %s", e)
+                break
             except Exception:
-                payload = {"forward_hash": data}
-            fh = payload.get("forward_hash")
-            if fh:
-                asyncio.create_task(_process_forward_hash(fh))
+                logger.exception("telethon_ingest: error while processing redis message")
+                await asyncio.sleep(1)
     except Exception:
-        logger.exception("telethon_ingest: redis listener failed")
+        logger.exception("telethon_ingest: redis listener failed to start")
+    finally:
+        try:
+            if pub is not None:
+                try:
+                    await pub.unsubscribe(fetch_channel)
+                except Exception:
+                    pass
+                try:
+                    await pub.close()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        try:
+            if r is not None:
+                try:
+                    await r.close()
+                except Exception:
+                    pass
+        except Exception:
+            pass
 
 
 def _make_temp_path(msg_id: str, ext: str = "") -> str:
@@ -422,14 +462,27 @@ async def main():
 
     # Start Redis fetch listener (if available) so this single service can
     # both accept incoming messages and process published forward fetches
+    redis_task = None
     try:
-        asyncio.create_task(redis_listener())
+        redis_task = asyncio.create_task(redis_listener())
     except Exception:
         logger.exception("telethon_ingest: failed to start redis listener")
 
     try:
         await client.run_until_disconnected()
     finally:
+        # Cancel background redis listener if started
+        try:
+            if redis_task is not None:
+                redis_task.cancel()
+                try:
+                    await redis_task
+                except asyncio.CancelledError:
+                    pass
+                except Exception:
+                    pass
+        except Exception:
+            pass
         try:
             await client.disconnect()
         except Exception:
