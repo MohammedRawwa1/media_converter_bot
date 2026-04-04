@@ -124,7 +124,7 @@ def upload():
         except Exception as e:
             return jsonify({"error": "failed to load forward metadata", "detail": str(e)}), 500
 
-            if not meta:
+        if not meta:
             # default extension while we wait for metadata to appear
             ext = ".mp4"
             input_path = os.path.join(INPUT_DIR, f"{job_id}{ext}")
