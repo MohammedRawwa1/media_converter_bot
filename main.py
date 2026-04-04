@@ -787,7 +787,11 @@ async def main(background: bool = False) -> None:
                 pass
 
             polling_task = None
-            if WEBHOOK_URL:
+            polling_task = None
+            # Background ASGI mode: support either webhook mode or an opt-in
+            # FORCE_POLLING long-poller (useful when running under ASGI but
+            # developer wants getUpdates polling instead of webhooks).
+            if WEBHOOK_URL and not force_polling:
                 logger.info(f"🌐 Starting bot in webhook mode: {WEBHOOK_URL}")
                 try:
                     await application.bot.set_webhook(
@@ -803,20 +807,50 @@ async def main(background: bool = False) -> None:
                     # let caller observe failure via exception
                     raise
             else:
-                # Polling under an already-running event loop (ASGI/uvicorn)
-                # can cause runtime errors because `run_polling()` tries to
-                # manage the loop. Advise using a webhook or running the
-                # bot in a non-ASGI process. We keep the application started
-                # so webhook mode works; otherwise we won't start polling here.
-                logger.warning(
-                    "Polling under ASGI is unsafe — not starting polling. "
-                    "Set WEBHOOK_URL for webhook mode or run the bot outside ASGI."
-                )
-                polling_task = None
+                # FORCE_POLLING override: delete any existing webhook and
+                # start a lightweight long-polling task that fetches updates
+                # via getUpdates and enqueues them onto Application.update_queue
+                if WEBHOOK_URL and force_polling:
+                    try:
+                        await application.bot.delete_webhook(drop_pending_updates=False)
+                        logger.info("Deleted existing webhook to allow FORCE_POLLING long-poller")
+                    except Exception as e:
+                        logger.warning(f"Failed to delete webhook before long-poller: {e}")
+
+                logger.info("Starting background long-poller (FORCE_POLLING enabled)")
+
+                async def _longpoll_loop():
+                    offset = None
+                    bot = application.bot
+                    while True:
+                        try:
+                            # Use a modest timeout so we can react to shutdown_event
+                            updates = await bot.get_updates(offset=offset, timeout=30)
+                            if updates:
+                                for u in updates:
+                                    try:
+                                        if getattr(u, "update_id", None) is not None:
+                                            offset = int(u.update_id) + 1
+                                    except Exception:
+                                        pass
+                                    try:
+                                        # Enqueue for ASGI consumer/dispatcher
+                                        await BOT_APPLICATION.update_queue.put(u)
+                                    except Exception:
+                                        logger.exception("Failed to enqueue polled update")
+                            else:
+                                # no updates; brief pause before next long-poll
+                                await asyncio.sleep(0.1)
+                        except asyncio.CancelledError:
+                            break
+                        except Exception as e:
+                            logger.exception(f"Long-poller error: {e}")
+                            await asyncio.sleep(1)
+
                 try:
-                    BOT_READY.set()
+                    polling_task = asyncio.create_task(_longpoll_loop())
                 except Exception:
-                    pass
+                    logger.exception("Failed to start background long-poller")
 
             # Wait for shutdown_event or cancellation; FastAPI will cancel
             # this task on shutdown which will raise CancelledError here.
