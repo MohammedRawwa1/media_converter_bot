@@ -81,9 +81,40 @@ def enqueue_from_url():
         "type": data.get("type") or "ffmpeg",
         "created_at": time.time(),
     }
-    r.lpush(JOB_LIST, json.dumps(job))
-    logger.info("Enqueued job from URL %s -> %s", job_id, source_url)
-    return jsonify({"status": "ok", "job_id": job_id}), 201
+
+    # Prepare a Redis job hash before pushing into the queue so workers
+    # that pop the job can immediately read metadata (avoids race conditions).
+    try:
+        mapping = {
+            "status": "queued",
+            "progress": 0,
+            "message": "queued",
+            "input": job.get("source_url") or "",
+            "input_key": "",
+            "output": "",
+            "created_at": str(job.get("created_at") or ""),
+        }
+        try:
+            r.hset(f"ffmpeg:job:{job_id}", mapping=mapping)
+            # Optional TTL for job metadata (fall back to 1 day)
+            try:
+                ttl = int(os.environ.get("JOB_METADATA_TTL", "86400"))
+                if ttl and ttl > 0:
+                    r.expire(f"ffmpeg:job:{job_id}", ttl)
+            except Exception:
+                pass
+        except Exception:
+            logger.exception("Failed to HSET job metadata for %s", job_id)
+    except Exception:
+        pass
+
+    try:
+        r.lpush(JOB_LIST, json.dumps(job))
+        logger.info("Enqueued job from URL %s -> %s", job_id, source_url)
+        return jsonify({"status": "ok", "job_id": job_id}), 201
+    except Exception:
+        logger.exception("Failed to push job onto Redis list for job %s", job_id)
+        return jsonify({"error": "enqueue_failed"}), 500
 
 
 @app.route("/presign", methods=["GET"])
