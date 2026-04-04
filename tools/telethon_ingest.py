@@ -101,6 +101,27 @@ async def _upload_and_enqueue(local_path: str, original_name: str, chat_id: Opti
         "cleanup_input": not keep_local,
     }
 
+    # Optionally save metadata to MongoDB for Telethon ingestion (best-effort, non-blocking)
+    try:
+        if os.environ.get("TELETHON_MONGO_BRIDGE", "").lower() in ("1", "true", "yes"):
+            try:
+                from utils.telethon_mongo import save_telethon_forward
+
+                try:
+                    # Schedule in background so ingestion isn't delayed by DB latency
+                    asyncio.create_task(save_telethon_forward(job))
+                except Exception:
+                    try:
+                        loop = asyncio.get_event_loop()
+                        loop.create_task(save_telethon_forward(job))
+                    except Exception:
+                        # best-effort only
+                        pass
+            except Exception:
+                logger.exception("Telethon->Mongo bridge unavailable")
+    except Exception:
+        pass
+
     if enqueue_job is None:
         logger.error("enqueue_job not available; cannot enqueue %s", job_id)
         return

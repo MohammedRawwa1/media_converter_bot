@@ -608,8 +608,20 @@ class EnhancedMediaHandler:
             # are saved to S3/R2 when configured instead of failing silently.
             if "file is too big" in err_text.lower() or "too big" in err_text.lower():
                 try:
-                    await self._handle_large_forward(update, current_file, err_text, upload_url)
-                    return
+                    fh = await self._handle_large_forward(update, current_file, err_text, upload_url)
+                    # Do not continue processing — inform caller that the file
+                    # was too large and we've saved forward metadata (when
+                    # available) or scheduled a server fetch.
+                    if fh:
+                        raise Exception(
+                            "Telegram reports the file is too big to download via the bot. "
+                            f"Forward saved (id={fh}). The server will attempt to fetch it; or upload via {upload_url}?forward_hash={fh}"
+                        )
+                    else:
+                        raise Exception(
+                            "Telegram reports the file is too big to download via the bot. "
+                            f"Please either upload the file via the web uploader (POST to {upload_url}) or provide a direct public URL to the file."
+                        )
                 except Exception:
                     # If handling the large forward fails, propagate a user-friendly
                     # error so callers can inform the user.
@@ -807,7 +819,7 @@ class EnhancedMediaHandler:
                                     delete_forward_metadata(fh)
                                 except Exception:
                                     pass
-                                return
+                                return fh
                             except Exception:
                                 logger.exception("Failed to parse webapp enqueue response for %s", fh)
                     except Exception:
@@ -865,7 +877,7 @@ class EnhancedMediaHandler:
                                 delete_forward_metadata(fh)
                             except Exception:
                                 pass
-                            return
+                            return fh
                         except Exception:
                             logger.exception("Failed to enqueue job after fetch for %s", fh)
                     except Exception:

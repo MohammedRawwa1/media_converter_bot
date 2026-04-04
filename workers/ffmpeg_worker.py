@@ -51,6 +51,82 @@ JOBS_SUCCEEDED = Counter("media_jobs_succeeded", "Total ffmpeg jobs succeeded")
 JOB_DURATION = Histogram("media_job_duration_seconds", "Duration of ffmpeg jobs")
 ACTIVE_JOBS = Gauge("media_jobs_active", "Number of active ffmpeg jobs")
 
+# Forward notification event (set by background pubsub listener)
+FORWARD_NOTIFY_EVENT: Optional[asyncio.Event] = None
+LAST_FORWARD_NOTIFICATION: Optional[dict] = None
+
+
+async def _forward_pubsub_listener(stop_event: Optional[asyncio.Event], event: asyncio.Event) -> None:
+    """Background task: subscribe to forward publish channel and set `event` when a notification arrives.
+
+    This is best-effort: failures are logged and the task exits without raising.
+    """
+    try:
+        import redis.asyncio as aioredis
+    except Exception:
+        logger.warning("forward listener: redis.asyncio not available; listener disabled")
+        return
+
+    redis_url = os.environ.get("REDIS_URL")
+    if not redis_url:
+        logger.info("forward listener: REDIS_URL not configured; listener disabled")
+        return
+
+    channel = os.environ.get("FORWARD_PUBLISH_CHANNEL", "ffmpeg:forwards")
+
+    try:
+        client = aioredis.from_url(redis_url, decode_responses=True)
+        pub = client.pubsub()
+        await pub.subscribe(channel)
+        logger.info("Subscribed to forward publish channel %s", channel)
+    except Exception:
+        logger.exception("Failed to subscribe to forward publish channel; listener disabled")
+        try:
+            await client.close()
+        except Exception:
+            pass
+        return
+
+    try:
+        async for msg in pub.listen():
+            if stop_event and stop_event.is_set():
+                break
+            if not msg:
+                continue
+            if msg.get("type") != "message":
+                continue
+            data = msg.get("data")
+            if isinstance(data, bytes):
+                try:
+                    data = data.decode("utf-8")
+                except Exception:
+                    data = str(data)
+            try:
+                payload = json.loads(data)
+            except Exception:
+                payload = {"fid": data}
+
+            # store last payload and notify waiter(s)
+            global LAST_FORWARD_NOTIFICATION
+            LAST_FORWARD_NOTIFICATION = payload
+            try:
+                event.set()
+            except Exception:
+                pass
+    except asyncio.CancelledError:
+        pass
+    except Exception:
+        logger.exception("Exception in forward pubsub listener")
+    finally:
+        try:
+            await pub.unsubscribe(channel)
+        except Exception:
+            pass
+        try:
+            await client.close()
+        except Exception:
+            pass
+
 
 async def handle_job(job: dict):
     job_id = job.get("job_id")
@@ -464,7 +540,25 @@ async def handle_job(job: dict):
                                         except Exception:
                                             # swallow per-iteration errors and continue waiting
                                             pass
-                                        await asyncio.sleep(1)
+                                        # Wait up to 1s, but wake early if a forward notification arrives
+                                        try:
+                                            if FORWARD_NOTIFY_EVENT is not None:
+                                                try:
+                                                    await asyncio.wait_for(FORWARD_NOTIFY_EVENT.wait(), timeout=1)
+                                                    try:
+                                                        FORWARD_NOTIFY_EVENT.clear()
+                                                    except Exception:
+                                                        pass
+                                                except asyncio.TimeoutError:
+                                                    pass
+                                            else:
+                                                await asyncio.sleep(1)
+                                        except Exception:
+                                            # on any error, fall back to sleeping briefly
+                                            try:
+                                                await asyncio.sleep(0.5)
+                                            except Exception:
+                                                pass
                                 finally:
                                     try:
                                         await rr.close()
@@ -1055,7 +1149,18 @@ async def worker_loop(stop_event: Optional[asyncio.Event] = None):
     except Exception:
         logger.exception("Failed to init job_store (Mongo)")
 
-    while True:
+    # Start background forward pubsub listener to wake waiting jobs early
+    forward_task = None
+    try:
+        forward_event = asyncio.Event()
+        global FORWARD_NOTIFY_EVENT
+        FORWARD_NOTIFY_EVENT = forward_event
+        forward_task = asyncio.create_task(_forward_pubsub_listener(stop_event, forward_event))
+    except Exception:
+        forward_task = None
+
+    try:
+        while True:
         if stop_event and stop_event.is_set():
             logger.info("Stop event set, exiting worker loop")
             break
@@ -1077,7 +1182,17 @@ async def worker_loop(stop_event: Optional[asyncio.Event] = None):
         except Exception:
             logger.exception("Exception in worker loop")
             await asyncio.sleep(1)
-
+    finally:
+        # ensure forward listener is cancelled
+        try:
+            if forward_task:
+                forward_task.cancel()
+                try:
+                    await forward_task
+                except Exception:
+                    pass
+        except Exception:
+            pass
 
 def main():
     loop = asyncio.new_event_loop()

@@ -10,6 +10,90 @@ except Exception:
     config = None
 
 from .storage import get_storage_backend, get_storage_backend_sync
+import logging
+
+logger = logging.getLogger(__name__)
+
+
+def _publish_forward_notification(fid: str, extra: dict = None) -> None:
+    """Best-effort notify Redis that a forward metadata object exists.
+    Payload published on channel defined by `FORWARD_PUBLISH_CHANNEL` (default `ffmpeg:forwards`).
+    Optionally also publishes a fetch request to `ffmpeg:fetch` when
+    `AUTO_FETCH_FORWARDS` is enabled. This function never raises.
+    """
+    try:
+        import os, json
+
+        forward_channel = os.environ.get("FORWARD_PUBLISH_CHANNEL", "ffmpeg:forwards")
+        fetch_channel = os.environ.get("FETCH_CHANNEL", "ffmpeg:fetch")
+        do_auto_fetch = os.environ.get("AUTO_FETCH_FORWARDS", "").lower() in ("1", "true", "yes")
+
+        redis_url = os.environ.get("REDIS_URL") or os.environ.get("REDIS_URI") or os.environ.get("REDIS")
+        payload = {"fid": fid}
+        if extra:
+            payload.update(extra)
+
+        def _sync_publish(client, ch, pl):
+            try:
+                client.publish(ch, json.dumps(pl))
+                return True
+            except Exception:
+                return False
+
+        # Try sync redis client first (most common)
+        try:
+            import redis as _redis
+            if redis_url:
+                client = _redis.from_url(redis_url, decode_responses=True)
+            else:
+                client = _redis.Redis(decode_responses=True)
+            try:
+                _sync_publish(client, forward_channel, payload)
+                if do_auto_fetch:
+                    # publish a lightweight fetch request for fetcher service
+                    try:
+                        _sync_publish(client, fetch_channel, {"forward_hash": fid})
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+        # Fall back to async redis when available and loop running
+        try:
+            import asyncio
+            try:
+                import redis.asyncio as aioredis
+            except Exception:
+                aioredis = None
+            if aioredis:
+                loop = None
+                try:
+                    loop = asyncio.get_event_loop()
+                except Exception:
+                    loop = None
+                client = aioredis.from_url(redis_url, decode_responses=True) if redis_url else aioredis.Redis(decode_responses=True)
+                if loop and loop.is_running():
+                    try:
+                        asyncio.ensure_future(client.publish(forward_channel, json.dumps(payload)))
+                        if do_auto_fetch:
+                            asyncio.ensure_future(client.publish(fetch_channel, json.dumps({"forward_hash": fid})))
+                    except Exception:
+                        pass
+                else:
+                    try:
+                        loop = asyncio.new_event_loop()
+                        asyncio.set_event_loop(loop)
+                        loop.run_until_complete(client.publish(forward_channel, json.dumps(payload)))
+                        if do_auto_fetch:
+                            loop.run_until_complete(client.publish(fetch_channel, json.dumps({"forward_hash": fid})))
+                        loop.close()
+                    except Exception:
+                        pass
+    except Exception:
+        # never raise
+        pass
 
 
 def _local_forwards_dir() -> str:
@@ -58,11 +142,11 @@ def save_forward_metadata(metadata: dict) -> str:
 
                 loop = asyncio.get_event_loop()
                 if loop.is_running():
-                    # schedule upload asynchronously
-                    asyncio.ensure_future(_upload_file_async(tmp, key))
-                else:
-                    # run briefly
-                    loop.run_until_complete(_upload_file_async(tmp, key))
+                        # schedule upload asynchronously
+                        asyncio.ensure_future(_upload_file_async(tmp, key))
+                    else:
+                        # run briefly
+                        loop.run_until_complete(_upload_file_async(tmp, key))
             except Exception:
                 # fallback: run synchronous attempt via sync backend helper
                 try:
@@ -83,6 +167,11 @@ def save_forward_metadata(metadata: dict) -> str:
                     t.submit(_sync_upload)
                 except Exception:
                     pass
+            try:
+                # Best-effort publish that forward metadata is available (include remote key)
+                _publish_forward_notification(fid, {"remote_key": key, "file_id": data.get("file_id")})
+            except Exception:
+                pass
             return fid
         except Exception:
             # fallback to local
@@ -102,6 +191,10 @@ def save_forward_metadata(metadata: dict) -> str:
             return fid
         except Exception:
             raise
+    try:
+        _publish_forward_notification(fid, {"local_path": p, "file_id": data.get("file_id")})
+    except Exception:
+        pass
     return fid
 
 
