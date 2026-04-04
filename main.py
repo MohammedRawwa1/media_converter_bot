@@ -19,7 +19,15 @@ import inspect
 
 from telegram import Update, Bot
 from telegram.error import TelegramError
-from telegram.request import Request
+# Request location differs across PTB releases; try both locations and
+# fall back to None so the application can continue using default Request.
+try:
+    from telegram.request import Request
+except Exception:
+    try:
+        from telegram.utils.request import Request
+    except Exception:
+        Request = None
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
