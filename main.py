@@ -18,7 +18,8 @@ import functools
 import inspect
 
 from telegram import Update, Bot
-from telegram.error import TelegramError
+from telegram.error import TelegramError, TimedOut, Conflict
+import httpx
 # Request location differs across PTB releases; try both locations and
 # fall back to None so the application can continue using default Request.
 try:
@@ -101,6 +102,13 @@ BOT_APPLICATION = None
 BOT_STARTED_AT = None
 START_TIME = time.time()
 BOT_READY = asyncio.Event()
+
+# Guard to ensure we don't start multiple concurrent long-pollers
+LONG_POLLER_STARTED = False
+
+# Globals for isolating getUpdates calls (initialized in main)
+GET_UPDATES_SEMAPHORE = None
+GET_UPDATES_BOT = None
 
 # Simple in-memory Prometheus-style counters
 METRICS = {
@@ -671,6 +679,36 @@ async def main(background: bool = False) -> None:
     # Allow forcing polling even when WEBHOOK_URL is set (useful for local/dev runs)
     force_polling = os.environ.get("FORCE_POLLING", "").lower() in ("1", "true", "yes")
 
+    # Initialize get_updates isolation primitives (semaphore + optional dedicated client)
+    try:
+        global GET_UPDATES_SEMAPHORE, GET_UPDATES_BOT
+        try:
+            GET_UPDATES_SEMAPHORE = asyncio.Semaphore(int(os.environ.get("GET_UPDATES_CONCURRENCY", "1")))
+        except Exception:
+            GET_UPDATES_SEMAPHORE = asyncio.Semaphore(1)
+        GET_UPDATES_BOT = None
+        if Request is not None:
+            try:
+                gu_pool_size = int(os.environ.get("GET_UPDATES_POOL_SIZE", "5"))
+                gu_pool_timeout = float(os.environ.get("GET_UPDATES_POOL_TIMEOUT", str(http_pool_timeout)))
+                gu_req = Request(con_pool_size=gu_pool_size, pool_timeout=gu_pool_timeout, connect_timeout=http_connect_timeout, read_timeout=http_read_timeout)
+                GET_UPDATES_BOT = Bot(token=BOT_TOKEN, request=gu_req)
+                logger.info("Dedicated get_updates client initialized (pool=%s)", gu_pool_size)
+            except Exception as e:
+                logger.warning("Failed to initialize dedicated get_updates client: %s", e)
+                GET_UPDATES_BOT = None
+    except Exception:
+        GET_UPDATES_SEMAPHORE = asyncio.Semaphore(1)
+        GET_UPDATES_BOT = None
+
+    # If FORCE_POLLING is requested, remove any existing webhook immediately
+    if force_polling:
+        try:
+            await application.bot.delete_webhook(drop_pending_updates=False)
+            logger.info("FORCE_POLLING enabled at startup: deleted existing webhook")
+        except Exception as e:
+            logger.warning("Failed to delete webhook on startup for FORCE_POLLING: %s", e)
+
     # Expose external service config into application context
     try:
         application.bot_data["redis_url"] = getattr(cfg, "REDIS_URL", None)
@@ -876,7 +914,24 @@ async def main(background: bool = False) -> None:
                     while True:
                         try:
                             # Use a modest timeout so we can react to shutdown_event
-                            updates = await bot.get_updates(offset=offset, timeout=30)
+                            sem = globals().get("GET_UPDATES_SEMAPHORE")
+                            get_bot = globals().get("GET_UPDATES_BOT")
+                            if sem is None:
+                                sem = asyncio.Semaphore(1)
+                            acquired = False
+                            try:
+                                await sem.acquire()
+                                acquired = True
+                                if get_bot:
+                                    updates = await get_bot.get_updates(offset=offset, timeout=30)
+                                else:
+                                    updates = await bot.get_updates(offset=offset, timeout=30)
+                            finally:
+                                if acquired:
+                                    try:
+                                        sem.release()
+                                    except Exception:
+                                        pass
                             if updates:
                                 for u in updates:
                                     try:
@@ -894,12 +949,23 @@ async def main(background: bool = False) -> None:
                                 await asyncio.sleep(0.1)
                         except asyncio.CancelledError:
                             break
+                        except (TimedOut, httpx.PoolTimeout) as e:
+                            logger.warning("Long-poller timed out (pool exhausted): %s. Backing off 5s", e)
+                            await asyncio.sleep(5)
+                        except Conflict as e:
+                            logger.error("Long-poller conflict (another getUpdates active): %s. Stopping long-poller", e)
+                            break
                         except Exception as e:
                             logger.exception(f"Long-poller error: {e}")
                             await asyncio.sleep(1)
 
                 try:
-                    polling_task = asyncio.create_task(_longpoll_loop())
+                    global LONG_POLLER_STARTED
+                    if not globals().get("LONG_POLLER_STARTED", False):
+                        globals()["LONG_POLLER_STARTED"] = True
+                        polling_task = asyncio.create_task(_longpoll_loop())
+                    else:
+                        logger.info("Background long-poller already running; skipping duplicate start")
                 except Exception:
                     logger.exception("Failed to start background long-poller")
 
@@ -930,6 +996,11 @@ async def main(background: bool = False) -> None:
                         await polling_task
                     except Exception:
                         pass
+                    finally:
+                        try:
+                            globals()["LONG_POLLER_STARTED"] = False
+                        except Exception:
+                            pass
 
                 try:
                     await application.stop()
@@ -938,6 +1009,18 @@ async def main(background: bool = False) -> None:
                         BOT_READY.clear()
                     except Exception:
                         pass
+                # Close dedicated get_updates client if present
+                try:
+                    gu = globals().get("GET_UPDATES_BOT")
+                    if gu is not None:
+                        close_fn = getattr(gu, "close", None)
+                        if close_fn:
+                            try:
+                                await close_fn()
+                            except Exception:
+                                pass
+                except Exception:
+                    pass
 
         else:
             # Non-ASGI mode: use the context manager as before which manages
@@ -1884,7 +1967,24 @@ try:
                         try:
                             while True:
                                 try:
-                                    updates = await bot.get_updates(offset=offset, timeout=30)
+                                    sem = globals().get("GET_UPDATES_SEMAPHORE")
+                                    get_bot = globals().get("GET_UPDATES_BOT")
+                                    if sem is None:
+                                        sem = asyncio.Semaphore(1)
+                                    acquired = False
+                                    try:
+                                        await sem.acquire()
+                                        acquired = True
+                                        if get_bot:
+                                            updates = await get_bot.get_updates(offset=offset, timeout=30)
+                                        else:
+                                            updates = await bot.get_updates(offset=offset, timeout=30)
+                                    finally:
+                                        if acquired:
+                                            try:
+                                                sem.release()
+                                            except Exception:
+                                                pass
                                     if updates:
                                         for u in updates:
                                             try:
@@ -1900,6 +2000,12 @@ try:
                                         await asyncio.sleep(0.1)
                                 except asyncio.CancelledError:
                                     break
+                                except (TimedOut, httpx.PoolTimeout) as e:
+                                    logger.warning("ASGI long-poller timed out (pool exhausted): %s. Backing off 5s", e)
+                                    await asyncio.sleep(5)
+                                except Conflict as e:
+                                    logger.error("ASGI long-poller conflict (another getUpdates active): %s. Stopping long-poller", e)
+                                    break
                                 except Exception as e:
                                     logger.exception("ASGI long-poller error: %s", e)
                                     await asyncio.sleep(1)
@@ -1907,8 +2013,13 @@ try:
                             logger.exception("ASGI long-poller fatal error")
 
                     try:
-                        app.state.longpoll = asyncio.create_task(_asgi_longpoll_loop())
-                        logger.info("ASGI long-poller started")
+                        global LONG_POLLER_STARTED
+                        if not globals().get("LONG_POLLER_STARTED", False):
+                            globals()["LONG_POLLER_STARTED"] = True
+                            app.state.longpoll = asyncio.create_task(_asgi_longpoll_loop())
+                            logger.info("ASGI long-poller started")
+                        else:
+                            logger.info("ASGI long-poller skipped; background poller already running")
                     except Exception:
                         logger.exception("Failed to start ASGI long-poller")
             except Exception:
@@ -1940,6 +2051,11 @@ try:
                     logger.info("ASGI long-poller cancelled on shutdown")
         except Exception as e:
             logger.error(f"Error stopping ASGI long-poller: {e}")
+        finally:
+            try:
+                globals()["LONG_POLLER_STARTED"] = False
+            except Exception:
+                pass
         # Cancel update consumer if present
         try:
             uc = getattr(app.state, "update_consumer", None)
@@ -1951,6 +2067,19 @@ try:
                     logger.info("ASGI update consumer cancelled on shutdown")
         except Exception as e:
             logger.error(f"Error stopping ASGI update consumer: {e}")
+
+        # Close dedicated get_updates client if present
+        try:
+            gu = globals().get("GET_UPDATES_BOT")
+            if gu is not None:
+                close_fn = getattr(gu, "close", None)
+                if close_fn:
+                    try:
+                        await close_fn()
+                    except Exception:
+                        pass
+        except Exception as e:
+            logger.warning(f"Error closing GET_UPDATES_BOT: {e}")
 
 except Exception as e:
     logger.warning(f"FastAPI not available or import failed: {e}")
