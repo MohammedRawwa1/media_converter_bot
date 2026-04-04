@@ -18,12 +18,22 @@ import logging
 import os
 import pathlib
 import sys
+from pathlib import Path
 
 # Ensure repository root is importable when running as a script
-sys.path.insert(0, os.getcwd())
+project_root = Path(__file__).resolve().parents[1]
+if str(project_root) not in sys.path:
+    sys.path.insert(0, str(project_root))
 
-from utils.job_queue import enqueue_job, get_redis
-from utils.storage import get_storage_backend_sync
+try:
+    from utils.job_queue import enqueue_job, get_redis
+    from utils.storage import get_storage_backend_sync
+except Exception as e:
+    print("Failed to import project helpers (utils.*). Ensure you're running this script from the repository root and have installed dependencies.")
+    import traceback
+
+    traceback.print_exc()
+    sys.exit(2)
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("requeue_job")

@@ -21,6 +21,8 @@ import logging
 import uuid
 import time
 from typing import Optional
+import sys
+from pathlib import Path
 
 try:
     from telethon import TelegramClient, events
@@ -31,8 +33,16 @@ except Exception:  # pragma: no cover - Telethon may be optional in some envs
     StringSession = None
 
 try:
+    # Ensure project root is on sys.path so imports like `from utils...` work
+    # even when this script is executed from the `tools/` directory.
+    project_root = Path(__file__).resolve().parents[1]
+    if str(project_root) not in sys.path:
+        sys.path.insert(0, str(project_root))
+
     from utils.storage import get_storage_backend
-except Exception:
+except Exception as e:
+    # Do not silently swallow import failures - surface them for diagnostics.
+    print("Failed to import get_storage_backend from utils.storage:", e)
     get_storage_backend = None
 
 try:
@@ -56,6 +66,10 @@ async def _upload_and_enqueue(local_path: str, original_name: str, chat_id: Opti
 
     input_key = None
     try:
+        if get_storage_backend is None:
+            logger.error("Storage backend factory unavailable; cannot upload %s", local_path)
+            return
+
         backend = await get_storage_backend()
         ts = time.gmtime()
         key = f"uploads/{ts.tm_year}/{ts.tm_mon:02d}/{job_id}_{os.path.basename(local_path)}"

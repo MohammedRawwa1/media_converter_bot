@@ -30,9 +30,12 @@ import json
 import logging
 import os
 import sys
+from pathlib import Path
 
-# allow importing project modules when run from scripts dir
-sys.path.insert(0, os.getcwd())
+# Ensure project root is importable when running this script directly
+project_root = Path(__file__).resolve().parents[1]
+if str(project_root) not in sys.path:
+    sys.path.insert(0, str(project_root))
 
 try:
     import redis.asyncio as aioredis
