@@ -17,8 +17,9 @@ from urllib.parse import urlparse
 import functools
 import inspect
 
-from telegram import Update
+from telegram import Update, Bot
 from telegram.error import TelegramError
+from telegram.request import Request
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -632,7 +633,32 @@ async def main(background: bool = False) -> None:
         raise ValueError("BOT_TOKEN is required. Set it in .env file.")
 
     # Create the Application for PTB v20+
-    application = Application.builder().token(BOT_TOKEN).build()
+    # Build a Bot with a custom Request to increase the HTTP connection pool
+    # and avoid httpx PoolTimeouts when many concurrent API calls occur.
+    try:
+        http_pool_size = int(os.environ.get("HTTP_POOL_SIZE", "50"))
+    except Exception:
+        http_pool_size = 50
+    try:
+        http_pool_timeout = float(os.environ.get("HTTP_POOL_TIMEOUT", "30"))
+    except Exception:
+        http_pool_timeout = 30.0
+    try:
+        http_connect_timeout = float(os.environ.get("HTTP_CONNECT_TIMEOUT", "5"))
+    except Exception:
+        http_connect_timeout = 5.0
+    try:
+        http_read_timeout = float(os.environ.get("HTTP_READ_TIMEOUT", "30"))
+    except Exception:
+        http_read_timeout = 30.0
+
+    try:
+        req = Request(con_pool_size=http_pool_size, pool_timeout=http_pool_timeout, connect_timeout=http_connect_timeout, read_timeout=http_read_timeout)
+        bot_instance = Bot(token=BOT_TOKEN, request=req)
+        application = Application.builder().bot(bot_instance).build()
+    except Exception:
+        # Fallback to default behavior
+        application = Application.builder().token(BOT_TOKEN).build()
 
     # Allow forcing polling even when WEBHOOK_URL is set (useful for local/dev runs)
     force_polling = os.environ.get("FORCE_POLLING", "").lower() in ("1", "true", "yes")
