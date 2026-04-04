@@ -321,13 +321,31 @@ async def main():
         logger.error("API_ID must be an integer")
         return
 
-    session_str = os.getenv("TELETHON_SESSION")
-    session_name = os.getenv("TELETHON_SESSION_NAME", "telethon_ingest")
+    # Accept multiple environment variable names for the string session
+    session_env_used = None
+    session_str = None
+    for k in ("TELETHON_SESSION", "API_SESSION", "USERBOT_SESSION", "api_session", "API_SESSION_STR"):
+        v = os.getenv(k)
+        if v:
+            session_str = v
+            session_env_used = k
+            break
+
+    session_name = os.getenv("TELETHON_SESSION_NAME") or os.getenv("API_SESSION_NAME") or "telethon_ingest"
 
     if session_str and StringSession is not None:
-        session = StringSession(session_str)
+        try:
+            session = StringSession(session_str)
+            logger.info("Using Telethon string session from env %s", session_env_used)
+        except Exception:
+            logger.exception("Failed to load StringSession from env %s; falling back to file-based session name %s", session_env_used, session_name)
+            session = session_name
     else:
         session = session_name
+        if session_env_used:
+            logger.warning("Found session env %s but StringSession class not available; using session name %s", session_env_used, session_name)
+        else:
+            logger.info("No string session env present; using session name %s", session_name)
 
     client = TelegramClient(session, api_id, api_hash)
 
@@ -376,6 +394,16 @@ async def main():
     # start client
     await client.start()
     logger.info("Telethon ingestion client started, listening for incoming media...")
+    # Write a small marker file so external deploy logs or healthchecks can
+    # confirm the Telethon ingest process started successfully.
+    try:
+        marker_dir = getattr(config, "TEMP_PATH", None) or os.path.join(os.path.dirname(os.path.dirname(__file__)), "storage", "temp")
+        os.makedirs(marker_dir, exist_ok=True)
+        marker = os.path.join(marker_dir, "telethon_ingest.started")
+        with open(marker, "w") as fh:
+            fh.write(f"started_at={time.time()}\nsession_env={session_env_used or ''}\n")
+    except Exception:
+        logger.exception("Failed to write telethon_ingest.started marker")
 
     # Start Redis fetch listener (if available) so this single service can
     # both accept incoming messages and process published forward fetches
