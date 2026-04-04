@@ -634,6 +634,9 @@ async def main(background: bool = False) -> None:
     # Create the Application for PTB v20+
     application = Application.builder().token(BOT_TOKEN).build()
 
+    # Allow forcing polling even when WEBHOOK_URL is set (useful for local/dev runs)
+    force_polling = os.environ.get("FORCE_POLLING", "").lower() in ("1", "true", "yes")
+
     # Expose external service config into application context
     try:
         application.bot_data["redis_url"] = getattr(cfg, "REDIS_URL", None)
@@ -733,9 +736,9 @@ async def main(background: bool = False) -> None:
     except Exception:
         logger.info("ffmpeg-python not available; falling back to CLI ffmpeg calls")
 
-    # Initialize webhook recovery manager if using webhooks
+    # Initialize webhook recovery manager if using webhooks (skip when forcing polling)
     webhook_manager = None
-    if WEBHOOK_URL:
+    if WEBHOOK_URL and not force_polling:
         webhook_manager = WebhookRecoveryManager(application, WEBHOOK_URL)
         try:
             await webhook_manager.start()
@@ -863,7 +866,7 @@ async def main(background: bool = False) -> None:
                 except Exception:
                     pass
 
-                if WEBHOOK_URL:
+                if WEBHOOK_URL and not force_polling:
                     logger.info(f"🌐 Starting bot in webhook mode: {WEBHOOK_URL}")
                     try:
                         await application.bot.set_webhook(
@@ -879,6 +882,14 @@ async def main(background: bool = False) -> None:
                         raise
 
                 else:
+                    # Either no WEBHOOK_URL configured, or FORCE_POLLING is enabled.
+                    if WEBHOOK_URL and force_polling:
+                        try:
+                            await application.bot.delete_webhook(drop_pending_updates=False)
+                            logger.info("Deleted existing webhook to allow polling (FORCE_POLLING enabled)")
+                        except Exception as e:
+                            logger.warning(f"Failed to delete existing webhook before polling: {e}")
+
                     logger.info("🚀 Starting bot in polling mode")
                     await application.run_polling(
                         allowed_updates=["message", "callback_query", "edited_message"], drop_pending_updates=False
