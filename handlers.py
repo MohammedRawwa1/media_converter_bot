@@ -307,7 +307,14 @@ class EnhancedMediaHandler:
             except Exception:
                 pass
             try:
-                await r.close()
+                try:
+                    aclose = getattr(r, "aclose", None)
+                    if aclose is not None:
+                        await aclose()
+                    else:
+                        await r.close()
+                except Exception:
+                    pass
             except Exception:
                 pass
         except Exception:

@@ -47,122 +47,139 @@ async def _run_once():
         return 2
 
     client = aioredis.from_url(REDIS_URL, decode_responses=True)
-    try:
-        count = 0
-        async for key in client.scan_iter(match="ffmpeg:job:*", count=200):
-            try:
-                if isinstance(key, (bytes, bytearray)):
-                    key = key.decode("utf-8")
-                job_id = key.rsplit(":", 1)[-1]
-                stored = await client.hgetall(key)
-                if not stored:
-                    continue
+    count = 0
 
-                def _sval(k):
-                    v = stored.get(k)
-                    if isinstance(v, (bytes, bytearray)):
-                        try:
-                            return v.decode()
-                        except Exception:
-                            return v
-                    return v
+    async def _process_key(key) -> int:
+        """Process a single Redis job key. Returns 1 if an action was taken, else 0."""
+        try:
+            if isinstance(key, (bytes, bytearray)):
+                key = key.decode("utf-8")
+            job_id = key.rsplit(":", 1)[-1]
+            stored = await client.hgetall(key)
+            if not stored:
+                return 0
 
-                inp = _sval("input") or ""
-                ik = _sval("input_key") or ""
-                source_url = _sval("source_url") or ""
-
-                if inp or ik or source_url:
-                    continue  # job already has an input
-
-                # try to find forward id
-                fh = _sval("forward_hash") or _sval("fh")
-                if not fh:
-                    # possibly stored as forwards/<fid>.json
-                    if isinstance(inp, str) and "forwards/" in inp and inp.endswith('.json'):
-                        try:
-                            fh = os.path.basename(inp).replace('.json','')
-                        except Exception:
-                            fh = None
-
-                if not fh:
-                    # maybe forward stored as JSON in 'forward' field
-                    fwd = _sval("forward")
-                    if fwd:
-                        try:
-                            if isinstance(fwd, (bytes, bytearray)):
-                                fwd = fwd.decode("utf-8")
-                            fj = json.loads(fwd) if isinstance(fwd, str) else fwd
-                            if isinstance(fj, dict):
-                                fh = str(fj.get("fid") or fj.get("forward_hash") or fj.get("file_id") or "")
-                                if not fh:
-                                    fh = None
-                        except Exception:
-                            fh = None
-
-                if not fh:
-                    continue
-
-                # lock to avoid duplicates
-                lock_key = f"ffmpeg:requeue_lock:{job_id}"
-                try:
-                    set_ok = await client.set(lock_key, "1", nx=True, ex=REQUEUE_LOCK_TTL)
-                except Exception:
-                    set_ok = True
-                if not set_ok:
-                    continue
-
-                # load forward metadata
-                try:
-                    from utils.forward_store import load_forward_metadata
-
-                    meta = load_forward_metadata(fh)
-                except Exception:
-                    meta = None
-
-                remote_key = None
-                if meta and isinstance(meta, dict):
-                    remote_key = meta.get("remote_key") or meta.get("input_key") or meta.get("s3_key") or meta.get("key")
-
-                if remote_key:
-                    # attempt to enqueue
+            def _sval(k):
+                v = stored.get(k)
+                if isinstance(v, (bytes, bytearray)):
                     try:
-                        from utils.job_queue import enqueue_job
+                        return v.decode()
+                    except Exception:
+                        return v
+                return v
 
-                        job = {"job_id": job_id, "input_key": remote_key}
-                        out = _sval("output")
-                        if out:
-                            job["output_path"] = out
-                        orig = _sval("original_filename")
-                        if orig:
-                            job["original_filename"] = orig
+            inp = _sval("input") or ""
+            ik = _sval("input_key") or ""
+            source_url = _sval("source_url") or ""
+            if inp or ik or source_url:
+                return 0
+
+            fh = _sval("forward_hash") or _sval("fh")
+            if not fh:
+                if isinstance(inp, str) and "forwards/" in inp and inp.endswith('.json'):
+                    try:
+                        fh = os.path.basename(inp).replace('.json', '')
+                    except Exception:
+                        fh = None
+
+            if not fh:
+                fwd = _sval("forward")
+                if fwd:
+                    try:
+                        if isinstance(fwd, (bytes, bytearray)):
+                            fwd = fwd.decode("utf-8")
+                        fj = json.loads(fwd) if isinstance(fwd, str) else fwd
+                        if isinstance(fj, dict):
+                            fh = str(fj.get("fid") or fj.get("forward_hash") or fj.get("file_id") or "")
+                            if not fh:
+                                fh = None
+                    except Exception:
+                        fh = None
+
+            if not fh:
+                return 0
+
+            lock_key = f"ffmpeg:requeue_lock:{job_id}"
+            try:
+                set_ok = await client.set(lock_key, "1", nx=True, ex=REQUEUE_LOCK_TTL)
+            except Exception:
+                set_ok = True
+            if not set_ok:
+                return 0
+
+            meta = None
+            try:
+                from utils.forward_store import load_forward_metadata
+
+                meta = load_forward_metadata(fh)
+            except Exception:
+                meta = None
+
+            remote_key = None
+            if meta and isinstance(meta, dict):
+                remote_key = meta.get("remote_key") or meta.get("input_key") or meta.get("s3_key") or meta.get("key")
+
+            if remote_key:
+                try:
+                    from utils.job_queue import enqueue_job
+                except Exception:
+                    enqueue_job = None
+
+                if enqueue_job:
+                    job = {"job_id": job_id, "input_key": remote_key}
+                    out = _sval("output")
+                    if out:
+                        job["output_path"] = out
+                    orig = _sval("original_filename")
+                    if orig:
+                        job["original_filename"] = orig
+                    try:
                         await enqueue_job(job)
                         logger.info("Re-enqueued job %s with input_key %s", job_id, remote_key)
-                        count += 1
-                        continue
+                        return 1
                     except Exception:
                         logger.exception("enqueue_job failed for %s; falling back to LPUSH", job_id)
-                        try:
-                            await client.lpush("ffmpeg:jobs", json.dumps({"job_id": job_id, "input_key": remote_key}))
-                            count += 1
-                            continue
-                        except Exception:
-                            logger.exception("Fallback LPUSH failed for %s", job_id)
-                else:
-                    # request fetcher to fetch
-                    try:
-                        await client.publish("ffmpeg:fetch", json.dumps({"forward_hash": fh}))
-                        logger.info("Published fetch request for forward %s", fh)
-                        count += 1
-                    except Exception:
-                        logger.exception("Failed to publish fetch request for %s", fh)
 
-        logger.info("Done scanning; actions taken: %s", count)
-        return 0
+                try:
+                    await client.lpush("ffmpeg:jobs", json.dumps({"job_id": job_id, "input_key": remote_key}))
+                    return 1
+                except Exception:
+                    logger.exception("Fallback LPUSH failed for %s", job_id)
+                    return 0
+            else:
+                try:
+                    await client.publish("ffmpeg:fetch", json.dumps({"forward_hash": fh}))
+                    logger.info("Published fetch request for forward %s", fh)
+                    return 1
+                except Exception:
+                    logger.exception("Failed to publish fetch request for %s", fh)
+                    return 0
+
+        except Exception:
+            logger.exception("Error processing key %s", key)
+            return 0
+
+    try:
+        async for key in client.scan_iter(match="ffmpeg:job:*", count=200):
+            inc = await _process_key(key)
+            try:
+                count += int(inc)
+            except Exception:
+                pass
+    except Exception:
+        logger.exception("Error scanning Redis keys")
     finally:
         try:
-            await client.close()
+            aclose = getattr(client, "aclose", None)
+            if aclose is not None:
+                await aclose()
+            else:
+                await client.close()
         except Exception:
             pass
+
+    logger.info("Done scanning; actions taken: %s", count)
+    return 0
 
 
 if __name__ == "__main__":

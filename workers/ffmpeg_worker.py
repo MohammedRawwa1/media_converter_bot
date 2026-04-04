@@ -82,7 +82,11 @@ async def _forward_pubsub_listener(stop_event: Optional[asyncio.Event], event: a
     except Exception:
         logger.exception("Failed to subscribe to forward publish channel; listener disabled")
         try:
-            await client.close()
+            aclose = getattr(client, "aclose", None)
+            if aclose is not None:
+                await aclose()
+            else:
+                await client.close()
         except Exception:
             pass
         return
@@ -123,7 +127,11 @@ async def _forward_pubsub_listener(stop_event: Optional[asyncio.Event], event: a
         except Exception:
             pass
         try:
-            await client.close()
+            aclose = getattr(client, "aclose", None)
+            if aclose is not None:
+                await aclose()
+            else:
+                await client.close()
         except Exception:
             pass
 
@@ -184,7 +192,11 @@ async def handle_job(job: dict):
             except Exception:
                 pass
             try:
-                await r.close()
+                aclose = getattr(r, "aclose", None)
+                if aclose is not None:
+                    await aclose()
+                else:
+                    await r.close()
             except Exception:
                 pass
     except Exception:
@@ -256,7 +268,11 @@ async def handle_job(job: dict):
 
                 if r2 is not None:
                     try:
-                        await r2.close()
+                        aclose = getattr(r2, "aclose", None)
+                        if aclose is not None:
+                            await aclose()
+                        else:
+                            await r2.close()
                     except Exception:
                         pass
                 return
@@ -271,7 +287,11 @@ async def handle_job(job: dict):
                     pass
                 if r2 is not None:
                     try:
-                        await r2.close()
+                        aclose = getattr(r2, "aclose", None)
+                        if aclose is not None:
+                            await aclose()
+                        else:
+                            await r2.close()
                     except Exception:
                         pass
                 return
@@ -315,7 +335,11 @@ async def handle_job(job: dict):
             finally:
                 if r2 is not None:
                     try:
-                        await r2.close()
+                        aclose = getattr(r2, "aclose", None)
+                        if aclose is not None:
+                            await aclose()
+                        else:
+                            await r2.close()
                     except Exception:
                         pass
         else:
@@ -393,7 +417,14 @@ async def handle_job(job: dict):
         except Exception:
             logger.warning("Failed to requeue locked job %s", job_id)
         try:
-            await redis_lock_client.close()
+            try:
+                aclose = getattr(redis_lock_client, "aclose", None)
+                if aclose is not None:
+                    await aclose()
+                else:
+                    await redis_lock_client.close()
+            except Exception:
+                pass
         except Exception:
             pass
         return
@@ -561,7 +592,11 @@ async def handle_job(job: dict):
                                                 pass
                                 finally:
                                     try:
-                                        await rr.close()
+                                        aclose = getattr(rr, "aclose", None)
+                                        if aclose is not None:
+                                            await aclose()
+                                        else:
+                                            await rr.close()
                                     except Exception:
                                         pass
 

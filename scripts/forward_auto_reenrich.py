@@ -215,7 +215,11 @@ async def _async_run():
         except Exception:
             pass
         try:
-            await client.close()
+            aclose = getattr(client, "aclose", None)
+            if aclose:
+                await aclose()
+            else:
+                await client.close()
         except Exception:
             pass
     return 0

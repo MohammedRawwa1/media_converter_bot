@@ -79,7 +79,11 @@ async def close_redis():
     try:
         if _redis_client is not None:
             try:
-                await _redis_client.close()
+                aclose = getattr(_redis_client, "aclose", None)
+                if aclose is not None:
+                    await aclose()
+                else:
+                    await _redis_client.close()
             except Exception:
                 pass
     finally:

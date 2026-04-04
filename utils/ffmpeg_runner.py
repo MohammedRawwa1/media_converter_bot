@@ -288,6 +288,13 @@ async def run_ffmpeg(
     finally:
         try:
             if redis_client:
-                await redis_client.close()
+                try:
+                    aclose = getattr(redis_client, "aclose", None)
+                    if aclose is not None:
+                        await aclose()
+                    else:
+                        await redis_client.close()
+                except Exception:
+                    pass
         except Exception:
             pass

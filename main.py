@@ -959,7 +959,11 @@ try:
                                         raw = await r.hgetall(f"ffmpeg:job:{job_id}")
                                     finally:
                                         try:
-                                            await r.close()
+                                            aclose = getattr(r, "aclose", None)
+                                            if aclose is not None:
+                                                await aclose()
+                                            else:
+                                                await r.close()
                                         except Exception:
                                             pass
                                     if raw:
@@ -1075,7 +1079,11 @@ try:
                                             result["redis"]["job_hash"] = {}
                                 finally:
                                     try:
-                                        await r.close()
+                                        aclose = getattr(r, "aclose", None)
+                                        if aclose is not None:
+                                            await aclose()
+                                        else:
+                                            await r.close()
                                     except Exception:
                                         pass
                             except Exception:
@@ -1262,7 +1270,11 @@ try:
                                 locks[kstr] = vstr
                         finally:
                             try:
-                                await r.close()
+                                aclose = getattr(r, "aclose", None)
+                                if aclose is not None:
+                                    await aclose()
+                                else:
+                                    await r.close()
                             except Exception:
                                 pass
                         out["locks"] = locks
@@ -1311,7 +1323,11 @@ try:
                                     pass
                         finally:
                             try:
-                                await r.close()
+                                aclose = getattr(r, "aclose", None)
+                                if aclose is not None:
+                                    await aclose()
+                                else:
+                                    await r.close()
                             except Exception:
                                 pass
                         out["removed"] = removed
