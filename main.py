@@ -1723,6 +1723,36 @@ try:
         except Exception:
             info["active_conversions"] = None
 
+        # Telethon / userbot readiness diagnostics
+        try:
+            import importlib
+
+            telethon_installed = False
+            telethon_version = None
+            telethon_import_error = None
+            try:
+                tmod = importlib.import_module("telethon")
+                telethon_installed = True
+                telethon_version = getattr(tmod, "__version__", None)
+            except Exception as e:
+                telethon_import_error = str(e)
+
+            info.update(
+                {
+                    "telethon_installed": telethon_installed,
+                    "telethon_version": telethon_version,
+                    "telethon_import_error": telethon_import_error,
+                    "enable_userbot_env": os.environ.get("ENABLE_USERBOT"),
+                    "telethon_api_id_present": bool(os.environ.get("API_ID") or os.environ.get("USERBOT_API_ID")),
+                    "telethon_api_hash_present": bool(os.environ.get("API_HASH") or os.environ.get("USERBOT_API_HASH")),
+                    "telethon_session_present": bool(
+                        os.environ.get("API_SESSION") or os.environ.get("TELETHON_SESSION") or os.environ.get("USERBOT_SESSION")
+                    ),
+                }
+            )
+        except Exception:
+            pass
+
         return info
 
     @app.on_event("startup")
