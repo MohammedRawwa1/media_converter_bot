@@ -26,7 +26,7 @@ async def probe_duration(path: str) -> Optional[float]:
     if not path:
         raise ValueError("Input path missing before ffprobe")
     if not os.path.exists(path):
-        raise FileNotFoundError(f"Input file missing before ffprobe: {path}")
+        raise FileNotFoundError(f"Input file missing before ffprobe: {path}")   
     ffprobe = getattr(config, "FFMPEG_PATH", "ffmpeg")
     ffprobe = ffprobe.replace("ffmpeg", "ffprobe") if "ffmpeg" in ffprobe else "ffprobe"
     try:
@@ -101,7 +101,7 @@ async def run_ffmpeg(
 
     # Validate input path before probing/starting ffmpeg
     if not input_path:
-        logger.error("Input file missing before ffmpeg for job %s", job_id)
+        logger.error("Input file missing before ffmpeg for job %s", job_id)     
         return False, "input file missing"
     if not os.path.exists(input_path):
         logger.error("Input file not found before ffmpeg for job %s: %s", job_id, input_path)
@@ -120,7 +120,7 @@ async def run_ffmpeg(
 
     cmd = [ffmpeg_bin, "-y", "-hide_banner", "-loglevel", "error", "-i", input_path] + ffmpeg_args + ["-progress", "pipe:1", "-nostats", output_path]
 
-    logger.info("Running ffmpeg: %s", " ".join(shlex.quote(p) for p in cmd))
+    logger.info("Running ffmpeg: %s", " ".join(shlex.quote(p) for p in cmd))    
 
     # choose platform-specific creation flags / preexec
     kwargs = {}
@@ -166,7 +166,7 @@ async def run_ffmpeg(
                 logger.exception("ffmpeg_runner: stderr drain failed for %s", job_id)
 
         try:
-            stderr_task = asyncio.create_task(_drain_stderr(proc, stderr_path))
+            stderr_task = asyncio.create_task(_drain_stderr(proc, stderr_path)) 
         except Exception:
             stderr_task = None
     except Exception:
@@ -189,25 +189,19 @@ async def run_ffmpeg(
     try:
         assert proc.stdout is not None
         # Read line by line (ffmpeg -progress emits key=value lines)
-        while True:
-            raw = await proc.stdout.readline()
-            if not raw:
-                # EOF
-                break
+        async for raw in proc.stdout:
             line = raw.decode(errors="ignore").strip()
-            if not line or "=" not in line:
+            if not line:
+                continue
+            if "=" not in line:
                 continue
             key, val = line.split("=", 1)
-
-            # Finish marker should be handled regardless of Redis client presence
-            if key == "progress" and val == "end":
-                break
-
             if key == "out_time":
                 current_out_time = _parse_out_time(val)
                 pct = (current_out_time / duration * 100.0) if duration and duration > 0 else 0.0
+                message = f"encoding {pct:.1f}%"
 
-                # Try to read the current output file size (non-blocking)
+                # Try to read the current output file size (non-blocking)       
                 out_bytes = 0
                 try:
                     loop = asyncio.get_event_loop()
@@ -223,36 +217,9 @@ async def run_ffmpeg(
                 except Exception:
                     progress_by_size = None
 
-                # Choose an effective progress value. Prefer time-based (pct),
-                # but fall back to size-based progress when it advances ahead
-                # of the time-based estimate (quick UX fallback). Also clamp to 100.
-                try:
-                    effective_progress = round(pct, 2)
-                    used_metric = "time"
-                    if progress_by_size is not None:
-                        # if duration is unknown, prefer size-based; otherwise use
-                        # size-based when it is ahead by at least 1 percentage point.
-                        if (not duration) or (progress_by_size > pct + 1.0):
-                            effective_progress = float(progress_by_size)
-                            used_metric = "size"
-                    # clamp
-                    try:
-                        if effective_progress > 100.0:
-                            effective_progress = 100.0
-                    except Exception:
-                        pass
-                except Exception:
-                    effective_progress = round(pct, 2)
-                    used_metric = "time"
-
-                if used_metric == "size":
-                    message = f"encoding {effective_progress:.1f}% (size-based)"
-                else:
-                    message = f"encoding {effective_progress:.1f}%"
-
                 payload = {
                     "job_id": job_id,
-                    "progress": effective_progress,
+                    "progress": round(pct, 2),
                     "message": message,
                     "out_bytes": out_bytes,
                     "in_bytes": in_bytes,
@@ -263,7 +230,7 @@ async def run_ffmpeg(
                 if redis_client and progress_channel:
                     try:
                         await redis_client.publish(progress_channel, json.dumps(payload))
-                        # store numeric values as strings to keep Redis simple
+                        # store numeric values as strings to keep Redis simple  
                         store_map = {"progress": payload["progress"], "message": message, "status": "processing", "out_bytes": str(out_bytes), "in_bytes": str(in_bytes)}
                         if progress_by_size is not None:
                             store_map["progress_by_size"] = str(progress_by_size)
@@ -275,7 +242,6 @@ async def run_ffmpeg(
                         on_progress(payload["progress"], message)
                     except Exception:
                         pass
-
             # periodically check for cancel flag in redis
             if redis_client:
                 try:
@@ -291,7 +257,7 @@ async def run_ffmpeg(
                             else:
                                 # Best-effort for Windows: send CTRL_BREAK to process group
                                 try:
-                                    proc.send_signal(signal.CTRL_BREAK_EVENT)
+                                    proc.send_signal(signal.CTRL_BREAK_EVENT)   
                                 except Exception:
                                     proc.kill()
                         except Exception:
@@ -306,6 +272,9 @@ async def run_ffmpeg(
                         return False, "cancelled"
                 except Exception:
                     pass
+            elif key == "progress" and val == "end":
+                # finish marker
+                break
 
         # wait for process exit
         await proc.wait()
@@ -357,19 +326,6 @@ async def run_ffmpeg(
                         await aclose()
                     else:
                         await redis_client.close()
-                except Exception:
-                    pass
-        except Exception:
-            pass
-        # ensure stderr drain task is cleaned up
-        try:
-            if stderr_task is not None and not stderr_task.done():
-                try:
-                    stderr_task.cancel()
-                except Exception:
-                    pass
-                try:
-                    await stderr_task
                 except Exception:
                     pass
         except Exception:

@@ -646,6 +646,22 @@ async def main():
         else:
             logger.info("No string session env present; using session name %s", session_name)
 
+    # Ensure file-based sessions are placed in a writable temp directory on remote platforms
+    try:
+        if not string_session_loaded:
+            # Prefer TELETHON_SESSION_DIR, then TEMP_PATH from config, then /tmp
+            session_dir = os.environ.get("TELETHON_SESSION_DIR") or os.environ.get("TEMP_PATH") or getattr(config, "TEMP_PATH", None) or "/tmp"
+            try:
+                os.makedirs(session_dir, exist_ok=True)
+            except Exception:
+                pass
+            # Use a path under the session_dir to avoid write-permissions issues on remote
+            session_path = os.path.join(session_dir, session_name)
+            session = session_path
+            logger.info("telethon_ingest: using session path %s", session)
+    except Exception:
+        logger.exception("telethon_ingest: failed to resolve session path")
+
     # Startup environment summary (safe): show which critical env vars/flags are present.
     try:
         env_summary = {
