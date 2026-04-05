@@ -47,5 +47,5 @@ services:
       - key: TELETHON_DEBUG_PORT
         value: "8081"
       - key: TELETHON_DEBUG_TOKEN
-        value: "1FirNPnfMlc-J1OrwDHfEUAcQivKhJp-2NTFOLZdIyc"
+        value: "REPLACE_WITH_SECRET"
     startCommand: python -u tools/telethon_ingest.py
