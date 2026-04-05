@@ -660,6 +660,35 @@ class EnhancedMediaHandler:
                 except Exception:
                     logger.exception("Userbot download fallback failed (origin forward)")
 
+            # If the bot API refused due to size, prefer trying the userbot
+            # fallback from the bot chat itself when the file is larger than
+            # BOT_API_MAX_MB even if no origin-forward metadata is available.
+            try:
+                try:
+                    bot_api_max_mb = int(os.environ.get("BOT_API_MAX_MB", "50"))
+                except Exception:
+                    bot_api_max_mb = 50
+                file_size = current_file.get("size") or 0
+                bot_chat = current_file.get("chat_id")
+                bot_msg = current_file.get("msg_id") or current_file.get("message_id")
+                if enable_userbot and file_size and file_size > bot_api_max_mb * 1024 * 1024 and bot_chat and bot_msg:
+                    try:
+                        from utils.userbot_downloader import download_forward_via_userbot
+
+                        ok = await download_forward_via_userbot(bot_chat, bot_msg, file_path)
+                        if ok and os.path.exists(file_path):
+                            current_file["path"] = file_path
+                            session["current_file"] = current_file
+                            try:
+                                self._persist_session(user_id)
+                            except Exception:
+                                logger.debug("Could not persist session after userbot download (bot chat)")
+                            return
+                    except Exception:
+                        logger.exception("Userbot download fallback failed (bot chat immediate) for large file")
+            except Exception:
+                logger.exception("Error checking BOT_API_MAX_MB fallback")
+
             # If the origin-forward attempt wasn't possible or failed, try to
             # download the forwarded message from the bot chat itself using
             # the message id/chat id we stored at registration time (or from
