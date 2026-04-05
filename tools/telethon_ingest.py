@@ -632,54 +632,61 @@ async def main():
         logger.info("telethon_ingest: startup env summary: %s", env_summary)
     except Exception:
         logger.exception("telethon_ingest: failed to emit startup env summary")
+    # Determine whether we should listen for incoming messages (legacy behavior)
+    LISTEN_INCOMING = os.environ.get("TELETHON_LISTEN_INCOMING", "").lower() in ("1", "true", "yes")
 
-    client = TelegramClient(session, api_id, api_hash)
+    client = None
+    if LISTEN_INCOMING:
+        # Legacy mode: register an event handler and keep a running Telethon client
+        client = TelegramClient(session, api_id, api_hash)
 
-    @client.on(events.NewMessage(incoming=True))
-    async def handler(event):
-        try:
-            msg = event.message
-            if not getattr(msg, "media", None):
+        @client.on(events.NewMessage(incoming=True))
+        async def handler(event):
+            try:
+                msg = event.message
+                if not getattr(msg, "media", None):
+                    return
+
+                # process message in background to avoid blocking Telethon event loop
+                asyncio.create_task(process_incoming(msg, client))
+            except Exception:
+                logger.exception("Error in Telethon handler")
+
+
+        async def process_incoming(msg, client_instance):
+            # determine filename/extension safely
+            fname = None
+            try:
+                # Telethon may expose a .file or .document with a name
+                file_attr = getattr(msg, "file", None)
+                if file_attr is not None:
+                    fname = getattr(file_attr, "name", None)
+            except Exception:
+                fname = None
+
+            msg_id = getattr(msg, "id", str(uuid.uuid4()))
+            # derive extension from file name or default to .mp4
+            ext = os.path.splitext(fname or "")[1] or ""
+            tmp = _make_temp_path(msg_id, ext)
+
+            try:
+                await client_instance.download_media(msg, file=tmp)
+                logger.info("Downloaded incoming media to %s", tmp)
+            except Exception:
+                logger.exception("Failed to download media from message %s", msg_id)
                 return
 
-            # process message in background to avoid blocking Telethon event loop
-            asyncio.create_task(process_incoming(msg))
-        except Exception:
-            logger.exception("Error in Telethon handler")
+            # Upload & enqueue
+            try:
+                await _upload_and_enqueue(tmp, fname, getattr(msg.chat, "id", None) or getattr(msg, "chat_id", None), getattr(msg, "id", None))
+            except Exception:
+                logger.exception("Failed to upload/enqueue for %s", tmp)
 
-
-    async def process_incoming(msg):
-        # determine filename/extension safely
-        fname = None
-        try:
-            # Telethon may expose a .file or .document with a name
-            file_attr = getattr(msg, "file", None)
-            if file_attr is not None:
-                fname = getattr(file_attr, "name", None)
-        except Exception:
-            fname = None
-
-        msg_id = getattr(msg, "id", str(uuid.uuid4()))
-        # derive extension from file name or default to .mp4
-        ext = os.path.splitext(fname or "")[1] or ""
-        tmp = _make_temp_path(msg_id, ext)
-
-        try:
-            await client.download_media(msg, file=tmp)
-            logger.info("Downloaded incoming media to %s", tmp)
-        except Exception:
-            logger.exception("Failed to download media from message %s", msg_id)
-            return
-
-        # Upload & enqueue
-        try:
-            await _upload_and_enqueue(tmp, fname, getattr(msg.chat, "id", None) or getattr(msg, "chat_id", None), getattr(msg, "id", None))
-        except Exception:
-            logger.exception("Failed to upload/enqueue for %s", tmp)
-
-    # start client
-    await client.start()
-    logger.info("Telethon ingestion client started, listening for incoming media...")
+        # start client
+        await client.start()
+        logger.info("Telethon ingestion client started, listening for incoming media...")
+    else:
+        logger.info("telethon_ingest: starting in fetch-only mode (no passive Telegram listeners)")
     # Write a small marker file so external deploy logs or healthchecks can
     # confirm the Telethon ingest process started successfully.
     try:
@@ -730,7 +737,23 @@ async def main():
         logger.exception("telethon_ingest: debug HTTP server failed to start")
 
     try:
-        await client.run_until_disconnected()
+        if LISTEN_INCOMING and client is not None:
+            try:
+                await client.run_until_disconnected()
+            finally:
+                try:
+                    await client.disconnect()
+                except Exception:
+                    pass
+        else:
+            # Fetch-only mode: wait on redis listener task, or sleep forever
+            if redis_task is not None:
+                try:
+                    await redis_task
+                except asyncio.CancelledError:
+                    pass
+            else:
+                await asyncio.Future()
     finally:
         # Cancel background redis listener if started
         try:
@@ -751,10 +774,6 @@ async def main():
                     await http_runner.cleanup()
                 except Exception:
                     pass
-        except Exception:
-            pass
-        try:
-            await client.disconnect()
         except Exception:
             pass
 
