@@ -48,4 +48,8 @@ services:
         value: "8081"
       - key: TELETHON_DEBUG_TOKEN
         value: "REPLACE_WITH_SECRET"
+      - key: TELETHON_LISTEN_INCOMING
+        value: "1"
+      - key: TEMP_UPLOAD_DIR
+        value: "/tmp/telethon_uploads"
     startCommand: python -u tools/telethon_ingest.py

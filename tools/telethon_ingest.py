@@ -632,6 +632,45 @@ async def main():
         logger.info("telethon_ingest: startup env summary: %s", env_summary)
     except Exception:
         logger.exception("telethon_ingest: failed to emit startup env summary")
+        # One-shot cleanup of local Telethon session files when requested.
+        try:
+            if os.environ.get("TELETHON_CLEAN_SESSION", "").lower() in ("1", "true", "yes"):
+                try:
+                    # If a StringSession is provided via env, do not touch file-based sessions.
+                    if session_str:
+                        logger.info("telethon_ingest: TELETHON_CLEAN_SESSION set, but using string session; skipping file deletion")
+                    else:
+                        deleted = []
+                        # Candidate directories to search for session files: cwd and project root
+                        cand_dirs = [os.getcwd(), str(Path(__file__).resolve().parents[1])]
+                        try:
+                            cand_dirs.append(str(Path.home()))
+                        except Exception:
+                            pass
+                        import glob, shutil
+                        for d in cand_dirs:
+                            try:
+                                # remove common explicit names and any files starting with session_name
+                                patterns = [session_name, f"{session_name}.session", f"{session_name}.session-journal", f"{session_name}.session.lock", f"{session_name}*"]
+                                for pat in patterns:
+                                    for p in glob.glob(os.path.join(d, pat)):
+                                        pth = Path(p)
+                                        try:
+                                            if pth.is_file():
+                                                pth.unlink()
+                                                deleted.append(str(pth))
+                                            elif pth.is_dir():
+                                                shutil.rmtree(pth)
+                                                deleted.append(str(pth))
+                                        except Exception:
+                                            logger.exception("telethon_ingest: failed deleting session candidate %s", p)
+                            except Exception:
+                                logger.exception("telethon_ingest: error scanning for session files in %s", d)
+                        logger.info("telethon_ingest: TELETHON_CLEAN_SESSION deleted %s", deleted)
+                except Exception:
+                    logger.exception("telethon_ingest: error during TELETHON_CLEAN_SESSION cleanup")
+        except Exception:
+            pass
     # Determine whether we should listen for incoming messages (legacy behavior)
     LISTEN_INCOMING = os.environ.get("TELETHON_LISTEN_INCOMING", "").lower() in ("1", "true", "yes")
 
