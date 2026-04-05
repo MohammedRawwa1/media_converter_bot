@@ -310,8 +310,14 @@ async def redis_listener():
                     logger.info("telethon_ingest: redis payload received: %s", payload)
                 except Exception:
                     pass
-                fh = payload.get("forward_hash")
-                if fh:
+                # Accept either `forward_hash` (preferred) or legacy `fid`.
+                fh = payload.get("forward_hash") or payload.get("fid") or payload.get("forward_id")
+                if not fh:
+                    try:
+                        logger.debug("telethon_ingest: fetch payload missing forward id; payload=%s", payload)
+                    except Exception:
+                        pass
+                else:
                     asyncio.create_task(_process_forward_hash(fh))
             except asyncio.CancelledError:
                 # Graceful cancellation requested

@@ -31,7 +31,8 @@ def _publish_forward_notification(fid: str, extra: dict = None) -> None:
         # (diagnostic logging intentionally minimal to avoid leaking secrets)
 
         redis_url = os.environ.get("REDIS_URL") or os.environ.get("REDIS_URI") or os.environ.get("REDIS")
-        payload = {"fid": fid}
+        # publish both legacy `fid` and a more descriptive `forward_hash`
+        payload = {"fid": fid, "forward_hash": fid}
         if extra:
             payload.update(extra)
 
