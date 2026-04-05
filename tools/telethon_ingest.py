@@ -305,6 +305,11 @@ async def redis_listener():
                     payload = json.loads(data)
                 except Exception:
                     payload = {"forward_hash": data}
+                # Debug: log received payload on fetch channel
+                try:
+                    logger.info("telethon_ingest: redis payload received: %s", payload)
+                except Exception:
+                    pass
                 fh = payload.get("forward_hash")
                 if fh:
                     asyncio.create_task(_process_forward_hash(fh))

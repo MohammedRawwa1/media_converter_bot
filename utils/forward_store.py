@@ -35,6 +35,14 @@ def _publish_forward_notification(fid: str, extra: dict = None) -> None:
         if extra:
             payload.update(extra)
 
+        # Temporary debug logging: record what we publish (avoid leaking secrets)
+        try:
+            logger.info("forward_store: publish -> forward_channel=%s fetch_channel=%s do_auto_fetch=%s payload=%s",
+                        forward_channel, fetch_channel, do_auto_fetch, payload)
+        except Exception:
+            # never fail the publish due to logging
+            pass
+
         def _sync_publish(client, ch, pl):
             try:
                 client.publish(ch, json.dumps(pl))
