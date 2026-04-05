@@ -755,6 +755,13 @@ class EnhancedMediaHandler:
             except Exception:
                 pass
 
+            # Extra debug: record which fetch paths we will try
+            try:
+                enable_userbot_env = os.environ.get("ENABLE_USERBOT", "").lower() in ("1", "true", "yes")
+                logger.info("_handle_large_forward debug: fh=%s enable_userbot_env=%s AUTO_FETCH_FORWARDS=%s PREFER_USERBOT=%s", fh, enable_userbot_env, auto_fetch, os.environ.get("PREFER_USERBOT"))
+            except Exception:
+                pass
+
             if auto_fetch:
                 # Prepare local paths
                 try:
@@ -1478,6 +1485,10 @@ class EnhancedMediaHandler:
         }
 
         try:
+            logger.info("registered current_file for user %s id=%s forward=%s size=%s", user_id, file_id, forward_info, video.file_size)
+        except Exception:
+            pass
+        try:
             self._persist_session(user_id)
         except Exception:
             logger.debug("Could not persist session after registering video")
@@ -1496,11 +1507,11 @@ class EnhancedMediaHandler:
     async def handle_audio(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE, session: Dict
     ):
-        """Handle incoming audio files."""
-        audio = update.message.audio
-        user_id = update.effective_user.id
 
-        # Register audio lazily (do not download yet).
+        try:
+            self._persist_session(user_id)
+        except Exception:
+            logger.debug("Could not persist session after registering video")
         ext = ".mp3"
         if audio.mime_type:
             ext_map = {
@@ -1567,6 +1578,11 @@ class EnhancedMediaHandler:
             "msg_date": msg_date,
             "file_unique_id": file_unique_id,
         }
+
+        try:
+            logger.info("registered current_file for user %s id=%s forward=%s size=%s", user_id, audio.file_id, forward_info, audio.file_size)
+        except Exception:
+            pass
 
         await update.message.reply_text(
             f"✅ Audio registered!\n"
@@ -1734,6 +1750,11 @@ class EnhancedMediaHandler:
             self._persist_session(user_id)
         except Exception:
             logger.debug("Could not persist session after registering document")
+
+        try:
+            logger.info("registered current_file for user %s id=%s forward=%s size=%s", user_id, document.file_id, forward_info, document.file_size)
+        except Exception:
+            pass
 
         await update.message.reply_text(
             f"✅ {file_type.capitalize()} registered!\n"
@@ -2670,23 +2691,29 @@ class EnhancedMediaHandler:
                     if success and os.path.exists(output_path):
                         file_size = os.path.getsize(output_path)
                         if file_size > 50 * 1024 * 1024:  # 50MB Telegram limit
-                            await self.safe_edit(
-                                query,
-                                f"❌ File too large ({file_size//1024//1024}MB).\n"
-                                "Try compression first.",
-                            )
-                            os.remove(output_path)
-                        else:
-                            with open(output_path, "rb") as audio_file:
-                                await context.bot.send_audio(
-                                    chat_id=update.effective_chat.id,
-                                    audio=audio_file,
-                                    caption="✅ Converted to MP3",
-                                    title=current_file.get("name", "file").replace(
-                                        ".mp4", ".mp3"
-                                    ),
-                                    performer="Media Bot",
+                            try:
+                                bot_api_max_mb = int(os.environ.get("BOT_API_MAX_MB", "50"))
+                            except Exception:
+                                bot_api_max_mb = 50
+                            if file_size > bot_api_max_mb * 1024 * 1024:
+                                await self.safe_edit(
+                                    query,
+                                    f"❌ File too large ({file_size//1024//1024}MB).\n"
+                                    "Try compression first.",
                                 )
+                                os.remove(output_path)
+                            else:
+                                with open(output_path, "rb") as audio_file:
+                                    await context.bot.send_audio(
+                                        chat_id=update.effective_chat.id,
+                                        audio=audio_file,
+                                        caption="✅ Converted to MP3",
+                                        title=current_file.get("name", "file").replace(
+                                            ".mp4", ".mp3"
+                                        ),
+                                        performer="Media Bot",
+                                    )
+                        
                             os.remove(output_path)
                     else:
                         await self.safe_edit(query, "❌ Conversion failed.")
@@ -2701,12 +2728,28 @@ class EnhancedMediaHandler:
                 if success and os.path.exists(output_path):
                     file_size = os.path.getsize(output_path)
                     if file_size > 50 * 1024 * 1024:  # 50MB Telegram limit
-                        await self.safe_edit(
-                            query,
-                            f"❌ File too large ({file_size//1024//1024}MB).\n"
-                            "Try compression first.",
-                        )
-                        os.remove(output_path)
+                                try:
+                                    bot_api_max_mb = int(os.environ.get("BOT_API_MAX_MB", "50"))
+                                except Exception:
+                                    bot_api_max_mb = 50
+                                if file_size > bot_api_max_mb * 1024 * 1024:
+                                    await self.safe_edit(
+                                        query,
+                                        f"❌ File too large ({file_size//1024//1024}MB).\n"
+                                        "Try compression first.",
+                                    )
+                                    os.remove(output_path)
+                                else:
+                                    with open(output_path, "rb") as audio_file:
+                                        await context.bot.send_audio(
+                                            chat_id=update.effective_chat.id,
+                                            audio=audio_file,
+                                            caption="✅ Converted to MP3",
+                                            title=current_file.get("name", "file").replace(
+                                                ".mp4", ".mp3"
+                                            ),
+                                            performer="Media Bot",
+                                        )
                     else:
                         with open(output_path, "rb") as audio_file:
                             await context.bot.send_audio(

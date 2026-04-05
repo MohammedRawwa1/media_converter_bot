@@ -14,6 +14,8 @@ services:
     envVars:
       - key: AUTO_FETCH_FORWARDS
         value: "1"
+      - key: BOT_API_MAX_MB
+        value: "50"
     startCommand: uvicorn main:app --host 0.0.0.0 --port 8000 --workers 4
 
   - type: worker
@@ -26,6 +28,8 @@ services:
     envVars:
       - key: AUTO_FETCH_FORWARDS
         value: "1"
+      - key: BOT_API_MAX_MB
+        value: "50"
     startCommand: python -u fetcher/service.py
 
   - type: worker
@@ -38,4 +42,6 @@ services:
     envVars:
       - key: ENABLE_TELETHON_INGEST
         value: "1"
+      - key: BOT_API_MAX_MB
+        value: "50"
     startCommand: python -u tools/telethon_ingest.py
