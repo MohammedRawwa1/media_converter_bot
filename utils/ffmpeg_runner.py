@@ -140,6 +140,38 @@ async def run_ffmpeg(
     else:
         proc = await asyncio.create_subprocess_exec(*cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE, **kwargs)
 
+    # Start a background task to capture stderr to a per-job file for debugging.
+    stderr_task = None
+    try:
+        logs_dir = os.path.join(os.getcwd(), "logs")
+        os.makedirs(logs_dir, exist_ok=True)
+        stderr_path = os.path.join(logs_dir, f"ffmpeg_{job_id}.stderr")
+
+        async def _drain_stderr(p, dst):
+            try:
+                if not p.stderr:
+                    return
+                # open file in binary append mode
+                with open(dst, "ab") as fh:
+                    while True:
+                        chunk = await p.stderr.read(1024)
+                        if not chunk:
+                            break
+                        try:
+                            fh.write(chunk)
+                            fh.flush()
+                        except Exception:
+                            pass
+            except Exception:
+                logger.exception("ffmpeg_runner: stderr drain failed for %s", job_id)
+
+        try:
+            stderr_task = asyncio.create_task(_drain_stderr(proc, stderr_path))
+        except Exception:
+            stderr_task = None
+    except Exception:
+        stderr_task = None
+
     redis_client = None
     if aioredis and (redis_url or os.environ.get("REDIS_URL")):
         try:
@@ -167,7 +199,6 @@ async def run_ffmpeg(
             if key == "out_time":
                 current_out_time = _parse_out_time(val)
                 pct = (current_out_time / duration * 100.0) if duration and duration > 0 else 0.0
-                message = f"encoding {pct:.1f}%"
 
                 # Try to read the current output file size (non-blocking)
                 out_bytes = 0
@@ -185,9 +216,36 @@ async def run_ffmpeg(
                 except Exception:
                     progress_by_size = None
 
+                # Choose an effective progress value. Prefer time-based (pct),
+                # but fall back to size-based progress when it advances ahead
+                # of the time-based estimate (quick UX fallback). Also clamp to 100.
+                try:
+                    effective_progress = round(pct, 2)
+                    used_metric = "time"
+                    if progress_by_size is not None:
+                        # if duration is unknown, prefer size-based; otherwise use
+                        # size-based when it is ahead by at least 1 percentage point.
+                        if (not duration) or (progress_by_size > pct + 1.0):
+                            effective_progress = float(progress_by_size)
+                            used_metric = "size"
+                    # clamp
+                    try:
+                        if effective_progress > 100.0:
+                            effective_progress = 100.0
+                    except Exception:
+                        pass
+                except Exception:
+                    effective_progress = round(pct, 2)
+                    used_metric = "time"
+
+                if used_metric == "size":
+                    message = f"encoding {effective_progress:.1f}% (size-based)"
+                else:
+                    message = f"encoding {effective_progress:.1f}%"
+
                 payload = {
                     "job_id": job_id,
-                    "progress": round(pct, 2),
+                    "progress": effective_progress,
                     "message": message,
                     "out_bytes": out_bytes,
                     "in_bytes": in_bytes,
