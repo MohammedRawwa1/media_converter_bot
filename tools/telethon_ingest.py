@@ -286,9 +286,50 @@ async def _upload_and_enqueue(local_path: str, original_name: str, chat_id: Opti
         except Exception:
             logger.exception("telethon_ingest: failed to stat local_path %s", local_path)
 
-        await backend.upload_file(local_path, key)
-        input_key = key
-        logger.info("Uploaded %s -> %s", local_path, input_key)
+        # Ensure we pass an absolute, resolved path to the storage backend
+        try:
+            from pathlib import Path as _Path
+            abs_path = str(_Path(local_path).resolve())
+        except Exception:
+            abs_path = os.path.abspath(local_path)
+
+        if not os.path.exists(abs_path):
+            logger.error("telethon_ingest: upload path missing, aborting: %s (resolved from %s)", abs_path, local_path)
+            raise ValueError(f"Invalid src_path: {abs_path}")
+
+        # Some storage backends may reject Windows-style paths; copy to a
+        # temporary POSIX-like path before uploading to ensure compatibility.
+        try:
+            import shutil, tempfile
+            tmp_dir = os.environ.get("TEMP_UPLOAD_DIR") or _Path(getattr(config, "TEMP_PATH", os.path.join(os.path.dirname(os.path.dirname(__file__)), "storage", "temp"))).as_posix()
+            os.makedirs(tmp_dir, exist_ok=True)
+            tmp_dst = os.path.join(tmp_dir, os.path.basename(abs_path))
+            # If source and tmp_dst are the same, skip copy
+            if os.path.abspath(abs_path) != os.path.abspath(tmp_dst):
+                shutil.copy2(abs_path, tmp_dst)
+            upload_src = tmp_dst
+        except Exception:
+            logger.exception("telethon_ingest: failed to copy to temp upload path, will attempt direct upload")
+            upload_src = abs_path
+
+        try:
+            await backend.upload_file(upload_src, key)
+            input_key = key
+            logger.info("Uploaded %s -> %s", upload_src, input_key)
+        finally:
+            # cleanup temporary copy if we created one and KEEP_LOCAL_UPLOADS not set
+            try:
+                keep_local = os.environ.get("KEEP_LOCAL_UPLOADS", "").lower() in ("1", "true", "yes")
+            except Exception:
+                keep_local = False
+            try:
+                if upload_src != abs_path and not keep_local:
+                    try:
+                        os.remove(upload_src)
+                    except Exception:
+                        pass
+            except Exception:
+                pass
         # Only remove local temp copy if operator did NOT request to keep uploads.
         # Prefer leaving cleanup responsibility to the worker which also respects
         # KEEP_LOCAL_UPLOADS (we patched worker to honor this global flag).
