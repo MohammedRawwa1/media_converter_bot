@@ -472,11 +472,21 @@ async def redis_listener():
     r = None
     pub = None
     fetch_channel = os.environ.get("FETCH_CHANNEL", "ffmpeg:fetch")
+    forward_channel = os.environ.get("FORWARD_PUBLISH_CHANNEL", "ffmpeg:forwards")
     try:
         r = aioredis.from_url(redis_url, decode_responses=True)
         pub = r.pubsub()
-        await pub.subscribe(fetch_channel)
-        logger.info("telethon_ingest: subscribed to %s", fetch_channel)
+        # Subscribe to both fetch requests and forward-publish notifications
+        try:
+            await pub.subscribe(fetch_channel, forward_channel)
+            logger.info("telethon_ingest: subscribed to %s and %s", fetch_channel, forward_channel)
+        except Exception:
+            # fallback to subscribing to fetch_channel only
+            try:
+                await pub.subscribe(fetch_channel)
+                logger.info("telethon_ingest: subscribed to %s", fetch_channel)
+            except Exception:
+                logger.exception("telethon_ingest: failed to subscribe to redis channels")
 
         # Use get_message loop which is friendlier to cancellation and
         # allows explicit timeout checks instead of relying on async generators
@@ -487,23 +497,37 @@ async def redis_listener():
                 if not msg:
                     await asyncio.sleep(0.1)
                     continue
+                # Extract raw data from the pubsub message
                 try:
-                    payload = json.loads(data)
+                    # redis.asyncio pubsub returns a dict-like message
+                    data = None
+                    if isinstance(msg, dict):
+                        data = msg.get("data")
+                    else:
+                        # fallback: assume message itself is payload
+                        data = msg
+                    # decode bytes if necessary
+                    if isinstance(data, (bytes, bytearray)):
+                        try:
+                            data = data.decode("utf-8")
+                        except Exception:
+                            data = data.decode(errors="ignore")
+                    # Attempt JSON parse; fall back to raw string as forward_hash
+                    try:
+                        payload = json.loads(data) if data else {}
+                    except Exception:
+                        payload = {"forward_hash": data}
                 except Exception:
-                    payload = {"forward_hash": data}
-                # Debug: log received payload on fetch channel with context
-                try:
-                    logger.info("telethon_ingest: redis payload received (raw=%s) parsed=%s", data, payload)
-                except Exception:
-                    logger.exception("telethon_ingest: failed to log redis payload")
-                # Accept either `forward_hash` (preferred) or legacy `fid`.
-                fh = payload.get("forward_hash") or payload.get("fid") or payload.get("forward_id")
-                # Debug: log received payload on fetch channel
+                    logger.exception("telethon_ingest: failed to extract data from redis message")
+                    payload = {}
+
+                # Debug: log received payload (non-sensitive)
                 try:
                     logger.info("telethon_ingest: redis payload received: %s", payload)
                 except Exception:
                     pass
-                # Accept either `forward_hash` (preferred) or legacy `fid`.
+
+                # Accept either `forward_hash` (preferred) or legacy `fid`/`forward_id`.
                 fh = payload.get("forward_hash") or payload.get("fid") or payload.get("forward_id")
                 if not fh:
                     try:
@@ -511,7 +535,10 @@ async def redis_listener():
                     except Exception:
                         pass
                 else:
-                    asyncio.create_task(_process_forward_hash(fh))
+                    try:
+                        asyncio.create_task(_process_forward_hash(fh))
+                    except Exception:
+                        logger.exception("telethon_ingest: failed to schedule _process_forward_hash for %s", fh)
             except asyncio.CancelledError:
                 # Graceful cancellation requested
                 break
