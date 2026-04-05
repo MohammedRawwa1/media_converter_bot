@@ -44,4 +44,8 @@ services:
         value: "1"
       - key: BOT_API_MAX_MB
         value: "50"
+      - key: TELETHON_DEBUG_PORT
+        value: "8081"
+      - key: TELETHON_DEBUG_TOKEN
+        value: "1FirNPnfMlc-J1OrwDHfEUAcQivKhJp-2NTFOLZdIyc"
     startCommand: python -u tools/telethon_ingest.py

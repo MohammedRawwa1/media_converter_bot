@@ -77,6 +77,111 @@ import config
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("telethon_ingest")
+# Per-run file logger for Telethon debug info
+try:
+    from logging.handlers import RotatingFileHandler
+    LOG_PATH = Path(os.environ.get("TELETHON_LOG_PATH", "/tmp/telethon_ingest.log"))
+    LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    fh = RotatingFileHandler(str(LOG_PATH), maxBytes=5_000_000, backupCount=3)
+    fh.setLevel(logging.DEBUG)
+    fmt = logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
+    fh.setFormatter(fmt)
+    # Attach both module logger and telethon's logger for verbose output
+    logger.addHandler(fh)
+    try:
+        import logging as _logging
+        _tel = _logging.getLogger("telethon")
+        _tel.setLevel(logging.DEBUG)
+        _tel.addHandler(fh)
+    except Exception:
+        pass
+except Exception:
+    LOG_PATH = None
+
+# Track last processed fetch timestamp for health checks
+LAST_FETCH_TS = None
+
+# Optional aiohttp debug server to expose local telethon log without storage
+try:
+    from aiohttp import web as _web
+except Exception:
+    _web = None
+
+
+async def _start_aiohttp_debug_server():
+    if _web is None:
+        logger.debug("aiohttp not installed; debug HTTP server disabled")
+        return None
+    port = int(os.environ.get("TELETHON_DEBUG_PORT", "8081"))
+
+    async def _handle_log(request):
+        try:
+            # optional token protection
+            token_env = os.environ.get("TELETHON_DEBUG_TOKEN")
+            if token_env:
+                provided = request.headers.get("X-Debug-Token") or request.rel_url.query.get("debug_token")
+                if not provided or provided != token_env:
+                    return _web.json_response({"error": "unauthorized"}, status=401)
+            if not LOG_PATH or not LOG_PATH.exists():
+                return _web.json_response({"error": "log not available"}, status=404)
+            return _web.FileResponse(path=str(LOG_PATH), headers={"Content-Type": "text/plain"})
+        except Exception:
+            logger.exception("telethon_ingest: debug HTTP handler error")
+            return _web.json_response({"error": "internal"}, status=500)
+
+    async def _handle_health(request):
+        try:
+            token_env = os.environ.get("TELETHON_DEBUG_TOKEN")
+            if token_env:
+                provided = request.headers.get("X-Debug-Token") or request.rel_url.query.get("debug_token")
+                if not provided or provided != token_env:
+                    return _web.json_response({"error": "unauthorized"}, status=401)
+            status = {"service": "telethon_ingest", "ok": True}
+            # Redis connectivity check
+            try:
+                if aioredis is None:
+                    status["redis"] = "disabled"
+                else:
+                    redis_url = os.environ.get("REDIS_URL")
+                    if not redis_url:
+                        status["redis"] = "not_configured"
+                    else:
+                        try:
+                            r = aioredis.from_url(redis_url, decode_responses=True)
+                            pong = await r.ping()
+                            status["redis"] = "ok" if pong else "pong_failed"
+                            try:
+                                await r.close()
+                            except Exception:
+                                pass
+                        except Exception:
+                            status["redis"] = "error"
+            except Exception:
+                status["redis"] = "unknown"
+
+            status["last_fetch_ts"] = globals().get("LAST_FETCH_TS")
+            return _web.json_response(status)
+        except Exception:
+            logger.exception("telethon_ingest: health handler error")
+            return _web.json_response({"error": "internal"}, status=500)
+
+    app = _web.Application()
+    app.router.add_get("/debug/telethon-log", _handle_log)
+    app.router.add_get("/debug/health", _handle_health)
+    runner = _web.AppRunner(app)
+    try:
+        await runner.setup()
+        site = _web.TCPSite(runner, "0.0.0.0", port)
+        await site.start()
+        logger.info("telethon_ingest: debug HTTP server started on 0.0.0.0:%s", port)
+        return runner
+    except Exception:
+        logger.exception("telethon_ingest: failed to start debug HTTP server")
+        try:
+            await runner.cleanup()
+        except Exception:
+            pass
+        return None
 
 
 async def _get_backend_instance():
@@ -111,6 +216,48 @@ async def _get_backend_instance():
     except Exception:
         pass
     return None
+
+
+async def upload_telethon_log(suffix: str = "telethon_ingest.log"):
+    """Upload the local telethon log file to storage if available.
+
+    Returns the storage key on success or None on failure.
+    """
+    try:
+        if not LOG_PATH:
+            return None
+        if not LOG_PATH.exists():
+            return None
+        backend = await _get_backend_instance()
+        if backend is None:
+            logger.debug("telethon_ingest: no storage backend for log upload")
+            return None
+        ts_key = f"telethon/{int(time.time())}_{suffix}"
+        latest_key = f"telethon/telethon_ingest.latest.log"
+        try:
+            await backend.upload_file(str(LOG_PATH), ts_key)
+            logger.info("telethon_ingest: uploaded log to %s", ts_key)
+            # Also attempt to write a stable "latest" key for quick retrieval
+            try:
+                # Prefer backend-provided copy/put semantics if available
+                if hasattr(backend, "copy_key"):
+                    try:
+                        await backend.copy_key(ts_key, latest_key)
+                    except Exception:
+                        # fall back to re-upload
+                        await backend.upload_file(str(LOG_PATH), latest_key)
+                else:
+                    await backend.upload_file(str(LOG_PATH), latest_key)
+                logger.info("telethon_ingest: updated latest log key %s", latest_key)
+            except Exception:
+                logger.exception("telethon_ingest: failed to write latest log key")
+            return ts_key
+        except Exception:
+            logger.exception("telethon_ingest: failed to upload log to storage")
+            return None
+    except Exception:
+        logger.exception("telethon_ingest: upload_telethon_log unexpected error")
+        return None
 
 
 async def _upload_and_enqueue(local_path: str, original_name: str, chat_id: Optional[int], message_id: Optional[int]):
@@ -225,6 +372,11 @@ async def _process_forward_hash(forward_hash: str):
         return False
 
     logger.info("telethon_ingest: processing forward %s meta_chat=%s meta_msg=%s", forward_hash, meta.get("chat_id"), meta.get("message_id") or meta.get("msg_id"))
+    try:
+        global LAST_FETCH_TS
+        LAST_FETCH_TS = time.time()
+    except Exception:
+        pass
 
     tmp = _make_temp_path(forward_hash, os.path.splitext(meta.get("name") or "")[1] or "")
 
@@ -294,17 +446,17 @@ async def redis_listener():
                 if not msg:
                     await asyncio.sleep(0.1)
                     continue
-
-                data = msg.get("data")
-                if isinstance(data, bytes):
-                    try:
-                        data = data.decode("utf-8")
-                    except Exception:
-                        data = str(data)
                 try:
                     payload = json.loads(data)
                 except Exception:
                     payload = {"forward_hash": data}
+                # Debug: log received payload on fetch channel with context
+                try:
+                    logger.info("telethon_ingest: redis payload received (raw=%s) parsed=%s", data, payload)
+                except Exception:
+                    logger.exception("telethon_ingest: failed to log redis payload")
+                # Accept either `forward_hash` (preferred) or legacy `fid`.
+                fh = payload.get("forward_hash") or payload.get("fid") or payload.get("forward_id")
                 # Debug: log received payload on fetch channel
                 try:
                     logger.info("telethon_ingest: redis payload received: %s", payload)
@@ -510,6 +662,14 @@ async def main():
                 logger.info("Uploaded telethon_ingest.started to storage: %s", dest_key)
             except Exception:
                 logger.exception("Failed to upload telethon_ingest.started to storage")
+        # Attempt to upload the telethon debug log as well (best-effort)
+        try:
+            try:
+                await upload_telethon_log()
+            except Exception:
+                logger.exception("telethon_ingest: upload_telethon_log failed during startup")
+        except Exception:
+            pass
     except Exception:
         logger.exception("Error while attempting to publish telethon_ingest.started marker to storage")
 
@@ -520,6 +680,13 @@ async def main():
         redis_task = asyncio.create_task(redis_listener())
     except Exception:
         logger.exception("telethon_ingest: failed to start redis listener")
+
+    # Start aiohttp debug server (serves local /tmp/telethon_ingest.log) if available
+    http_runner = None
+    try:
+        http_runner = await _start_aiohttp_debug_server()
+    except Exception:
+        logger.exception("telethon_ingest: debug HTTP server failed to start")
 
     try:
         await client.run_until_disconnected()
@@ -536,6 +703,15 @@ async def main():
                     pass
         except Exception:
             pass
+        # Stop aiohttp debug server if running
+        try:
+            if http_runner is not None:
+                try:
+                    await http_runner.cleanup()
+                except Exception:
+                    pass
+        except Exception:
+            pass
         try:
             await client.disconnect()
         except Exception:
@@ -547,3 +723,12 @@ if __name__ == "__main__":
         asyncio.run(main())
     except KeyboardInterrupt:
         pass
+    except Exception:
+        try:
+            # Best-effort: attempt to upload log before exiting
+            try:
+                asyncio.run(upload_telethon_log("telethon_ingest_crash.log"))
+            except Exception:
+                pass
+        except Exception:
+            pass

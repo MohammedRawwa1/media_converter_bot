@@ -82,7 +82,14 @@ async def download_forward_via_userbot(
         client = TelegramClient(session_name, api_id, api_hash)
 
     # Start client
-    await client.start()
+    try:
+        # Log session details (do not log secrets)
+        logger.info("userbot: starting Telethon client session_name=%s string_session_provided=%s", session_name if 'session_name' in locals() else None, bool(session_str))
+        await client.start()
+        logger.info("userbot: Telethon client started successfully")
+    except Exception as e:
+        logger.exception("userbot: failed to start Telethon client: %s", e)
+        raise
     try:
         target = await _normalize_target(chat_id, client)
 
@@ -111,7 +118,7 @@ async def download_forward_via_userbot(
         try:
             msgs = await client.get_messages(target, ids=message_id)
         except Exception as e:
-            logger.debug("userbot: get_messages direct by id failed: %s", e)
+            logger.exception("userbot: get_messages direct by id failed: %s", e)
             msgs = None
 
         if msgs:
@@ -121,6 +128,7 @@ async def download_forward_via_userbot(
                 # Attempt download with basic retry and verification
                 for attempt in range(3):
                     try:
+                        logger.debug("userbot: download attempt %s for %s/%s -> %s", attempt + 1, target, getattr(msg, 'id', None), dest_path)
                         await client.download_media(msg, file=dest_path)
                         if os.path.exists(dest_path) and os.path.getsize(dest_path) > 0:
                             ok = await _ffprobe_ok(dest_path)
@@ -132,10 +140,10 @@ async def download_forward_via_userbot(
                         except Exception:
                             pass
                     except Exception as e:
-                        logger.debug("userbot: download attempt %s failed: %s", attempt + 1, e)
+                        logger.exception("userbot: download attempt %s failed: %s", attempt + 1, e)
                 logger.debug("userbot: message found but downloads failed validation: %s/%s", target, message_id)
-            else:
-                logger.debug("userbot: message found but no media: %s/%s", target, message_id)
+                else:
+                    logger.debug("userbot: message found but no media: %s/%s", target, message_id)
 
         # If direct id lookup failed, try searching around the message date if provided
         search_done = False
@@ -176,6 +184,7 @@ async def download_forward_via_userbot(
                     if getattr(m, "media", None):
                         for attempt in range(3):
                             try:
+                                logger.debug("userbot: recent-scan download attempt %s for msg %s -> %s", attempt + 1, getattr(m, 'id', None), dest_path)
                                 await client.download_media(m, file=dest_path)
                                 if os.path.exists(dest_path) and os.path.getsize(dest_path) > 0:
                                     ok = await _ffprobe_ok(dest_path)

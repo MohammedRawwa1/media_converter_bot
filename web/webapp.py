@@ -552,6 +552,120 @@ def upload():
     return jsonify({"job_id": job_id})
 
 
+@app.route("/debug/telethon-log", methods=["GET"])
+def telethon_log():
+    """Fetch the most recent Telethon ingest log from configured storage.
+
+    Protected by `DEBUG_SECRET` if present in env. Returns plain text log
+    or 404 if not found.
+    """
+    debug_secret = os.environ.get("DEBUG_SECRET")
+    if debug_secret:
+        token = request.headers.get("X-Debug-Token") or request.args.get("debug_token")
+        if not token or token != debug_secret:
+            return jsonify({"error": "unauthorized"}), 401
+
+    # Prefer synchronous backend helper if present, else attempt async helper
+    backend = None
+    async_backend = None
+    if get_storage_backend_sync is not None:
+        try:
+            backend = get_storage_backend_sync()
+        except Exception as e:
+            logger.exception("telethon_log: failed to init sync storage backend: %s", e)
+            backend = None
+    if backend is None:
+        # Try to import async factory and instantiate it via asyncio
+        try:
+            import asyncio as _asyncio
+            from utils.storage import get_storage_backend as _get_async_backend
+
+            try:
+                async_backend = _asyncio.run(_get_async_backend())
+            except Exception as e:
+                logger.exception("telethon_log: failed to init async storage backend: %s", e)
+                async_backend = None
+        except Exception:
+            async_backend = None
+
+    if backend is None and async_backend is None:
+        return jsonify({"error": "no available storage backend to fetch logs"}), 500
+
+    # Candidate key prefixes where telethon_ingest uploads logs
+    prefixes = ["telethon/", "telethon_ingest/", "telethon/telethon_ingest"]
+    # Try to list objects if backend exposes a list method, else try common names
+    candidates = []
+    try:
+        if hasattr(backend, "list_keys"):
+            for p in prefixes:
+                try:
+                    keys = backend.list_keys(prefix=p)
+                    if keys:
+                        candidates.extend(keys)
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+    # If no candidates discovered, try some well-known names
+    if not candidates:
+        candidates = [
+            "telethon/telethon_ingest.log",
+            "telethon/telethon_ingest.started",
+            "telethon/telethon_ingest_crash.log",
+            "telethon/telethon_ingest.latest.log",
+        ]
+
+    # Prefer newest by timestamp encoded in key name if possible
+    candidates = sorted(set(candidates), reverse=True)
+    for key in candidates:
+        try:
+            tmpdir = os.path.join("storage", "temp")
+            os.makedirs(tmpdir, exist_ok=True)
+            dst = os.path.join(tmpdir, os.path.basename(key))
+            # Try sync backend first
+            if backend is not None:
+                try:
+                    backend.download_file(key, dst)
+                except Exception:
+                    try:
+                        backend.get_file(key, dst)
+                    except Exception:
+                        logger.debug("telethon_log: sync backend cannot fetch %s", key)
+                        continue
+                if os.path.exists(dst):
+                    return send_file(dst, mimetype="text/plain", as_attachment=False)
+            # Try async backend via asyncio.run
+            if async_backend is not None:
+                try:
+                    import asyncio as _asyncio
+
+                    async def _dl(a_backend, a_key, a_dst):
+                        try:
+                            await a_backend.download_file(a_key, a_dst)
+                            return True
+                        except Exception:
+                            try:
+                                if hasattr(a_backend, "get_file"):
+                                    await a_backend.get_file(a_key, a_dst)
+                                    return True
+                            except Exception:
+                                return False
+                        return False
+
+                    ok = _asyncio.run(_dl(async_backend, key, dst))
+                    if ok and os.path.exists(dst):
+                        return send_file(dst, mimetype="text/plain", as_attachment=False)
+                except Exception:
+                    logger.exception("telethon_log: async backend failed to fetch %s", key)
+                    continue
+        except Exception:
+            logger.exception("telethon_log: failed to fetch %s", key)
+            continue
+
+    return jsonify({"error": "telethon log not found in storage"}), 404
+
+
 @app.route("/presign", methods=["POST"])
 def presign():
     """Return a presigned S3 POST (or PUT) for client direct upload.
