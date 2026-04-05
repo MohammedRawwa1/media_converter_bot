@@ -189,13 +189,20 @@ async def run_ffmpeg(
     try:
         assert proc.stdout is not None
         # Read line by line (ffmpeg -progress emits key=value lines)
-        async for raw in proc.stdout:
+        while True:
+            raw = await proc.stdout.readline()
+            if not raw:
+                # EOF
+                break
             line = raw.decode(errors="ignore").strip()
-            if not line:
-                continue
-            if "=" not in line:
+            if not line or "=" not in line:
                 continue
             key, val = line.split("=", 1)
+
+            # Finish marker should be handled regardless of Redis client presence
+            if key == "progress" and val == "end":
+                break
+
             if key == "out_time":
                 current_out_time = _parse_out_time(val)
                 pct = (current_out_time / duration * 100.0) if duration and duration > 0 else 0.0
@@ -268,6 +275,7 @@ async def run_ffmpeg(
                         on_progress(payload["progress"], message)
                     except Exception:
                         pass
+
             # periodically check for cancel flag in redis
             if redis_client:
                 try:
@@ -298,9 +306,6 @@ async def run_ffmpeg(
                         return False, "cancelled"
                 except Exception:
                     pass
-            elif key == "progress" and val == "end":
-                # finish marker
-                break
 
         # wait for process exit
         await proc.wait()
@@ -352,6 +357,19 @@ async def run_ffmpeg(
                         await aclose()
                     else:
                         await redis_client.close()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        # ensure stderr drain task is cleaned up
+        try:
+            if stderr_task is not None and not stderr_task.done():
+                try:
+                    stderr_task.cancel()
+                except Exception:
+                    pass
+                try:
+                    await stderr_task
                 except Exception:
                     pass
         except Exception:
