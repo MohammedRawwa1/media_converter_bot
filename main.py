@@ -876,7 +876,30 @@ def setup_handlers(application: Application) -> None:
                     if PhoneCodeInvalidError and isinstance(exc, PhoneCodeInvalidError):
                         friendly = "The code you entered is invalid. Please request a new code and try again."
                     elif PhoneCodeExpiredError and isinstance(exc, PhoneCodeExpiredError):
-                        friendly = "The code has expired. Please request a new code with /login and try again."
+                        # Attempt an automatic resend with a small retry cap to
+                        # avoid triggering flood limits.
+                        resend_count = context.user_data.get("login_resend_count", 0)
+                        if resend_count < 3:
+                            try:
+                                # Send a fresh code and update stored code hash
+                                try:
+                                    sent = await client.send_code_request(phone)
+                                except TypeError:
+                                    sent = await client.send_code_request(phone)
+                                new_hash = getattr(sent, "phone_code_hash", None)
+                                if new_hash:
+                                    context.user_data["login_code_hash"] = new_hash
+                                context.user_data["login_resend_count"] = resend_count + 1
+                                context.user_data["awaiting_login_code"] = True
+                                context.user_data["login_client"] = client
+                                context.user_data["login_phone"] = phone
+                                context.user_data["login_session_path"] = context.user_data.get("login_session_path")
+                                friendly = "The code expired — I sent a new code. Please reply with the fresh code you receive."
+                            except Exception as e2:
+                                logger.exception("Failed to resend login code: %s", e2)
+                                friendly = "The code expired and I couldn't request a new one. Try /login again in a few minutes."
+                        else:
+                            friendly = "The code has expired. Please request a new code with /login and try again."
                     elif FloodWaitError and isinstance(exc, FloodWaitError):
                         wait = getattr(exc, 'seconds', None) or getattr(exc, 'timeout', None) or 'a while'
                         friendly = f"Too many attempts; please wait {wait} seconds before retrying."
