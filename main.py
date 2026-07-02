@@ -2239,7 +2239,11 @@ try:
 
                     async def _asgi_longpoll_loop():
                         offset = None
-                        bot = BOT_APPLICATION.bot
+                        await BOT_READY.wait()
+                        bot = BOT_APPLICATION.bot if BOT_APPLICATION is not None else None
+                        if bot is None:
+                            logger.error("ASGI long-poller could not start because BOT_APPLICATION is not initialized")
+                            return
                         try:
                             while True:
                                 try:
