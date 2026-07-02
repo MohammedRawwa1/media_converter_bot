@@ -103,6 +103,15 @@ BOT_STARTED_AT = None
 START_TIME = time.time()
 BOT_READY = asyncio.Event()
 LOGIN_PENDING_USERS = set()
+# Simple Prometheus-style in-memory metrics for ASGI endpoints and dispatch tracking
+METRICS = {
+    "webhooks_received": 0,
+    "updates_dispatched": 0,
+    "updates_queued": 0,
+    "dispatch_failures": 0,
+    "dispatch_attempts": 0,
+}
+METRICS_LOCK = threading.Lock()
 
 class AwaitingLoginFilter(filters.MessageFilter):
     """Filter text messages only for users in the login flow."""
@@ -113,6 +122,68 @@ class AwaitingLoginFilter(filters.MessageFilter):
             return bool(user and user.id in LOGIN_PENDING_USERS)
         except Exception:
             return False
+
+
+async def _dispatch_update_task(update):
+    """Dispatch a single Update to the Application or dispatcher, updating metrics.
+
+    This helper is safe to schedule from background tasks and centralizes
+    error handling and metrics increments used by webhook and ASGI consumers.
+    """
+    try:
+        disp = getattr(BOT_APPLICATION, "dispatcher", None)
+        if disp and hasattr(disp, "process_update"):
+            try:
+                with METRICS_LOCK:
+                    METRICS["dispatch_attempts"] = METRICS.get("dispatch_attempts", 0) + 1
+            except Exception:
+                pass
+            await disp.process_update(update)
+            try:
+                with METRICS_LOCK:
+                    METRICS["updates_dispatched"] = METRICS.get("updates_dispatched", 0) + 1
+            except Exception:
+                pass
+            return
+
+        # Fall back to Application.process_update if available
+        if hasattr(BOT_APPLICATION, "process_update"):
+            try:
+                with METRICS_LOCK:
+                    METRICS["dispatch_attempts"] = METRICS.get("dispatch_attempts", 0) + 1
+            except Exception:
+                pass
+            await BOT_APPLICATION.process_update(update)
+            try:
+                with METRICS_LOCK:
+                    METRICS["updates_dispatched"] = METRICS.get("updates_dispatched", 0) + 1
+            except Exception:
+                pass
+            return
+
+        # As a last resort, try to enqueue back onto the application's update queue
+        try:
+            await BOT_APPLICATION.update_queue.put(update)
+            try:
+                with METRICS_LOCK:
+                    METRICS["updates_queued"] = METRICS.get("updates_queued", 0) + 1
+            except Exception:
+                pass
+            return
+        except Exception:
+            try:
+                with METRICS_LOCK:
+                    METRICS["dispatch_failures"] = METRICS.get("dispatch_failures", 0) + 1
+            except Exception:
+                pass
+            logger.exception("Failed to dispatch or enqueue update")
+    except Exception as exc:
+        try:
+            with METRICS_LOCK:
+                METRICS["dispatch_failures"] = METRICS.get("dispatch_failures", 0) + 1
+        except Exception:
+            pass
+        logger.exception("Error dispatching update: %s", exc)
 
 
 
