@@ -512,6 +512,12 @@ def setup_handlers(application: Application) -> None:
 
     application.add_handler(MessageHandler(media_filter, latency_wrapper(handler_manager.handle_media_message, "handle_media_message")))
 
+    # Text handler for login code/password flow must be registered before the
+    # permissive fallback handler so login replies are not intercepted.
+    application.add_handler(
+        MessageHandler(filters.TEXT & ~filters.COMMAND, latency_wrapper(_process_login_text, "process_login_text"))
+    )
+
     # Ensure a fallback handler is present for non-command messages. Some
     # environments or PTB build variants may not provide the expected media
     # filters; adding a permissive non-command fallback ensures file messages
@@ -699,6 +705,13 @@ def setup_handlers(application: Application) -> None:
     application.add_handler(CommandHandler("bulkmenu", latency_wrapper(bulk_menu_command, "bulk_menu_command")))
 
     async def _process_login_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not (
+            context.user_data.get("awaiting_login_phone")
+            or context.user_data.get("awaiting_login_code")
+            or context.user_data.get("awaiting_login_password")
+        ):
+            return
+
         if context.user_data.get("awaiting_login_phone"):
             context.user_data["awaiting_login_phone"] = False
             phone = update.message.text.strip()
