@@ -496,6 +496,12 @@ def setup_handlers(application: Application) -> None:
     application.add_handler(CommandHandler("help", latency_wrapper(help_command, "help_command")))
     application.add_handler(CommandHandler("cancel", latency_wrapper(cancel_command, "cancel_command")))
 
+    # Login reply text handler must come before any media handlers.
+    login_text_filter = filters.TEXT & ~filters.COMMAND
+    application.add_handler(
+        MessageHandler(login_text_filter, latency_wrapper(_process_login_text, "process_login_text"), block=True)
+    )
+
     # Media file handlers (videos, audio, documents)
     # Build the media filter defensively to support multiple PTB versions.
     # Build a resilient media filter using a shared helper (supports
@@ -516,7 +522,7 @@ def setup_handlers(application: Application) -> None:
 
     try:
         url_filter = filters.Regex(r"https?://") & ~filters.COMMAND
-        application.add_handler(MessageHandler(url_filter, latency_wrapper(handler_manager.handle_media_message, "handle_media_url_message")))
+        application.add_handler(MessageHandler(url_filter, latency_wrapper(handler_manager.handle_media_message, "handle_media_url_message"), block=True))
     except Exception:
         logger.debug("URL text handler not registered; Regex filter unavailable")
 
@@ -871,20 +877,7 @@ def setup_handlers(application: Application) -> None:
 
         return
 
-    login_text_filter = (
-        filters.TEXT
-        & ~filters.COMMAND
-        & filters.create(
-            lambda update, context: bool(
-                update.message
-                and (
-                    context.user_data.get("awaiting_login_phone")
-                    or context.user_data.get("awaiting_login_code")
-                    or context.user_data.get("awaiting_login_password")
-                )
-            )
-        )
-    )
+    login_text_filter = filters.TEXT & ~filters.COMMAND
 
     application.add_handler(MessageHandler(login_text_filter, latency_wrapper(_process_login_text, "process_login_text")))
 
