@@ -546,11 +546,6 @@ def setup_handlers(application: Application) -> None:
     # Callback query handler for menu interactions
     application.add_handler(CallbackQueryHandler(latency_wrapper(handler_manager.callback_handler, "callback_handler")))
 
-    login_text_filter = filters.TEXT & ~filters.COMMAND & AwaitingLoginFilter()
-    application.add_handler(
-        MessageHandler(login_text_filter, latency_wrapper(_process_login_text, "process_login_text"), block=True)
-    )
-
     # Register custom thumbnail commands if module available
     try:
         from custom_thumbnail import add_thumb, del_thumb
@@ -909,6 +904,11 @@ def setup_handlers(application: Application) -> None:
 
         _clear_login_flow(user_id, context)
         return
+
+    login_text_filter = filters.TEXT & ~filters.COMMAND & AwaitingLoginFilter()
+    application.add_handler(
+        MessageHandler(login_text_filter, latency_wrapper(_process_login_text, "process_login_text"), block=True)
+    )
 
     # Store handler manager in bot_data for access in other handlers
     application.bot_data["handler_manager"] = handler_manager
