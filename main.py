@@ -146,6 +146,10 @@ async def _dispatch_update_task(u: Update) -> None:
         logger.debug("dispatch.start (could not serialize structured log)")
 
     try:
+        if not BOT_READY.is_set():
+            logger.warning("Dispatch waiting for bot readiness before processing update %s", update_id)
+            await BOT_READY.wait()
+
         disp = getattr(BOT_APPLICATION, "dispatcher", None)
         if disp and hasattr(disp, "process_update"):
             with METRICS_LOCK:
@@ -2166,16 +2170,9 @@ try:
 
             logger.info("Background bot task started via ASGI startup event")
 
-            # Wait briefly for the bot to become ready to process updates
-            try:
-                await asyncio.wait_for(BOT_READY.wait(), timeout=15.0)
-                logger.info("Bot signalled ready within startup window")
-            except asyncio.TimeoutError:
-                logger.warning("Bot did not become ready within 15s startup window")
-            # Start a lightweight update consumer to ensure updates placed on
-            # Application.update_queue are dispatched even if the internal
-            # dispatcher task is not present in this ASGI-hosted environment.
+            # Start a lightweight update consumer only after the bot is ready.
             async def _update_consumer():
+                await BOT_READY.wait()
                 logger.info("Starting ASGI update consumer task")
                 app.state.update_consumer_running = True
                 try:
