@@ -43,7 +43,8 @@ def build_media_filter(filters_module) -> Optional[object]:
             continue
 
     if media_filter is None:
-        # Fall back to a permissive catch-all filter if available
-        return getattr(filters_module, "ALL", None)
+        # If no specific media filters are available, do not fall back to ALL.
+        # Returning None allows the caller to apply a safer text-excluding filter.
+        return None
 
     return media_filter

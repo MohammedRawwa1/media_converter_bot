@@ -505,21 +505,26 @@ def setup_handlers(application: Application) -> None:
 
         media_filter = build_media_filter(filters)
         if media_filter is None:
-            media_filter = filters.ALL
+            # Preserve non-text media handling even when PTB-specific filters
+            # cannot be resolved cleanly.
+            media_filter = filters.ALL & ~filters.TEXT
     except Exception:
-        # In case the helper isn't available for any reason, fall back to ALL
-        media_filter = filters.ALL
+        # In case the helper isn't available for any reason, fall back safely.
+        media_filter = filters.ALL & ~filters.TEXT
 
     application.add_handler(MessageHandler(media_filter, latency_wrapper(handler_manager.handle_media_message, "handle_media_message")))
 
-    # Ensure a fallback handler is present for non-command messages. Some
-    # environments or PTB build variants may not provide the expected media
-    # filters; adding a permissive non-command fallback ensures file messages
-    # still reach `handle_media_message`.
     try:
-        fallback_filter = filters.ALL & ~filters.COMMAND
+        url_filter = filters.Regex(r"https?://") & ~filters.COMMAND
+        application.add_handler(MessageHandler(url_filter, latency_wrapper(handler_manager.handle_media_message, "handle_media_url_message")))
+    except Exception:
+        logger.debug("URL text handler not registered; Regex filter unavailable")
+
+    # Ensure a fallback handler is present for non-command, non-text messages.
+    try:
+        fallback_filter = filters.ALL & ~filters.COMMAND & ~filters.TEXT
         application.add_handler(MessageHandler(fallback_filter, latency_wrapper(handler_manager.handle_media_message, "handle_media_message_fallback")))
-        logger.info("Fallback media handler registered for non-command messages")
+        logger.info("Fallback media handler registered for non-command non-text messages")
     except Exception:
         logger.debug("Fallback media handler not registered")
 
@@ -866,7 +871,22 @@ def setup_handlers(application: Application) -> None:
 
         return
 
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, latency_wrapper(_process_login_text, "process_login_text")))
+    login_text_filter = (
+        filters.TEXT
+        & ~filters.COMMAND
+        & filters.create(
+            lambda update, context: bool(
+                update.message
+                and (
+                    context.user_data.get("awaiting_login_phone")
+                    or context.user_data.get("awaiting_login_code")
+                    or context.user_data.get("awaiting_login_password")
+                )
+            )
+        )
+    )
+
+    application.add_handler(MessageHandler(login_text_filter, latency_wrapper(_process_login_text, "process_login_text")))
 
     # Store handler manager in bot_data for access in other handlers
     application.bot_data["handler_manager"] = handler_manager
