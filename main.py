@@ -500,12 +500,6 @@ def setup_handlers(application: Application) -> None:
     application.add_handler(CommandHandler("help", latency_wrapper(help_command, "help_command")))
     application.add_handler(CommandHandler("cancel", latency_wrapper(cancel_command, "cancel_command")))
 
-    # Login reply text handler must come before any media handlers.
-    login_text_filter = filters.TEXT & ~filters.COMMAND
-    application.add_handler(
-        MessageHandler(login_text_filter, latency_wrapper(_process_login_text, "process_login_text"), block=True)
-    )
-
     # Media file handlers (videos, audio, documents)
     # Build the media filter defensively to support multiple PTB versions.
     # Build a resilient media filter using a shared helper (supports
