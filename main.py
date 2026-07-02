@@ -845,6 +845,28 @@ def setup_handlers(application: Application) -> None:
                 return
 
             try:
+                # Debug: record code usage context before attempting sign-in
+                try:
+                    entered_at = time.time()
+                    sent_at = context.user_data.get("login_code_sent_at")
+                    resend_count = context.user_data.get("login_resend_count", 0)
+                    code_hash_preview = str(context.user_data.get("login_code_hash"))
+                    client_session = getattr(getattr(client, 'session', None), 'filename', None) or repr(getattr(client, 'session', None))
+                    masked_code = (code[-2:].rjust(2, "*") if code else "")
+                    logger.info(
+                        "Attempting sign_in: user=%s entered_at=%s sent_at=%s delta=%.3fs resend_count=%s code_hash=%s session=%s code_tail=%s",
+                        user_id,
+                        entered_at,
+                        sent_at,
+                        (entered_at - sent_at) if sent_at else -1,
+                        resend_count,
+                        code_hash_preview,
+                        client_session,
+                        masked_code,
+                    )
+                except Exception:
+                    pass
+
                 # Use stored phone_code_hash when available to match the
                 # send_code_request response; fall back to alternate
                 # sign_in signatures for different Telethon versions.
