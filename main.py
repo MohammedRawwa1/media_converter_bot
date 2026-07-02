@@ -705,7 +705,6 @@ def setup_handlers(application: Application) -> None:
             await update.message.reply_text("Got phone number. Please wait while I generate the Telethon session...")
             try:
                 from telethon import TelegramClient
-                from telethon.sessions import StringSession
             except Exception:
                 await update.message.reply_text(
                     "Telethon is not installed on the server. Install telethon to use /login."
@@ -735,17 +734,18 @@ def setup_handlers(application: Application) -> None:
             try:
                 await client.connect()
                 if not await client.is_user_authorized():
-                    sent = await client.send_code_request(phone)
+                    await client.send_code_request(phone)
                     await update.message.reply_text(
                         "A login code has been sent. Please reply with the code you receive."
                     )
                     context.user_data["awaiting_login_code"] = True
                     context.user_data["login_phone"] = phone
                     context.user_data["login_client"] = client
+                    context.user_data["login_session_path"] = session_path
                     return
                 else:
                     await update.message.reply_text(
-                        f"Telethon session saved to {session_path}. You can now use userbot fallback." 
+                        f"Telethon session is already authorized and saved to {session_path}. You can now use userbot fallback."
                     )
                     await client.disconnect()
                     return
@@ -764,30 +764,97 @@ def setup_handlers(application: Application) -> None:
             code = update.message.text.strip()
             client = context.user_data.get("login_client")
             phone = context.user_data.get("login_phone")
-            context.user_data["awaiting_login_code"] = False
-            context.user_data["awaiting_login_phone"] = False
+            if client is None or not phone:
+                await update.message.reply_text(
+                    "Session state lost. Please run /login again to start a fresh login.")
+                context.user_data.pop("awaiting_login_code", None)
+                context.user_data.pop("awaiting_login_phone", None)
+                return
+
             try:
                 await client.sign_in(phone=phone, code=code)
                 if await client.is_user_authorized():
+                    session_path = context.user_data.get("login_session_path")
                     await update.message.reply_text(
                         "✅ Telethon userbot login successful. Session saved locally."
+                        + (f"\nSaved session: {session_path}" if session_path else "")
                     )
+                    context.user_data.pop("awaiting_login_code", None)
+                    context.user_data.pop("login_phone", None)
+                    context.user_data.pop("login_client", None)
+                    context.user_data.pop("login_session_path", None)
+                    await client.disconnect()
+                    return
                 else:
                     await update.message.reply_text(
-                        "Login code accepted but the session is not authorized. Please try /login again."
+                        "Login code accepted but the session is not authorized. Please reply with your password if 2FA is enabled."
                     )
+                    context.user_data["awaiting_login_password"] = True
+                    context.user_data.pop("awaiting_login_code", None)
+                    return
             except Exception as exc:
+                try:
+                    from telethon.errors import SessionPasswordNeededError
+                except Exception:
+                    SessionPasswordNeededError = None
+
+                if SessionPasswordNeededError and isinstance(exc, SessionPasswordNeededError):
+                    await update.message.reply_text(
+                        "Two-step verification is enabled. Please reply with your account password."
+                    )
+                    context.user_data["awaiting_login_password"] = True
+                    context.user_data.pop("awaiting_login_code", None)
+                    return
+
                 logger.exception("/login code step failed: %s", exc)
                 await update.message.reply_text(
                     "Failed to complete Telethon login. Please make sure the code is correct and try /login again."
+                )
+                try:
+                    await client.disconnect()
+                except Exception:
+                    pass
+                context.user_data.pop("awaiting_login_code", None)
+                context.user_data.pop("awaiting_login_phone", None)
+                context.user_data.pop("login_phone", None)
+                context.user_data.pop("login_client", None)
+                return
+
+        if context.user_data.get("awaiting_login_password"):
+            password = update.message.text.strip()
+            client = context.user_data.get("login_client")
+            if client is None:
+                await update.message.reply_text(
+                    "Session state lost. Please run /login again to start a fresh login."
+                )
+                context.user_data.pop("awaiting_login_password", None)
+                return
+
+            try:
+                await client.sign_in(password=password)
+                if await client.is_user_authorized():
+                    session_path = context.user_data.get("login_session_path")
+                    await update.message.reply_text(
+                        "✅ Telethon userbot login successful. Session saved locally."
+                        + (f"\nSaved session: {session_path}" if session_path else "")
+                    )
+                else:
+                    await update.message.reply_text(
+                        "Password accepted but the session is not authorized. Please run /login again."
+                    )
+            except Exception as exc:
+                logger.exception("/login password step failed: %s", exc)
+                await update.message.reply_text(
+                    "Failed to complete Telethon login with password. Please try /login again."
                 )
             finally:
                 try:
                     await client.disconnect()
                 except Exception:
                     pass
-                context.user_data.pop("login_client", None)
+                context.user_data.pop("awaiting_login_password", None)
                 context.user_data.pop("login_phone", None)
+                context.user_data.pop("login_client", None)
             return
 
         return
