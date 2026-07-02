@@ -737,7 +737,8 @@ async def handle_job(job: dict):
                                 dest_key = f"outputs/{job_id}/{base}"
                                 # Upload the file (local backend will copy to storage path)
                                 dest = await backend.upload_file(out, dest_key)
-                                # Try to produce a presigned GET URL when supported
+                                # Try to produce a presigned GET URL when supported. Do not expose it
+                                # as the default output unless link delivery is explicitly enabled.
                                 try:
                                     get_url = await backend.generate_presigned_get(dest)
                                 except Exception:
@@ -745,14 +746,12 @@ async def handle_job(job: dict):
 
                                 # Update Redis job hash with output metadata for the web UI
                                 try:
+                                    send_link = os.environ.get("ENABLE_LINK_SEND", "").lower() in ("1", "true", "yes")
                                     r = await get_redis()
                                     mapping = {"output_key": dest}
                                     if get_url:
                                         mapping["output_get_url"] = get_url
-                                        # retain compatibility: set output to a reachable URL when possible
-                                        mapping["output"] = get_url
-                                    else:
-                                        mapping["output"] = dest
+                                    mapping["output"] = get_url if get_url and send_link else dest
                                     try:
                                         mapping["out_bytes"] = str(os.path.getsize(out))
                                     except Exception:
@@ -816,15 +815,18 @@ async def handle_job(job: dict):
                         bot_api_max_mb = int(os.environ.get("BOT_API_MAX_SIZE_MB", "50"))
                         bot_api_max_bytes = bot_api_max_mb * 1024 * 1024
 
-                        # If we uploaded the output and generated a presigned GET URL, prefer sending the link
-                        # (User → Bot → Process → Upload → Bot sends link). This avoids Bot API upload limits.
-                        if upload_success and get_url and chat_id and bot_token:
+                        send_link = os.environ.get("ENABLE_LINK_SEND", "").lower() in ("1", "true", "yes")
+                        # If we uploaded the output and generated a presigned GET URL, only send it if
+                        # explicit link delivery is enabled. Otherwise keep delivery inside Telegram.
+                        if send_link and upload_success and get_url and chat_id and bot_token:
                             try:
-                                async with Bot(token=bot_token) as bot:
-                                    text = f"Your video is ready: {get_url}"
-                                    await bot.send_message(chat_id=chat_id, text=text)
-                                logger.info("Sent presigned URL to chat %s for job %s", chat_id, job_id)
-                                sent = True
+                                job_type = job.get("type") if isinstance(job, dict) else None
+                                if file_size > bot_api_max_bytes or (job_type and job_type != "generate_sample"):
+                                    async with Bot(token=bot_token) as bot:
+                                        text = f"Your video is ready: {get_url}"
+                                        await bot.send_message(chat_id=chat_id, text=text)
+                                    logger.info("Sent presigned URL to chat %s for job %s", chat_id, job_id)
+                                    sent = True
                             except Exception:
                                 logger.exception("Failed to send presigned URL for job %s", job_id)
                                 sent = False

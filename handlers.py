@@ -301,8 +301,9 @@ class EnhancedMediaHandler:
                 if status == "done" and output:
                     display_output = output
                     try:
-                        # If output looks like a storage key (not an http(s) URL), try to generate a presigned GET URL
-                        if not (str(output).startswith("http://") or str(output).startswith("https://")):
+                        # Only generate and display a presigned URL if explicit link delivery is enabled.
+                        send_link = os.environ.get("ENABLE_LINK_SEND", "").lower() in ("1", "true", "yes")
+                        if send_link and not (str(output).startswith("http://") or str(output).startswith("https://")):
                             try:
                                 from utils.storage import get_storage_backend
 
@@ -619,25 +620,78 @@ class EnhancedMediaHandler:
         file_path = os.path.join(input_dir, f"{user_id}_{file_id}{ext}")
 
         # Attempt to fetch file via Telegram API (bot). If Telegram refuses due to
-        # file size or access rules, optionally try a user-account (userbot) fallback
-        # if configured via env (`ENABLE_USERBOT` + API_ID/API_HASH).
+        # file size or access rules, prefer a user-account (userbot) fallback when
+        # configured via env (`ENABLE_USERBOT` + API_ID/API_HASH).
         try:
             file = await context.bot.get_file(file_id)
         except Exception as e:
             logger.exception("get_file failed for %s: %s", file_id, e)
             err_text = str(e) or ""
             upload_url = os.environ.get("WEB_UPLOAD_URL") or os.environ.get("WEBAPP_URL") or "<your-server>/upload"
+            enable_userbot = os.environ.get("ENABLE_USERBOT", "").lower() in ("1", "true", "yes")
 
-            # If the error indicates the file is too large for the Bot API, handle
-            # it centrally (persist forward metadata / trigger web fetch / user guidance)
-            # regardless of whether a userbot is configured. This ensures forwards
-            # are saved to S3/R2 when configured instead of failing silently.
+            async def _try_userbot_download(chat_id, message_id, reason):
+                if not enable_userbot or not chat_id or not message_id:
+                    return False
+                try:
+                    from utils.userbot_downloader import download_forward_via_userbot
+
+                    logger.info(
+                        "Attempting userbot download fallback (%s) for %s/%s -> %s",
+                        reason,
+                        chat_id,
+                        message_id,
+                        file_path,
+                    )
+                    ok = await download_forward_via_userbot(
+                        chat_id,
+                        message_id,
+                        file_path,
+                        msg_date=current_file.get("msg_date")
+                        or current_file.get("date")
+                        or current_file.get("registered_at"),
+                        file_unique_id=current_file.get("file_unique_id"),
+                    )
+                    logger.info(
+                        "Userbot download fallback (%s) result for %s/%s: ok=%s exists=%s",
+                        reason,
+                        chat_id,
+                        message_id,
+                        bool(ok),
+                        os.path.exists(file_path),
+                    )
+                    if ok and os.path.exists(file_path):
+                        current_file["path"] = file_path
+                        session["current_file"] = current_file
+                        try:
+                            self._persist_session(user_id)
+                        except Exception:
+                            logger.debug("Could not persist session after userbot download (%s)", reason)
+                        return True
+                except Exception:
+                    logger.exception("Userbot download fallback failed (%s) for %s/%s", reason, chat_id, message_id)
+                return False
+
+            # For large-file bot API failures, try the userbot fallback first.
+            if enable_userbot and ("file is too big" in err_text.lower() or "too big" in err_text.lower()):
+                forward = current_file.get("forward") if current_file else None
+                if forward and forward.get("chat_id") and forward.get("message_id"):
+                    if await _try_userbot_download(
+                        forward.get("chat_id"), forward.get("message_id"), "origin_forward"
+                    ):
+                        return
+
+                bot_chat = current_file.get("chat_id")
+                bot_msg = current_file.get("msg_id") or current_file.get("message_id")
+                if bot_chat and bot_msg:
+                    if await _try_userbot_download(bot_chat, bot_msg, "bot_chat_large_file"):
+                        return
+
+            # If userbot fallback did not produce a file, keep the existing large-forward
+            # handling behavior so the bot can persist metadata or provide upload guidance.
             if "file is too big" in err_text.lower() or "too big" in err_text.lower():
                 try:
                     fh = await self._handle_large_forward(update, current_file, err_text, upload_url)
-                    # Do not continue processing — inform caller that the file
-                    # was too large and we've saved forward metadata (when
-                    # available) or scheduled a server fetch.
                     if fh:
                         raise Exception(
                             "Telegram reports the file is too big to download via the bot. "
@@ -649,17 +703,11 @@ class EnhancedMediaHandler:
                             f"Please either upload the file via the web uploader (POST to {upload_url}) or provide a direct public URL to the file."
                         )
                 except Exception:
-                    # If handling the large forward fails, propagate a user-friendly
-                    # error so callers can inform the user.
                     raise Exception(
                         "Telegram reports the file is too big to download via the bot. "
                         f"Please either upload the file via the web uploader (POST to {upload_url}) or provide a direct public URL to the file."
                     )
 
-            # Opt-in userbot fallback: try origin-of-forward first (if present),
-            # then fall back to downloading the forwarded message as it appears
-            # in the bot chat (useful when forward metadata lacks origin IDs).
-            enable_userbot = os.environ.get("ENABLE_USERBOT", "").lower() in ("1", "true", "yes")
             forward = current_file.get("forward") if current_file else None
             if enable_userbot and forward and forward.get("chat_id") and forward.get("message_id"):
                 try:
@@ -679,9 +727,6 @@ class EnhancedMediaHandler:
                 except Exception:
                     logger.exception("Userbot download fallback failed (origin forward)")
 
-            # If the bot API refused due to size, prefer trying the userbot
-            # fallback from the bot chat itself when the file is larger than
-            # BOT_API_MAX_MB even if no origin-forward metadata is available.
             try:
                 try:
                     bot_api_max_mb = int(os.environ.get("BOT_API_MAX_MB", "50"))
@@ -708,10 +753,6 @@ class EnhancedMediaHandler:
             except Exception:
                 logger.exception("Error checking BOT_API_MAX_MB fallback")
 
-            # If the origin-forward attempt wasn't possible or failed, try to
-            # download the forwarded message from the bot chat itself using
-            # the message id/chat id we stored at registration time (or from
-            # the provided `update` object).
             if enable_userbot:
                 try:
                     bot_chat = current_file.get("chat_id")
@@ -720,7 +761,6 @@ class EnhancedMediaHandler:
                     bot_chat = None
                     bot_msg = None
 
-                # Try to extract from the update if not present in session
                 if not bot_chat or not bot_msg:
                     try:
                         if getattr(update, "message", None) and getattr(update.message, "chat", None):
@@ -748,7 +788,6 @@ class EnhancedMediaHandler:
                     except Exception:
                         logger.exception("Userbot download fallback failed (bot chat)")
 
-            # Other get_file errors: re-raise
             raise
 
         # Download with the bot (if we reached here, get_file succeeded)

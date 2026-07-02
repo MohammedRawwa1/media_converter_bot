@@ -72,22 +72,13 @@ async def download_forward_via_userbot(
         raise RuntimeError("API_ID must be an integer")
 
     # Build client (prefer string session if provided)
-    if session_str and StringSession is not None:
-        client = TelegramClient(StringSession(session_str), api_id, api_hash)
-    else:
-        session_name = (
-            os.getenv("API_SESSION_NAME")
-            or os.getenv("SESSION_NAME")
-            or os.getenv("USERBOT_SESSION_NAME")
-            or os.getenv("TELETHON_SESSION_NAME")
-            or "userbot_session"
-        )
-        client = TelegramClient(session_name, api_id, api_hash)
+    from utils.telethon_session import build_telethon_client
+
+    client = build_telethon_client(api_id, api_hash)
 
     # Start client
     try:
-        # Log session details (do not log secrets)
-        logger.info("userbot: starting Telethon client session_name=%s string_session_provided=%s", session_name if 'session_name' in locals() else None, bool(session_str))
+        logger.info("userbot: starting Telethon client for download")
         await client.start()
         logger.info("userbot: Telethon client started successfully")
     except Exception as e:

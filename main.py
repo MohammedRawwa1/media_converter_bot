@@ -103,6 +103,9 @@ BOT_STARTED_AT = None
 START_TIME = time.time()
 BOT_READY = asyncio.Event()
 
+# Conversation states for local Telethon login
+LOGIN_PHONE, LOGIN_CODE = range(2)
+
 # Guard to ensure we don't start multiple concurrent long-pollers
 LONG_POLLER_STARTED = False
 
@@ -577,7 +580,75 @@ def setup_handlers(application: Application) -> None:
 
     application.add_handler(CommandHandler("admin", latency_wrapper(admin_command, "admin_command")))
 
-    # Admin: cancel a queued/running job by id
+    async def login_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        user_id = update.effective_user.id
+        if ADMIN_USER_ID and user_id != ADMIN_USER_ID:
+            await update.message.reply_text("Unauthorized: admin only")
+            return
+
+        # We require API_ID/API_HASH for local Telethon login.
+        api_id = os.getenv("API_ID") or os.getenv("USERBOT_API_ID")
+        api_hash = os.getenv("API_HASH") or os.getenv("USERBOT_API_HASH")
+        if not api_id or not api_hash:
+            await update.message.reply_text(
+                "Missing Telethon credentials. Set API_ID and API_HASH in the environment before using /login."
+            )
+            return
+
+        try:
+            await update.message.reply_text(
+                "Please send the phone number for the userbot session in international format, e.g. +1234567890."
+            )
+            context.user_data["awaiting_login_phone"] = True
+            return
+        except Exception:
+            await update.message.reply_text("Failed to prompt for Telethon login phone number.")
+            return
+
+    application.add_handler(CommandHandler("login", latency_wrapper(login_command, "login_command")))
+
+    async def logout_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        user_id = update.effective_user.id
+        if ADMIN_USER_ID and user_id != ADMIN_USER_ID:
+            await update.message.reply_text("Unauthorized: admin only")
+            return
+
+        try:
+            from utils.telethon_session import get_telethon_session_path
+
+            session_path = get_telethon_session_path()
+            removed = []
+            if os.path.exists(session_path):
+                try:
+                    os.remove(session_path)
+                    removed.append(session_path)
+                except Exception:
+                    pass
+            for suffix in (".session", ".session-journal", ".session.lock"):
+                path_with_suffix = session_path + suffix
+                if os.path.exists(path_with_suffix):
+                    try:
+                        os.remove(path_with_suffix)
+                        removed.append(path_with_suffix)
+                    except Exception:
+                        pass
+
+            if removed:
+                await update.message.reply_text(
+                    f"✅ Logged out and removed Telethon session files:\n{chr(10).join(removed)}"
+                )
+            else:
+                await update.message.reply_text(
+                    "No local Telethon session file was found to remove."
+                )
+        except Exception as exc:
+            logger.exception("/logout failed: %s", exc)
+            await update.message.reply_text(
+                "Failed to remove the Telethon session. Check server logs for details."
+            )
+
+    application.add_handler(CommandHandler("logout", latency_wrapper(logout_command, "logout_command")))
+
     async def canceljob_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_id = update.effective_user.id
         # restrict to admin or allowed users
@@ -626,6 +697,102 @@ def setup_handlers(application: Application) -> None:
             await update.message.reply_text("⚠️ Failed to open bulk menu.")
 
     application.add_handler(CommandHandler("bulkmenu", latency_wrapper(bulk_menu_command, "bulk_menu_command")))
+
+    async def _process_login_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if context.user_data.get("awaiting_login_phone"):
+            context.user_data["awaiting_login_phone"] = False
+            phone = update.message.text.strip()
+            await update.message.reply_text("Got phone number. Please wait while I generate the Telethon session...")
+            try:
+                from telethon import TelegramClient
+                from telethon.sessions import StringSession
+            except Exception:
+                await update.message.reply_text(
+                    "Telethon is not installed on the server. Install telethon to use /login."
+                )
+                return
+
+            api_id = os.getenv("API_ID") or os.getenv("USERBOT_API_ID")
+            api_hash = os.getenv("API_HASH") or os.getenv("USERBOT_API_HASH")
+            try:
+                api_id = int(api_id)
+            except Exception:
+                await update.message.reply_text("Configured API_ID is invalid. It must be an integer.")
+                return
+
+            session_name = (
+                os.getenv("API_SESSION_NAME")
+                or os.getenv("SESSION_NAME")
+                or os.getenv("USERBOT_SESSION_NAME")
+                or os.getenv("TELETHON_SESSION_NAME")
+                or "userbot_session"
+            )
+            session_dir = os.getenv("TELETHON_SESSION_DIR") or os.getenv("TEMP_PATH") or os.getcwd()
+            os.makedirs(session_dir, exist_ok=True)
+            session_path = os.path.join(session_dir, session_name)
+
+            client = TelegramClient(session_path, api_id, api_hash)
+            try:
+                await client.connect()
+                if not await client.is_user_authorized():
+                    sent = await client.send_code_request(phone)
+                    await update.message.reply_text(
+                        "A login code has been sent. Please reply with the code you receive."
+                    )
+                    context.user_data["awaiting_login_code"] = True
+                    context.user_data["login_phone"] = phone
+                    context.user_data["login_client"] = client
+                    return
+                else:
+                    await update.message.reply_text(
+                        f"Telethon session saved to {session_path}. You can now use userbot fallback." 
+                    )
+                    await client.disconnect()
+                    return
+            except Exception as exc:
+                logger.exception("/login phone step failed: %s", exc)
+                await update.message.reply_text(
+                    "Failed to start Telethon login. Check API_ID/API_HASH and the phone number."
+                )
+                try:
+                    await client.disconnect()
+                except Exception:
+                    pass
+                return
+
+        if context.user_data.get("awaiting_login_code"):
+            code = update.message.text.strip()
+            client = context.user_data.get("login_client")
+            phone = context.user_data.get("login_phone")
+            context.user_data["awaiting_login_code"] = False
+            context.user_data["awaiting_login_phone"] = False
+            try:
+                await client.sign_in(phone=phone, code=code)
+                if await client.is_user_authorized():
+                    await update.message.reply_text(
+                        "✅ Telethon userbot login successful. Session saved locally."
+                    )
+                else:
+                    await update.message.reply_text(
+                        "Login code accepted but the session is not authorized. Please try /login again."
+                    )
+            except Exception as exc:
+                logger.exception("/login code step failed: %s", exc)
+                await update.message.reply_text(
+                    "Failed to complete Telethon login. Please make sure the code is correct and try /login again."
+                )
+            finally:
+                try:
+                    await client.disconnect()
+                except Exception:
+                    pass
+                context.user_data.pop("login_client", None)
+                context.user_data.pop("login_phone", None)
+            return
+
+        return
+
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, latency_wrapper(_process_login_text, "process_login_text")))
 
     # Store handler manager in bot_data for access in other handlers
     application.bot_data["handler_manager"] = handler_manager

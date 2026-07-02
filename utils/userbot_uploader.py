@@ -54,18 +54,9 @@ async def send_file_via_userbot(
     except Exception:
         raise RuntimeError("API_ID must be an integer")
 
-    if session_str and StringSession is not None:
-        client = TelegramClient(StringSession(session_str), api_id, api_hash)
-    else:
-        session_name = (
-            os.getenv("API_SESSION_NAME")
-            or os.getenv("SESSION_NAME")
-            or os.getenv("USERBOT_SESSION_NAME")
-            or os.getenv("TELETHON_SESSION_NAME")
-            or "userbot_session"
-        )
-        client = TelegramClient(session_name, api_id, api_hash)
+    from utils.telethon_session import build_telethon_client
 
+    client = build_telethon_client(api_id, api_hash)
     await client.start()
     try:
         target = await _normalize_target(chat_id, client)
