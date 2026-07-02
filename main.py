@@ -102,6 +102,17 @@ BOT_APPLICATION = None
 BOT_STARTED_AT = None
 START_TIME = time.time()
 BOT_READY = asyncio.Event()
+LOGIN_PENDING_USERS = set()
+
+class AwaitingLoginFilter(filters.MessageFilter):
+    """Filter text messages only for users in the login flow."""
+
+    def filter(self, message):
+        try:
+            user = getattr(message, "from_user", None)
+            return bool(user and user.id in LOGIN_PENDING_USERS)
+        except Exception:
+            return False
 
 # Conversation states for local Telethon login
 LOGIN_PHONE, LOGIN_CODE = range(2)
@@ -500,6 +511,11 @@ def setup_handlers(application: Application) -> None:
     application.add_handler(CommandHandler("help", latency_wrapper(help_command, "help_command")))
     application.add_handler(CommandHandler("cancel", latency_wrapper(cancel_command, "cancel_command")))
 
+    login_text_filter = filters.TEXT & ~filters.COMMAND & AwaitingLoginFilter()
+    application.add_handler(
+        MessageHandler(login_text_filter, latency_wrapper(_process_login_text, "process_login_text"), block=True)
+    )
+
     # Media file handlers (videos, audio, documents)
     # Build the media filter defensively to support multiple PTB versions.
     # Build a resilient media filter using a shared helper (supports
@@ -609,6 +625,7 @@ def setup_handlers(application: Application) -> None:
                 "Please send the phone number for the userbot session in international format, e.g. +1234567890."
             )
             context.user_data["awaiting_login_phone"] = True
+            LOGIN_PENDING_USERS.add(user_id)
             return
         except Exception:
             await update.message.reply_text("Failed to prompt for Telethon login phone number.")
@@ -707,12 +724,33 @@ def setup_handlers(application: Application) -> None:
 
     application.add_handler(CommandHandler("bulkmenu", latency_wrapper(bulk_menu_command, "bulk_menu_command")))
 
+    def _clear_login_flow(user_id, context):
+        try:
+            LOGIN_PENDING_USERS.discard(user_id)
+        except Exception:
+            pass
+        if context is not None and getattr(context, "user_data", None) is not None:
+            for key in (
+                "awaiting_login_phone",
+                "awaiting_login_code",
+                "awaiting_login_password",
+                "login_phone",
+                "login_client",
+                "login_session_path",
+            ):
+                context.user_data.pop(key, None)
+
     async def _process_login_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        user_id = getattr(update.effective_user, "id", None)
+        if not user_id:
+            return
+
         if not (
             context.user_data.get("awaiting_login_phone")
             or context.user_data.get("awaiting_login_code")
             or context.user_data.get("awaiting_login_password")
         ):
+            _clear_login_flow(user_id, context)
             return
 
         if context.user_data.get("awaiting_login_phone"):
@@ -725,6 +763,7 @@ def setup_handlers(application: Application) -> None:
                 await update.message.reply_text(
                     "Telethon is not installed on the server. Install telethon to use /login."
                 )
+                _clear_login_flow(user_id, context)
                 return
 
             api_id = os.getenv("API_ID") or os.getenv("USERBOT_API_ID")
@@ -733,6 +772,7 @@ def setup_handlers(application: Application) -> None:
                 api_id = int(api_id)
             except Exception:
                 await update.message.reply_text("Configured API_ID is invalid. It must be an integer.")
+                _clear_login_flow(user_id, context)
                 return
 
             session_name = (
@@ -764,6 +804,7 @@ def setup_handlers(application: Application) -> None:
                         f"Telethon session is already authorized and saved to {session_path}. You can now use userbot fallback."
                     )
                     await client.disconnect()
+                    _clear_login_flow(user_id, context)
                     return
             except Exception as exc:
                 logger.exception("/login phone step failed: %s", exc)
@@ -774,6 +815,7 @@ def setup_handlers(application: Application) -> None:
                     await client.disconnect()
                 except Exception:
                     pass
+                _clear_login_flow(user_id, context)
                 return
 
         if context.user_data.get("awaiting_login_code"):
@@ -782,9 +824,9 @@ def setup_handlers(application: Application) -> None:
             phone = context.user_data.get("login_phone")
             if client is None or not phone:
                 await update.message.reply_text(
-                    "Session state lost. Please run /login again to start a fresh login.")
-                context.user_data.pop("awaiting_login_code", None)
-                context.user_data.pop("awaiting_login_phone", None)
+                    "Session state lost. Please run /login again to start a fresh login."
+                )
+                _clear_login_flow(user_id, context)
                 return
 
             try:
@@ -795,11 +837,8 @@ def setup_handlers(application: Application) -> None:
                         "✅ Telethon userbot login successful. Session saved locally."
                         + (f"\nSaved session: {session_path}" if session_path else "")
                     )
-                    context.user_data.pop("awaiting_login_code", None)
-                    context.user_data.pop("login_phone", None)
-                    context.user_data.pop("login_client", None)
-                    context.user_data.pop("login_session_path", None)
                     await client.disconnect()
+                    _clear_login_flow(user_id, context)
                     return
                 else:
                     await update.message.reply_text(
@@ -830,10 +869,7 @@ def setup_handlers(application: Application) -> None:
                     await client.disconnect()
                 except Exception:
                     pass
-                context.user_data.pop("awaiting_login_code", None)
-                context.user_data.pop("awaiting_login_phone", None)
-                context.user_data.pop("login_phone", None)
-                context.user_data.pop("login_client", None)
+                _clear_login_flow(user_id, context)
                 return
 
         if context.user_data.get("awaiting_login_password"):
@@ -843,7 +879,7 @@ def setup_handlers(application: Application) -> None:
                 await update.message.reply_text(
                     "Session state lost. Please run /login again to start a fresh login."
                 )
-                context.user_data.pop("awaiting_login_password", None)
+                _clear_login_flow(user_id, context)
                 return
 
             try:
@@ -868,16 +904,11 @@ def setup_handlers(application: Application) -> None:
                     await client.disconnect()
                 except Exception:
                     pass
-                context.user_data.pop("awaiting_login_password", None)
-                context.user_data.pop("login_phone", None)
-                context.user_data.pop("login_client", None)
+                _clear_login_flow(user_id, context)
             return
 
+        _clear_login_flow(user_id, context)
         return
-
-    login_text_filter = filters.TEXT & ~filters.COMMAND
-
-    application.add_handler(MessageHandler(login_text_filter, latency_wrapper(_process_login_text, "process_login_text")))
 
     # Store handler manager in bot_data for access in other handlers
     application.bot_data["handler_manager"] = handler_manager
