@@ -784,6 +784,19 @@ def setup_handlers(application: Application) -> None:
                         # signatures; fall back to the simple call.
                         sent = await client.send_code_request(phone)
 
+                    # Debug: record when the code was requested and returned hash
+                    try:
+                        logger.info(
+                            "Requested login code for %s; sent_obj=%s",
+                            phone,
+                            repr(sent),
+                        )
+                        sent_time = time.time()
+                        context.user_data["login_code_sent_at"] = sent_time
+                        context.user_data["login_code_sent_repr"] = repr(sent)
+                    except Exception:
+                        pass
+
                     # Store the phone_code_hash if available for later sign_in.
                     try:
                         code_hash = getattr(sent, "phone_code_hash", None)
@@ -903,6 +916,16 @@ def setup_handlers(application: Application) -> None:
                                 except TypeError:
                                     sent = await client.send_code_request(phone)
                                 new_hash = getattr(sent, "phone_code_hash", None)
+                                try:
+                                    logger.info(
+                                        "Resent login code for %s; sent_obj=%s",
+                                        phone,
+                                        repr(sent),
+                                    )
+                                    context.user_data["login_code_sent_at"] = time.time()
+                                    context.user_data["login_code_sent_repr"] = repr(sent)
+                                except Exception:
+                                    pass
                                 if new_hash:
                                     context.user_data["login_code_hash"] = new_hash
                                 context.user_data["login_resend_count"] = resend_count + 1
