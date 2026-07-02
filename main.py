@@ -114,88 +114,6 @@ class AwaitingLoginFilter(filters.MessageFilter):
         except Exception:
             return False
 
-# Conversation states for local Telethon login
-LOGIN_PHONE, LOGIN_CODE = range(2)
-
-# Guard to ensure we don't start multiple concurrent long-pollers
-LONG_POLLER_STARTED = False
-
-# Globals for isolating getUpdates calls (initialized in main)
-GET_UPDATES_SEMAPHORE = None
-GET_UPDATES_BOT = None
-
-# Simple in-memory Prometheus-style counters
-METRICS = {
-    "webhooks_received": 0,
-    "updates_dispatched": 0,
-    "updates_queued": 0,
-    "dispatch_failures": 0,
-    "dispatch_attempts": 0,
-}
-METRICS_LOCK = threading.Lock()
-
-
-async def _dispatch_update_task(u: Update) -> None:
-    """Dispatch an Update in a background task and maintain metrics.
-
-    Adds structured per-update logging (update_id, user) and measures dispatch duration.
-    """
-    update_id = getattr(u, "update_id", None)
-    user_id = None
-    username = None
-    try:
-        if getattr(u, "effective_user", None):
-            user_id = getattr(u.effective_user, "id", None)
-            username = getattr(u.effective_user, "username", None) or getattr(u.effective_user, "first_name", None)
-    except Exception:
-        pass
-
-    start = time.time()
-    try:
-        logger.info(json.dumps({"event": "dispatch.start", "update_id": update_id, "user_id": user_id, "username": username, "type": type(u).__name__}))
-    except Exception:
-        logger.debug("dispatch.start (could not serialize structured log)")
-
-    try:
-        if not BOT_READY.is_set():
-            logger.warning("Dispatch waiting for bot readiness before processing update %s", update_id)
-            await BOT_READY.wait()
-
-        disp = getattr(BOT_APPLICATION, "dispatcher", None)
-        if disp and hasattr(disp, "process_update"):
-            with METRICS_LOCK:
-                METRICS["dispatch_attempts"] += 1
-            await disp.process_update(u)
-            with METRICS_LOCK:
-                METRICS["updates_dispatched"] += 1
-            return
-
-        if hasattr(BOT_APPLICATION, "process_update"):
-            with METRICS_LOCK:
-                METRICS["dispatch_attempts"] += 1
-            await BOT_APPLICATION.process_update(u)
-            with METRICS_LOCK:
-                METRICS["updates_dispatched"] += 1
-            return
-
-        logger.warning("No dispatcher/application.process_update available to dispatch update")
-    except Exception as exc:
-        try:
-            with METRICS_LOCK:
-                METRICS["dispatch_failures"] += 1
-        except Exception:
-            pass
-        try:
-            logger.exception("Error dispatching update %s (user=%s): %s", update_id, user_id, exc)
-        except Exception:
-            logger.exception("Error dispatching update (exception logging failed)")
-    finally:
-        duration = time.time() - start
-        try:
-            logger.info(json.dumps({"event": "dispatch.end", "update_id": update_id, "user_id": user_id, "username": username, "duration_s": round(duration, 3)}))
-        except Exception:
-            logger.debug("dispatch.end (could not serialize structured log)")
-
 
 
 async def check_ffmpeg_available() -> bool:
@@ -785,7 +703,25 @@ def setup_handlers(application: Application) -> None:
             try:
                 await client.connect()
                 if not await client.is_user_authorized():
-                    await client.send_code_request(phone)
+                    # Capture the returned object from send_code_request so we can
+                    # provide the phone_code_hash to sign_in when required by
+                    # certain Telethon/server variants.
+                    try:
+                        sent = await client.send_code_request(phone)
+                    except TypeError:
+                        # Older/newer Telethon variants may have different call
+                        # signatures; fall back to the simple call.
+                        sent = await client.send_code_request(phone)
+
+                    # Store the phone_code_hash if available for later sign_in.
+                    try:
+                        code_hash = getattr(sent, "phone_code_hash", None)
+                    except Exception:
+                        code_hash = None
+
+                    if code_hash:
+                        context.user_data["login_code_hash"] = code_hash
+
                     await update.message.reply_text(
                         "A login code has been sent. Please reply with the code you receive."
                     )
