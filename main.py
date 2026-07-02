@@ -832,7 +832,23 @@ def setup_handlers(application: Application) -> None:
                 return
 
             try:
-                await client.sign_in(phone=phone, code=code)
+                # Use stored phone_code_hash when available to match the
+                # send_code_request response; fall back to alternate
+                # sign_in signatures for different Telethon versions.
+                code_hash = context.user_data.get("login_code_hash")
+                if code_hash:
+                    try:
+                        await client.sign_in(phone=phone, code=code, phone_code_hash=code_hash)
+                    except TypeError:
+                        try:
+                            await client.sign_in(code=code)
+                        except TypeError:
+                            await client.sign_in(phone=phone, code=code)
+                else:
+                    try:
+                        await client.sign_in(code=code)
+                    except TypeError:
+                        await client.sign_in(phone=phone, code=code)
                 if await client.is_user_authorized():
                     session_path = context.user_data.get("login_session_path")
                     await update.message.reply_text(
