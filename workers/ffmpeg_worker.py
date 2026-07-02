@@ -718,6 +718,8 @@ async def handle_job(job: dict):
 
                     # Attempt to upload processed output to configured storage backend
                     upload_success = False
+                    dest = None
+                    get_url = None
                     try:
                         # Only attempt when a storage backend helper is available
                         if get_storage_backend is not None:
@@ -813,6 +815,19 @@ async def handle_job(job: dict):
 
                         bot_api_max_mb = int(os.environ.get("BOT_API_MAX_SIZE_MB", "50"))
                         bot_api_max_bytes = bot_api_max_mb * 1024 * 1024
+
+                        # If we uploaded the output and generated a presigned GET URL, prefer sending the link
+                        # (User → Bot → Process → Upload → Bot sends link). This avoids Bot API upload limits.
+                        if upload_success and get_url and chat_id and bot_token:
+                            try:
+                                async with Bot(token=bot_token) as bot:
+                                    text = f"Your video is ready: {get_url}"
+                                    await bot.send_message(chat_id=chat_id, text=text)
+                                logger.info("Sent presigned URL to chat %s for job %s", chat_id, job_id)
+                                sent = True
+                            except Exception:
+                                logger.exception("Failed to send presigned URL for job %s", job_id)
+                                sent = False
 
                         # If output is large and userbot is enabled, prefer userbot for delivery
                         if chat_id and file_size > bot_api_max_bytes and enable_userbot:

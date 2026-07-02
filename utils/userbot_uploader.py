@@ -42,6 +42,8 @@ async def send_file_via_userbot(
         or os.getenv("api_session")
         or os.getenv("USERBOT_SESSION")
         or os.getenv("userbot_session")
+        or os.getenv("TELETHON_SESSION")
+        or os.getenv("telethon_session")
     )
 
     if not api_id or not api_hash:
@@ -55,7 +57,13 @@ async def send_file_via_userbot(
     if session_str and StringSession is not None:
         client = TelegramClient(StringSession(session_str), api_id, api_hash)
     else:
-        session_name = os.getenv("API_SESSION_NAME") or os.getenv("SESSION_NAME") or os.getenv("USERBOT_SESSION_NAME") or "userbot_session"
+        session_name = (
+            os.getenv("API_SESSION_NAME")
+            or os.getenv("SESSION_NAME")
+            or os.getenv("USERBOT_SESSION_NAME")
+            or os.getenv("TELETHON_SESSION_NAME")
+            or "userbot_session"
+        )
         client = TelegramClient(session_name, api_id, api_hash)
 
     await client.start()

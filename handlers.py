@@ -299,7 +299,26 @@ class EnhancedMediaHandler:
                 status = info.get("status")
                 output = info.get("output")
                 if status == "done" and output:
-                    await self.safe_edit(query, f"✅ Job {job_id} finished. Output: {output}")
+                    display_output = output
+                    try:
+                        # If output looks like a storage key (not an http(s) URL), try to generate a presigned GET URL
+                        if not (str(output).startswith("http://") or str(output).startswith("https://")):
+                            try:
+                                from utils.storage import get_storage_backend
+
+                                backend = await get_storage_backend()
+                            except Exception:
+                                backend = None
+                            if backend is not None:
+                                try:
+                                    presigned = await backend.generate_presigned_get(output)
+                                    if presigned:
+                                        display_output = presigned
+                                except Exception:
+                                    pass
+                    except Exception:
+                        pass
+                    await self.safe_edit(query, f"✅ Job {job_id} finished. Output: {display_output}")
                 elif status == "cancelled":
                     await self.safe_edit(query, f"⏹️ Job {job_id} was cancelled.")
                 else:
