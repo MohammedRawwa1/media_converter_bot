@@ -850,11 +850,18 @@ def setup_handlers(application: Application) -> None:
                     context.user_data.pop("awaiting_login_code", None)
                     return
             except Exception as exc:
+                # Detect Telethon-specific exceptions and give actionable messages
                 try:
-                    from telethon.errors import SessionPasswordNeededError
+                    from telethon.errors import (
+                        SessionPasswordNeededError,
+                        PhoneCodeInvalidError,
+                        PhoneCodeExpiredError,
+                        FloodWaitError,
+                    )
                 except Exception:
-                    SessionPasswordNeededError = None
+                    SessionPasswordNeededError = PhoneCodeInvalidError = PhoneCodeExpiredError = FloodWaitError = None
 
+                # 2FA required
                 if SessionPasswordNeededError and isinstance(exc, SessionPasswordNeededError):
                     await update.message.reply_text(
                         "Two-step verification is enabled. Please reply with your account password."
@@ -863,10 +870,38 @@ def setup_handlers(application: Application) -> None:
                     context.user_data.pop("awaiting_login_code", None)
                     return
 
-                logger.exception("/login code step failed: %s", exc)
-                await update.message.reply_text(
-                    "Failed to complete Telethon login. Please make sure the code is correct and try /login again."
-                )
+                # Specific error responses
+                friendly = None
+                try:
+                    if PhoneCodeInvalidError and isinstance(exc, PhoneCodeInvalidError):
+                        friendly = "The code you entered is invalid. Please request a new code and try again."
+                    elif PhoneCodeExpiredError and isinstance(exc, PhoneCodeExpiredError):
+                        friendly = "The code has expired. Please request a new code with /login and try again."
+                    elif FloodWaitError and isinstance(exc, FloodWaitError):
+                        wait = getattr(exc, 'seconds', None) or getattr(exc, 'timeout', None) or 'a while'
+                        friendly = f"Too many attempts; please wait {wait} seconds before retrying."
+                except Exception:
+                    friendly = None
+
+                # Log detailed exception information for debugging
+                logger.exception("/login code step failed (user=%s): %s", user_id, exc)
+
+                # Reply with a helpful message to admin users; others get a generic prompt
+                try:
+                    if friendly:
+                        await update.message.reply_text(friendly)
+                    else:
+                        if user_id == ADMIN_USER_ID:
+                            await update.message.reply_text(
+                                f"Sign-in error: {exc.__class__.__name__}: {exc}\nSee logs for details."
+                            )
+                        else:
+                            await update.message.reply_text(
+                                "Failed to complete Telethon login. Please make sure the code is correct and try /login again."
+                            )
+                except Exception:
+                    pass
+
                 try:
                     await client.disconnect()
                 except Exception:
