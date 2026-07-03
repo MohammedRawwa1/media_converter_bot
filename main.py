@@ -772,6 +772,23 @@ def setup_handlers(application: Application) -> None:
         if not user_id:
             return
 
+        # Respect any outstanding FloodWait imposed earlier: block retries
+        try:
+            flood_until = context.user_data.get("login_flood_wait_until")
+            if flood_until:
+                now = time.time()
+                if now < flood_until:
+                    remaining = int(flood_until - now)
+                    await update.message.reply_text(
+                        f"Too many login attempts. Please wait {remaining} seconds before retrying."
+                    )
+                    return
+                else:
+                    # expired — clear stored flood info
+                    context.user_data.pop("login_flood_wait_until", None)
+        except Exception:
+            pass
+
         if not (
             context.user_data.get("awaiting_login_phone")
             or context.user_data.get("awaiting_login_code")
@@ -827,7 +844,27 @@ def setup_handlers(application: Application) -> None:
                         except TypeError:
                             # Older Telethon signatures may differ; try fallback.
                             sent = await client.send_code_request(phone)
-                    except Exception:
+                    except Exception as e:
+                        # Detect FloodWaitError specifically to inform the user
+                        try:
+                            from telethon.errors import FloodWaitError
+
+                            if isinstance(e, FloodWaitError):
+                                wait = getattr(e, "seconds", None) or getattr(e, "timeout", None) or 60
+                                until = time.time() + int(wait)
+                                context.user_data["login_flood_wait_until"] = until
+                                await update.message.reply_text(
+                                    f"Too many requests; please wait {int(wait)} seconds before retrying."
+                                )
+                                logger.warning("FloodWait during send_code_request for %s: wait=%s", phone, wait)
+                                try:
+                                    await client.disconnect()
+                                except Exception:
+                                    pass
+                                _clear_login_flow(user_id, context)
+                                return
+                        except Exception:
+                            pass
                         # Final fallback (rare) — attempt raw call once more.
                         sent = await client.send_code_request(phone)
 
@@ -1037,13 +1074,31 @@ def setup_handlers(application: Application) -> None:
                             try:
                                 # Send a fresh code and update stored code hash
                                 try:
-                                    # Don't attempt the deprecated force_sms parameter.
-                                    try:
-                                        sent = await client.send_code_request(phone)
-                                    except TypeError:
-                                        sent = await client.send_code_request(phone)
-                                except Exception:
                                     sent = await client.send_code_request(phone)
+                                except TypeError:
+                                    sent = await client.send_code_request(phone)
+                            except Exception as e2:
+                                try:
+                                    from telethon.errors import FloodWaitError
+
+                                    if isinstance(e2, FloodWaitError):
+                                        wait = getattr(e2, "seconds", None) or getattr(e2, "timeout", None) or 60
+                                        until = time.time() + int(wait)
+                                        context.user_data["login_flood_wait_until"] = until
+                                        friendly = f"Too many requests; please wait {int(wait)} seconds before retrying."
+                                        logger.warning("FloodWait during resend for %s: wait=%s", phone, wait)
+                                        try:
+                                            await client.disconnect()
+                                        except Exception:
+                                            pass
+                                        _clear_login_flow(user_id, context)
+                                        await update.message.reply_text(friendly)
+                                        return
+                                except Exception:
+                                    pass
+                                logger.exception("Failed to resend login code: %s", e2)
+                                friendly = "The code expired and I couldn't request a new one. Try /login again in a few minutes."
+                            else:
                                 new_hash = getattr(sent, "phone_code_hash", None)
                                 try:
                                     try:
@@ -1083,14 +1138,13 @@ def setup_handlers(application: Application) -> None:
                                         friendly = "The code expired — I sent a new code via flash call. Check the incoming call for the fresh code."
                                 except Exception:
                                     pass
-                            except Exception as e2:
-                                logger.exception("Failed to resend login code: %s", e2)
-                                friendly = "The code expired and I couldn't request a new one. Try /login again in a few minutes."
                         else:
                             friendly = "The code has expired. Please request a new code with /login and try again."
                     elif FloodWaitError and isinstance(exc, FloodWaitError):
-                        wait = getattr(exc, 'seconds', None) or getattr(exc, 'timeout', None) or 'a while'
-                        friendly = f"Too many attempts; please wait {wait} seconds before retrying."
+                        wait = getattr(exc, 'seconds', None) or getattr(exc, 'timeout', None) or 60
+                        until = time.time() + int(wait)
+                        context.user_data["login_flood_wait_until"] = until
+                        friendly = f"Too many attempts; please wait {int(wait)} seconds before retrying."
                 except Exception:
                     friendly = None
 
