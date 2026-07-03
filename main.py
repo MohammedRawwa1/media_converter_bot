@@ -821,19 +821,26 @@ def setup_handlers(application: Application) -> None:
                     # provide the phone_code_hash to sign_in when required by
                     # certain Telethon/server variants.
                     try:
-                        sent = await client.send_code_request(phone)
-                    except TypeError:
-                        # Older/newer Telethon variants may have different call
-                        # signatures; fall back to the simple call.
+                        # Prefer forcing SMS delivery where possible to avoid
+                        # app-only code delivery which some users miss.
+                        try:
+                            sent = await client.send_code_request(phone, force_sms=True)
+                        except TypeError:
+                            sent = await client.send_code_request(phone)
+                    except Exception:
+                        # Final fallback to simple call if signature differs
                         sent = await client.send_code_request(phone)
 
                     # Debug: record when the code was requested and returned hash
                     try:
+                        sent_type = getattr(sent, 'type', None)
                         logger.info(
-                            "Requested login code for %s; sent_obj=%s",
+                            "Requested login code for %s; sent_obj=%s sent_type=%s",
                             phone,
                             repr(sent),
+                            repr(sent_type),
                         )
+                        context.user_data['login_code_type'] = repr(sent_type)
                         sent_time = time.time()
                         context.user_data["login_code_sent_at"] = sent_time
                         context.user_data["login_code_sent_repr"] = repr(sent)
@@ -1012,10 +1019,17 @@ def setup_handlers(application: Application) -> None:
                             try:
                                 # Send a fresh code and update stored code hash
                                 try:
-                                    sent = await client.send_code_request(phone)
-                                except TypeError:
+                                    try:
+                                        sent = await client.send_code_request(phone, force_sms=True)
+                                    except TypeError:
+                                        sent = await client.send_code_request(phone)
+                                except Exception:
                                     sent = await client.send_code_request(phone)
                                 new_hash = getattr(sent, "phone_code_hash", None)
+                                try:
+                                    context.user_data['login_code_type'] = repr(getattr(sent, 'type', None))
+                                except Exception:
+                                    pass
                                 try:
                                     logger.info(
                                         "Resent login code for %s; sent_obj=%s",
