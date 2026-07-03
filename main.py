@@ -751,6 +751,87 @@ def setup_handlers(application: Application) -> None:
 
     application.add_handler(CommandHandler("bulkmenu", latency_wrapper(bulk_menu_command, "bulk_menu_command")))
 
+    async def clearflood_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Admin-only: clear FloodWait block for current login flow and optionally resend code.
+
+        Usage: /clearflood [resend]
+        - Without args: clears flood wait for your current login attempt.
+        - With 'resend': attempts a best-effort resend of the login code using stored Telethon client/phone.
+        """
+        try:
+            user_id = update.effective_user.id
+        except Exception:
+            await update.message.reply_text("Could not determine user id")
+            return
+        if ADMIN_USER_ID and user_id != ADMIN_USER_ID:
+            await update.message.reply_text("Unauthorized: admin only")
+            return
+
+        # Clear flood wait state for this user's context
+        try:
+            cleared = False
+            if context.user_data.pop("login_flood_wait_until", None) is not None:
+                cleared = True
+        except Exception:
+            cleared = False
+
+        # Check for optional 'resend' arg
+        args = context.args if hasattr(context, "args") else []
+        want_resend = len(args) > 0 and args[0].lower() in ("resend", "r")
+
+        if not want_resend:
+            await update.message.reply_text("Cleared FloodWait state." if cleared else "No FloodWait state found.")
+            return
+
+        # Attempt best-effort resend using stored Telethon client/session
+        client = context.user_data.get("login_client")
+        phone = context.user_data.get("login_phone")
+        if client is None or not phone:
+            await update.message.reply_text("No active login session found to resend for. Start /login first.")
+            return
+
+        try:
+            try:
+                sent = await client.send_code_request(phone)
+            except TypeError:
+                sent = await client.send_code_request(phone)
+        except Exception as e:
+            try:
+                from telethon.errors import FloodWaitError
+
+                if isinstance(e, FloodWaitError):
+                    wait = getattr(e, "seconds", None) or getattr(e, "timeout", None) or 60
+                    until = time.time() + int(wait)
+                    context.user_data["login_flood_wait_until"] = until
+                    await update.message.reply_text(f"Too many requests; please wait {int(wait)} seconds before retrying.")
+                    logger.warning("FloodWait during clearflood resend for %s: wait=%s", phone, wait)
+                    return
+            except Exception:
+                pass
+            logger.exception("Resend via /clearflood failed: %s", e)
+            await update.message.reply_text("Failed to resend login code. See server logs for details.")
+            return
+
+        # Update stored context and inform admin
+        try:
+            sent_type = getattr(sent, "type", None)
+            sent_type_name = sent_type.__class__.__name__ if sent_type is not None else None
+        except Exception:
+            sent_type_name = None
+        try:
+            context.user_data["login_code_type"] = sent_type_name
+            context.user_data["login_code_sent_at"] = time.time()
+            context.user_data["login_code_sent_repr"] = repr(sent)
+            new_hash = getattr(sent, "phone_code_hash", None)
+            if new_hash:
+                context.user_data["login_code_hash"] = new_hash
+        except Exception:
+            pass
+
+        await update.message.reply_text("Cleared FloodWait and resent login code (best-effort). Check your Telegram app for the code.")
+
+    application.add_handler(CommandHandler("clearflood", latency_wrapper(clearflood_command, "clearflood_command")))
+
     def _clear_login_flow(user_id, context):
         try:
             LOGIN_PENDING_USERS.discard(user_id)
