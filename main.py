@@ -821,26 +821,32 @@ def setup_handlers(application: Application) -> None:
                     # provide the phone_code_hash to sign_in when required by
                     # certain Telethon/server variants.
                     try:
-                        # Prefer forcing SMS delivery where possible to avoid
-                        # app-only code delivery which some users miss.
+                        # Request a login code. Avoid using deprecated `force_sms`.
                         try:
-                            sent = await client.send_code_request(phone, force_sms=True)
+                            sent = await client.send_code_request(phone)
                         except TypeError:
+                            # Older Telethon signatures may differ; try fallback.
                             sent = await client.send_code_request(phone)
                     except Exception:
-                        # Final fallback to simple call if signature differs
+                        # Final fallback (rare) — attempt raw call once more.
                         sent = await client.send_code_request(phone)
 
                     # Debug: record when the code was requested and returned hash
                     try:
-                        sent_type = getattr(sent, 'type', None)
+                        sent_type = getattr(sent, "type", None)
+                        # Determine a simple human-friendly type name
+                        try:
+                            sent_type_name = sent_type.__class__.__name__ if sent_type is not None else None
+                        except Exception:
+                            sent_type_name = repr(sent_type)
+
                         logger.info(
                             "Requested login code for %s; sent_obj=%s sent_type=%s",
                             phone,
                             repr(sent),
-                            repr(sent_type),
+                            sent_type_name,
                         )
-                        context.user_data['login_code_type'] = repr(sent_type)
+                        context.user_data["login_code_type"] = sent_type_name
                         sent_time = time.time()
                         context.user_data["login_code_sent_at"] = sent_time
                         context.user_data["login_code_sent_repr"] = repr(sent)
@@ -856,9 +862,21 @@ def setup_handlers(application: Application) -> None:
                     if code_hash:
                         context.user_data["login_code_hash"] = code_hash
 
-                    await update.message.reply_text(
-                        "A login code has been sent. Please reply with the code you receive."
-                    )
+                    # Inform the user where the code was delivered (app, SMS, flash call)
+                    try:
+                        st = context.user_data.get("login_code_type")
+                        if st and "App" in st:
+                            user_msg = "A login code was sent to your Telegram app. Open your Telegram app or desktop client and reply with the code."
+                        elif st and ("Sms" in st or "SMS" in st):
+                            user_msg = "A login code was sent via SMS. Reply with the code you receive by SMS."
+                        elif st and "Flash" in st:
+                            user_msg = "A login code was sent via flash call. Check the incoming call for the code and reply with it."
+                        else:
+                            user_msg = "A login code has been sent. Please reply with the code you receive."
+                    except Exception:
+                        user_msg = "A login code has been sent. Please reply with the code you receive."
+
+                    await update.message.reply_text(user_msg)
                     context.user_data["awaiting_login_code"] = True
                     context.user_data["login_phone"] = phone
                     context.user_data["login_client"] = client
@@ -1019,22 +1037,29 @@ def setup_handlers(application: Application) -> None:
                             try:
                                 # Send a fresh code and update stored code hash
                                 try:
+                                    # Don't attempt the deprecated force_sms parameter.
                                     try:
-                                        sent = await client.send_code_request(phone, force_sms=True)
+                                        sent = await client.send_code_request(phone)
                                     except TypeError:
                                         sent = await client.send_code_request(phone)
                                 except Exception:
                                     sent = await client.send_code_request(phone)
                                 new_hash = getattr(sent, "phone_code_hash", None)
                                 try:
-                                    context.user_data['login_code_type'] = repr(getattr(sent, 'type', None))
+                                    try:
+                                        sent_type = getattr(sent, "type", None)
+                                        sent_type_name = sent_type.__class__.__name__ if sent_type is not None else None
+                                    except Exception:
+                                        sent_type_name = repr(getattr(sent, "type", None))
+                                    context.user_data["login_code_type"] = sent_type_name
                                 except Exception:
                                     pass
                                 try:
                                     logger.info(
-                                        "Resent login code for %s; sent_obj=%s",
+                                        "Resent login code for %s; sent_obj=%s sent_type=%s",
                                         phone,
                                         repr(sent),
+                                        context.user_data.get("login_code_type"),
                                     )
                                     context.user_data["login_code_sent_at"] = time.time()
                                     context.user_data["login_code_sent_repr"] = repr(sent)
@@ -1047,7 +1072,17 @@ def setup_handlers(application: Application) -> None:
                                 context.user_data["login_client"] = client
                                 context.user_data["login_phone"] = phone
                                 context.user_data["login_session_path"] = context.user_data.get("login_session_path")
-                                friendly = "The code expired — I sent a new code. Please reply with the fresh code you receive."
+                                # After resending, instruct user based on delivery method if known
+                                try:
+                                    st = context.user_data.get("login_code_type")
+                                    if st and "App" in st:
+                                        friendly = "The code expired — I sent a new code to your Telegram app. Open your Telegram app or desktop client and reply with the fresh code."
+                                    elif st and ("Sms" in st or "SMS" in st):
+                                        friendly = "The code expired — I sent a new code via SMS. Reply with the fresh SMS code."
+                                    elif st and "Flash" in st:
+                                        friendly = "The code expired — I sent a new code via flash call. Check the incoming call for the fresh code."
+                                except Exception:
+                                    pass
                             except Exception as e2:
                                 logger.exception("Failed to resend login code: %s", e2)
                                 friendly = "The code expired and I couldn't request a new one. Try /login again in a few minutes."
