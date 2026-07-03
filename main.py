@@ -500,6 +500,49 @@ def setup_handlers(application: Application) -> None:
     application.add_handler(CommandHandler("help", latency_wrapper(help_command, "help_command")))
     application.add_handler(CommandHandler("cancel", latency_wrapper(cancel_command, "cancel_command")))
 
+    async def loginstatus_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Admin-only diagnostic: show current login flow context (masked)."""
+        try:
+            user_id = update.effective_user.id
+        except Exception:
+            await update.message.reply_text("Could not determine user id")
+            return
+        if user_id != ADMIN_USER_ID:
+            await update.message.reply_text("Unauthorized")
+            return
+
+        data = context.user_data
+        sent_at = data.get("login_code_sent_at")
+        sent_repr = data.get("login_code_sent_repr")
+        resend_count = data.get("login_resend_count", 0)
+        code_hash = data.get("login_code_hash")
+        session_path = data.get("login_session_path")
+        awaiting = {
+            "phone": bool(data.get("awaiting_login_phone")),
+            "code": bool(data.get("awaiting_login_code")),
+            "password": bool(data.get("awaiting_login_password")),
+        }
+        # Mask code_hash
+        masked_hash = None
+        try:
+            if code_hash:
+                s = str(code_hash)
+                masked_hash = s[:4] + "..." + s[-4:]
+        except Exception:
+            masked_hash = None
+
+        lines = [
+            f"awaiting: {awaiting}",
+            f"sent_at: {sent_at}",
+            f"resend_count: {resend_count}",
+            f"code_hash: {masked_hash}",
+            f"sent_repr: {str(sent_repr)[:200] if sent_repr else None}",
+            f"session_path: {session_path}",
+        ]
+        await update.message.reply_text("\n".join(lines))
+
+    application.add_handler(CommandHandler("loginstatus", latency_wrapper(loginstatus_command, "loginstatus_command")))
+
     # Media file handlers (videos, audio, documents)
     # Build the media filter defensively to support multiple PTB versions.
     # Build a resilient media filter using a shared helper (supports
@@ -845,6 +888,35 @@ def setup_handlers(application: Application) -> None:
                 return
 
             try:
+                # Normalize code input (handle Unicode digits and stray chars)
+                trans_digits = str.maketrans(
+                    {
+                        "٠": "0",
+                        "١": "1",
+                        "٢": "2",
+                        "٣": "3",
+                        "٤": "4",
+                        "٥": "5",
+                        "٦": "6",
+                        "٧": "7",
+                        "٨": "8",
+                        "٩": "9",
+                        "۰": "0",
+                        "۱": "1",
+                        "۲": "2",
+                        "۳": "3",
+                        "۴": "4",
+                        "۵": "5",
+                        "۶": "6",
+                        "۷": "7",
+                        "۸": "8",
+                        "۹": "9",
+                    }
+                )
+                norm_code = (code or "").translate(trans_digits)
+                # Remove any non-digit characters
+                norm_code = "".join([c for c in norm_code if c.isdigit()])
+
                 # Debug: record code usage context before attempting sign-in
                 try:
                     entered_at = time.time()
@@ -852,7 +924,7 @@ def setup_handlers(application: Application) -> None:
                     resend_count = context.user_data.get("login_resend_count", 0)
                     code_hash_preview = str(context.user_data.get("login_code_hash"))
                     client_session = getattr(getattr(client, 'session', None), 'filename', None) or repr(getattr(client, 'session', None))
-                    masked_code = (code[-2:].rjust(2, "*") if code else "")
+                    masked_code = (norm_code[-2:].rjust(2, "*") if norm_code else "")
                     logger.info(
                         "Attempting sign_in: user=%s entered_at=%s sent_at=%s delta=%.3fs resend_count=%s code_hash=%s session=%s code_tail=%s",
                         user_id,
@@ -864,6 +936,12 @@ def setup_handlers(application: Application) -> None:
                         client_session,
                         masked_code,
                     )
+                    # Admin-only: log the full normalized code for debugging
+                    try:
+                        if user_id == ADMIN_USER_ID:
+                            logger.info("Admin sign-in code (normalized) for user=%s: %s", user_id, norm_code)
+                    except Exception:
+                        pass
                 except Exception:
                     pass
 
@@ -873,17 +951,17 @@ def setup_handlers(application: Application) -> None:
                 code_hash = context.user_data.get("login_code_hash")
                 if code_hash:
                     try:
-                        await client.sign_in(phone=phone, code=code, phone_code_hash=code_hash)
+                        await client.sign_in(phone=phone, code=norm_code, phone_code_hash=code_hash)
                     except TypeError:
                         try:
-                            await client.sign_in(code=code)
+                            await client.sign_in(code=norm_code)
                         except TypeError:
-                            await client.sign_in(phone=phone, code=code)
+                            await client.sign_in(phone=phone, code=norm_code)
                 else:
                     try:
-                        await client.sign_in(code=code)
+                        await client.sign_in(code=norm_code)
                     except TypeError:
-                        await client.sign_in(phone=phone, code=code)
+                        await client.sign_in(phone=phone, code=norm_code)
                 if await client.is_user_authorized():
                     session_path = context.user_data.get("login_session_path")
                     await update.message.reply_text(
