@@ -1088,34 +1088,54 @@ def setup_handlers(application: Application) -> None:
                 except Exception:
                     pass
 
-                # Add a small delay before sign_in to account for message delivery/processing latency.
-                # This helps when network conditions or server processing add overhead.
-                await asyncio.sleep(0.5)
+                # Add a significant delay before sign_in to absorb network latency,
+                # especially during DC migration. Telegram's code validity window is
+                # measured from the backend RPC time, not from when the user sees the code.
+                # Without this delay, codes can expire in-flight.
+                await asyncio.sleep(1.5)
 
                 # Use stored phone_code_hash when available to match the
                 # send_code_request response. If the hash is stale (e.g. after
                 # DC migration), try without it before giving up.
                 code_hash = context.user_data.get("login_code_hash")
 
-                if code_hash:
+                # Retry sign_in up to 3 times with brief pauses, as codes can expire
+                # in-flight due to network latency and DC migration delays.
+                sign_in_attempts = 0
+                last_error = None
+                while sign_in_attempts < 3:
+                    sign_in_attempts += 1
                     try:
-                        await client.sign_in(phone=phone, code=norm_code, phone_code_hash=code_hash)
-                    except ValueError as ve:
-                        # Hash may be stale after DC migration and Telethon raises ValueError.
-                        # Try without hash as fallback.
-                        if "phone_code_hash" in str(ve):
+                        if code_hash:
+                            try:
+                                await client.sign_in(phone=phone, code=norm_code, phone_code_hash=code_hash)
+                            except ValueError as ve:
+                                # Hash may be stale after DC migration and Telethon raises ValueError.
+                                # Try without hash as fallback.
+                                if "phone_code_hash" in str(ve):
+                                    try:
+                                        await client.sign_in(code=norm_code)
+                                    except TypeError:
+                                        await client.sign_in(phone=phone, code=norm_code)
+                                else:
+                                    raise
+                        else:
+                            # No stored hash (e.g. resumed session, older flow).
                             try:
                                 await client.sign_in(code=norm_code)
                             except TypeError:
                                 await client.sign_in(phone=phone, code=norm_code)
+                        # Success — break the retry loop
+                        break
+                    except Exception as e:
+                        last_error = e
+                        # If this was not the last attempt, wait briefly and retry
+                        if sign_in_attempts < 3:
+                            logger.debug("Sign-in attempt %d failed; retrying in 0.3s: %s", sign_in_attempts, e)
+                            await asyncio.sleep(0.3)
                         else:
+                            # Last attempt failed; re-raise the error
                             raise
-                else:
-                    # No stored hash (e.g. resumed session, older flow).
-                    try:
-                        await client.sign_in(code=norm_code)
-                    except TypeError:
-                        await client.sign_in(phone=phone, code=norm_code)
 
                 if await client.is_user_authorized():
                     session_path = context.user_data.get("login_session_path")
@@ -1163,14 +1183,19 @@ def setup_handlers(application: Application) -> None:
                         # Code has expired. Do NOT auto-resend, as this creates an infinite
                         # loop when the code validity window is very short (< 10s).
                         # With 2FA enabled, Telegram is especially strict about code timing.
-                        # The expiry window is controlled by Telegram's server, not the bot.
-                        # Solution: Copy code immediately when received and paste quickly.
+                        # The expiry window is controlled by Telegram's server-side security policy.
+                        # Even with the retry logic, if Telegram's window is < 5 seconds from the RPC request time,
+                        # the code may expire in-flight before reaching the server.
                         friendly = (
-                            "🔐 Your login code expired (Telegram's 2FA security window is very short).\n"
-                            "Please try /login again and enter the code as soon as you receive it.\n"
-                            "Tip: Copy the code the moment it arrives — you have ~5-7 seconds."
+                            "🔐 Your login code expired (Telegram's 2FA security policy has an extremely short code validity window).\n\n"
+                            "ℹ️ We attempted the code 3 times with brief retries, but Telegram's server rejected it as expired.\n"
+                            "This suggests Telegram's security setting on your account has a window of ~4-5 seconds from the backend RPC time.\n\n"
+                            "Options:\n"
+                            "• Try /login again (make sure your internet is stable)\n"
+                            "• Temporarily disable 2FA in Telegram Settings to test if that increases the code window\n"
+                            "• Contact Telegram support about your account's security policy"
                         )
-                        logger.warning("PhoneCodeExpiredError for %s; likely 2FA/account security setting", phone)
+                        logger.warning("PhoneCodeExpiredError after 3 sign_in attempts for %s; account has extremely strict code window", phone)
                     elif FloodWaitError and isinstance(exc, FloodWaitError):
                         wait = getattr(exc, 'seconds', None) or getattr(exc, 'timeout', None) or 60
                         until = time.time() + int(wait)
