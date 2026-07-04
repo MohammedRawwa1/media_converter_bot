@@ -1156,113 +1156,11 @@ def setup_handlers(application: Application) -> None:
                     if PhoneCodeInvalidError and isinstance(exc, PhoneCodeInvalidError):
                         friendly = "The code you entered is invalid. Please request a new code and try again."
                     elif PhoneCodeExpiredError and isinstance(exc, PhoneCodeExpiredError):
-                        # Attempt an automatic resend with a small retry cap to
-                        # avoid triggering flood limits.
-                        resend_count = context.user_data.get("login_resend_count", 0)
-                        last_send_at = context.user_data.get("login_code_sent_at", 0)
-                        now = time.time()
-                        
-                        # Guard: require at least 2 seconds between resends to prevent
-                        # rapid-fire resend loops (which would flood Telegram and trigger
-                        # aggressive rate limits). The real flood protection is the 3-attempt cap.
-                        if now - last_send_at < 2:
-                            friendly = f"Code expired too quickly. Please wait a moment before your next attempt."
-                            logger.warning("Resend blocked for %s: too fast (%.1fs since last send)", phone, now - last_send_at)
-                        elif resend_count < 3:
-                            try:
-                                # Send a fresh code and update stored code hash
-                                try:
-                                    sent = await client.send_code_request(phone)
-                                except TypeError:
-                                    sent = await client.send_code_request(phone)
-                            except Exception as e2:
-                                try:
-                                    from telethon.errors import FloodWaitError
-
-                                    if isinstance(e2, FloodWaitError):
-                                        wait = getattr(e2, "seconds", None) or getattr(e2, "timeout", None) or 60
-                                        until = time.time() + int(wait)
-                                        context.user_data["login_flood_wait_until"] = until
-                                        friendly = f"Too many requests; please wait {int(wait)} seconds before retrying."
-                                        logger.warning("FloodWait during resend for %s: wait=%s", phone, wait)
-                                        try:
-                                            await client.disconnect()
-                                        except Exception:
-                                            pass
-                                        _clear_login_flow(user_id, context)
-                                        await update.message.reply_text(friendly)
-                                        return
-                                except Exception:
-                                    pass
-                                logger.exception("Failed to resend login code: %s", e2)
-                                friendly = "The code expired and I couldn't request a new one. Try /login again in a few minutes."
-                            else:
-                                new_hash = getattr(sent, "phone_code_hash", None)
-                                try:
-                                    try:
-                                        sent_type = getattr(sent, "type", None)
-                                        sent_type_name = sent_type.__class__.__name__ if sent_type is not None else None
-                                    except Exception:
-                                        sent_type_name = repr(getattr(sent, "type", None))
-                                    context.user_data["login_code_type"] = sent_type_name
-                                except Exception:
-                                    pass
-                                try:
-                                    logger.info(
-                                        "Resent login code for %s; sent_obj=%s sent_type=%s",
-                                        phone,
-                                        repr(sent),
-                                        context.user_data.get("login_code_type"),
-                                    )
-                                    context.user_data["login_code_sent_at"] = time.time()
-                                    context.user_data["login_code_sent_repr"] = repr(sent)
-                                except Exception:
-                                    pass
-                                if new_hash:
-                                    context.user_data["login_code_hash"] = new_hash
-
-                                # Explicitly re-affirm the login flow state rather than
-                                # relying on the fact that nothing has cleared it yet.
-                                # This keeps the user routed into _process_login_text
-                                # (via LOGIN_PENDING_USERS) and keeps the flow on the
-                                # "awaiting code" step, regardless of what else may run
-                                # between now and their next message.
-                                context.user_data["login_resend_count"] = resend_count + 1
-                                context.user_data["awaiting_login_code"] = True
-                                context.user_data["login_client"] = client
-                                context.user_data["login_phone"] = phone
-                                # (login_session_path is already set from the phone step;
-                                # no need to reassign it to itself.)
-                                try:
-                                    LOGIN_PENDING_USERS.add(user_id)
-                                except Exception:
-                                    logger.debug("Could not re-add user %s to LOGIN_PENDING_USERS", user_id)
-
-                                # After resending, instruct user based on delivery method if known
-                                try:
-                                    st = context.user_data.get("login_code_type")
-                                    if st and "App" in st:
-                                        friendly = "The code expired — I sent a new code to your Telegram app. Open your Telegram app or desktop client and reply with the fresh code."
-                                    elif st and ("Sms" in st or "SMS" in st):
-                                        friendly = "The code expired — I sent a new code via SMS. Reply with the fresh SMS code."
-                                    elif st and "Flash" in st:
-                                        friendly = "The code expired — I sent a new code via flash call. Check the incoming call for the fresh code."
-                                except Exception:
-                                    pass
-                                # Resend succeeded — reply and return early to preserve awaiting_login_code state
-                                try:
-                                    await update.message.reply_text(friendly or "The code expired. A fresh code was sent. Please reply with it.")
-                                except Exception:
-                                    pass
-                                return
-                        else:
-                            friendly = "The code has expired. Please request a new code with /login and try again."
-                            logger.warning("Resend cap reached for %s (resend_count=%s); closing login flow", phone, resend_count)
-                            try:
-                                await client.disconnect()
-                            except Exception:
-                                pass
-                            _clear_login_flow(user_id, context)
+                        # Code has expired. Do NOT auto-resend, as this creates an infinite
+                        # loop when the code validity window is very short (< 10s).
+                        # Instead, inform the user and require explicit /login to proceed.
+                        friendly = "The login code has expired. Please use /login again to request a fresh code."
+                        logger.warning("PhoneCodeExpiredError for %s; requiring manual /login retry", phone)
                     elif FloodWaitError and isinstance(exc, FloodWaitError):
                         wait = getattr(exc, 'seconds', None) or getattr(exc, 'timeout', None) or 60
                         until = time.time() + int(wait)
