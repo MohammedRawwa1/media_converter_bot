@@ -1162,11 +1162,11 @@ def setup_handlers(application: Application) -> None:
                         last_send_at = context.user_data.get("login_code_sent_at", 0)
                         now = time.time()
                         
-                        # Guard: require at least 8 seconds between resends to prevent
+                        # Guard: require at least 2 seconds between resends to prevent
                         # rapid-fire resend loops (which would flood Telegram and trigger
-                        # aggressive rate limits). If too fast, inform user without resending.
-                        if now - last_send_at < 8:
-                            friendly = f"Code expired, but it's too soon to resend (wait ~{int(8 - (now - last_send_at))}s). This usually means the code window is very short. Try again after waiting a moment."
+                        # aggressive rate limits). The real flood protection is the 3-attempt cap.
+                        if now - last_send_at < 2:
+                            friendly = f"Code expired too quickly. Please wait a moment before your next attempt."
                             logger.warning("Resend blocked for %s: too fast (%.1fs since last send)", phone, now - last_send_at)
                         elif resend_count < 3:
                             try:
