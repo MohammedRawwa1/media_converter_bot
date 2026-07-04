@@ -1092,14 +1092,20 @@ def setup_handlers(application: Application) -> None:
                 # send_code_request response; fall back to alternate
                 # sign_in signatures for different Telethon versions.
                 code_hash = context.user_data.get("login_code_hash")
+                sign_in_error = None
                 if code_hash:
                     try:
                         await client.sign_in(phone=phone, code=norm_code, phone_code_hash=code_hash)
-                    except TypeError:
+                    except Exception as e_hash:
+                        # Hash may be stale (e.g., after DC migration); try without hash
+                        sign_in_error = e_hash
                         try:
                             await client.sign_in(code=norm_code)
                         except TypeError:
-                            await client.sign_in(phone=phone, code=norm_code)
+                            try:
+                                await client.sign_in(phone=phone, code=norm_code)
+                            except Exception:
+                                raise sign_in_error
                 else:
                     try:
                         await client.sign_in(code=norm_code)
@@ -1219,6 +1225,12 @@ def setup_handlers(application: Application) -> None:
                                         friendly = "The code expired — I sent a new code via flash call. Check the incoming call for the fresh code."
                                 except Exception:
                                     pass
+                                # Resend succeeded — reply and return early to preserve awaiting_login_code state
+                                try:
+                                    await update.message.reply_text(friendly or "The code expired. A fresh code was sent. Please reply with it.")
+                                except Exception:
+                                    pass
+                                return
                         else:
                             friendly = "The code has expired. Please request a new code with /login and try again."
                     elif FloodWaitError and isinstance(exc, FloodWaitError):
