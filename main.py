@@ -1088,6 +1088,10 @@ def setup_handlers(application: Application) -> None:
                 except Exception:
                     pass
 
+                # Add a small delay before sign_in to account for message delivery/processing latency.
+                # This helps when network conditions or server processing add overhead.
+                await asyncio.sleep(0.5)
+
                 # Use stored phone_code_hash when available to match the
                 # send_code_request response. If the hash is stale (e.g. after
                 # DC migration), try without it before giving up.
@@ -1158,9 +1162,15 @@ def setup_handlers(application: Application) -> None:
                     elif PhoneCodeExpiredError and isinstance(exc, PhoneCodeExpiredError):
                         # Code has expired. Do NOT auto-resend, as this creates an infinite
                         # loop when the code validity window is very short (< 10s).
-                        # Instead, inform the user and require explicit /login to proceed.
-                        friendly = "The login code has expired. Please use /login again to request a fresh code."
-                        logger.warning("PhoneCodeExpiredError for %s; requiring manual /login retry", phone)
+                        # With 2FA enabled, Telegram is especially strict about code timing.
+                        # The expiry window is controlled by Telegram's server, not the bot.
+                        # Solution: Copy code immediately when received and paste quickly.
+                        friendly = (
+                            "🔐 Your login code expired (Telegram's 2FA security window is very short).\n"
+                            "Please try /login again and enter the code as soon as you receive it.\n"
+                            "Tip: Copy the code the moment it arrives — you have ~5-7 seconds."
+                        )
+                        logger.warning("PhoneCodeExpiredError for %s; likely 2FA/account security setting", phone)
                     elif FloodWaitError and isinstance(exc, FloodWaitError):
                         wait = getattr(exc, 'seconds', None) or getattr(exc, 'timeout', None) or 60
                         until = time.time() + int(wait)
