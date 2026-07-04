@@ -1088,11 +1088,9 @@ def setup_handlers(application: Application) -> None:
                 except Exception:
                     pass
 
-                # Add a significant delay before sign_in to absorb network latency,
-                # especially during DC migration. Telegram's code validity window is
-                # measured from the backend RPC time, not from when the user sees the code.
-                # Without this delay, codes can expire in-flight.
-                await asyncio.sleep(1.5)
+                # Do NOT add pre-wait delay; attempt sign_in immediately to minimize
+                # time lost. Telegram's code validity window appears to be < 4 seconds
+                # from send time. Every millisecond counts.
 
                 # Use stored phone_code_hash when available to match the
                 # send_code_request response. If the hash is stale (e.g. after
@@ -1131,8 +1129,8 @@ def setup_handlers(application: Application) -> None:
                         last_error = e
                         # If this was not the last attempt, wait briefly and retry
                         if sign_in_attempts < 3:
-                            logger.debug("Sign-in attempt %d failed; retrying in 0.3s: %s", sign_in_attempts, e)
-                            await asyncio.sleep(0.3)
+                            logger.debug("Sign-in attempt %d failed; retrying in 0.1s: %s", sign_in_attempts, e)
+                            await asyncio.sleep(0.1)
                         else:
                             # Last attempt failed; re-raise the error
                             raise
