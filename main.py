@@ -1092,25 +1092,24 @@ def setup_handlers(application: Application) -> None:
                 # send_code_request response; fall back to alternate
                 # sign_in signatures for different Telethon versions.
                 code_hash = context.user_data.get("login_code_hash")
-                sign_in_error = None
+
                 if code_hash:
-                    try:
-                        await client.sign_in(phone=phone, code=norm_code, phone_code_hash=code_hash)
-                    except Exception as e_hash:
-                        # Hash may be stale (e.g., after DC migration); try without hash
-                        sign_in_error = e_hash
-                        try:
-                            await client.sign_in(code=norm_code)
-                        except TypeError:
-                            try:
-                                await client.sign_in(phone=phone, code=norm_code)
-                            except Exception:
-                                raise sign_in_error
+                    # We have a hash from the original send_code_request —
+                    # use it directly. Do NOT fall back to a hash-less
+                    # sign_in on failure: Telethon will raise
+                    # ValueError('You also need to provide a
+                    # phone_code_hash.') instead of the real underlying
+                    # error (e.g. PhoneCodeExpiredError), which breaks the
+                    # specific error handling below. Let the real exception
+                    # propagate instead.
+                    await client.sign_in(phone=phone, code=norm_code, phone_code_hash=code_hash)
                 else:
+                    # No stored hash (e.g. resumed session, older flow).
                     try:
                         await client.sign_in(code=norm_code)
                     except TypeError:
                         await client.sign_in(phone=phone, code=norm_code)
+
                 if await client.is_user_authorized():
                     session_path = context.user_data.get("login_session_path")
                     await update.message.reply_text(
@@ -1209,11 +1208,24 @@ def setup_handlers(application: Application) -> None:
                                     pass
                                 if new_hash:
                                     context.user_data["login_code_hash"] = new_hash
+
+                                # Explicitly re-affirm the login flow state rather than
+                                # relying on the fact that nothing has cleared it yet.
+                                # This keeps the user routed into _process_login_text
+                                # (via LOGIN_PENDING_USERS) and keeps the flow on the
+                                # "awaiting code" step, regardless of what else may run
+                                # between now and their next message.
                                 context.user_data["login_resend_count"] = resend_count + 1
                                 context.user_data["awaiting_login_code"] = True
                                 context.user_data["login_client"] = client
                                 context.user_data["login_phone"] = phone
-                                context.user_data["login_session_path"] = context.user_data.get("login_session_path")
+                                # (login_session_path is already set from the phone step;
+                                # no need to reassign it to itself.)
+                                try:
+                                    LOGIN_PENDING_USERS.add(user_id)
+                                except Exception:
+                                    logger.debug("Could not re-add user %s to LOGIN_PENDING_USERS", user_id)
+
                                 # After resending, instruct user based on delivery method if known
                                 try:
                                     st = context.user_data.get("login_code_type")
