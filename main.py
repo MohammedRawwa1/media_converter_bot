@@ -1089,26 +1089,23 @@ def setup_handlers(application: Application) -> None:
                     pass
 
                 # Use stored phone_code_hash when available to match the
-                # send_code_request response. If the hash fails (e.g. after
-                # DC migration), fall back to hash-less sign_in before
-                # propagating PhoneCodeExpiredError.
+                # send_code_request response. If the hash is stale (e.g. after
+                # DC migration), try without it before giving up.
                 code_hash = context.user_data.get("login_code_hash")
-                hash_error = None
 
                 if code_hash:
                     try:
                         await client.sign_in(phone=phone, code=norm_code, phone_code_hash=code_hash)
-                    except Exception as e:
-                        # Hash may be stale after DC migration; save error and try without hash
-                        hash_error = e
-                        try:
-                            await client.sign_in(code=norm_code)
-                        except TypeError:
+                    except ValueError as ve:
+                        # Hash may be stale after DC migration and Telethon raises ValueError.
+                        # Try without hash as fallback.
+                        if "phone_code_hash" in str(ve):
                             try:
+                                await client.sign_in(code=norm_code)
+                            except TypeError:
                                 await client.sign_in(phone=phone, code=norm_code)
-                            except Exception:
-                                # Both attempts failed; re-raise the original hash error
-                                raise hash_error
+                        else:
+                            raise
                 else:
                     # No stored hash (e.g. resumed session, older flow).
                     try:
