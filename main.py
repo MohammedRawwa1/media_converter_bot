@@ -1089,20 +1089,26 @@ def setup_handlers(application: Application) -> None:
                     pass
 
                 # Use stored phone_code_hash when available to match the
-                # send_code_request response; fall back to alternate
-                # sign_in signatures for different Telethon versions.
+                # send_code_request response. If the hash fails (e.g. after
+                # DC migration), fall back to hash-less sign_in before
+                # propagating PhoneCodeExpiredError.
                 code_hash = context.user_data.get("login_code_hash")
+                hash_error = None
 
                 if code_hash:
-                    # We have a hash from the original send_code_request —
-                    # use it directly. Do NOT fall back to a hash-less
-                    # sign_in on failure: Telethon will raise
-                    # ValueError('You also need to provide a
-                    # phone_code_hash.') instead of the real underlying
-                    # error (e.g. PhoneCodeExpiredError), which breaks the
-                    # specific error handling below. Let the real exception
-                    # propagate instead.
-                    await client.sign_in(phone=phone, code=norm_code, phone_code_hash=code_hash)
+                    try:
+                        await client.sign_in(phone=phone, code=norm_code, phone_code_hash=code_hash)
+                    except Exception as e:
+                        # Hash may be stale after DC migration; save error and try without hash
+                        hash_error = e
+                        try:
+                            await client.sign_in(code=norm_code)
+                        except TypeError:
+                            try:
+                                await client.sign_in(phone=phone, code=norm_code)
+                            except Exception:
+                                # Both attempts failed; re-raise the original hash error
+                                raise hash_error
                 else:
                     # No stored hash (e.g. resumed session, older flow).
                     try:
@@ -1156,7 +1162,16 @@ def setup_handlers(application: Application) -> None:
                         # Attempt an automatic resend with a small retry cap to
                         # avoid triggering flood limits.
                         resend_count = context.user_data.get("login_resend_count", 0)
-                        if resend_count < 3:
+                        last_send_at = context.user_data.get("login_code_sent_at", 0)
+                        now = time.time()
+                        
+                        # Guard: require at least 8 seconds between resends to prevent
+                        # rapid-fire resend loops (which would flood Telegram and trigger
+                        # aggressive rate limits). If too fast, inform user without resending.
+                        if now - last_send_at < 8:
+                            friendly = f"Code expired, but it's too soon to resend (wait ~{int(8 - (now - last_send_at))}s). This usually means the code window is very short. Try again after waiting a moment."
+                            logger.warning("Resend blocked for %s: too fast (%.1fs since last send)", phone, now - last_send_at)
+                        elif resend_count < 3:
                             try:
                                 # Send a fresh code and update stored code hash
                                 try:
@@ -1245,6 +1260,12 @@ def setup_handlers(application: Application) -> None:
                                 return
                         else:
                             friendly = "The code has expired. Please request a new code with /login and try again."
+                            logger.warning("Resend cap reached for %s (resend_count=%s); closing login flow", phone, resend_count)
+                            try:
+                                await client.disconnect()
+                            except Exception:
+                                pass
+                            _clear_login_flow(user_id, context)
                     elif FloodWaitError and isinstance(exc, FloodWaitError):
                         wait = getattr(exc, 'seconds', None) or getattr(exc, 'timeout', None) or 60
                         until = time.time() + int(wait)
