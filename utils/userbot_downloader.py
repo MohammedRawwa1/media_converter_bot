@@ -168,7 +168,7 @@ async def _download_with_pyrogram(
 ) -> bool:
     """Download using Pyrogram client (session string fallback)."""
     if PyrogramClient is None:
-        logger.debug("Pyrogram not installed; skipping Pyrogram download")
+        logger.info("userbot: Pyrogram not installed; skipping")
         return False
 
     from utils.telethon_session import build_pyrogram_client, get_userbot_credentials
@@ -176,8 +176,16 @@ async def _download_with_pyrogram(
 
     client = build_pyrogram_client(api_id, api_hash)
     if client is None:
-        logger.debug("Pyrogram session string not configured")
+        logger.info("userbot: Pyrogram session string not configured")
         return False
+
+    # Ensure dest dir exists
+    _dest_dir = os.path.dirname(dest_path)
+    if _dest_dir:
+        try:
+            os.makedirs(_dest_dir, exist_ok=True)
+        except Exception as e:
+            logger.warning("userbot: could not create dest dir %s: %s", _dest_dir, e)
 
     try:
         await client.start()
@@ -202,51 +210,120 @@ async def _download_with_pyrogram(
         _found_msg = False
         for _peer in _candidates:
             try:
-                logger.debug("userbot: Pyrogram trying get_messages(peer=%s, msg=%s)", _peer, message_id)
+                logger.info(
+                    "userbot: Pyrogram trying get_messages(peer=%s, msg=%s)",
+                    _peer, message_id,
+                )
                 messages = await client.get_messages(_peer, message_ids=[message_id])
 
                 if messages:
                     msg = messages[0] if isinstance(messages, list) else messages
                     if msg:
                         _found_msg = True
+                        logger.info(
+                            "userbot: Pyrogram get_messages returned msg id=%s peer=%s has_media=%s",
+                            getattr(msg, "id", None),
+                            _peer,
+                            bool(getattr(msg, "media", None)),
+                        )
                     if msg and getattr(msg, "media", None):
                         logger.info(
-                            "userbot: Pyrogram downloading %s/%s to %s (peer=%s)",
+                            "userbot: Pyrogram downloading %s/%s -> %s (peer=%s)",
                             _peer, message_id, dest_path, _peer,
                         )
-                        await client.download_media(msg, file=dest_path)
-                        if os.path.exists(dest_path) and os.path.getsize(dest_path) > 0:
-                            ok = await _ffprobe_ok(dest_path)
+                        # download_media returns the file path on success, None on failure
+                        _dl_result = await client.download_media(msg, file=dest_path)
+                        logger.info(
+                            "userbot: Pyrogram download_media returned: %s",
+                            _dl_result,
+                        )
+                        if _dl_result and os.path.exists(_dl_result) and os.path.getsize(_dl_result) > 0:
+                            ok = await _ffprobe_ok(_dl_result)
                             if ok:
                                 return True
-                        # File was found but download failed validation — break out
-                        # to avoid re-downloading from another peer
+                            logger.warning(
+                                "userbot: Pyrogram download_media succeeded but ffprobe validation failed: %s",
+                                _dl_result,
+                            )
+                        else:
+                            logger.warning(
+                                "userbot: Pyrogram download_media failed or produced empty file for %s/%s (peer=%s): result=%s",
+                                _peer, message_id, _peer, _dl_result,
+                            )
+                        # File was found but download failed — break out to avoid re-downloading
+                        # from another peer (the message is correct, download itself failed)
                         break
                     else:
-                        logger.debug(
-                            "userbot: Pyrogram message %s/%s found but no media (peer=%s)",
+                        logger.info(
+                            "userbot: Pyrogram message %s/%s found but has no media (peer=%s)",
                             _peer, message_id, _peer,
                         )
+                else:
+                    logger.info(
+                        "userbot: Pyrogram get_messages(peer=%s) returned None/empty for msg %s",
+                        _peer, message_id,
+                    )
             except Exception as e:
-                logger.debug("userbot: Pyrogram get_messages(peer=%s) failed: %s", _peer, e)
+                logger.warning(
+                    "userbot: Pyrogram error with peer=%s msg=%s: %s",
+                    _peer, message_id, e,
+                )
 
         # Fallback: scan the recent history of each candidate peer for a matching media message.
         for _peer in _candidates:
             try:
-                logger.debug("userbot: Pyrogram scanning history of peer=%s for msg=%s", _peer, message_id)
+                logger.info(
+                    "userbot: Pyrogram scanning history of peer=%s for msg=%s (fallback)",
+                    _peer, message_id,
+                )
                 async for msg in client.get_chat_history(_peer, limit=50):
                     if getattr(msg, "id", None) == message_id and getattr(msg, "media", None):
                         logger.info(
-                            "userbot: Pyrogram found matching history message %s/%s (peer=%s)",
+                            "userbot: Pyrogram found msg %s/%s in history (peer=%s)",
                             _peer, message_id, _peer,
                         )
-                        await client.download_media(msg, file=dest_path)
-                        if os.path.exists(dest_path) and os.path.getsize(dest_path) > 0:
-                            ok = await _ffprobe_ok(dest_path)
+                        _dl_result = await client.download_media(msg, file=dest_path)
+                        if _dl_result and os.path.exists(_dl_result) and os.path.getsize(_dl_result) > 0:
+                            ok = await _ffprobe_ok(_dl_result)
                             if ok:
                                 return True
+                        break
             except Exception as e:
-                logger.debug("userbot: Pyrogram history scan(peer=%s) failed: %s", _peer, e)
+                logger.warning(
+                    "userbot: Pyrogram history scan(peer=%s) failed: %s", _peer, e,
+                )
+
+        # Final attempt: try get_chat to resolve peer properly, then retry get_messages
+        if not _found_msg:
+            # The message wasn't found by any method. Try resolving the peer via get_chat first.
+            for _peer in _candidates:
+                try:
+                    logger.info(
+                        "userbot: Pyrogram resolving peer=%s via get_chat() for msg %s",
+                        _peer, message_id,
+                    )
+                    _chat = await client.get_chat(_peer)
+                    if _chat:
+                        _resolved_id = getattr(_chat, "id", _peer)
+                        logger.info(
+                            "userbot: Pyrogram resolved chat peer=%s -> id=%s",
+                            _peer, _resolved_id,
+                        )
+                        messages = await client.get_messages(_resolved_id, message_ids=[message_id])
+                        if messages:
+                            msg = messages[0] if isinstance(messages, list) else messages
+                            if msg and getattr(msg, "media", None):
+                                _found_msg = True
+                                _dl_result = await client.download_media(msg, file=dest_path)
+                                if _dl_result and os.path.exists(_dl_result) and os.path.getsize(_dl_result) > 0:
+                                    ok = await _ffprobe_ok(_dl_result)
+                                    if ok:
+                                        return True
+                except Exception as e:
+                    logger.warning(
+                        "userbot: Pyrogram get_chat(peer=%s) or retry failed: %s",
+                        _peer, e,
+                    )
 
         if not _found_msg:
             logger.warning(
