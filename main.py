@@ -515,6 +515,7 @@ def setup_handlers(application: Application) -> None:
         sent_at = data.get("login_code_sent_at")
         sent_repr = data.get("login_code_sent_repr")
         resend_count = data.get("login_resend_count", 0)
+        "login_password_retry_count",
         code_hash = data.get("login_code_hash")
         session_path = data.get("login_session_path")
         awaiting = {
@@ -1217,22 +1218,52 @@ def setup_handlers(application: Application) -> None:
                     if PhoneCodeInvalidError and isinstance(exc, PhoneCodeInvalidError):
                         friendly = "The code you entered is invalid. Please request a new code and try again."
                     elif PhoneCodeExpiredError and isinstance(exc, PhoneCodeExpiredError):
-                        # Code has expired. Do NOT auto-resend, as this creates an infinite
-                        # loop when the code validity window is very short (< 10s).
-                        # With 2FA enabled, Telegram is especially strict about code timing.
-                        # The expiry window is controlled by Telegram's server-side security policy.
-                        # Even with the retry logic, if Telegram's window is < 5 seconds from the RPC request time,
-                        # the code may expire in-flight before reaching the server.
-                        friendly = (
-                            "🔐 Your login code expired (Telegram's 2FA security policy has an extremely short code validity window).\n\n"
-                            "ℹ️ We attempted the code 3 times with brief retries, but Telegram's server rejected it as expired.\n"
-                            "This suggests Telegram's security setting on your account has a window of ~4-5 seconds from the backend RPC time.\n\n"
-                            "Options:\n"
-                            "• Try /login again (make sure your internet is stable)\n"
-                            "• Temporarily disable 2FA in Telegram Settings to test if that increases the code window\n"
-                            "• Contact Telegram support about your account's security policy"
-                        )
-                        logger.warning("PhoneCodeExpiredError after 3 sign_in attempts for %s; account has extremely strict code window", phone)
+                        # Code expired — auto-resend a new one immediately.
+                        # The Telethon client is already connected to the correct DC,
+                        # so resending is fast (< 1s). This avoids restarting /login.
+                        # Cap auto-resends at 3 to prevent infinite loops.
+                        resend_count = context.user_data.get("login_resend_count", 0)
+                        if resend_count >= 3:
+                            logger.warning(
+                                "PhoneCodeExpiredError for %s after %s resends; giving up",
+                                phone, resend_count,
+                            )
+                            friendly = (
+                                "Your login codes keep expiring even after multiple resends.\n\n"
+                                "Please run /login again to restart the process.\n"
+                                "If this keeps happening, your account may have a very strict code timeout."
+                            )
+                        else:
+                            logger.warning(
+                                "PhoneCodeExpiredError for %s (resend #%s); auto-resending...",
+                                phone, resend_count + 1,
+                            )
+                            try:
+                                sent = await client.send_code_request(phone)
+                                new_hash = getattr(sent, "phone_code_hash", None)
+                                if new_hash:
+                                    context.user_data["login_code_hash"] = new_hash
+                                context.user_data["login_code_sent_at"] = time.time()
+                                context.user_data["login_code_sent_repr"] = repr(sent)
+                                context.user_data["login_resend_count"] = resend_count + 1
+                                # Refresh code type info
+                                try:
+                                    sent_type = getattr(sent, "type", None)
+                                    st_name = sent_type.__class__.__name__ if sent_type is not None else None
+                                    context.user_data["login_code_type"] = st_name
+                                except Exception:
+                                    pass
+                                await update.message.reply_text(
+                                    "Your previous login code expired. A new one has been sent. Please reply with the new code."
+                                )
+                                # Stay in awaiting_login_code state — do not clear the flow
+                                return
+                            except Exception as resend_exc:
+                                logger.exception("Auto-resend after PhoneCodeExpiredError failed: %s", resend_exc)
+                                friendly = (
+                                    "Your login code expired and I couldn't auto-send a new one.\n\n"
+                                    "Please run /login again to restart the process."
+                                )
                     elif FloodWaitError and isinstance(exc, FloodWaitError):
                         wait = getattr(exc, 'seconds', None) or getattr(exc, 'timeout', None) or 60
                         until = time.time() + int(wait)
@@ -1276,6 +1307,74 @@ def setup_handlers(application: Application) -> None:
                 )
                 _clear_login_flow(user_id, context)
                 return
+
+            # Track password retries to prevent infinite loop
+            retry_count = context.user_data.get("login_password_retry_count", 0)
+
+            try:
+                await client.sign_in(password=password)
+                if await client.is_user_authorized():
+                    session_path = context.user_data.get("login_session_path")
+                    await update.message.reply_text(
+                        "✅ Telethon userbot login successful. Session saved locally."
+                        + (f"\\nSaved session: {session_path}" if session_path else "")
+                    )
+                    await client.disconnect()
+                    _clear_login_flow(user_id, context)
+                else:
+                    await update.message.reply_text(
+                        "Password accepted but the session is not authorized. Please run /login again."
+                    )
+                    await client.disconnect()
+                    _clear_login_flow(user_id, context)
+            except Exception as exc:
+                try:
+                    from telethon.errors import PasswordHashInvalidError, FloodWaitError
+
+                    if isinstance(exc, PasswordHashInvalidError):
+                        retry_count += 1
+                        context.user_data["login_password_retry_count"] = retry_count
+                        if retry_count >= 3:
+                            logger.warning("Password retry limit reached for user %s", user_id)
+                            await update.message.reply_text(
+                                "Too many incorrect password attempts. Please run /login again to restart."
+                            )
+                            await client.disconnect()
+                            _clear_login_flow(user_id, context)
+                        else:
+                            remaining = 3 - retry_count
+                            await update.message.reply_text(
+                                f"Incorrect password. You have {remaining} attempt(s) remaining.\\n"
+                                "Please send the correct password."
+                            )
+                            # Keep client connected — stay in awaiting_login_password state
+                            return
+                    elif isinstance(exc, FloodWaitError):
+                        wait = getattr(exc, "seconds", None) or getattr(exc, "timeout", None) or 60
+                        until = time.time() + int(wait)
+                        context.user_data["login_flood_wait_until"] = until
+                        await update.message.reply_text(
+                            f"Too many attempts. Please wait {int(wait)} seconds before retrying."
+                        )
+                        await client.disconnect()
+                        _clear_login_flow(user_id, context)
+                    else:
+                        # Unknown error during password sign-in
+                        logger.exception("/login password step failed: %s", exc)
+                        await update.message.reply_text(
+                            "Failed to complete Telethon login with password. Please try /login again."
+                        )
+                        await client.disconnect()
+                        _clear_login_flow(user_id, context)
+                except Exception:
+                    # Fallback if Telethon error types are not importable
+                    logger.exception("/login password step failed: %s", exc)
+                    await update.message.reply_text(
+                        "Failed to complete Telethon login with password. Please try /login again."
+                    )
+                    await client.disconnect()
+                    _clear_login_flow(user_id, context)
+            return
 
             try:
                 await client.sign_in(password=password)
