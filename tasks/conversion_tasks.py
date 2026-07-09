@@ -5,6 +5,11 @@ import os
 import tempfile
 from typing import Dict, List, Tuple
 
+import config
+
+# Use configured FFMPEG_PATH, fallback to FFMPEG_PATH
+FFMPEG_PATH = getattr(config, 'FFMPEG_PATH', FFMPEG_PATH) or FFMPEG_PATH 
+
 logger = logging.getLogger(__name__)
 
 # Import timeout utilities

@@ -775,12 +775,29 @@ def setup_handlers(application: Application) -> None:
         except Exception:
             cleared = False
 
+        # Also clear any login client disconnect/restart state
+        try:
+            client = context.user_data.get("login_client")
+            if client is not None:
+                try:
+                    import asyncio
+                    try:
+                        loop = asyncio.get_event_loop()
+                        if loop.is_running():
+                            asyncio.create_task(client.disconnect())
+                    except RuntimeError:
+                        pass
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
         # Check for optional 'resend' arg
         args = context.args if hasattr(context, "args") else []
         want_resend = len(args) > 0 and args[0].lower() in ("resend", "r")
 
         if not want_resend:
-            await update.message.reply_text("Cleared FloodWait state." if cleared else "No FloodWait state found.")
+            await update.message.reply_text("✅ FloodWait state cleared." if cleared else "No FloodWait state found.")
             return
 
         # Attempt best-effort resend using stored Telethon client/session
@@ -838,6 +855,22 @@ def setup_handlers(application: Application) -> None:
         except Exception:
             pass
         if context is not None and getattr(context, "user_data", None) is not None:
+            # Disconnect any active Telethon client before clearing
+            try:
+                client = context.user_data.get("login_client")
+                if client is not None:
+                    try:
+                        import asyncio
+                        try:
+                            loop = asyncio.get_event_loop()
+                            if loop.is_running():
+                                asyncio.create_task(client.disconnect())
+                        except RuntimeError:
+                            pass
+                    except Exception:
+                        pass
+            except Exception:
+                pass
             for key in (
                 "awaiting_login_phone",
                 "awaiting_login_code",
@@ -845,6 +878,12 @@ def setup_handlers(application: Application) -> None:
                 "login_phone",
                 "login_client",
                 "login_session_path",
+                "login_code_sent_at",
+                "login_code_sent_repr",
+                "login_code_hash",
+                "login_code_type",
+                "login_flood_wait_until",
+                "login_resend_count",
             ):
                 context.user_data.pop(key, None)
 

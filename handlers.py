@@ -1594,11 +1594,10 @@ class EnhancedMediaHandler:
     async def handle_audio(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE, session: Dict
     ):
+        """Handle incoming audio files."""
+        audio = update.message.audio
+        user_id = update.effective_user.id
 
-        try:
-            self._persist_session(user_id)
-        except Exception:
-            logger.debug("Could not persist session after registering video")
         ext = ".mp3"
         if audio.mime_type:
             ext_map = {

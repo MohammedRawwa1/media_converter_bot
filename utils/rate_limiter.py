@@ -64,7 +64,7 @@ class RateLimiter:
             try:
                 new_tokens = min(self.capacity, current_tokens + (elapsed * refill_rate))
             except Exception:
-                new_tokens = min(initial_tokens, current_tokens + (elapsed * refill_rate))
+                new_tokens = min(self.capacity, current_tokens + (elapsed * refill_rate))
 
             if new_tokens >= tokens:
                 self.buckets[key] = (new_tokens - tokens, now)
