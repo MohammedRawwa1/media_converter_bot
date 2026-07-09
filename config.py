@@ -9,6 +9,39 @@ import re
 
 ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
 
+try:
+    from dotenv import load_dotenv
+except Exception:  # pragma: no cover - optional dependency
+    load_dotenv = None
+
+
+def _load_environment_file(env_path: Optional[str] = None) -> None:
+    """Load values from a .env file when available, without overriding existing env vars."""
+    if load_dotenv is None:
+        return
+
+    candidates = []
+    if env_path:
+        candidates.append(env_path)
+    candidates.extend(
+        [
+            os.path.join(ROOT_DIR, ".env"),
+            os.path.join(os.getcwd(), ".env"),
+            os.path.join(ROOT_DIR, ".env.local"),
+        ]
+    )
+
+    seen = set()
+    for candidate in candidates:
+        if not candidate or candidate in seen:
+            continue
+        seen.add(candidate)
+        if os.path.exists(candidate):
+            load_dotenv(candidate, override=False)
+
+
+_load_environment_file()
+
 # Basic required configuration
 BOT_TOKEN = os.getenv("BOT_TOKEN") or ""
 WEBHOOK_URL = os.getenv("WEBHOOK_URL") or ""
