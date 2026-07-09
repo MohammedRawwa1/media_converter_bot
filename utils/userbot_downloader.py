@@ -322,7 +322,7 @@ async def _download_with_pyrogram(
                             _peer, message_id, dest_path, _peer,
                         )
                         # download_media returns the file path on success, None on failure
-                        _dl_result = await client.download_media(msg, file=dest_path)
+                        _dl_result = await client.download_media(msg, file_name=dest_path)
                         logger.info(
                             "userbot: Pyrogram download_media returned: %s",
                             _dl_result,
@@ -374,7 +374,7 @@ async def _download_with_pyrogram(
                                     message_id,
                                 )
                                 _dl_result = await client.download_media(
-                                    msg, file=dest_path,
+                                    msg, file_name=dest_path,
                                 )
                                 if _dl_result and os.path.exists(_dl_result) and os.path.getsize(_dl_result) > 0:
                                     ok = await _ffprobe_ok(_dl_result)
@@ -421,7 +421,7 @@ async def _download_with_pyrogram(
             )
             if msg is None or not getattr(msg, "media", None):
                 return None
-            dl = await client.download_media(msg, file=dest_path)
+            dl = await client.download_media(msg, file_name=dest_path)
             if dl and os.path.exists(dl) and os.path.getsize(dl) > 0 and await _ffprobe_ok(dl):
                 return True
             return None
@@ -439,7 +439,7 @@ async def _download_with_pyrogram(
                             "userbot: Pyrogram found msg %s/%s in history (peer=%s)",
                             _peer, message_id, _peer,
                         )
-                        _dl_result = await client.download_media(msg, file=dest_path)
+                        _dl_result = await client.download_media(msg, file_name=dest_path)
                         if _dl_result and os.path.exists(_dl_result) and os.path.getsize(_dl_result) > 0:
                             ok = await _ffprobe_ok(_dl_result)
                             if ok:
@@ -477,7 +477,7 @@ async def _download_with_pyrogram(
                             msg = messages[0] if isinstance(messages, list) else messages
                             if msg and getattr(msg, "media", None):
                                 _found_msg = True
-                                _dl_result = await client.download_media(msg, file=dest_path)
+                                _dl_result = await client.download_media(msg, file_name=dest_path)
                                 if _dl_result and os.path.exists(_dl_result) and os.path.getsize(_dl_result) > 0:
                                     ok = await _ffprobe_ok(_dl_result)
                                     if ok:
