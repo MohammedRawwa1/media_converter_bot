@@ -22,13 +22,17 @@ from telegram.error import TelegramError, TimedOut, Conflict
 import httpx
 # Request location differs across PTB releases; try both locations and
 # fall back to None so the application can continue using default Request.
+# PTB v20+ uses HTTPXRequest; older versions use Request from telegram.request.
 try:
-    from telegram.request import Request
+    from telegram.request import HTTPXRequest as Request
 except Exception:
     try:
-        from telegram.utils.request import Request
+        from telegram.request import Request
     except Exception:
-        Request = None
+        try:
+            from telegram.utils.request import Request
+        except Exception:
+            Request = None
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -1437,7 +1441,7 @@ async def main(background: bool = False) -> None:
         http_read_timeout = 30.0
 
     try:
-        req = Request(con_pool_size=http_pool_size, pool_timeout=http_pool_timeout, connect_timeout=http_connect_timeout, read_timeout=http_read_timeout)
+        req = Request(connection_pool_size=http_pool_size, pool_timeout=http_pool_timeout, connect_timeout=http_connect_timeout, read_timeout=http_read_timeout)
         bot_instance = Bot(token=BOT_TOKEN, request=req)
         application = Application.builder().bot(bot_instance).build()
     except Exception:
@@ -1459,7 +1463,7 @@ async def main(background: bool = False) -> None:
             try:
                 gu_pool_size = int(os.environ.get("GET_UPDATES_POOL_SIZE", "5"))
                 gu_pool_timeout = float(os.environ.get("GET_UPDATES_POOL_TIMEOUT", str(http_pool_timeout)))
-                gu_req = Request(con_pool_size=gu_pool_size, pool_timeout=gu_pool_timeout, connect_timeout=http_connect_timeout, read_timeout=http_read_timeout)
+                gu_req = Request(connection_pool_size=gu_pool_size, pool_timeout=gu_pool_timeout, connect_timeout=http_connect_timeout, read_timeout=http_read_timeout)
                 GET_UPDATES_BOT = Bot(token=BOT_TOKEN, request=gu_req)
                 logger.info("Dedicated get_updates client initialized (pool=%s)", gu_pool_size)
             except Exception as e:

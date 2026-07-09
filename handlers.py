@@ -154,7 +154,7 @@ class EnhancedMediaHandler:
         self._cache = None
         try:
             if get_cache is not None:
-                import asyncio
+                # asyncio is already imported at module level
                 loop = None
                 try:
                     loop = asyncio.get_running_loop()
