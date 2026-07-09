@@ -185,8 +185,16 @@ async def _download_with_pyrogram(
 
         target = await _normalize_target(chat_id)
         try:
-            # Pyrogram uses get_messages differently
-            messages = await client.get_messages(target, ids=message_id)
+            # Pyrogram 2.x uses get_messages(chat_id, message_ids=[...]) or
+            # get_chat_history depending on the installed version.
+            try:
+                messages = await client.get_messages(target, message_ids=[message_id])
+            except TypeError:
+                messages = await client.get_messages(target, ids=[message_id])
+            except Exception as e:
+                logger.debug("userbot: Pyrogram direct lookup failed: %s", e)
+                messages = None
+
             if messages:
                 msg = messages[0] if isinstance(messages, list) else messages
                 if msg and getattr(msg, "media", None):
@@ -198,6 +206,19 @@ async def _download_with_pyrogram(
                             return True
         except Exception as e:
             logger.exception("userbot: Pyrogram download failed: %s", e)
+
+        # Fallback: scan the recent history of the target chat for a matching media message.
+        try:
+            async for msg in client.get_chat_history(target, limit=50):
+                if getattr(msg, "id", None) == message_id and getattr(msg, "media", None):
+                    logger.info("userbot: Pyrogram found matching history message %s/%s", target, message_id)
+                    await client.download_media(msg, file=dest_path)
+                    if os.path.exists(dest_path) and os.path.getsize(dest_path) > 0:
+                        ok = await _ffprobe_ok(dest_path)
+                        if ok:
+                            return True
+        except Exception as e:
+            logger.debug("userbot: Pyrogram history fallback failed: %s", e)
 
         return False
     finally:
