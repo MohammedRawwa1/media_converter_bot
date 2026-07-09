@@ -37,6 +37,12 @@ PRESIGN_EXPIRES = int(os.getenv("PRESIGN_EXPIRES", "3600"))
 MAX_FILE_SIZE = int(os.getenv("MAX_FILE_SIZE", "4")) * 1024 * 1024 * 1024
 MAX_CONCURRENT_TASKS = int(os.getenv("MAX_CONCURRENT_TASKS", "5"))
 
+# Telethon / Pyrogram userbot session string (alternative to /login flow)
+# Set PYROGRAM_SESSION to a Pyrogram session string to bypass the Telethon
+# login flow entirely. Generate one with: python scripts/create_pyrogram_session.py
+# Format: a long base64-encoded string from Pyrogram's export_session_string()
+PYROGRAM_SESSION = os.getenv("PYROGRAM_SESSION", "")
+
 # Binaries and external services
 FFMPEG_PATH = os.getenv("FFMPEG_PATH", "ffmpeg")
 # Do not assume a localhost Redis in production; prefer an empty default so

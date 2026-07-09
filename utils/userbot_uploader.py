@@ -9,10 +9,15 @@ except Exception:  # pragma: no cover - optional dependency
     TelegramClient = None
     StringSession = None
 
+try:
+    from pyrogram import Client as PyrogramClient
+except Exception:  # pragma: no cover - optional dependency
+    PyrogramClient = None
+
 logger = logging.getLogger(__name__)
 
 
-async def _normalize_target(chat_id: Union[int, str], client: TelegramClient):
+async def _normalize_target(chat_id: Union[int, str], client=None):
     try:
         if isinstance(chat_id, str) and chat_id.startswith("@"):
             return chat_id
@@ -24,51 +29,93 @@ async def _normalize_target(chat_id: Union[int, str], client: TelegramClient):
         return chat_id
 
 
-async def send_file_via_userbot(
+async def _send_with_telethon(
     chat_id: Union[int, str], file_path: str, caption: Optional[str] = None
 ) -> bool:
-    """Send a file using a user account (Telethon).
-
-    Returns True on success, False on failure. Raises RuntimeError for missing config.
-    """
+    """Send a file using Telethon."""
     if TelegramClient is None:
-        raise RuntimeError("Telethon is not installed. Add telethon to requirements and install it.")
+        return False
 
-    api_id = os.getenv("API_ID") or os.getenv("api_id") or os.getenv("USERBOT_API_ID") or os.getenv("userbot_api_id")
-    api_hash = os.getenv("API_HASH") or os.getenv("api_hash") or os.getenv("USERBOT_API_HASH") or os.getenv("userbot_api_hash")
-    session_str = (
-        os.getenv("API_SESSION")
-        or os.getenv("SESSION")
-        or os.getenv("api_session")
-        or os.getenv("USERBOT_SESSION")
-        or os.getenv("userbot_session")
-        or os.getenv("TELETHON_SESSION")
-        or os.getenv("telethon_session")
-    )
-
-    if not api_id or not api_hash:
-        raise RuntimeError("API_ID and API_HASH must be set to use userbot fallback")
-
-    try:
-        api_id = int(api_id)
-    except Exception:
-        raise RuntimeError("API_ID must be an integer")
-
-    from utils.telethon_session import build_telethon_client
+    from utils.telethon_session import build_telethon_client, get_userbot_credentials
+    api_id, api_hash = get_userbot_credentials()
 
     client = build_telethon_client(api_id, api_hash)
-    await client.start()
     try:
+        await client.start()
         target = await _normalize_target(chat_id, client)
-        try:
-            await client.send_file(target, file=file_path, caption=caption)
-            logger.info("userbot: sent file %s to %s", file_path, target)
-            return True
-        except Exception:
-            logger.exception("userbot: failed to send file %s to %s", file_path, target)
-            return False
+        await client.send_file(target, file=file_path, caption=caption)
+        logger.info("userbot: Telethon sent file %s to %s", file_path, target)
+        return True
+    except Exception:
+        logger.exception("userbot: Telethon failed to send file %s", file_path)
+        return False
     finally:
         try:
             await client.disconnect()
         except Exception:
             pass
+
+
+async def _send_with_pyrogram(
+    chat_id: Union[int, str], file_path: str, caption: Optional[str] = None
+) -> bool:
+    """Send a file using Pyrogram (session string fallback)."""
+    if PyrogramClient is None:
+        return False
+
+    from utils.telethon_session import build_pyrogram_client, get_userbot_credentials
+    api_id, api_hash = get_userbot_credentials()
+
+    client = build_pyrogram_client(api_id, api_hash)
+    if client is None:
+        return False
+
+    try:
+        await client.start()
+        target = await _normalize_target(chat_id)
+        await client.send_document(target, file_path, caption=caption or "")
+        logger.info("userbot: Pyrogram sent file %s to %s", file_path, target)
+        return True
+    except Exception:
+        logger.exception("userbot: Pyrogram failed to send file %s", file_path)
+        return False
+    finally:
+        try:
+            await client.stop()
+        except Exception:
+            pass
+
+
+async def send_file_via_userbot(
+    chat_id: Union[int, str], file_path: str, caption: Optional[str] = None
+) -> bool:
+    """Send a file using a user account.
+
+    Tries Telethon first, then falls back to Pyrogram if a session string is configured.
+
+    Returns True on success, False on failure. Raises RuntimeError for missing config.
+    """
+    if TelegramClient is None and PyrogramClient is None:
+        raise RuntimeError(
+            "Neither Telethon nor Pyrogram are installed. "
+            "Install at least one: pip install telethon or pip install pyrogram"
+        )
+
+    # Try Telethon first
+    if TelegramClient is not None:
+        try:
+            result = await _send_with_telethon(chat_id, file_path, caption)
+            if result:
+                return True
+            logger.info("userbot: Telethon send failed; trying Pyrogram fallback")
+        except Exception as e:
+            logger.warning("userbot: Telethon send error (%s); trying Pyrogram fallback", e)
+
+    # Fall back to Pyrogram
+    if PyrogramClient is not None:
+        result = await _send_with_pyrogram(chat_id, file_path, caption)
+        if result:
+            return True
+
+    logger.warning("userbot: all send methods failed for %s", chat_id)
+    return False
