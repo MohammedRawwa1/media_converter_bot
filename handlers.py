@@ -744,6 +744,39 @@ class EnhancedMediaHandler:
                     if await _try_userbot_download(bot_chat, bot_msg, "bot_chat_large_file"):
                         return
 
+                # Relay group fallback: forward the file to a shared group/channel
+                # where the userbot account has access, then download from there.
+                _relay_chat_id = os.environ.get("RELAY_CHAT_ID", "")
+                if _relay_chat_id and bot_chat and bot_msg:
+                    try:
+                        _relay_chat_id = int(_relay_chat_id)
+                        logger.info(
+                            "Relay: forwarding message %s/%s to relay group %s",
+                            bot_chat, bot_msg, _relay_chat_id,
+                        )
+                        _forwarded = await context.bot.forward_message(
+                            chat_id=_relay_chat_id,
+                            from_chat_id=bot_chat,
+                            message_id=bot_msg,
+                        )
+                        if _forwarded and getattr(_forwarded, "message_id", None):
+                            _relay_msg_id = _forwarded.message_id
+                            logger.info(
+                                "Relay: forwarded to %s/%s, trying userbot download",
+                                _relay_chat_id, _relay_msg_id,
+                            )
+                            if await _try_userbot_download(
+                                _relay_chat_id, _relay_msg_id, "relay_group"
+                            ):
+                                return
+                            else:
+                                logger.warning(
+                                    "Relay: userbot download from %s/%s failed",
+                                    _relay_chat_id, _relay_msg_id,
+                                )
+                    except Exception as _relay_exc:
+                        logger.exception("Relay: forwarding/download failed: %s", _relay_exc)
+
             # If userbot fallback did not produce a file, keep the existing large-forward
             # handling behavior so the bot can persist metadata or provide upload guidance.
             if "file is too big" in err_text.lower() or "too big" in err_text.lower():

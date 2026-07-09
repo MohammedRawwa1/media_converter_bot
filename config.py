@@ -44,6 +44,9 @@ _load_environment_file()
 
 # Basic required configuration
 BOT_TOKEN = os.getenv("BOT_TOKEN") or ""
+
+# Relay group for large file downloads (bot forwards file here, userbot downloads from here)
+RELAY_CHAT_ID = os.getenv("RELAY_CHAT_ID", "")
 WEBHOOK_URL = os.getenv("WEBHOOK_URL") or ""
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET") or os.getenv("TELEGRAM_SECRET_TOKEN") or os.getenv("WEBHOOK_SECRET_TOKEN") or ""
 
