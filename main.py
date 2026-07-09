@@ -885,6 +885,7 @@ def setup_handlers(application: Application) -> None:
                 "login_code_type",
                 "login_flood_wait_until",
                 "login_resend_count",
+                "login_password_retry_count",
             ):
                 context.user_data.pop(key, None)
 
@@ -992,6 +993,36 @@ def setup_handlers(application: Application) -> None:
                     # Debug: record when the code was requested and returned hash
                     try:
                         sent_type = getattr(sent, "type", None)
+                        # If code was sent to app (SentCodeTypeApp), immediately request
+                        # again to force SMS delivery. App-delivered codes have a very
+                        # short expiry window (~15-30s), making them impractical for
+                        # bot-based login where the user must switch chats.
+                        if sent_type_name and "App" in sent_type_name:
+                            logger.info(
+                                "Phone %s got SentCodeTypeApp; re-requesting to force SMS delivery",
+                                phone,
+                            )
+                            try:
+                                sent = await client.send_code_request(phone)
+                                # Refresh all sent data after the re-request
+                                new_sent_type = getattr(sent, "type", None)
+                                try:
+                                    new_st_name = new_sent_type.__class__.__name__ if new_sent_type is not None else None
+                                    sent_type_name = new_st_name
+                                    context.user_data["login_code_type"] = new_st_name
+                                except Exception:
+                                    pass
+                                new_hash = getattr(sent, "phone_code_hash", None)
+                                if new_hash:
+                                    context.user_data["login_code_hash"] = new_hash
+                                context.user_data["login_code_sent_at"] = time.time()
+                                context.user_data["login_code_sent_repr"] = repr(sent)
+                                logger.info(
+                                    "Re-requested code for %s; now got type=%s (replacing SentCodeTypeApp)",
+                                    phone, sent_type_name,
+                                )
+                            except Exception:
+                                logger.exception("Failed to re-request code for SMS forcing")
                         # Determine a simple human-friendly type name
                         try:
                             sent_type_name = sent_type.__class__.__name__ if sent_type is not None else None
@@ -1129,7 +1160,7 @@ def setup_handlers(application: Application) -> None:
                     pass
 
                 # Do NOT add pre-wait delay; attempt sign_in immediately to minimize
-                # time lost. Telegram's code validity window appears to be < 4 seconds
+                # time lost. Telegram's code validity window can be extremely short
                 # from send time. Every millisecond counts.
 
                 # Use stored phone_code_hash when available to match the
@@ -1137,43 +1168,27 @@ def setup_handlers(application: Application) -> None:
                 # DC migration), try without it before giving up.
                 code_hash = context.user_data.get("login_code_hash")
 
-                # Retry sign_in up to 3 times with brief pauses, as codes can expire
-                # in-flight due to network latency and DC migration delays.
-                sign_in_attempts = 0
-                last_error = None
-                while sign_in_attempts < 3:
-                    sign_in_attempts += 1
+                # Single attempt only - retrying an expired code is wasteful.
+                # If the code expired, we auto-resend a fresh one below.
+                if code_hash:
                     try:
-                        if code_hash:
-                            try:
-                                await client.sign_in(phone=phone, code=norm_code, phone_code_hash=code_hash)
-                            except ValueError as ve:
-                                # Hash may be stale after DC migration and Telethon raises ValueError.
-                                # Try without hash as fallback.
-                                if "phone_code_hash" in str(ve):
-                                    try:
-                                        await client.sign_in(code=norm_code)
-                                    except TypeError:
-                                        await client.sign_in(phone=phone, code=norm_code)
-                                else:
-                                    raise
-                        else:
-                            # No stored hash (e.g. resumed session, older flow).
+                        await client.sign_in(phone=phone, code=norm_code, phone_code_hash=code_hash)
+                    except ValueError as ve:
+                        # Hash may be stale after DC migration and Telethon raises ValueError.
+                        # Try without hash as fallback.
+                        if "phone_code_hash" in str(ve):
                             try:
                                 await client.sign_in(code=norm_code)
                             except TypeError:
                                 await client.sign_in(phone=phone, code=norm_code)
-                        # Success — break the retry loop
-                        break
-                    except Exception as e:
-                        last_error = e
-                        # If this was not the last attempt, wait briefly and retry
-                        if sign_in_attempts < 3:
-                            logger.debug("Sign-in attempt %d failed; retrying in 0.1s: %s", sign_in_attempts, e)
-                            await asyncio.sleep(0.1)
                         else:
-                            # Last attempt failed; re-raise the error
                             raise
+                else:
+                    # No stored hash (e.g. resumed session, older flow).
+                    try:
+                        await client.sign_in(code=norm_code)
+                    except TypeError:
+                        await client.sign_in(phone=phone, code=norm_code)
 
                 if await client.is_user_authorized():
                     session_path = context.user_data.get("login_session_path")
