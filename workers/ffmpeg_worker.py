@@ -11,6 +11,10 @@ from typing import Optional
 
 from utils.job_queue import pop_job, publish_update, get_redis, JOB_LIST, close_redis
 from utils.ffmpeg_runner import run_ffmpeg
+try:
+    from utils.cache import get_cache
+except Exception:
+    get_cache = None
 from utils import job_store
 from utils import file_utils
 from telegram import Bot
@@ -53,6 +57,8 @@ ACTIVE_JOBS = Gauge("media_jobs_active", "Number of active ffmpeg jobs")
 
 # Forward notification event (set by background pubsub listener)
 FORWARD_NOTIFY_EVENT: Optional[asyncio.Event] = None
+# Redis cache instance shared between worker_loop and handle_job
+_cache = None
 LAST_FORWARD_NOTIFICATION: Optional[dict] = None
 
 
@@ -432,6 +438,15 @@ async def handle_job(job: dict):
     # mark processing start
     try:
         await job_store.update_job(job_id, {"status": "processing", "started_at": time.time()})
+        # Cache job start for fast status queries
+        try:
+            if _cache:
+                await _cache.cache_job_metadata(job_id, {
+                    "status": "processing",
+                    "started_at": time.time(),
+                }, ttl=3600)
+        except Exception:
+            pass
     except Exception:
         pass
     try:
@@ -713,6 +728,16 @@ async def handle_job(job: dict):
                     await publish_update(progress_channel, {"job_id": job_id, "progress": 100, "message": "done", "output": out})
                     try:
                         await job_store.update_job(job_id, {"status": "done", "finished_at": time.time(), "output": out})
+                        # Cache job result for fast status queries
+                        try:
+                            if _cache:
+                                await _cache.cache_job_metadata(job_id, {
+                                    "status": "done",
+                                    "output": out,
+                                    "finished_at": time.time(),
+                                }, ttl=3600)
+                        except Exception:
+                            pass
                     except Exception:
                         pass
 
@@ -857,16 +882,37 @@ async def handle_job(job: dict):
                                             # prefer ffprobe if available to detect real video streams
                                             ffprobe_bin = getattr(config, "FFPROBE_PATH", None) or getattr(config, "FFMPEG_PATH", "ffmpeg").replace("ffmpeg", "ffprobe")
 
-                                            def _probe():
-                                                try:
-                                                    return subprocess.run([ffprobe_bin, "-v", "quiet", "-print_format", "json", "-show_streams", out], capture_output=True)
-                                                except Exception:
-                                                    return None
+                                            # Try cache first for ffprobe results
+                                            probe_info = None
+                                            try:
+                                                if _cache and out and os.path.exists(out):
+                                                    import hashlib as _hl
+                                                    _fhash = _hl.sha256(f"{out}:{os.path.getsize(out)}".encode()).hexdigest()[:16]
+                                                    probe_info = await _cache.get(f"cache:probe:{_fhash}")
+                                                    if probe_info:
+                                                        logger.debug("Worker: ffprobe cache HIT for %s", out)
+                                            except Exception:
+                                                pass
 
-                                            p = await asyncio.to_thread(_probe)
+                                            if probe_info is None:  # cache miss
+                                                def _probe():
+                                                    try:
+                                                        return subprocess.run([ffprobe_bin, "-v", "quiet", "-print_format", "json", "-show_streams", out], capture_output=True)
+                                                    except Exception:
+                                                        return None
+
+                                                p = await asyncio.to_thread(_probe)
                                             if p and getattr(p, "returncode", 1) == 0:
                                                 try:
                                                     probe_info = json.loads(p.stdout.decode() or "{}")
+                                                    # Cache ffprobe result
+                                                    try:
+                                                        if _cache and out and os.path.exists(out) and probe_info:
+                                                            _fhash = _hl.sha256(f"{out}:{os.path.getsize(out)}".encode()).hexdigest()[:16]
+                                                            await _cache.set(f"cache:probe:{_fhash}", probe_info, ttl=86400)
+                                                            logger.debug("Worker: cached ffprobe result for %s", out)
+                                                    except Exception:
+                                                        pass
                                                     streams = probe_info.get("streams", [])
                                                     if any(s.get("codec_type") == "video" for s in streams):
                                                         kind = "video"
@@ -1364,6 +1410,15 @@ async def handle_job(job: dict):
                     await publish_update(progress_channel, {"job_id": job_id, "progress": 0, "message": "error", "error": info})
                     try:
                         await job_store.update_job(job_id, {"status": "error", "error": info, "attempt": attempt})
+                        try:
+                            if _cache:
+                                await _cache.cache_job_metadata(job_id, {
+                                    "status": "error",
+                                    "error": info,
+                                    "attempt": attempt,
+                                }, ttl=1800)
+                        except Exception:
+                            pass
                     except Exception:
                         pass
 
@@ -1429,6 +1484,15 @@ async def worker_loop(stop_event: Optional[asyncio.Event] = None):
             await job_store.init(mongo_uri)
     except Exception:
         logger.exception("Failed to init job_store (Mongo)")
+
+    # Initialize Redis cache for ffprobe results and job progress
+    global _cache
+    try:
+        if get_cache is not None:
+            _cache = await get_cache()
+            logger.info("Redis cache initialized for worker")
+    except Exception as e:
+        logger.debug("Worker cache init failed (non-fatal): %s", e)
 
     # Start background forward pubsub listener to wake waiting jobs early
     forward_task = None
@@ -1506,8 +1570,16 @@ def main():
         except Exception:
             pass
         try:
+            # Close cache if initialized
+            if _cache is not None:
+                loop.run_until_complete(_cache.close())
+        except Exception:
+            pass
+        try:
             # Close shared Redis client used across utils
             loop.run_until_complete(close_redis())
+        except Exception:
+            pass
         except Exception:
             pass
         loop.close()

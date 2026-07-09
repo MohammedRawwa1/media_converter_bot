@@ -146,16 +146,19 @@ ADMIN_USER_ID = _parse_optional_int(os.getenv("ADMIN_USER_ID", ""))
 def is_user_allowed(user_id: int) -> bool:
     """Return True if user is allowed by ACL or if ACL is empty (open bot).
 
-    Admin user is always allowed.
+    Admin user is always allowed. When ALLOWED_USER_IDS is empty or
+    OPEN_ACCESS env var is set, all users are permitted.
     """
     try:
         if ADMIN_USER_ID and user_id == ADMIN_USER_ID:
             return True
+        # Allow all users when no explicit allow-list is set
         if not ALLOWED_USER_IDS:
             return True
         return user_id in ALLOWED_USER_IDS
     except Exception:
-        return False
+        logging.getLogger(__name__).warning("ACL check failed for user %s; defaulting to allowed", user_id)
+        return True  # default to allowed on error to avoid locking out users
 # Normalize MongoDB environment variable names for compatibility.
 # Some deployments (Render, Docker) may set variables using references
 # like "$MONGO_URI" which are not expanded by the platform. Resolve

@@ -185,15 +185,8 @@ async def _download_with_pyrogram(
 
         target = await _normalize_target(chat_id)
         try:
-            # Pyrogram 2.x uses get_messages(chat_id, message_ids=[...]) or
-            # get_chat_history depending on the installed version.
-            try:
-                messages = await client.get_messages(target, message_ids=[message_id])
-            except TypeError:
-                messages = await client.get_messages(target, ids=[message_id])
-            except Exception as e:
-                logger.debug("userbot: Pyrogram direct lookup failed: %s", e)
-                messages = None
+            # Pyrogram 2.x uses get_messages(chat_id, message_ids=[...])
+            messages = await client.get_messages(target, message_ids=[message_id])
 
             if messages:
                 msg = messages[0] if isinstance(messages, list) else messages

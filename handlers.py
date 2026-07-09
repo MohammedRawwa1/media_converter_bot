@@ -45,6 +45,11 @@ except Exception:
 # Import ACL helper
 try:
     from config import MAX_FILE_SIZE, is_user_allowed
+    try:
+        from utils.bigfile_pipeline import BigFilePipeline
+        _bigfile_pipeline = BigFilePipeline()
+    except Exception:
+        _bigfile_pipeline = None
 except Exception:
 
     def is_user_allowed(_):
@@ -55,6 +60,10 @@ except Exception:
 # Optional user settings helper
 try:
     from utils import user_settings
+    try:
+        from utils.cache import get_cache
+    except Exception:
+        get_cache = None
 except Exception:
     user_settings = None
 
@@ -140,6 +149,21 @@ class EnhancedMediaHandler:
         except Exception:
             # Best-effort; continue if cannot create
             logger.debug("Could not create session store dir: %s", self._session_store_dir)
+
+        # Redis cache for media analysis, user preferences, and file metadata
+        self._cache = None
+        try:
+            if get_cache is not None:
+                import asyncio
+                loop = None
+                try:
+                    loop = asyncio.get_running_loop()
+                except RuntimeError:
+                    pass
+                if loop and loop.is_running():
+                    asyncio.ensure_future(self._init_cache())
+        except Exception:
+            pass
 
     async def _cleanup_session(self, user_id: int):
         """Cleanup user session asynchronously."""
@@ -623,6 +647,39 @@ class EnhancedMediaHandler:
         # file size or access rules, prefer a user-account (userbot) fallback when
         # configured via env (`ENABLE_USERBOT` + API_ID/API_HASH).
         try:
+            # -- Big files pipeline: route files > BOT_API_MAX_MB through Pyrogram->S3->Worker
+            bot_api_max_mb = int(os.environ.get("BOT_API_MAX_MB", "50"))
+            file_size = current_file.get("size") or 0
+            if file_size and file_size > bot_api_max_mb * 1024 * 1024 and _bigfile_pipeline is not None:
+                _bot_chat = None
+                _bot_msg = None
+                try:
+                    _bot_chat = current_file.get("bot_chat") or current_file.get("forward_chat_id")
+                    _bot_msg = current_file.get("bot_msg") or current_file.get("forward_message_id")
+                except Exception:
+                    pass
+                if _bot_chat and _bot_msg:
+                    try:
+                        _ingest = await _bigfile_pipeline.ingest_large_file(
+                            chat_id=_bot_chat,
+                            message_id=_bot_msg,
+                            file_size=file_size,
+                            file_unique_id=current_file.get("file_unique_id"),
+                            user_id=user_id,
+                            original_filename=current_file.get("name"),
+                        )
+                        if _ingest.ok:
+                            logger.info("Big files pipeline: job %s queued for %s/%s (%dMB)",
+                                        _ingest.job_id, _bot_chat, _bot_msg, file_size // (1024*1024))
+                            await update.message.reply_text(
+                                f"Large file ({file_size // (1024*1024)} MB) queued for processing.\n"
+                                f"Job: {_ingest.job_id[:8]}... You will receive the result shortly."
+                            )
+                            return
+                        else:
+                            logger.warning("Big files pipeline failed: %s; falling back to Bot API", _ingest.error)
+                    except Exception as pipeline_exc:
+                        logger.warning("Big files pipeline error: %s; falling back to Bot API", pipeline_exc)
             file = await context.bot.get_file(file_id)
         except Exception as e:
             logger.exception("get_file failed for %s: %s", file_id, e)
@@ -1023,7 +1080,20 @@ class EnhancedMediaHandler:
             raise
 
     async def show_settings(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Display and start interactive settings flow for the user."""
+        """Show user settings with Redis cache for preferences."""
+        user_id = update.effective_user.id
+        # Try loading preferences from Redis cache first
+        _cached_prefs = None
+        try:
+            if self._cache:
+                _cached_prefs = await self._cache.get_user_session(str(user_id))
+        except Exception:
+            pass
+        if _cached_prefs and context.user_data is not None:
+            # Merge cached prefs into user_data for fast access
+            for k, v in _cached_prefs.items():
+                if k not in context.user_data or context.user_data.get(k) is None:
+                    context.user_data[k] = v
         user_id = update.effective_user.id
         if user_settings is None:
             await update.message.reply_text("⚠️ Settings not available (missing module).")

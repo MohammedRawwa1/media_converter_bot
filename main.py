@@ -515,7 +515,6 @@ def setup_handlers(application: Application) -> None:
         sent_at = data.get("login_code_sent_at")
         sent_repr = data.get("login_code_sent_repr")
         resend_count = data.get("login_resend_count", 0)
-        "login_password_retry_count",
         code_hash = data.get("login_code_hash")
         session_path = data.get("login_session_path")
         awaiting = {
@@ -1390,30 +1389,6 @@ def setup_handlers(application: Application) -> None:
                     await client.disconnect()
                     _clear_login_flow(user_id, context)
             return
-
-            try:
-                await client.sign_in(password=password)
-                if await client.is_user_authorized():
-                    session_path = context.user_data.get("login_session_path")
-                    await update.message.reply_text(
-                        "✅ Telethon userbot login successful. Session saved locally."
-                        + (f"\nSaved session: {session_path}" if session_path else "")
-                    )
-                else:
-                    await update.message.reply_text(
-                        "Password accepted but the session is not authorized. Please run /login again."
-                    )
-            except Exception as exc:
-                logger.exception("/login password step failed: %s", exc)
-                await update.message.reply_text(
-                    "Failed to complete Telethon login with password. Please try /login again."
-                )
-            finally:
-                try:
-                    await client.disconnect()
-                except Exception:
-                    pass
-                _clear_login_flow(user_id, context)
             return
 
         _clear_login_flow(user_id, context)
@@ -1705,11 +1680,29 @@ async def main(background: bool = False) -> None:
 
                 logger.info("Starting background long-poller (FORCE_POLLING enabled)")
 
+                # Distributed lock to prevent multiple workers from polling simultaneously
+                _longpoll_redis_lock = None
+                try:
+                    from utils.redis_lock import RedisLock
+                    _longpoll_redis_lock = RedisLock("longpoller", ttl=35)
+                except Exception:
+                    _longpoll_redis_lock = None
+
                 async def _longpoll_loop():
                     offset = None
                     bot = application.bot
                     while True:
                         try:
+                            # Acquire distributed lock (only one worker polls at a time)
+                            if _longpoll_redis_lock is not None:
+                                if not await _longpoll_redis_lock.acquire():
+                                    logger.debug("Long-poller: another worker holds the lock; sleeping")
+                                    await asyncio.sleep(5)
+                                    continue
+                                try:
+                                    await _longpoll_redis_lock.renew()
+                                except Exception:
+                                    pass
                             # Use a modest timeout so we can react to shutdown_event
                             sem = globals().get("GET_UPDATES_SEMAPHORE")
                             get_bot = globals().get("GET_UPDATES_BOT")
@@ -1750,19 +1743,36 @@ async def main(background: bool = False) -> None:
                             logger.warning("Long-poller timed out (pool exhausted): %s. Backing off 5s", e)
                             await asyncio.sleep(5)
                         except Conflict as e:
-                            logger.error("Long-poller conflict (another getUpdates active): %s. Stopping long-poller", e)
-                            break
+                            logger.warning("Long-poller conflict: %s. Releasing lock and retrying", e)
+                            if _longpoll_redis_lock is not None:
+                                try:
+                                    await _longpoll_redis_lock.release()
+                                except Exception:
+                                    pass
+                            await asyncio.sleep(10)
+                            continue
                         except Exception as e:
                             logger.exception(f"Long-poller error: {e}")
                             await asyncio.sleep(1)
+                        finally:
+                            if _longpoll_redis_lock is not None and _longpoll_redis_lock.is_acquired:
+                                try:
+                                    await _longpoll_redis_lock.renew()
+                                except Exception:
+                                    pass
 
                 try:
                     global LONG_POLLER_STARTED
-                    if not globals().get("LONG_POLLER_STARTED", False):
+                    can_start = True
+                    if _longpoll_redis_lock is not None:
+                        can_start = await _longpoll_redis_lock.acquire()
+                    if can_start and not globals().get("LONG_POLLER_STARTED", False):
                         globals()["LONG_POLLER_STARTED"] = True
                         polling_task = asyncio.create_task(_longpoll_loop())
-                    else:
+                    elif globals().get("LONG_POLLER_STARTED", False):
                         logger.info("Background long-poller already running; skipping duplicate start")
+                    else:
+                        logger.info("Another worker holds long-poller lock; skipping")
                 except Exception:
                     logger.exception("Failed to start background long-poller")
 
