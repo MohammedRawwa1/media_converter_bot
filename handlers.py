@@ -607,9 +607,10 @@ class EnhancedMediaHandler:
         if not current_file:
             raise Exception("No file in session")
 
-        # If already downloaded, nothing to do
+        # If already downloaded (local) or already streamed to S3, nothing to do
         path = current_file.get("path")
-        if path and os.path.exists(path):
+        input_key = current_file.get("input_key")
+        if input_key or (path and os.path.exists(path)):
             return
 
         file_id = current_file.get("id") or current_file.get("file_id")
@@ -882,18 +883,37 @@ class EnhancedMediaHandler:
 
             raise
 
-        # Download with the bot (if we reached here, get_file succeeded)
-        await file.download_to_drive(file_path)
-
-        # Attempt to detect a better filename now that the file is present
+        # Check if we should stream directly to remote storage (S3/R2), skipping local disk
+        _backend = None
+        _use_remote = False
         try:
-            final_name = await detect_filename(file_path, getattr(update, "message", None))
-            if final_name:
-                current_file["name"] = final_name
+            from utils.storage import get_storage_backend as _gsb
+            _bn = (os.getenv("STORAGE_BACKEND") or getattr(config, "STORAGE_BACKEND", "local") or "local").lower()
+            if _bn in ("s3", "r2") and _gsb is not None:
+                _backend = await _gsb()
+                _use_remote = True
         except Exception:
-            logger.debug("detect_filename failed after download")
+            pass
 
-        current_file["path"] = file_path
+        if _use_remote and _backend is not None:
+            # Stream: download bytes from Telegram -> upload directly to S3, no local disk write
+            data = await file.download_as_bytearray()
+            _input_key = f"inputs/{user_id}/{file_id}{ext}"
+            await _backend.upload_bytes(bytes(data), _input_key)
+            current_file["input_key"] = _input_key
+            current_file["path"] = None  # Not on local disk
+            logger.info("Streamed file directly to S3: %s -> %s (size=%d bytes)", file_id, _input_key, len(data))
+        else:
+            # Fallback: download to local disk
+            await file.download_to_drive(file_path)
+            try:
+                final_name = await detect_filename(file_path, getattr(update, "message", None))
+                if final_name:
+                    current_file["name"] = final_name
+            except Exception:
+                logger.debug("detect_filename failed after download")
+            current_file["path"] = file_path
+
         session["current_file"] = current_file
         try:
             self._persist_session(user_id)
@@ -1311,6 +1331,7 @@ class EnhancedMediaHandler:
         job = {
             "job_id": job_id,
             "input_path": input_path,
+            "input_key": current_file.get("input_key"),
             "output_path": output_path,
             "ffmpeg_args": None,  # let worker infer from extension or use default
             "progress_channel": f"ffmpeg:progress:{job_id}",
@@ -3389,6 +3410,7 @@ class EnhancedMediaHandler:
             job = {
                 "job_id": job_id,
                 "input_path": current_file["path"],
+                "input_key": current_file.get("input_key"),
                 "output_path": output_path,
                 "ffmpeg_args": cmd,
                 "progress_channel": f"ffmpeg:progress:{job_id}",
@@ -3474,6 +3496,7 @@ class EnhancedMediaHandler:
         job = {
             "job_id": job_id,
             "input_path": current_file["path"],
+            "input_key": current_file.get("input_key"),
             "output_path": output_path,
             "ffmpeg_args": ["-c", "copy"],
             "progress_channel": f"ffmpeg:progress:{job_id}",
@@ -3704,6 +3727,7 @@ class EnhancedMediaHandler:
             "job_id": job_id,
             "type": "extract_streams",
             "input_path": current_file["path"],
+            "input_key": current_file.get("input_key"),
             "output_dir": out_dir,
             "archive_path": archive_path,
             "progress_channel": f"ffmpeg:progress:{job_id}",
@@ -4169,6 +4193,7 @@ class EnhancedMediaHandler:
             "job_id": job_id,
             "type": "generate_sample",
             "input_path": current_file["path"],
+            "input_key": current_file.get("input_key"),
             "output_path": output_path,
             "duration": 30,
             "progress_channel": f"ffmpeg:progress:{job_id}",

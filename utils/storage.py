@@ -285,6 +285,47 @@ class S3AsyncBackend(AsyncStorageBackend):
         await asyncio.to_thread(_sync)
         return dest_key
 
+    async def upload_bytes(self, data: bytes, dest_key: str) -> str:
+        """Upload bytes directly to S3 without writing to local disk first."""
+        if not dest_key:
+            raise ValueError("dest_key must not be empty")
+        if not self.bucket:
+            raise ValueError(f"Invalid S3 bucket name: {self.bucket}")
+        if "http://" in str(self.bucket) or "https://" in str(self.bucket):
+            raise ValueError(f"S3_BUCKET must be a bucket name, not a URL: {self.bucket}")
+
+        retries = int(os.getenv("S3_OP_RETRIES", "3"))
+        backoff_base = float(os.getenv("S3_OP_BACKOFF_BASE", "1"))
+        max_backoff = float(os.getenv("S3_OP_BACKOFF_MAX", "60"))
+        import random
+
+        for attempt in range(1, retries + 1):
+            try:
+                logger.info(
+                    "Uploading bytes → bucket=%s key=%s (attempt %s/%s) size=%d",
+                    self.bucket, dest_key, attempt, retries, len(data),
+                )
+                if self._use_aioboto3:
+                    async with self._session.client("s3", **self._client_kwargs()) as client:
+                        await client.put_object(Bucket=self.bucket, Key=dest_key, Body=data)
+                    return dest_key
+                if boto3 is None:
+                    raise RuntimeError("boto3 is required when aioboto3 is not installed")
+
+                def _sync():
+                    client = boto3.client("s3", **self._client_kwargs())
+                    client.put_object(Bucket=self.bucket, Key=dest_key, Body=data)
+
+                await asyncio.to_thread(_sync)
+                return dest_key
+            except Exception as e:
+                logger.warning("S3 bytes upload failed (attempt %s/%s): %s", attempt, retries, e)
+                if attempt == retries:
+                    logger.exception("S3 bytes upload failed permanently for key=%s", dest_key)
+                    raise
+                backoff = min(max_backoff, backoff_base * (2 ** (attempt - 1)))
+                await asyncio.sleep(backoff + random.random())
+
     async def download_file(self, key: str, dest_path: str) -> bool:
         # Retry/backoff parameters
         retries = int(os.getenv("S3_OP_RETRIES", "3"))

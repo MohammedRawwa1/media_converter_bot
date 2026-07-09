@@ -34,6 +34,9 @@ logger = logging.getLogger(__name__)
 DEFAULT_BOT_API_MAX_MB = int(os.getenv("BOT_API_MAX_MB", "50"))
 DEFAULT_BOT_API_MAX_BYTES = DEFAULT_BOT_API_MAX_MB * 1024 * 1024
 
+# Files up to this size (200MB) get streamed through memory instead of temp disk
+IN_MEMORY_MAX_BYTES = int(os.getenv("BIGFILE_IN_MEMORY_MAX_MB", "200")) * 1024 * 1024
+
 # Imports — all guarded for optional dependencies
 try:
     from utils.storage import get_storage_backend
@@ -112,76 +115,142 @@ class BigFilePipeline:
         job_id = uuid.uuid4().hex
         input_s3_key = f"inputs/{job_id}/source"
 
-        # Step 1: Download via Pyrogram userbot to temp
-        try:
-            temp_dir = os.path.join(
-                os.getenv("STORAGE_PATH", "storage"), "temp"
-            )
-            os.makedirs(temp_dir, exist_ok=True)
+        # Determine extension from filename
+        ext = ""
+        if original_filename:
+            _, ext = os.path.splitext(original_filename)
+        if not ext:
+            ext = ".bin"
 
-            # Determine extension from filename
-            ext = ""
-            if original_filename:
-                _, ext = os.path.splitext(original_filename)
-            if not ext:
-                ext = ".bin"
+        actual_size = 0
+        s3_key = input_s3_key
+        _in_memory_success = False
 
-            temp_path = os.path.join(temp_dir, f"{job_id}_src{ext}")
-            logger.info(
-                "BigFilePipeline: downloading via Pyrogram chat=%s msg=%s size=%dMB -> %s",
-                chat_id, message_id, file_size // (1024 * 1024), temp_path,
-            )
+        # Try in-memory streaming for files 50-200MB when S3 is available
+        _use_in_memory = (
+            self._storage is not None
+            and file_size > DEFAULT_BOT_API_MAX_BYTES
+            and file_size <= IN_MEMORY_MAX_BYTES
+        )
 
-            download_ok = await self._download_via_pyrogram(
-                chat_id, message_id, temp_path
-            )
-            if not download_ok or not os.path.exists(temp_path) or os.path.getsize(temp_path) == 0:
-                return IngestResult(
-                    ok=False,
-                    error="Pyrogram download failed",
+        if _use_in_memory:
+            try:
+                from utils.userbot_downloader import download_bytes_via_userbot
+
+                logger.info(
+                    "BigFilePipeline: in-memory download chat=%s msg=%s size=%dMB",
+                    chat_id, message_id, file_size // (1024 * 1024),
+                )
+                data = await download_bytes_via_userbot(chat_id, message_id)
+                if data is not None and len(data) > 0:
+                    actual_size = len(data)
+                    logger.info(
+                        "BigFilePipeline: in-memory download complete, size=%dMB, uploading to S3",
+                        actual_size // (1024 * 1024),
+                    )
+                    await self._storage.upload_bytes(data, s3_key)
+                    logger.info("BigFilePipeline: S3 upload via bytes complete")
+                    _in_memory_success = True
+
+                    # Cache file info
+                    if self._cache and file_unique_id:
+                        try:
+                            await self._cache.cache_file_info(
+                                file_unique_id,
+                                {
+                                    "job_id": job_id,
+                                    "size": actual_size,
+                                    "path": s3_key,
+                                    "chat_id": chat_id,
+                                    "message_id": message_id,
+                                },
+                                ttl=86400,
+                            )
+                        except Exception:
+                            pass
+
+                    logger.info(
+                        "BigFilePipeline: in-memory pipeline succeeded for %s/%s (%d bytes)",
+                        chat_id, message_id, actual_size,
+                    )
+                else:
+                    logger.info(
+                        "BigFilePipeline: in-memory download returned None; falling back to disk-based path",
+                    )
+            except Exception as e:
+                logger.warning(
+                    "BigFilePipeline: in-memory path failed (%s); falling back to disk-based download", e,
                 )
 
-            actual_size = os.path.getsize(temp_path)
-            logger.info(
-                "BigFilePipeline: download complete, actual_size=%dMB", actual_size // (1024 * 1024)
-            )
+        if not _in_memory_success:
+            # Fallback: download to temp file, upload to S3, clean up
+            try:
+                temp_dir = os.path.join(
+                    os.getenv("STORAGE_PATH", "storage"), "temp"
+                )
+                os.makedirs(temp_dir, exist_ok=True)
 
-            # Cache file info
-            if self._cache and file_unique_id:
-                try:
-                    await self._cache.cache_file_info(
-                        file_unique_id,
-                        {
-                            "job_id": job_id,
-                            "size": actual_size,
-                            "path": temp_path,
-                            "chat_id": chat_id,
-                            "message_id": message_id,
-                        },
-                        ttl=86400,
+                temp_path = os.path.join(temp_dir, f"{job_id}_src{ext}")
+                logger.info(
+                    "BigFilePipeline: downloading via Pyrogram chat=%s msg=%s size=%dMB -> %s",
+                    chat_id, message_id, file_size // (1024 * 1024), temp_path,
+                )
+
+                download_ok = await self._download_via_pyrogram(
+                    chat_id, message_id, temp_path
+                )
+                if not download_ok or not os.path.exists(temp_path) or os.path.getsize(temp_path) == 0:
+                    return IngestResult(
+                        ok=False,
+                        error="Pyrogram download failed",
                     )
-                except Exception:
-                    pass
 
-        except Exception as e:
-            logger.exception("BigFilePipeline: Pyrogram download error: %s", e)
-            return IngestResult(ok=False, error=f"Download error: {e}")
+                actual_size = os.path.getsize(temp_path)
+                logger.info(
+                    "BigFilePipeline: disk download complete, actual_size=%dMB", actual_size // (1024 * 1024)
+                )
 
-        # Step 2: Upload to S3
-        s3_key = input_s3_key
-        try:
-            if self._storage is not None:
-                logger.info("BigFilePipeline: uploading to S3 key=%s", s3_key)
-                await self._storage.upload_file(temp_path, s3_key)
-                logger.info("BigFilePipeline: S3 upload complete")
-            else:
-                # No S3 — keep the file locally
+                # Cache file info
+                if self._cache and file_unique_id:
+                    try:
+                        await self._cache.cache_file_info(
+                            file_unique_id,
+                            {
+                                "job_id": job_id,
+                                "size": actual_size,
+                                "path": input_s3_key if self._storage is not None else temp_path,
+                                "chat_id": chat_id,
+                                "message_id": message_id,
+                            },
+                            ttl=86400,
+                        )
+                    except Exception:
+                        pass
+
+            except Exception as e:
+                logger.exception("BigFilePipeline: Pyrogram download error: %s", e)
+                return IngestResult(ok=False, error=f"Download error: {e}")
+
+            # Upload to S3
+            try:
+                if self._storage is not None:
+                    logger.info("BigFilePipeline: uploading to S3 key=%s", s3_key)
+                    await self._storage.upload_file(temp_path, s3_key)
+                    logger.info("BigFilePipeline: S3 upload complete")
+                    # Immediately clean up temp file
+                    try:
+                        if os.path.exists(temp_path):
+                            os.remove(temp_path)
+                            logger.info("BigFilePipeline: cleaned up temp file %s", temp_path)
+                    except Exception as cleanup_err:
+                        logger.warning("BigFilePipeline: failed to clean up temp file %s: %s", temp_path, cleanup_err)
+                else:
+                    # No S3 — keep the file locally
+                    s3_key = temp_path
+                    logger.info("BigFilePipeline: no S3 backend, using local path: %s", temp_path)
+            except Exception as e:
+                logger.exception("BigFilePipeline: S3 upload failed: %s", e)
                 s3_key = temp_path
-                logger.info("BigFilePipeline: no S3 backend, using local path: %s", temp_path)
-        except Exception as e:
-            logger.exception("BigFilePipeline: S3 upload failed: %s", e)
-            # Fall back to local path
-            s3_key = temp_path
 
         # Step 3: Enqueue processing job
         try:

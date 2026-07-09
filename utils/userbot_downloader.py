@@ -1,3 +1,4 @@
+import io
 import os
 import logging
 import shutil
@@ -300,6 +301,121 @@ async def _download_and_ensure_path(client, msg, dest_path):
     return False
 
 
+async def _download_bytes_with_pyrogram(
+    chat_id: Union[int, str],
+    message_id: int,
+) -> Optional[bytes]:
+    """Download a message's media into memory (bytes) using Pyrogram.
+
+    Uses ``download_media(..., in_memory=True)`` to get raw bytes without
+    writing to disk. Returns ``None`` on any failure.
+    """
+    if PyrogramClient is None:
+        logger.info("userbot: Pyrogram not installed; cannot do in-memory download")
+        return None
+
+    from utils.telethon_session import build_pyrogram_client, get_userbot_credentials
+    api_id, api_hash = get_userbot_credentials()
+
+    client = build_pyrogram_client(api_id, api_hash)
+    if client is None:
+        logger.info("userbot: Pyrogram session string not configured; cannot do in-memory download")
+        return None
+
+    try:
+        await client.start()
+        logger.info("userbot: Pyrogram client started for in-memory download")
+
+        target = await _normalize_target(chat_id)
+
+        # Collect candidate peers: provided chat_id first, then bot's user ID
+        _candidates = [target]
+        _bot_token = os.getenv("BOT_TOKEN", "")
+        if _bot_token and ":" in _bot_token:
+            try:
+                _bot_id = int(_bot_token.split(":")[0])
+                if _bot_id != target:
+                    _candidates.append(_bot_id)
+            except (ValueError, IndexError):
+                pass
+
+        for _peer in _candidates:
+            try:
+                logger.info(
+                    "userbot: Pyrogram in-memory get_messages(peer=%s, msg=%s)",
+                    _peer, message_id,
+                )
+                messages = await client.get_messages(_peer, message_ids=[message_id])
+
+                if messages:
+                    msg = messages[0] if isinstance(messages, list) else messages
+                    if msg and getattr(msg, "media", None):
+                        logger.info(
+                            "userbot: Pyrogram in-memory downloading %s/%s (peer=%s)",
+                            _peer, message_id, _peer,
+                        )
+                        data = await client.download_media(msg, in_memory=True)
+                        if data is not None and isinstance(data, bytes) and len(data) > 0:
+                            logger.info(
+                                "userbot: Pyrogram in-memory download succeeded: %d bytes from %s/%s",
+                                len(data), _peer, message_id,
+                            )
+                            return data
+                        logger.warning(
+                            "userbot: Pyrogram in-memory returned empty/invalid data for %s/%s",
+                            _peer, message_id,
+                        )
+                    else:
+                        logger.info(
+                            "userbot: Pyrogram in-memory msg %s/%s no media (peer=%s)",
+                            _peer, message_id, _peer,
+                        )
+                else:
+                    logger.info(
+                        "userbot: Pyrogram in-memory get_messages(peer=%s) returned None for msg %s",
+                        _peer, message_id,
+                    )
+            except ValueError as e:
+                if "Peer id invalid" in str(e) and isinstance(_peer, int) and _is_large_bot_api_channel(_peer):
+                    logger.info(
+                        "userbot: large channel ID %s for in-memory, trying raw API", _peer,
+                    )
+                    channel_peer = await _resolve_bot_api_channel_raw(client, _peer)
+                    if channel_peer is not None:
+                        msg = await _get_messages_via_raw_channel_api(
+                            client, channel_peer, message_id,
+                        )
+                        if msg is not None and getattr(msg, "media", None):
+                            data = await client.download_media(msg, in_memory=True)
+                            if data is not None and isinstance(data, bytes) and len(data) > 0:
+                                logger.info(
+                                    "userbot: raw API in-memory download succeeded: %d bytes",
+                                    len(data),
+                                )
+                                return data
+                else:
+                    logger.warning(
+                        "userbot: Pyrogram in-memory error with peer=%s msg=%s: %s",
+                        _peer, message_id, e,
+                    )
+            except Exception as e:
+                logger.warning(
+                    "userbot: Pyrogram in-memory error with peer=%s msg=%s: %s",
+                    _peer, message_id, e,
+                )
+
+        logger.warning(
+            "userbot: Pyrogram in-memory download failed for %s/%s",
+            chat_id, message_id,
+        )
+        return None
+    finally:
+        try:
+            await client.stop()
+        except Exception:
+            pass
+
+
 async def _download_with_pyrogram(
     chat_id: Union[int, str],
     message_id: int,
@@ -593,3 +709,79 @@ async def download_forward_via_userbot(
 
     logger.warning("userbot: all download methods failed for %s/%s", chat_id, message_id)
     return False
+
+
+async def download_bytes_via_userbot(
+    chat_id: Union[int, str],
+    message_id: int,
+) -> Optional[bytes]:
+    """Download a message media into memory (bytes) using userbot.
+
+    Tries Pyrogram with ``in_memory=True`` first to avoid any disk I/O.
+    Falls back to Telethon (file-like object) if Pyrogram fails.
+
+    Returns the file contents as ``bytes`` on success, or ``None`` on failure.
+    """
+    if TelegramClient is None and PyrogramClient is None:
+        raise RuntimeError(
+            "Neither Telethon nor Pyrogram are installed. "
+            "Install at least one: pip install telethon or pip install pyrogram"
+        )
+
+    from utils.telethon_session import (
+        get_pyrogram_session_string,
+        has_usable_telethon_session,
+    )
+
+    pyrogram_session_configured = bool(get_pyrogram_session_string())
+
+    # Try Pyrogram in-memory first
+    if PyrogramClient is not None and pyrogram_session_configured:
+        try:
+            data = await _download_bytes_with_pyrogram(chat_id, message_id)
+            if data is not None:
+                logger.info(
+                    "userbot: in-memory download via Pyrogram succeeded: %d bytes",
+                    len(data),
+                )
+                return data
+            logger.info("userbot: Pyrogram in-memory download failed; trying Telethon fallback")
+        except Exception as e:
+            logger.warning(
+                "userbot: Pyrogram in-memory download error (%s); trying Telethon fallback", e,
+            )
+
+    # Try Telethon with BytesIO as fallback
+    if TelegramClient is not None and has_usable_telethon_session():
+        try:
+            from utils.telethon_session import build_telethon_client, get_userbot_credentials as _get_creds
+
+            _api_id, _api_hash = _get_creds()
+            _client = build_telethon_client(_api_id, _api_hash)
+            if _client is not None:
+                await _client.start()
+                target = await _normalize_target(chat_id, _client)
+                msgs = await _client.get_messages(target, ids=message_id)
+                if msgs:
+                    msg = msgs[0] if isinstance(msgs, (list, tuple)) else msgs
+                    if getattr(msg, "media", None):
+                        buf = io.BytesIO()
+                        await _client.download_media(msg, file=buf)
+                        data = buf.getvalue()
+                        if data and len(data) > 0:
+                            logger.info(
+                                "userbot: in-memory download via Telethon succeeded: %d bytes",
+                                len(data),
+                            )
+                            return data
+                await _client.disconnect()
+        except Exception as e:
+            logger.warning(
+                "userbot: Telethon in-memory download error (%s)", e,
+            )
+
+    logger.warning(
+        "userbot: all in-memory download methods failed for %s/%s",
+        chat_id, message_id,
+    )
+    return None
