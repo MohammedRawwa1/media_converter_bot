@@ -482,8 +482,6 @@ def setup_handlers(application: Application) -> None:
                 # Schedule asynchronous index creation so failures are handled
                 # inside the event loop rather than in background threads.
                 try:
-                    import asyncio
-
                     asyncio.create_task(model.ensure_indexes())
                 except Exception:
                     logger.debug("Could not schedule async index creation for Mongo model")
@@ -780,7 +778,6 @@ def setup_handlers(application: Application) -> None:
             client = context.user_data.get("login_client")
             if client is not None:
                 try:
-                    import asyncio
                     try:
                         loop = asyncio.get_event_loop()
                         if loop.is_running():
@@ -860,7 +857,6 @@ def setup_handlers(application: Application) -> None:
                 client = context.user_data.get("login_client")
                 if client is not None:
                     try:
-                        import asyncio
                         try:
                             loop = asyncio.get_event_loop()
                             if loop.is_running():
