@@ -1,5 +1,6 @@
 import os
 import logging
+import shutil
 from typing import Union, Optional
 from datetime import datetime
 import asyncio
@@ -251,6 +252,54 @@ async def _get_messages_via_raw_channel_api(
     return None
 
 
+async def _download_and_ensure_path(client, msg, dest_path):
+    """Download media from *msg* and ensure the file ends up at *dest_path*.
+
+    Pyrogram 2.0.106's ``download_media`` resolves relative paths against
+    ``self.PARENT_DIR`` and returns an absolute path.  The caller's ``dest_path``
+    is often relative.  This helper reconciles the two.
+
+    Returns ``True`` on success, ``False`` otherwise.
+    """
+    _dl = await client.download_media(msg, file_name=dest_path)
+    logger.info(
+        "userbot: download_media dest_path=%s returned=%s",
+        dest_path, _dl,
+    )
+    if not _dl:
+        logger.warning("userbot: download_media returned None")
+        return False
+
+    # If the file was saved to a different path, move it to the expected destination
+    _dl_path = str(_dl)
+    _abs_dest = os.path.abspath(dest_path)
+    if _dl_path != _abs_dest and not os.path.exists(dest_path):
+        if os.path.exists(_dl_path):
+            logger.info(
+                "userbot: moving downloaded file %s -> %s",
+                _dl_path, _abs_dest,
+            )
+            shutil.move(_dl_path, _abs_dest)
+        else:
+            logger.warning(
+                "userbot: download_media returned %s but file does not exist", _dl_path,
+            )
+
+    # Check at the absolute destination path (where the file should be)
+    if os.path.exists(_abs_dest) and os.path.getsize(_abs_dest) > 0:
+        ok = await _ffprobe_ok(_abs_dest)
+        if ok:
+            return True
+        logger.warning(
+            "userbot: download succeeded but ffprobe validation failed: %s", _abs_dest,
+        )
+    else:
+        logger.warning(
+            "userbot: download_media produced empty/missing file at %s", _abs_dest,
+        )
+    return False
+
+
 async def _download_with_pyrogram(
     chat_id: Union[int, str],
     message_id: int,
@@ -321,25 +370,12 @@ async def _download_with_pyrogram(
                             "userbot: Pyrogram downloading %s/%s -> %s (peer=%s)",
                             _peer, message_id, dest_path, _peer,
                         )
-                        # download_media returns the file path on success, None on failure
-                        _dl_result = await client.download_media(msg, file_name=dest_path)
-                        logger.info(
-                            "userbot: Pyrogram download_media returned: %s",
-                            _dl_result,
+                        if await _download_and_ensure_path(client, msg, dest_path):
+                            return True
+                        logger.warning(
+                            "userbot: Pyrogram download failed for %s/%s (peer=%s)",
+                            _peer, message_id, _peer,
                         )
-                        if _dl_result and os.path.exists(_dl_result) and os.path.getsize(_dl_result) > 0:
-                            ok = await _ffprobe_ok(_dl_result)
-                            if ok:
-                                return True
-                            logger.warning(
-                                "userbot: Pyrogram download_media succeeded but ffprobe validation failed: %s",
-                                _dl_result,
-                            )
-                        else:
-                            logger.warning(
-                                "userbot: Pyrogram download_media failed or produced empty file for %s/%s (peer=%s): result=%s",
-                                _peer, message_id, _peer, _dl_result,
-                            )
                         # File was found but download failed — break out to avoid re-downloading
                         # from another peer (the message is correct, download itself failed)
                         break
@@ -373,13 +409,8 @@ async def _download_with_pyrogram(
                                     "userbot: raw API got msg %s with media, downloading...",
                                     message_id,
                                 )
-                                _dl_result = await client.download_media(
-                                    msg, file_name=dest_path,
-                                )
-                                if _dl_result and os.path.exists(_dl_result) and os.path.getsize(_dl_result) > 0:
-                                    ok = await _ffprobe_ok(_dl_result)
-                                    if ok:
-                                        return True
+                                if await _download_and_ensure_path(client, msg, dest_path):
+                                    return True
                                 logger.warning(
                                     "userbot: raw API download failed validation for %s/%s",
                                     _peer, message_id,
@@ -421,8 +452,7 @@ async def _download_with_pyrogram(
             )
             if msg is None or not getattr(msg, "media", None):
                 return None
-            dl = await client.download_media(msg, file_name=dest_path)
-            if dl and os.path.exists(dl) and os.path.getsize(dl) > 0 and await _ffprobe_ok(dl):
+            if await _download_and_ensure_path(client, msg, dest_path):
                 return True
             return None
 
@@ -439,11 +469,8 @@ async def _download_with_pyrogram(
                             "userbot: Pyrogram found msg %s/%s in history (peer=%s)",
                             _peer, message_id, _peer,
                         )
-                        _dl_result = await client.download_media(msg, file_name=dest_path)
-                        if _dl_result and os.path.exists(_dl_result) and os.path.getsize(_dl_result) > 0:
-                            ok = await _ffprobe_ok(_dl_result)
-                            if ok:
-                                return True
+                        if await _download_and_ensure_path(client, msg, dest_path):
+                            return True
                         break
             except ValueError as e:
                 if "Peer id invalid" in str(e):
@@ -477,11 +504,8 @@ async def _download_with_pyrogram(
                             msg = messages[0] if isinstance(messages, list) else messages
                             if msg and getattr(msg, "media", None):
                                 _found_msg = True
-                                _dl_result = await client.download_media(msg, file_name=dest_path)
-                                if _dl_result and os.path.exists(_dl_result) and os.path.getsize(_dl_result) > 0:
-                                    ok = await _ffprobe_ok(_dl_result)
-                                    if ok:
-                                        return True
+                                if await _download_and_ensure_path(client, msg, dest_path):
+                                    return True
                 except ValueError as e:
                     if "Peer id invalid" in str(e):
                         result = await _try_large_channel(_peer)
