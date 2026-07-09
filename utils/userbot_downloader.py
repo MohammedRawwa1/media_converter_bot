@@ -161,6 +161,96 @@ async def _download_with_telethon(
             pass
 
 
+async def _resolve_bot_api_channel_raw(client, bot_api_chat_id: int):
+    """Resolve a Bot API channel ID (-100xxxxx...) using raw MTProto API.
+
+    Pyrogram 2.0.106's ``get_peer_type()`` has a hardcoded range check that
+    only accepts channel IDs whose raw ``channel_id <= 2147483647``.
+    Channels with larger IDs (e.g. ``4367325292``) are rejected with
+    ``Peer id invalid`` **before** any network request is made.
+
+    This function bypasses the range check by invoking
+    ``channels.GetChannels`` directly with ``access_hash=0``, allowing the
+    server to respond with the correct access_hash.
+    """
+    from pyrogram import raw
+
+    raw_channel_id = abs(bot_api_chat_id) - 1000000000000
+    try:
+        result = await client.invoke(
+            raw.functions.channels.GetChannels(
+                id=[raw.types.InputChannel(
+                    channel_id=raw_channel_id,
+                    access_hash=0,
+                )]
+            )
+        )
+        if result and result.chats:
+            chat = result.chats[0]
+            access_hash = getattr(chat, "access_hash", 0)
+            logger.info(
+                "userbot: resolved large channel %s -> channel_id=%s access_hash=%s",
+                bot_api_chat_id, raw_channel_id, access_hash,
+            )
+            return raw.types.InputPeerChannel(
+                channel_id=raw_channel_id,
+                access_hash=access_hash,
+            )
+    except Exception as e:
+        logger.warning(
+            "userbot: failed to resolve large channel %s via raw API: %s",
+            bot_api_chat_id, e,
+        )
+    return None
+
+
+def _is_large_bot_api_channel(peer_id) -> bool:
+    """Return True if ``peer_id`` is a Bot API channel ID with a raw
+    channel_id that Pyrogram 2.0.106's range check can not handle.
+    """
+    if not isinstance(peer_id, int) or peer_id >= 0:
+        return False
+    s = str(peer_id)
+    if not s.startswith("-100"):
+        return False
+    raw_id = abs(peer_id) - 1000000000000
+    # Pyrogram's MIN_CHANNEL_ID = -1002147483647, which corresponds to
+    # a max raw channel_id of 2147483647 (2^31-1, 32-bit signed int).
+    return raw_id > 2147483647
+
+
+async def _get_messages_via_raw_channel_api(
+    client, channel_peer, message_id: int,
+):
+    """Get a single message from a channel using raw MTProto API.
+
+    Returns the first :class:`Message` from the response, or None.
+    """
+    from pyrogram import raw
+    from pyrogram import types as pyro_types
+
+    try:
+        r = await client.invoke(
+            raw.functions.channels.GetMessages(
+                channel=channel_peer,
+                id=[raw.types.InputMessageID(id=message_id)],
+            )
+        )
+        if r and r.messages:
+            users = {i.id: i for i in r.users}
+            chats = {i.id: i for i in r.chats}
+            msg = await pyro_types.Message._parse(
+                client, r.messages[0], users, chats, replies=0,
+            )
+            return msg
+    except Exception as e:
+        logger.warning(
+            "userbot: GetMessages via raw API failed for msg %s: %s",
+            message_id, e,
+        )
+    return None
+
+
 async def _download_with_pyrogram(
     chat_id: Union[int, str],
     message_id: int,
@@ -263,11 +353,78 @@ async def _download_with_pyrogram(
                         "userbot: Pyrogram get_messages(peer=%s) returned None/empty for msg %s",
                         _peer, message_id,
                     )
+            except ValueError as e:
+                err_str = str(e)
+                if "Peer id invalid" in err_str and isinstance(_peer, int) and _is_large_bot_api_channel(_peer):
+                    # Pyrogram's get_peer_type range check rejects this channel ID.
+                    # Retry using raw MTProto API.
+                    logger.info(
+                        "userbot: large channel ID %s, retrying via raw API", _peer,
+                    )
+                    channel_peer = await _resolve_bot_api_channel_raw(client, _peer)
+                    if channel_peer is not None:
+                        msg = await _get_messages_via_raw_channel_api(
+                            client, channel_peer, message_id,
+                        )
+                        if msg is not None:
+                            _found_msg = True
+                            if getattr(msg, "media", None):
+                                logger.info(
+                                    "userbot: raw API got msg %s with media, downloading...",
+                                    message_id,
+                                )
+                                _dl_result = await client.download_media(
+                                    msg, file=dest_path,
+                                )
+                                if _dl_result and os.path.exists(_dl_result) and os.path.getsize(_dl_result) > 0:
+                                    ok = await _ffprobe_ok(_dl_result)
+                                    if ok:
+                                        return True
+                                logger.warning(
+                                    "userbot: raw API download failed validation for %s/%s",
+                                    _peer, message_id,
+                                )
+                            else:
+                                logger.info(
+                                    "userbot: raw API msg %s/%s has no media",
+                                    _peer, message_id,
+                                )
+                        else:
+                            logger.warning(
+                                "userbot: raw API returned no message for %s/%s",
+                                _peer, message_id,
+                            )
+                else:
+                    logger.warning(
+                        "userbot: Pyrogram error with peer=%s msg=%s: %s",
+                        _peer, message_id, e,
+                    )
             except Exception as e:
                 logger.warning(
                     "userbot: Pyrogram error with peer=%s msg=%s: %s",
                     _peer, message_id, e,
                 )
+
+        async def _try_large_channel(peer):
+            """Try downloading from a large Bot API channel ID using raw MTProto.
+            Returns True on success, False if peer not applicable, or None."""
+            if not _is_large_bot_api_channel(peer):
+                return False
+            logger.info(
+                "userbot: large channel ID %s, trying raw API", peer,
+            )
+            channel_peer = await _resolve_bot_api_channel_raw(client, peer)
+            if channel_peer is None:
+                return None
+            msg = await _get_messages_via_raw_channel_api(
+                client, channel_peer, message_id,
+            )
+            if msg is None or not getattr(msg, "media", None):
+                return None
+            dl = await client.download_media(msg, file=dest_path)
+            if dl and os.path.exists(dl) and os.path.getsize(dl) > 0 and await _ffprobe_ok(dl):
+                return True
+            return None
 
         # Fallback: scan the recent history of each candidate peer for a matching media message.
         for _peer in _candidates:
@@ -288,6 +445,13 @@ async def _download_with_pyrogram(
                             if ok:
                                 return True
                         break
+            except ValueError as e:
+                if "Peer id invalid" in str(e):
+                    result = await _try_large_channel(_peer)
+                    if result is True:
+                        return True
+                    if result is not None:
+                        _found_msg = True
             except Exception as e:
                 logger.warning(
                     "userbot: Pyrogram history scan(peer=%s) failed: %s", _peer, e,
@@ -295,7 +459,6 @@ async def _download_with_pyrogram(
 
         # Final attempt: try get_chat to resolve peer properly, then retry get_messages
         if not _found_msg:
-            # The message wasn't found by any method. Try resolving the peer via get_chat first.
             for _peer in _candidates:
                 try:
                     logger.info(
@@ -319,6 +482,13 @@ async def _download_with_pyrogram(
                                     ok = await _ffprobe_ok(_dl_result)
                                     if ok:
                                         return True
+                except ValueError as e:
+                    if "Peer id invalid" in str(e):
+                        result = await _try_large_channel(_peer)
+                        if result is True:
+                            return True
+                        if result is not None:
+                            _found_msg = True
                 except Exception as e:
                     logger.warning(
                         "userbot: Pyrogram get_chat(peer=%s) or retry failed: %s",
