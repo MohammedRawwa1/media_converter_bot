@@ -8,7 +8,7 @@ from typing import Dict, List, Tuple
 import config
 
 # Use configured FFMPEG_PATH, fallback to FFMPEG_PATH
-FFMPEG_PATH = getattr(config, 'FFMPEG_PATH', FFMPEG_PATH) or FFMPEG_PATH 
+FFMPEG_PATH = getattr(config, 'FFMPEG_PATH', 'ffmpeg') or 'ffmpeg' 
 
 logger = logging.getLogger(__name__)
 
