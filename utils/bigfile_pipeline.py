@@ -61,7 +61,7 @@ class BigFilePipeline:
     def __init__(self):
         self._storage = None
         self._cache = None
-        self._init_lock = None  # lazy-init to avoid Windows deprecation
+        self._init_lock = asyncio.Lock()
 
     async def _ensure_initialized(self):
         """Lazy-init storage and cache backends."""
