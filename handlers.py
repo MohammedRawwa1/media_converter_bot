@@ -701,11 +701,13 @@ class EnhancedMediaHandler:
                         raise Exception(
                             "Telegram reports the file is too big to download via the bot. "
                             f"Please either upload the file via the web uploader (POST to {upload_url}) or provide a direct public URL to the file."
+                            + (" Configure PYROGRAM_SESSION (preferred) or API_ID/API_HASH + API_SESSION if you want automatic userbot fallback." if enable_userbot else "")
                         )
                 except Exception:
                     raise Exception(
                         "Telegram reports the file is too big to download via the bot. "
                         f"Please either upload the file via the web uploader (POST to {upload_url}) or provide a direct public URL to the file."
+                        + (" Configure PYROGRAM_SESSION (preferred) or API_ID/API_HASH + API_SESSION if you want automatic userbot fallback." if enable_userbot else "")
                     )
 
             forward = current_file.get("forward") if current_file else None

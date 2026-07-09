@@ -234,23 +234,37 @@ async def download_forward_via_userbot(
             "Install at least one: pip install telethon or pip install pyrogram"
         )
 
-    # Try Telethon first (traditional)
-    if TelegramClient is not None:
+    from utils.telethon_session import (
+        get_pyrogram_session_string,
+        has_usable_telethon_session,
+    )
+
+    pyrogram_session_configured = bool(get_pyrogram_session_string())
+
+    # Prefer a pre-configured Pyrogram session when available; it avoids
+    # interactive Telethon login prompts on server environments.
+    if PyrogramClient is not None and pyrogram_session_configured:
+        try:
+            result = await _download_with_pyrogram(chat_id, message_id, dest_path)
+            if result:
+                return True
+            logger.info("userbot: Pyrogram download failed; trying Telethon fallback")
+        except Exception as e:
+            logger.warning("userbot: Pyrogram download error (%s); trying Telethon fallback", e)
+
+    # Try Telethon only when a usable session exists.
+    if TelegramClient is not None and has_usable_telethon_session():
         try:
             result = await _download_with_telethon(
                 chat_id, message_id, dest_path, msg_date, file_unique_id
             )
             if result:
                 return True
-            logger.info("userbot: Telethon download failed; trying Pyrogram fallback")
+            logger.info("userbot: Telethon download failed; no further fallback")
         except Exception as e:
-            logger.warning("userbot: Telethon download error (%s); trying Pyrogram fallback", e)
-
-    # Fall back to Pyrogram
-    if PyrogramClient is not None:
-        result = await _download_with_pyrogram(chat_id, message_id, dest_path)
-        if result:
-            return True
+            logger.warning("userbot: Telethon download error (%s)", e)
+    elif TelegramClient is not None:
+        logger.info("userbot: Telethon session not configured; skipping Telethon download")
 
     logger.warning("userbot: all download methods failed for %s/%s", chat_id, message_id)
     return False

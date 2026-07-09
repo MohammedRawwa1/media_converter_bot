@@ -114,23 +114,25 @@ def is_pyrogram_available() -> bool:
     return PyrogramClient is not None and bool(get_pyrogram_session_string())
 
 
-def is_telethon_available() -> bool:
-    """Return True if Telethon is installed and configured."""
+def has_usable_telethon_session() -> bool:
+    """Return True when Telethon can use a pre-existing session without prompting for login."""
     if TelegramClient is None:
         return False
-    # Check if we have either a session string or API credentials for file-based auth
+
     session_str = _get_env_value(
         "API_SESSION", "SESSION", "api_session", "USERBOT_SESSION",
         "userbot_session", "TELETHON_SESSION", "telethon_session",
     )
     if session_str:
         return True
-    # File-based session may exist on disk
+
     session_path = get_telethon_session_path()
-    if os.path.exists(session_path + ".session"):
-        return True
-    # No session configured yet, but Telethon is installed
-    return True  # API creds are checked by callers
+    return os.path.exists(session_path) or os.path.exists(session_path + ".session")
+
+
+def is_telethon_available() -> bool:
+    """Return True if Telethon is installed and configured."""
+    return has_usable_telethon_session()
 
 
 def get_preferred_client_type() -> str:
