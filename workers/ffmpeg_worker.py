@@ -62,6 +62,97 @@ _cache = None
 LAST_FORWARD_NOTIFICATION: Optional[dict] = None
 
 
+async def _update_upload_progress(job_id: str, progress_channel: str, pct: int, message: str) -> None:
+    """Update Redis job hash and publish progress for Telegram upload."""
+    try:
+        r = await get_redis()
+        try:
+            await r.hset(f"ffmpeg:job:{job_id}", mapping={
+                "progress": str(pct),
+                "message": message,
+                "status": "uploading" if pct < 100 else "sending",
+            })
+            await publish_update(progress_channel, {
+                "job_id": job_id,
+                "progress": pct,
+                "message": message,
+            })
+        finally:
+            try:
+                await r.close()
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+
+def _make_upload_progress_callback(job_id: str, progress_channel: str):
+    """Create a throttled sync progress callback for userbot uploads.
+
+    Returns a callable(sent_bytes, total_bytes) suitable for both
+    Telethon's progress_callback and Pyrogram's progress parameter.
+    Updates are throttled to at most once per second or when the
+    percentage changes.
+    """
+    _last_pct = [-1]
+    _last_update = [0.0]
+    _interval = 1.0
+
+    def _progress(sent_bytes: int, total_bytes: int) -> None:
+        try:
+            if total_bytes <= 0:
+                return
+            pct = min(int(sent_bytes * 100 / total_bytes), 100)
+            now = time.time()
+            if pct != _last_pct[0] or (now - _last_update[0]) >= _interval:
+                _last_pct[0] = pct
+                _last_update[0] = now
+                mb_sent = sent_bytes // (1024 * 1024)
+                mb_total = total_bytes // (1024 * 1024)
+                msg = f"Uploading to Telegram: {pct}% ({mb_sent}MB / {mb_total}MB)"
+                try:
+                    loop = asyncio.get_running_loop()
+                    asyncio.run_coroutine_threadsafe(
+                        _update_upload_progress(job_id, progress_channel, pct, msg),
+                        loop,
+                    )
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    return _progress
+
+
+class _ProgressFileWrapper:
+    """Wraps a file-like object and calls a progress callback as bytes are read.
+
+    The Bot API (python-telegram-bot via httpx) reads from the file handle in
+    chunks during multipart upload. This wrapper intercepts those reads and
+    tracks progress so we can show upload status in the Telegram progress message.
+    """
+
+    def __init__(self, fh, total_size: int, progress_callback):
+        self._fh = fh
+        self._total = total_size
+        self._sent = 0
+        self._progress_callback = progress_callback
+
+    def read(self, size: int = -1):
+        chunk = self._fh.read(size)
+        if chunk:
+            self._sent += len(chunk)
+            if self._progress_callback:
+                try:
+                    self._progress_callback(self._sent, self._total)
+                except Exception:
+                    pass
+        return chunk
+
+    def __getattr__(self, name):
+        return getattr(self._fh, name)
+
+
 async def _forward_pubsub_listener(stop_event: Optional[asyncio.Event], event: asyncio.Event) -> None:
     """Background task: subscribe to forward publish channel and set `event` when a notification arrives.
 
@@ -861,7 +952,8 @@ async def handle_job(job: dict):
                             try:
                                 from utils.userbot_uploader import send_file_via_userbot
 
-                                ok = await send_file_via_userbot(chat_id, out, caption=caption)
+                                _up_cb = _make_upload_progress_callback(job_id, progress_channel)
+                                ok = await send_file_via_userbot(chat_id, out, caption=caption, progress_callback=_up_cb)
                                 if ok:
                                     logger.info("Sent output via Telethon userbot (preferred) for job %s", job_id)
                                     sent = True
@@ -1008,8 +1100,10 @@ async def handle_job(job: dict):
                                                 except Exception:
                                                     thumb_path = None
 
+                                                _bot_up_cb = _make_upload_progress_callback(job_id, progress_channel)
                                                 try:
                                                     with open(out, "rb") as fh:
+                                                        fh = _ProgressFileWrapper(fh, file_size, _bot_up_cb) if file_size else fh
                                                         if thumb_path:
                                                             try:
                                                                 with open(thumb_path, "rb") as tf:
@@ -1082,8 +1176,10 @@ async def handle_job(job: dict):
                                                 except Exception:
                                                     thumb_path = None
 
+                                                _bot_up_cb = _make_upload_progress_callback(job_id, progress_channel)
                                                 try:
                                                     with open(out, "rb") as fh:
+                                                        fh = _ProgressFileWrapper(fh, file_size, _bot_up_cb) if file_size else fh
                                                         if thumb_path:
                                                             try:
                                                                 with open(thumb_path, "rb") as tf:
@@ -1124,8 +1220,10 @@ async def handle_job(job: dict):
                                                 except Exception:
                                                     thumb_path = None
 
+                                                _bot_up_cb = _make_upload_progress_callback(job_id, progress_channel)
                                                 try:
                                                     with open(out, "rb") as fh:
+                                                        fh = _ProgressFileWrapper(fh, file_size, _bot_up_cb) if file_size else fh
                                                         if thumb_path:
                                                             try:
                                                                 with open(thumb_path, "rb") as tf:
@@ -1153,7 +1251,8 @@ async def handle_job(job: dict):
                             try:
                                 from utils.userbot_uploader import send_file_via_userbot
 
-                                ok = await send_file_via_userbot(chat_id, out, caption=caption)
+                                _up_cb = _make_upload_progress_callback(job_id, progress_channel)
+                                ok = await send_file_via_userbot(chat_id, out, caption=caption, progress_callback=_up_cb)
                                 if ok:
                                     logger.info("Sent output via Telethon userbot fallback for job %s", job_id)
                                     sent = True
@@ -1164,6 +1263,32 @@ async def handle_job(job: dict):
 
                         if not sent and chat_id:
                             logger.warning("Could not deliver output for job %s — neither Bot API nor userbot succeeded", job_id)
+
+                        # Set final job status on Redis hash so _watch_job_progress (and web UI) can see it.
+                        try:
+                            _final_status = "done" if sent else "error"
+                            _final_msg = "delivered to Telegram" if sent else "delivery failed"
+                            _r = await get_redis()
+                            try:
+                                await _r.hset(f"ffmpeg:job:{job_id}", mapping={
+                                    "status": _final_status,
+                                    "progress": "100",
+                                    "message": _final_msg,
+                                })
+                                await publish_update(progress_channel, {
+                                    "job_id": job_id,
+                                    "progress": 100,
+                                    "message": _final_msg,
+                                    "status": _final_status,
+                                })
+                            finally:
+                                try:
+                                    await _r.close()
+                                except Exception:
+                                    pass
+                        except Exception:
+                            pass
+
                     except Exception:
                         logger.exception("Failed to send result via Telegram")
 

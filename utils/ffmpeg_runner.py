@@ -292,10 +292,10 @@ async def run_ffmpeg(
                     except Exception:
                         final_out = 0
 
-                    finished_map = {"progress": 100, "message": "finished", "status": "done", "output": output_path, "out_bytes": str(final_out), "in_bytes": str(in_bytes), "output_filename": os.path.basename(output_path)}
+                    finished_map = {"progress": 100, "message": "encoding finished", "status": "processing", "output": output_path, "out_bytes": str(final_out), "in_bytes": str(in_bytes), "output_filename": os.path.basename(output_path)}
                     await redis_client.hset(f"ffmpeg:job:{job_id}", mapping=finished_map)
                     if progress_channel:
-                        await redis_client.publish(progress_channel, json.dumps({"job_id": job_id, "progress": 100, "message": "finished", "output": output_path, "out_bytes": final_out, "in_bytes": in_bytes}))
+                        await redis_client.publish(progress_channel, json.dumps({"job_id": job_id, "progress": 100, "message": "encoding finished", "output": output_path, "out_bytes": final_out, "in_bytes": in_bytes}))
                 except Exception:
                     pass
             return True, output_path

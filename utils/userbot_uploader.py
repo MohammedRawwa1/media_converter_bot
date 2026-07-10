@@ -1,6 +1,6 @@
 import os
 import logging
-from typing import Union, Optional
+from typing import Union, Optional, Callable
 
 try:
     from telethon import TelegramClient
@@ -30,20 +30,41 @@ async def _normalize_target(chat_id: Union[int, str], client=None):
 
 
 async def _send_with_telethon(
-    chat_id: Union[int, str], file_path: str, caption: Optional[str] = None
+    chat_id: Union[int, str], file_path: str, caption: Optional[str] = None,
+    progress_callback: Optional[Callable[[int, int], None]] = None,
 ) -> bool:
-    """Send a file using Telethon."""
+    """Send a file using Telethon.
+
+    Args:
+        chat_id: Target chat ID or username.
+        file_path: Path to the file to send.
+        caption: Optional caption text.
+        progress_callback: Optional callable(sent_bytes, total_bytes) for upload progress.
+    """
     if TelegramClient is None:
         return False
 
-    from utils.telethon_session import build_telethon_client, get_userbot_credentials
+    from utils.telethon_session import build_telethon_client, get_userbot_credentials, has_usable_telethon_session
+
+    # Fail fast if no usable Telethon session is available — avoids
+    # client.start() prompting for a phone number on stdin (EOFError).
+    if not has_usable_telethon_session():
+        logger.info("userbot: Telethon session not configured; skipping Telethon upload")
+        return False
+
     api_id, api_hash = get_userbot_credentials()
 
     client = build_telethon_client(api_id, api_hash)
     try:
-        await client.start()
+        # Pass a phone callback that raises instead of prompting stdin.
+        async def _no_phone():
+            raise RuntimeError("Telethon phone prompt unexpectedly triggered")
+        await client.start(phone=_no_phone)
         target = await _normalize_target(chat_id, client)
-        await client.send_file(target, file=file_path, caption=caption)
+        kwargs = {"file": file_path, "caption": caption}
+        if progress_callback is not None:
+            kwargs["progress_callback"] = progress_callback
+        await client.send_file(target, **kwargs)
         logger.info("userbot: Telethon sent file %s to %s", file_path, target)
         return True
     except Exception:
@@ -57,9 +78,18 @@ async def _send_with_telethon(
 
 
 async def _send_with_pyrogram(
-    chat_id: Union[int, str], file_path: str, caption: Optional[str] = None
+    chat_id: Union[int, str], file_path: str, caption: Optional[str] = None,
+    progress_callback: Optional[Callable[[int, int], None]] = None,
 ) -> bool:
-    """Send a file using Pyrogram (session string fallback)."""
+    """Send a file using Pyrogram (session string fallback).
+
+    Args:
+        chat_id: Target chat ID or username.
+        file_path: Path to the file to send.
+        caption: Optional caption text.
+        progress_callback: Optional callable(current, total) for upload progress.
+                           Pyrogram progress callback is synchronous.
+    """
     if PyrogramClient is None:
         return False
 
@@ -73,8 +103,11 @@ async def _send_with_pyrogram(
     try:
         await client.start()
         target = await _normalize_target(chat_id)
-        await client.send_document(target, file_path, caption=caption or "")
-        logger.info("userbot: Pyrogram sent file %s to %s", file_path, target)
+        kwargs = {"caption": caption or "", "supports_streaming": True}
+        if progress_callback is not None:
+            kwargs["progress"] = progress_callback
+        await client.send_video(target, file_path, **kwargs)
+        logger.info("userbot: Pyrogram sent video %s to %s", file_path, target)
         return True
     except Exception:
         logger.exception("userbot: Pyrogram failed to send file %s", file_path)
@@ -87,11 +120,21 @@ async def _send_with_pyrogram(
 
 
 async def send_file_via_userbot(
-    chat_id: Union[int, str], file_path: str, caption: Optional[str] = None
+    chat_id: Union[int, str], file_path: str, caption: Optional[str] = None,
+    progress_callback: Optional[Callable[[int, int], None]] = None,
 ) -> bool:
     """Send a file using a user account.
 
-    Tries Telethon first, then falls back to Pyrogram if a session string is configured.
+    Tries Telethon first (when a session is available), then falls back to
+    Pyrogram if a session string is configured. Fails fast without connecting
+    to Telegram when no session is configured.
+
+    Args:
+        chat_id: Target chat ID or username.
+        file_path: Path to the file to send.
+        caption: Optional caption text.
+        progress_callback: Optional callable(sent_bytes, total_bytes) for upload progress.
+                           Both Telethon and Pyrogram callbacks follow this signature.
 
     Returns True on success, False on failure. Raises RuntimeError for missing config.
     """
@@ -101,19 +144,23 @@ async def send_file_via_userbot(
             "Install at least one: pip install telethon or pip install pyrogram"
         )
 
-    # Try Telethon first
-    if TelegramClient is not None:
+    from utils.telethon_session import has_usable_telethon_session
+
+    # Try Telethon first only when a usable session exists.
+    if TelegramClient is not None and has_usable_telethon_session():
         try:
-            result = await _send_with_telethon(chat_id, file_path, caption)
+            result = await _send_with_telethon(chat_id, file_path, caption, progress_callback=progress_callback)
             if result:
                 return True
             logger.info("userbot: Telethon send failed; trying Pyrogram fallback")
         except Exception as e:
             logger.warning("userbot: Telethon send error (%s); trying Pyrogram fallback", e)
+    elif TelegramClient is not None:
+        logger.info("userbot: Telethon session not configured; skipping Telethon upload")
 
-    # Fall back to Pyrogram
+    # Fall back to Pyrogram (requires PYROGRAM_SESSION env var)
     if PyrogramClient is not None:
-        result = await _send_with_pyrogram(chat_id, file_path, caption)
+        result = await _send_with_pyrogram(chat_id, file_path, caption, progress_callback=progress_callback)
         if result:
             return True
 
