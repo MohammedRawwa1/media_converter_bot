@@ -16,6 +16,21 @@ services:
     # (via create_worker_task in main.py) so jobs are processed whenever
     # this service is awake. This is critical for Render free tier where
     # separate worker services also spin down after inactivity.
+    #
+    # KEEP-ALIVE: The web service has a built-in keep-alive heartbeat
+    # that pings its own /health endpoint every 10 minutes (configurable
+    # via KEEP_ALIVE_INTERVAL env var). This prevents Render's free tier
+    # from spinning down the service due to inactivity.
+    #
+    # The heartbeat URL is auto-detected from RENDER_EXTERNAL_URL env var
+    # (set automatically by Render) or falls back to WEBHOOK_URL parsing.
+    # You can also explicitly set KEEP_ALIVE_URL to override.
+    #
+    # Additionally, the bot webhook is NOT deleted on shutdown, so Telegram
+    # can wake the service if it ever does spin down.
+    #
+    # To disable the keep-alive (e.g., if you upgrade to a paid plan),
+    # set KEEP_ALIVE_DISABLED=1 in environment variables.
     envVars:
       - key: AUTO_FETCH_FORWARDS
         value: "1"

@@ -1794,6 +1794,61 @@ async def main(background: bool = False) -> None:
             else:
                 logger.info("create_worker_task not available; background worker disabled")
 
+            # Start keep-alive heartbeat to prevent Render free tier spin-down.
+            # Periodically makes an HTTP GET to our own /health endpoint,
+            # which counts as inbound traffic and resets the 15-min inactivity timer.
+            keep_alive_task = None
+            _ka_enabled = not (os.environ.get("KEEP_ALIVE_DISABLED", "").lower() in ("1", "true", "yes"))
+            if _ka_enabled:
+                try:
+                    _ka_url = (os.environ.get("KEEP_ALIVE_URL") or os.environ.get("RENDER_EXTERNAL_URL") or "")
+                    if not _ka_url:
+                        try:
+                            from urllib.parse import urlparse as _urlparse
+                            _parsed = _urlparse(WEBHOOK_URL or "")
+                            if _parsed.netloc:
+                                _ka_url = f"{_parsed.scheme}://{_parsed.netloc}"
+                        except Exception:
+                            _ka_url = ""
+
+                    if _ka_url:
+                        _ka_url = _ka_url.rstrip("/")
+                        _health_url = f"{_ka_url}/health"
+                        _ka_interval = max(60, min(840, int(os.environ.get("KEEP_ALIVE_INTERVAL", "600"))))
+
+                        async def _keep_alive_loop():
+                            """Periodically ping /health to prevent Render free tier spin-down."""
+                            logger.info("Keep-alive heartbeat started: pinging %s every %ss", _health_url, _ka_interval)
+                            try:
+                                async with aiohttp.ClientSession() as _session:
+                                    while True:
+                                        try:
+                                            async with _session.get(_health_url, timeout=10) as _resp:
+                                                logger.debug("Keep-alive ping: %s", _resp.status)
+                                        except (asyncio.TimeoutError, aiohttp.ClientError, OSError) as _e:
+                                            logger.debug("Keep-alive ping failed (harmless): %s", _e)
+
+                                        # Wait for interval or shutdown event
+                                        try:
+                                            await asyncio.wait_for(shutdown_event.wait(), timeout=_ka_interval)
+                                            break  # Shutdown requested
+                                        except asyncio.TimeoutError:
+                                            continue  # Time to ping again
+                                        except asyncio.CancelledError:
+                                            break
+                            except asyncio.CancelledError:
+                                pass
+                            logger.info("Keep-alive heartbeat stopped")
+
+                        keep_alive_task = asyncio.create_task(_keep_alive_loop())
+                    else:
+                        logger.info("Keep-alive heartbeat disabled: no public URL available (set KEEP_ALIVE_URL, RENDER_EXTERNAL_URL, or WEBHOOK_URL)")
+                except Exception as _ka_err:
+                    logger.warning("Failed to start keep-alive heartbeat: %s", _ka_err)
+                    keep_alive_task = None
+            else:
+                logger.info("Keep-alive heartbeat disabled via KEEP_ALIVE_DISABLED=1")
+
             # Wait for shutdown_event or cancellation; FastAPI will cancel
             # this task on shutdown which will raise CancelledError here.
             try:
@@ -1802,12 +1857,18 @@ async def main(background: bool = False) -> None:
             except asyncio.CancelledError:
                 logger.info("Background bot task cancelled; stopping application")
             finally:
-                if WEBHOOK_URL:
-                    try:
-                        await application.bot.delete_webhook(drop_pending_updates=False)
-                        logger.info("Webhook deleted on shutdown")
-                    except Exception as e:
-                        logger.warning(f"Failed to delete webhook on shutdown: {e}")
+                # CRITICAL: Do NOT delete the webhook on graceful shutdown.
+                # On Render's free tier, the service spins down after 15 minutes
+                # of inactivity. The webhook MUST persist so that Telegram's
+                # next update POST can wake the service back up. If we delete
+                # the webhook here, Telegram has no URL to send updates to,
+                # and the service stays dead permanently with no way to be
+                # woken by incoming bot messages.
+                #
+                # The startup code (set_webhook above) always re-verifies and
+                # re-sets the webhook when the service starts, so a stale or
+                # outdated webhook will be corrected on the next boot.
+                # Don't delete it on the way out.
 
                 try:
                     stop_cleanup_task()
@@ -1832,6 +1893,14 @@ async def main(background: bool = False) -> None:
                     try:
                         worker_task.cancel()
                         await worker_task
+                    except Exception:
+                        pass
+
+                # Cancel the keep-alive heartbeat task
+                if keep_alive_task is not None:
+                    try:
+                        keep_alive_task.cancel()
+                        await keep_alive_task
                     except Exception:
                         pass
 
