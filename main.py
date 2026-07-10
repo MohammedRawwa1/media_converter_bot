@@ -70,6 +70,10 @@ from utils.rate_limiter import ConversionRateLimiter, TelegramAPIRateLimiter, Co
 from utils.webhook_monitor import WebhookRecoveryManager
 from utils.job_queue import cancel_job
 try:
+    from workers.ffmpeg_worker import create_worker_task
+except Exception:
+    create_worker_task = None
+try:
     from utils.storage import get_storage_backend
 except Exception:
     get_storage_backend = None
@@ -1776,6 +1780,20 @@ async def main(background: bool = False) -> None:
                 except Exception:
                     logger.exception("Failed to start background long-poller")
 
+            # Start the ffmpeg worker as a background task so the web service
+            # can process jobs whenever it is awake (critical for Render free tier
+            # where separate worker services may spin down).
+            worker_task = None
+            if create_worker_task is not None:
+                try:
+                    worker_task = create_worker_task(shutdown_event)
+                    logger.info("Background ffmpeg worker task started")
+                except Exception as e:
+                    logger.error(f"Failed to start background worker task: {e}")
+                    worker_task = None
+            else:
+                logger.info("create_worker_task not available; background worker disabled")
+
             # Wait for shutdown_event or cancellation; FastAPI will cancel
             # this task on shutdown which will raise CancelledError here.
             try:
@@ -1808,6 +1826,14 @@ async def main(background: bool = False) -> None:
                             globals()["LONG_POLLER_STARTED"] = False
                         except Exception:
                             pass
+
+                # Cancel the background worker task
+                if worker_task is not None:
+                    try:
+                        worker_task.cancel()
+                        await worker_task
+                    except Exception:
+                        pass
 
                 try:
                     await application.stop()

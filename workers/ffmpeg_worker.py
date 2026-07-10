@@ -1476,6 +1476,11 @@ async def handle_job(job: dict):
 
 
 async def worker_loop(stop_event: Optional[asyncio.Event] = None):
+    """Main worker loop: pop jobs from Redis, process them, deliver results.
+
+    Args:
+        stop_event: When set, the worker loop exits gracefully.
+    """
     logger.info("FFmpeg worker starting, waiting for jobs...")
     # init job store if MONGO_URI available
     try:
@@ -1538,6 +1543,73 @@ async def worker_loop(stop_event: Optional[asyncio.Event] = None):
                     pass
         except Exception:
             pass
+
+def create_worker_task(stop_event: Optional[asyncio.Event] = None) -> asyncio.Task:
+    """Create and return a background asyncio Task that runs the worker loop.
+
+    This is designed to be called from another async application (e.g. the
+    FastAPI/uvicorn process) so that the worker processes jobs in the same
+    event loop. The task respects the provided stop_event for graceful
+    shutdown.
+
+    Usage inside main.py (background mode):
+        from workers.ffmpeg_worker import create_worker_task
+        worker_task = create_worker_task(shutdown_event)
+        app.bot_data["worker_task"] = worker_task
+
+    Returns:
+        An asyncio.Task that runs :func:`worker_loop`. The caller should
+        ensure the task is cancelled during application shutdown.
+    """
+    # Initialize job store if MONGO_URI is configured
+    try:
+        mongo_uri = os.environ.get("MONGO_URI")
+        if mongo_uri:
+            try:
+                # Fire-and-forget init into the running loop
+                loop = asyncio.get_running_loop()
+                if loop.is_running():
+                    asyncio.create_task(job_store.init(mongo_uri))
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    # Initialize cache if helper available
+    global _cache
+    try:
+        if get_cache is not None:
+            loop = asyncio.get_running_loop()
+            if loop.is_running():
+                asyncio.create_task(_init_cache())
+    except Exception:
+        pass
+
+    # Wrap worker_loop to log top-level exceptions
+    async def _wrapped():
+        try:
+            await worker_loop(stop_event)
+        except asyncio.CancelledError:
+            logger.info("Background worker task cancelled")
+        except Exception:
+            logger.exception("Background worker task exited with unhandled exception")
+            raise
+
+    task = asyncio.create_task(_wrapped())
+    logger.info("Created background worker task")
+    return task
+
+
+async def _init_cache():
+    """Initialize the shared Redis cache instance."""
+    global _cache
+    try:
+        if get_cache is not None:
+            _cache = await get_cache()
+            logger.info("Worker cache initialized")
+    except Exception as e:
+        logger.debug("Worker cache init failed (non-fatal): %s", e)
+
 
 def main():
     loop = asyncio.new_event_loop()
