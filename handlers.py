@@ -1452,6 +1452,16 @@ class EnhancedMediaHandler:
         except Exception:
             pass
 
+        # Clear awaiting_custom_resolution if user sends non-text
+        if getattr(context, "user_data", {}).get("awaiting_custom_resolution"):
+            if not getattr(update.message, "text", None):
+                context.user_data.pop("awaiting_custom_resolution", None)
+                await update.message.reply_text(
+                    "❌ Cancelled custom resolution. Send text like 1280x720 or send a file.",
+                    reply_markup=MediaMenuBuilder.get_back_button()
+                )
+                return
+
         # If user is in settings flow and sends a photo, treat as thumbnail upload
         try:
             if getattr(context, "user_data", {}).get("awaiting_settings") and getattr(update.message, "photo", None):
@@ -1975,6 +1985,64 @@ class EnhancedMediaHandler:
             reply_markup=MediaMenuBuilder.get_main_menu(file_type),
         )
 
+    async def _apply_fade(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE, session: Dict,
+        fade_in: float = 0.0, fade_out: float = 0.0,
+    ):
+        """Apply audio fade-in and/or fade-out to the current file."""
+        query = getattr(update, "callback_query", None)
+        if query is None:
+            return
+
+        current_file = session.get("current_file") if session else None
+        if not current_file:
+            await self.safe_edit(query, "❌ No file registered. Send a media file first.",
+                reply_markup=MediaMenuBuilder.get_back_button())
+            return
+
+        if not await self._check_conversion_quota(update, context):
+            return
+
+        await self.safe_edit(query, "📈 Applying fade effect...",
+            reply_markup=MediaMenuBuilder.get_back_button())
+
+        if not current_file.get("path") or not os.path.exists(current_file.get("path") or ""):
+            try:
+                await self._ensure_current_file_downloaded(update, context, session)
+                current_file = session.get("current_file")
+            except Exception as e:
+                await self.safe_edit(query, f"❌ Failed to download file: {e}")
+                return
+
+        input_path = current_file.get("path")
+        if not input_path or not os.path.exists(input_path):
+            await self.safe_edit(query, "❌ File not found on disk.",
+                reply_markup=MediaMenuBuilder.get_back_button())
+            return
+        ext = os.path.splitext(input_path)[1] or ".mp3"
+        output_dir = getattr(config, "OUTPUT_PATH", "storage/output") if config else "storage/output"
+        try:
+            os.makedirs(output_dir, exist_ok=True)
+        except Exception:
+            pass
+        output_path = os.path.join(output_dir, f"{current_file.get('id', 'unknown')}_faded{ext}")
+
+        success = await self.converter.apply_fade(input_path, output_path, fade_in, fade_out)
+        if success and os.path.exists(output_path):
+            current_file["path"] = output_path
+            await self.safe_edit(query, f"✅ Fade applied! Sending file...",
+            reply_markup=MediaMenuBuilder.get_back_button())
+            try:
+                with open(output_path, "rb") as f:
+                    await context.bot.send_document(chat_id=update.effective_chat.id, document=f)
+            except Exception:
+                await self.safe_edit(query, "✅ Fade applied but failed to send. Check the output folder.",
+                reply_markup=MediaMenuBuilder.get_back_button())
+        else:
+            await self.safe_edit(query, "❌ Failed to apply fade effect.",
+            reply_markup=MediaMenuBuilder.get_back_button())
+
+
     async def callback_handler(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
     ):
@@ -2077,6 +2145,10 @@ class EnhancedMediaHandler:
             "subtitle_merger": "add_subtitles",
             "video_renamer": "video_renamer",
             "video_converter": "convert_format_menu",
+            # Fade aliases
+            "fade_in": "fade_in",
+            "fade_out": "fade_out",
+            "fade_both": "fade_both",
         }
 
         # Remap data if an alias exists
@@ -2212,6 +2284,16 @@ class EnhancedMediaHandler:
                     reply_markup=MediaMenuBuilder.get_resolution_menu(),
                 )
 
+            elif data == "res_custom":
+                if not current_file:
+                    await self.safe_edit(query, "❌ No file registered. Send a file first.")
+                else:
+                    await self.safe_edit(
+                        query,
+                        "📐 Enter custom resolution (widthxheight, e.g. 1280x720):",
+                    )
+                    context.user_data["awaiting_custom_resolution"] = True
+
             elif isinstance(data, str) and data.startswith("res_"):
                 resolution = data.split("_")[1]
                 await self.change_resolution(update, context, session, resolution)
@@ -2223,6 +2305,40 @@ class EnhancedMediaHandler:
                     reply_markup=MediaMenuBuilder.get_optimize_menu(),
                 )
 
+            elif data == "optimize_custom":
+                if not current_file:
+                    await self.safe_edit(query, "\u274c No file registered. Send a file first.")
+                else:
+                    await self.safe_edit(query, "\u2699\ufe0f Custom optimization: compressing with CRF 23, preset medium, faststart...")
+                    if not current_file.get("path") or not os.path.exists(current_file.get("path") or ""):
+                        try:
+                            await self._ensure_current_file_downloaded(update, context, session)
+                            current_file = session.get("current_file")
+                        except Exception as e:
+                            await self.safe_edit(query, f"\u274c Failed to download file: {e}")
+                            return
+                    input_path = current_file["path"]
+                    ext = os.path.splitext(input_path)[1] or ".mp4"
+                    output_dir = getattr(config, "OUTPUT_PATH", "storage/output") if config else "storage/output"
+                    try:
+                        os.makedirs(output_dir, exist_ok=True)
+                    except Exception:
+                        pass
+                    output_path = os.path.join(output_dir, f"{current_file.get('id', 'unknown')}_optimized{ext}")
+                    success = await self.converter.optimize_video(input_path, output_path, preset="medium", crf=23)
+                    if success and os.path.exists(output_path):
+                        current_file["path"] = output_path
+                        await self.safe_edit(query, "\u2705 Custom optimization complete!",
+                            reply_markup=MediaMenuBuilder.get_back_button())
+                        try:
+                            with open(output_path, "rb") as f:
+                                await context.bot.send_document(chat_id=update.effective_chat.id, document=f)
+                        except Exception:
+                            await self.safe_edit(query, "\u2705 Optimized but failed to send.",
+                                reply_markup=MediaMenuBuilder.get_back_button())
+                    else:
+                        await self.safe_edit(query, "\u274c Failed to optimize.",
+                            reply_markup=MediaMenuBuilder.get_back_button())
             elif isinstance(data, str) and data.startswith("optimize_"):
                 preset = data.split("_")[1]
                 await self.optimize_video(update, context, session, preset)
@@ -2236,6 +2352,17 @@ class EnhancedMediaHandler:
                     "🖼️ **Screenshot Options**\nChoose an option:",
                     reply_markup=MediaMenuBuilder.get_screenshots_menu(),
                 )
+
+            elif data == "screenshot_start":
+                await self._quick_screenshot(update, context, session, time_str="00:00:00.500")
+
+            elif data == "screenshot_middle":
+                # Will be resolved in the handler using video duration
+                await self._quick_screenshot(update, context, session, time_str="__middle__")
+
+            elif data == "screenshot_end":
+                # Will be resolved in the handler using video duration
+                await self._quick_screenshot(update, context, session, time_str="__end__")
 
             elif isinstance(data, str) and data.startswith("screenshot_"):
                 option = data.split("_")[1]
@@ -2376,8 +2503,20 @@ class EnhancedMediaHandler:
                         del context.user_data[key]
 
             elif data == "fade_menu":
-                await self.safe_edit(query, "📈 Fade In/Out: feature coming soon.")
+                await self.safe_edit(
+                    query,
+                    "📈 Fade In/Out\nChoose a fade type:",
+                    reply_markup=MediaMenuBuilder.get_fade_menu(),
+                )
 
+            elif data == "fade_in":
+                await self._apply_fade(update, context, session, fade_in=3.0)
+
+            elif data == "fade_out":
+                await self._apply_fade(update, context, session, fade_out=3.0)
+
+            elif data == "fade_both":
+                await self._apply_fade(update, context, session, fade_in=3.0, fade_out=3.0)
             elif data == "cancel":
                 # Clear any awaiting inputs and notify user
                 for key in list(context.user_data.keys()):
@@ -3625,7 +3764,7 @@ class EnhancedMediaHandler:
             os.makedirs(output_dir, exist_ok=True)
         except Exception:
             pass
-        output_path = os.path.join(output_dir, f"{current_file['id']}_screenshot.jpg")
+        output_path = os.path.join(output_dir, f"{current_file.get('id', 'unknown')}_screenshot.jpg")
         success = await self.converter.take_screenshot_at_time(
             current_file["path"], output_path, time_str
         )
@@ -4285,6 +4424,19 @@ class EnhancedMediaHandler:
                 logger.info("Logged media upload for user %s", user_id)
             except Exception as e:
                 logger.error(f"Failed to log to MongoDB: {e}")
+
+            else:
+                # Catch-all for any unhandled callback
+                await self.safe_edit(query, "⚠️ Unknown action. Please try again.",
+                reply_markup=MediaMenuBuilder.get_back_button())
+                await self._log_bad_callback(
+                    "unhandled_callback",
+                    data,
+                    user_id,
+                    getattr(update.effective_chat, "id", None),
+                    getattr(getattr(query, "message", None), "message_id", None),
+                )
+
         except Exception as e:
             logger.error(f"Failed to log to MongoDB: {e}")
 

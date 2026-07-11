@@ -458,37 +458,140 @@ class ExtendedMediaConverter:
         return False
 
     async def extract_thumbnail_grid(self, input_path: str, output_path: str, rows: int = 3, cols: int = 3) -> bool:
-        """Create thumbnail grid from video."""
+        """Create thumbnail grid from video using PIL compositing."""
+        import shutil
+
         # Get video duration for spacing
-        probe = ffmpeg.probe(input_path)
-        duration = float(probe["format"]["duration"])
+        try:
+            probe = ffmpeg.probe(input_path)
+            duration = float(probe["format"]["duration"])
+        except Exception as e:
+            logger.error("extract_thumbnail_grid: probe failed for %s: %s", input_path, e)
+            return False
+
+        total = rows * cols
+        if total <= 0:
+            return False
 
         # Create temporary screenshots
         temp_dir = tempfile.mkdtemp()
         screenshots = []
 
-        # Take screenshots at intervals
-        for i in range(rows * cols):
-            time_sec = (duration * i) / (rows * cols)
-            time_str = f"{int(time_sec // 3600):02d}:{int((time_sec % 3600) // 60):02d}:{time_sec % 60:06.3f}"
-            temp_file = os.path.join(temp_dir, f"temp_{i:02d}.jpg")
+        try:
+            # Take screenshots at evenly-spaced intervals (skip first and last)
+            for i in range(total):
+                time_sec = (duration * (i + 1)) / (total + 1)
+                time_str = f"{int(time_sec // 3600):02d}:{int((time_sec % 3600) // 60):02d}:{time_sec % 60:06.3f}"
+                temp_file = os.path.join(temp_dir, f"temp_{i:02d}.jpg")
 
-            if await self.take_screenshot_at_time(input_path, temp_file, time_str):
-                screenshots.append(temp_file)
+                if await self.take_screenshot_at_time(input_path, temp_file, time_str):
+                    screenshots.append(temp_file)
 
-        # Create grid using ImageMagick (simplified approach)
-        if len(screenshots) == rows * cols:
-            # This is simplified - actual implementation would use ImageMagick or PIL
-            # For now, just return first screenshot
-            import shutil
+            if len(screenshots) == 0:
+                logger.warning("extract_thumbnail_grid: no screenshots captured")
+                return False
 
-            shutil.copy(screenshots[0], output_path)
+            # Compose into grid using PIL if available
+            if Image is not None:
+                imgs = [Image.open(p) for p in screenshots]
+                # Resize all to the same dimensions (use first image size as reference)
+                cell_w, cell_h = imgs[0].size
+                imgs = [img.resize((cell_w, cell_h), Image.LANCZOS) for img in imgs]
 
-            # Cleanup
-            for f in screenshots:
-                os.unlink(f)
-            os.rmdir(temp_dir)
+                # Pad to full grid if some screenshots failed
+                while len(imgs) < total:
+                    imgs.append(Image.new("RGB", (cell_w, cell_h), (0, 0, 0)))
+
+                grid_w = cell_w * cols
+                grid_h = cell_h * rows
+                grid = Image.new("RGB", (grid_w, grid_h), (0, 0, 0))
+
+                for idx, img in enumerate(imgs[:total]):
+                    r = idx // cols
+                    c = idx % cols
+                    grid.paste(img, (c * cell_w, r * cell_h))
+
+                grid.save(output_path, quality=90)
+            else:
+                # Fallback: just copy the best available screenshot
+                shutil.copy(screenshots[0], output_path)
 
             return True
+        except Exception as e:
+            logger.error("extract_thumbnail_grid failed: %s", e)
+            return False
+        finally:
+            # Cleanup temp files
+            try:
+                import shutil
+                shutil.rmtree(temp_dir, ignore_errors=True)
+            except Exception:
+                pass
 
-        return False
+    async def apply_fade(
+        self, input_path: str, output_path: str,
+        fade_in_duration: float = 0.0, fade_out_duration: float = 0.0
+    ) -> bool:
+        """Apply fade-in and/or fade-out to audio track of a media file.
+
+        Uses the afade audio filter. Both durations are in seconds.
+        At least one must be > 0.
+        """
+        if fade_in_duration <= 0 and fade_out_duration <= 0:
+            logger.warning("apply_fade: both durations are zero, nothing to do")
+            return False
+
+        # Build the audio filter chain
+        afilters = []
+        if fade_in_duration > 0:
+            afilters.append(f"afade=t=in:st=0:d={fade_in_duration}")
+
+        if fade_out_duration > 0:
+            # Probe the file for audio duration
+            audio_duration = 0.0
+            try:
+                if ffmpeg is not None:
+                    probe = ffmpeg.probe(input_path)
+                    audio_stream = next(
+                        (s for s in probe.get("streams", []) if s.get("codec_type") == "audio"),
+                        None,
+                    )
+                    if audio_stream is not None:
+                        audio_duration = float(
+                            audio_stream.get("duration",
+                                probe.get("format", {}).get("duration", 0))
+                        )
+                    else:
+                        audio_duration = float(
+                            probe.get("format", {}).get("duration", 0)
+                        )
+            except Exception as e:
+                logger.error("apply_fade: probe failed: %s", e)
+
+            # Fallback: use ffprobe directly
+            if audio_duration <= 0:
+                try:
+                    import asyncio as _aio
+                    proc = await _aio.create_subprocess_exec(
+                        "ffprobe", "-v", "error",
+                        "-show_entries", "format=duration",
+                        "-of", "default=noprint_wrappers=1:nokey=1",
+                        input_path,
+                        stdout=_aio.subprocess.PIPE,
+                        stderr=_aio.subprocess.PIPE,
+                    )
+                    stdout, _ = await proc.communicate()
+                    audio_duration = float(stdout.decode().strip()) if stdout else 0.0
+                except Exception:
+                    pass
+
+            if audio_duration <= 0:
+                logger.error("apply_fade: cannot determine audio duration")
+                return False
+
+            fade_out_start = max(0.0, audio_duration - fade_out_duration)
+            afilters.append(f"afade=t=out:st={fade_out_start}:d={fade_out_duration}")
+
+        filter_str = ",".join(afilters)
+        cmd = ["-af", filter_str, "-c:v", "copy"]
+        return (await self.execute_ffmpeg(cmd, input_path, output_path))[0]

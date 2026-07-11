@@ -148,3 +148,19 @@ MP3_TAG_EDITOR = "mp3_tag_editor"
 # Additional formats
 FORMAT_M4V = "format_m4v"
 FORMAT_OPUS = "format_opus"
+
+# Fade options
+FADE_IN = "fade_in"
+FADE_OUT = "fade_out"
+FADE_BOTH = "fade_both"
+
+# Screenshot quick modes
+SCREENSHOT_START = "screenshot_start"
+SCREENSHOT_MIDDLE = "screenshot_middle"
+SCREENSHOT_END = "screenshot_end"
+SCREENSHOT_CUSTOM = "screenshot_custom"
+SCREENSHOT_9GRID = "screenshot_9grid"
+SCREENSHOT_MULTIPLE = "screenshot_multiple"
+
+# Resolution custom
+RES_CUSTOM = "res_custom"

@@ -14,6 +14,9 @@ from .callbacks import (
     COMPRESS_MENU,
     CONFIRM,
     EDIT_METADATA,
+    FADE_IN,
+    FADE_OUT,
+    FADE_BOTH,
     FORMAT_PREFIX,
     INFO,
     HELP,
@@ -391,6 +394,21 @@ class MediaMenuBuilder:
             [
                 InlineKeyboardButton("🖼️ Thumbnail", callback_data=THUMBNAIL_GRID),
                 InlineKeyboardButton("✏️ Metadata", callback_data=EDIT_METADATA),
+            ],
+            [InlineKeyboardButton("↩️ Back", callback_data=MENU_MAIN)],
+        ]
+        return InlineKeyboardMarkup(buttons)
+
+    @staticmethod
+    def get_fade_menu() -> InlineKeyboardMarkup:
+        """Get fade in/out options menu."""
+        buttons = [
+            [
+                InlineKeyboardButton("🔈 Fade In", callback_data=FADE_IN),
+                InlineKeyboardButton("🔉 Fade Out", callback_data=FADE_OUT),
+            ],
+            [
+                InlineKeyboardButton("🔊 Both", callback_data=FADE_BOTH),
             ],
             [InlineKeyboardButton("↩️ Back", callback_data=MENU_MAIN)],
         ]
