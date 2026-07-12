@@ -692,6 +692,15 @@ def setup_handlers(application: Application) -> None:
                     except Exception:
                         pass
 
+            # Also clear any saved Telethon session from MongoDB
+            try:
+                db_model_lo = context.application.bot_data.get("db_model")
+                if db_model_lo is not None:
+                    await db_model_lo.delete_session(user_id)
+                    removed.append("MongoDB session")
+            except Exception:
+                pass
+
             if removed:
                 await update.message.reply_text(
                     f"✅ Logged out and removed Telethon session files:\n{chr(10).join(removed)}"
@@ -953,6 +962,7 @@ def setup_handlers(application: Application) -> None:
             await update.message.reply_text("Got phone number. Please wait while I generate the Telethon session...")
             try:
                 from telethon import TelegramClient
+                from telethon.sessions import StringSession
             except Exception:
                 await update.message.reply_text(
                     "Telethon is not installed on the server. Install telethon to use /login."
@@ -980,7 +990,23 @@ def setup_handlers(application: Application) -> None:
             os.makedirs(session_dir, exist_ok=True)
             session_path = os.path.join(session_dir, session_name)
 
-            client = TelegramClient(session_path, api_id, api_hash)
+            # Try to load an existing Telethon session from MongoDB
+            saved_session_str = None
+            try:
+                db_model_l = context.application.bot_data.get("db_model")
+                if db_model_l is not None:
+                    sess_data = await db_model_l.load_session(user_id)
+                    if sess_data and isinstance(sess_data, dict):
+                        saved_session_str = sess_data.get("string_session")
+            except Exception as load_err:
+                logger.warning("Failed to load Telethon session from MongoDB: %s", load_err)
+                saved_session_str = None
+
+            if saved_session_str:
+                client = TelegramClient(StringSession(saved_session_str), api_id, api_hash)
+                logger.info("Loaded saved Telethon session from MongoDB for user=%s", user_id)
+            else:
+                client = TelegramClient(StringSession(), api_id, api_hash)
             try:
                 await client.connect()
 
@@ -1017,11 +1043,12 @@ def setup_handlers(application: Application) -> None:
                         context.user_data["login_client"] = client
                         context.user_data["login_session_path"] = session_path
                         context.user_data["awaiting_login_code"] = True
+                        _sent_type_name = type(sent).__name__
                         _sent_timeout = getattr(sent, "timeout", None)
                         logger.info(
-                            "Login code requested for %s; hash=%s timeout=%s",
+                            "Login code requested for %s; hash=%s type=%s timeout=%s",
                             phone, str(phone_code_hash)[:8] if phone_code_hash else "None",
-                            _sent_timeout,
+                            _sent_type_name, _sent_timeout,
                         )
 
                         # Future-based code callback
@@ -1068,8 +1095,9 @@ def setup_handlers(application: Application) -> None:
                                     sent = await client.send_code_request(phone)
                                     phone_code_hash = sent.phone_code_hash
                                     context.user_data["login_code_hash"] = phone_code_hash
+                                    _sent_type_name = type(sent).__name__
                                     _sent_timeout = getattr(sent, "timeout", None)
-                                    logger.info("Fresh code requested for %s; hash=%s timeout=%s", phone, str(phone_code_hash)[:8], _sent_timeout)
+                                    logger.info("Fresh code requested for %s; hash=%s type=%s timeout=%s", phone, str(phone_code_hash)[:8], _sent_type_name, _sent_timeout)
                                     new_future = loop.create_future()
                                     context.user_data["login_pending_future"] = new_future
                                     context.user_data["login_pending_type"] = "code"
@@ -1099,11 +1127,22 @@ def setup_handlers(application: Application) -> None:
                             await client.sign_in(password=password)
 
                         if await client.is_user_authorized():
+                            # Save session string to MongoDB for persistence
+                            session_str = client.session.save()
+                            try:
+                                db_model_login = context.application.bot_data.get("db_model")
+                                if db_model_login is not None:
+                                    await db_model_login.save_session(user_id, {"string_session": session_str})
+                                    session_saved = "MongoDB"
+                                else:
+                                    session_saved = "memory (no db_model)"
+                            except Exception:
+                                session_saved = "memory (save failed)"
                             await context.bot.send_message(
                                 chat_id=update.effective_chat.id,
-                                text=f"\u2705 Telethon userbot login successful. Session saved locally.\nSaved session: {session_path}",
+                                text=f"\u2705 Telethon userbot login successful.\nSession saved to: {session_saved}",
                             )
-                            logger.info("Telethon login successful for %s (session: %s)", phone, session_path)
+                            logger.info("Telethon login successful for %s (session: %s)", phone, session_saved)
                         else:
                             await context.bot.send_message(
                                 chat_id=update.effective_chat.id,
