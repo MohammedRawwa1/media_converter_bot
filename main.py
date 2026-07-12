@@ -982,6 +982,13 @@ def setup_handlers(application: Application) -> None:
 
             client = TelegramClient(session_path, api_id, api_hash)
             try:
+                # Delete stale session files to ensure a completely
+                # fresh authentication flow.
+                for _suff in ("", ".session", ".session-journal", ".session.lock"):
+                    try:
+                        os.remove(session_path + _suff)
+                    except FileNotFoundError:
+                        pass
                 await client.connect()
 
                 if await client.is_user_authorized():
@@ -1008,9 +1015,9 @@ def setup_handlers(application: Application) -> None:
                     try:
                         loop = asyncio.get_running_loop()
 
-                        # Call send_code_request directly in the background task.
-                        # This ensures DC migration and sign_in happen in the same
-                        # task context, avoiding stale DC state errors.
+                        # Call send_code_request in the background task.
+                        # Session files are cleaned before connect, so this
+                        # starts fresh with no stale auth state.
                         sent = await client.send_code_request(phone)
                         phone_code_hash = sent.phone_code_hash
                         context.user_data["login_code_hash"] = phone_code_hash
@@ -1018,9 +1025,11 @@ def setup_handlers(application: Application) -> None:
                         context.user_data["login_client"] = client
                         context.user_data["login_session_path"] = session_path
                         context.user_data["awaiting_login_code"] = True
+                        _sent_timeout = getattr(sent, "timeout", None)
                         logger.info(
-                            "Login code requested for %s; hash=%s",
+                            "Login code requested for %s; hash=%s timeout=%s",
                             phone, str(phone_code_hash)[:8] if phone_code_hash else "None",
+                            _sent_timeout,
                         )
 
                         # Future-based code callback
@@ -1049,12 +1058,42 @@ def setup_handlers(application: Application) -> None:
                         # Sign in with the hash returned by send_code_request.
                         # Both calls happen in the same task context, so DC
                         # migration state is consistent.
+                        # On PhoneCodeExpiredError, retry once with a fresh code.
                         try:
-                            await client.sign_in(
-                                phone=phone,
-                                code=code,
-                                phone_code_hash=phone_code_hash,
-                            )
+                            for _attempt in range(2):
+                                try:
+                                    await client.sign_in(
+                                        phone=phone,
+                                        code=code,
+                                        phone_code_hash=phone_code_hash,
+                                    )
+                                    break  # Success
+                                except PhoneCodeExpiredError:
+                                    if _attempt == 1:
+                                        raise  # Already retried
+                                    logger.warning("Code expired for %s; requesting fresh code", phone)
+                                    # Send a new code request to invalidate any pending code
+                                    sent = await client.send_code_request(phone)
+                                    phone_code_hash = sent.phone_code_hash
+                                    context.user_data["login_code_hash"] = phone_code_hash
+                                    _sent_timeout = getattr(sent, "timeout", None)
+                                    logger.info("Fresh code requested for %s; hash=%s timeout=%s", phone, str(phone_code_hash)[:8], _sent_timeout)
+                                    new_future = loop.create_future()
+                                    context.user_data["login_pending_future"] = new_future
+                                    context.user_data["login_pending_type"] = "code"
+                                    await context.bot.send_message(
+                                        chat_id=update.effective_chat.id,
+                                        text="The previous code expired. A new code has been sent. "
+                                             "Please enter the NEW code immediately:",
+                                    )
+                                    code = await new_future
+                                    # Re-normalize
+                                    try:
+                                        code = (code or "").translate(trans)
+                                        code = "".join(c for c in code if c.isdigit())
+                                    except Exception:
+                                        pass
+                                    continue
                         except SessionPasswordNeededError:
                             # 2FA required - prompt for password
                             pw_future = loop.create_future()
