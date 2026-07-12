@@ -860,6 +860,20 @@ def setup_handlers(application: Application) -> None:
         except Exception:
             pass
         if context is not None and getattr(context, "user_data", None) is not None:
+            # Cancel the background client.start() task if running
+            try:
+                login_task = context.user_data.get("login_start_task")
+                if login_task is not None and not login_task.done():
+                    login_task.cancel()
+            except Exception:
+                pass
+            # Cancel any pending future (code/password callback waiting)
+            try:
+                fut = context.user_data.get("login_pending_future")
+                if fut is not None and not fut.done():
+                    fut.cancel()
+            except Exception:
+                pass
             # Disconnect any active Telethon client before clearing
             try:
                 client = context.user_data.get("login_client")
@@ -889,6 +903,9 @@ def setup_handlers(application: Application) -> None:
                 "login_flood_wait_until",
                 "login_resend_count",
                 "login_password_retry_count",
+                "login_pending_future",
+                "login_pending_type",
+                "login_start_task",
             ):
                 context.user_data.pop(key, None)
 
@@ -914,13 +931,21 @@ def setup_handlers(application: Application) -> None:
         except Exception:
             pass
 
-        if not (
-            context.user_data.get("awaiting_login_phone")
-            or context.user_data.get("awaiting_login_code")
-            or context.user_data.get("awaiting_login_password")
-        ):
-            _clear_login_flow(user_id, context)
-            return
+        # Entry condition: if no pending future and no login flags are active,
+        # fall through to the single cleanup point at the bottom of the function.
+        _ec_pf = context.user_data.get("login_pending_future")
+        _ec_phone = context.user_data.get("awaiting_login_phone")
+        _ec_code = context.user_data.get("awaiting_login_code")
+        _ec_password = context.user_data.get("awaiting_login_password")
+        _ec_active = bool(
+            (_ec_pf is not None and not _ec_pf.done())
+            or _ec_phone
+            or _ec_code
+            or _ec_password
+        )
+        if not _ec_active:
+            # No active login flow — fall through to single cleanup below
+            pass
 
         if context.user_data.get("awaiting_login_phone"):
             context.user_data["awaiting_login_phone"] = False
@@ -958,112 +983,131 @@ def setup_handlers(application: Application) -> None:
             client = TelegramClient(session_path, api_id, api_hash)
             try:
                 await client.connect()
-                if not await client.is_user_authorized():
-                    # Request a login code. Prefer SMS delivery (longer TTL ~5 min)
-                    # over in-app delivery (~30s TTL) since the user must switch
-                    # chats to retrieve and enter the code through the bot.
-                    try:
-                        sent = await client.send_code_request(phone, force_sms=True)
-                    except TypeError:
-                        # Older Telethon may not accept force_sms keyword
-                        try:
-                            sent = await client.send_code_request(phone)
-                        except TypeError:
-                            sent = await client.send_code_request(phone)
-                    except Exception as e:
-                        # Fallback if force_sms is rejected
-                        try:
-                            sent = await client.send_code_request(phone)
-                        except TypeError:
-                            sent = await client.send_code_request(phone)
-                        # Detect FloodWaitError specifically to inform the user
-                        try:
-                            from telethon.errors import FloodWaitError
 
-                            if isinstance(e, FloodWaitError):
-                                wait = getattr(e, "seconds", None) or getattr(e, "timeout", None) or 60
-                                until = time.time() + int(wait)
-                                context.user_data["login_flood_wait_until"] = until
-                                await update.message.reply_text(
-                                    f"Too many requests; please wait {int(wait)} seconds before retrying."
-                                )
-                                logger.warning("FloodWait during send_code_request for %s: wait=%s", phone, wait)
-                                try:
-                                    await client.disconnect()
-                                except Exception:
-                                    pass
-                                _clear_login_flow(user_id, context)
-                                return
-                        except Exception:
-                            pass
-                        # Final fallback (rare) — attempt raw call once more.
-                        sent = await client.send_code_request(phone)
-
-                    # Determine a simple human-friendly delivery type name
-                    try:
-                        sent_type = getattr(sent, "type", None)
-                        try:
-                            sent_type_name = sent_type.__class__.__name__ if sent_type is not None else None
-                        except Exception:
-                            sent_type_name = repr(sent_type)
-                        context.user_data["login_code_type"] = sent_type_name
-
-                        logger.info(
-                            "Requested login code for %s; sent_obj=%s sent_type=%s",
-                            phone,
-                            repr(sent),
-                            sent_type_name,
-                        )
-                        context.user_data["login_code_type"] = sent_type_name
-                        sent_time = time.time()
-                        context.user_data["login_code_sent_at"] = sent_time
-                        context.user_data["login_code_sent_repr"] = repr(sent)
-                    except Exception:
-                        pass
-
-                    # Store the phone_code_hash if available for later sign_in.
-                    try:
-                        code_hash = getattr(sent, "phone_code_hash", None)
-                    except Exception:
-                        code_hash = None
-
-                    if code_hash:
-                        context.user_data["login_code_hash"] = code_hash
-
-                    # Inform the user where the code was delivered and warn about short TTL
-                    try:
-                        st = context.user_data.get("login_code_type")
-                        if st and "App" in st:
-                            user_msg = (
-                                "A login code was sent to your Telegram app (Desktop/Phone).\n\n"
-                                "⚠️ App-delivered codes expire quickly (~30 seconds). "
-                                "Reply with the code AS SOON AS you receive it."
-                            )
-                        elif st and ("Sms" in st or "SMS" in st):
-                            user_msg = "A login code was sent via SMS. Reply with the code you receive by SMS."
-                        elif st and "Flash" in st:
-                            user_msg = (
-                                "A login code was sent via flash call. Check the incoming call for the "
-                                "last digits and reply with them."
-                            )
-                        else:
-                            user_msg = "A login code has been sent. Please reply with the code you receive."
-                    except Exception:
-                        user_msg = "A login code has been sent. Please reply with the code you receive."
-
-                    await update.message.reply_text(user_msg)
-                    context.user_data["awaiting_login_code"] = True
-                    context.user_data["login_phone"] = phone
-                    context.user_data["login_client"] = client
-                    context.user_data["login_session_path"] = session_path
-                    return
-                else:
+                if await client.is_user_authorized():
                     await update.message.reply_text(
                         f"Telethon session is already authorized and saved to {session_path}. You can now use userbot fallback."
                     )
                     await client.disconnect()
                     _clear_login_flow(user_id, context)
                     return
+
+                # Start a background task that calls client.start() with Future-based
+                # callbacks. Telethon handles ALL the complexity internally: DC migration,
+                # phone_code_hash management, code retries, TOS acceptance, and 2FA.
+                #
+                # The callbacks create asyncio.Future objects stored in context.user_data.
+                # The PTB message handler detects these futures and resolves them with
+                # the user's input, bridging the gap between Telethon's blocking
+                # authentication flow and Telegram's chat-based message flow.
+
+                async def _do_start():
+                    try:
+                        # Define callbacks that communicate via asyncio.Future
+                        async def code_callback():
+                            loop = asyncio.get_running_loop()
+                            future = loop.create_future()
+                            context.user_data["login_pending_future"] = future
+                            context.user_data["login_pending_type"] = "code"
+                            await context.bot.send_message(
+                                chat_id=update.effective_chat.id,
+                                text="Please enter the login code you received on your Telegram app:",
+                            )
+                            code = await future
+                            # Normalize code (handle unicode digits, remove non-digits)
+                            try:
+                                trans = str.maketrans({
+                                    "٠": "0", "١": "1", "٢": "2", "٣": "3", "٤": "4",
+                                    "٥": "5", "٦": "6", "٧": "7", "٨": "8", "٩": "9",
+                                    "۰": "0", "۱": "1", "۲": "2", "۳": "3", "۴": "4",
+                                    "۵": "5", "۶": "6", "۷": "7", "۸": "8", "۹": "9",
+                                })
+                                code = (code or "").translate(trans)
+                                code = "".join(c for c in code if c.isdigit())
+                            except Exception:
+                                pass
+                            return code
+
+                        async def password_callback():
+                            loop = asyncio.get_running_loop()
+                            future = loop.create_future()
+                            context.user_data["login_pending_future"] = future
+                            context.user_data["login_pending_type"] = "password"
+                            await context.bot.send_message(
+                                chat_id=update.effective_chat.id,
+                                text="Two-step verification is enabled. Please enter your account password:",
+                            )
+                            return await future
+
+                        await client.start(
+                            phone=phone,
+                            code_callback=code_callback,
+                            password=password_callback,
+                        )
+
+                        if await client.is_user_authorized():
+                            await context.bot.send_message(
+                                chat_id=update.effective_chat.id,
+                                text=f"✅ Telethon userbot login successful. Session saved locally.\nSaved session: {session_path}",
+                            )
+                            logger.info("Telethon login successful for %s (session: %s)", phone, session_path)
+                        else:
+                            await context.bot.send_message(
+                                chat_id=update.effective_chat.id,
+                                text="Login completed but session is not authorized. Please run /login again."
+                            )
+
+                    except Exception as start_exc:
+                        logger.exception("client.start() failed: %s", start_exc)
+                        try:
+                            from telethon.errors import FloodWaitError
+                            if isinstance(start_exc, FloodWaitError):
+                                wait = getattr(start_exc, "seconds", None) or getattr(start_exc, "timeout", None) or 60
+                                await context.bot.send_message(
+                                    chat_id=update.effective_chat.id,
+                                    text=f"Too many attempts. Please wait {int(wait)} seconds before retrying."
+                                )
+                            else:
+                                await context.bot.send_message(
+                                    chat_id=update.effective_chat.id,
+                                    text=f"Login failed: {start_exc.__class__.__name__}.\nPlease run /login again."
+                                )
+                        except Exception:
+                            await context.bot.send_message(
+                                chat_id=update.effective_chat.id,
+                                text="Login failed unexpectedly. Please run /login again."
+                            )
+                    finally:
+                        try:
+                            await client.disconnect()
+                        except Exception:
+                            pass
+                        # Ensure pending future is cleared
+                        try:
+                            fut = context.user_data.get("login_pending_future")
+                            if fut and not fut.done():
+                                fut.cancel()
+                        except Exception:
+                            pass
+                        _clear_login_flow(user_id, context)
+
+                # Store the background task so _clear_login_flow can cancel it
+                login_task = asyncio.create_task(_do_start())
+                context.user_data["login_start_task"] = login_task
+                context.user_data["login_phone"] = phone
+                context.user_data["login_client"] = client
+                context.user_data["login_session_path"] = session_path
+
+                # Store login_pending for the message handler to know to listen
+                # (has a pending future to resolve)
+                LOGIN_PENDING_USERS.add(user_id)
+
+                # Inform the user that we're starting the flow
+                await update.message.reply_text(
+                    "Connecting to Telegram and requesting login code..."
+                )
+                return
+
             except Exception as exc:
                 logger.exception("/login phone step failed: %s", exc)
                 await update.message.reply_text(
@@ -1076,7 +1120,10 @@ def setup_handlers(application: Application) -> None:
                 _clear_login_flow(user_id, context)
                 return
 
-        if context.user_data.get("awaiting_login_code"):
+        # Check if there's a pending future to resolve (code or password from client.start())
+        pending_future = context.user_data.get("login_pending_future")
+        pending_type = context.user_data.get("login_pending_type")
+        if pending_future is not None and not pending_future.done():
             code = update.message.text.strip()
             client = context.user_data.get("login_client")
             phone = context.user_data.get("login_phone")
@@ -1088,302 +1135,43 @@ def setup_handlers(application: Application) -> None:
                 return
 
             try:
-                # Normalize code input (handle Unicode digits and stray chars)
-                trans_digits = str.maketrans(
-                    {
-                        "٠": "0",
-                        "١": "1",
-                        "٢": "2",
-                        "٣": "3",
-                        "٤": "4",
-                        "٥": "5",
-                        "٦": "6",
-                        "٧": "7",
-                        "٨": "8",
-                        "٩": "9",
-                        "۰": "0",
-                        "۱": "1",
-                        "۲": "2",
-                        "۳": "3",
-                        "۴": "4",
-                        "۵": "5",
-                        "۶": "6",
-                        "۷": "7",
-                        "۸": "8",
-                        "۹": "9",
-                    }
+                # Resolve the pending future with the user's input.
+                # client.start() handles sign_in internally with proper
+                # phone_code_hash management, DC migration, and 2FA.
+                _input = update.message.text.strip()
+                if pending_type == "code":
+                    # Normalize code input (handle Unicode digits)
+                    trans_digits = str.maketrans({
+                        "\u0660": "0", "\u0661": "1", "\u0662": "2", "\u0663": "3", "\u0664": "4",
+                        "\u0665": "5", "\u0666": "6", "\u0667": "7", "\u0668": "8", "\u0669": "9",
+                        "\u06F0": "0", "\u06F1": "1", "\u06F2": "2", "\u06F3": "3", "\u06F4": "4",
+                        "\u06F5": "5", "\u06F6": "6", "\u06F7": "7", "\u06F8": "8", "\u06F9": "9",
+                    })
+                    norm_code = (_input or "").translate(trans_digits)
+                    norm_code = "".join([c for c in norm_code if c.isdigit()])
+                    resolved_value = norm_code
+                else:
+                    # Password - no normalization needed
+                    resolved_value = _input
+                pending_future.set_result(resolved_value)
+                logger.info(
+                    "Telethon login %s resolved via client.start() for user=%s",
+                    pending_type or "input", user_id,
                 )
-                norm_code = (code or "").translate(trans_digits)
-                # Remove any non-digit characters
-                norm_code = "".join([c for c in norm_code if c.isdigit()])
-
-                # Debug: record code usage context before attempting sign-in
-                try:
-                    entered_at = time.time()
-                    sent_at = context.user_data.get("login_code_sent_at")
-                    resend_count = context.user_data.get("login_resend_count", 0)
-                    code_hash_preview = str(context.user_data.get("login_code_hash"))
-                    client_session = getattr(getattr(client, 'session', None), 'filename', None) or repr(getattr(client, 'session', None))
-                    masked_code = (norm_code[-2:].rjust(2, "*") if norm_code else "")
-                    logger.info(
-                        "Attempting sign_in: user=%s entered_at=%s sent_at=%s delta=%.3fs resend_count=%s code_hash=%s session=%s code_tail=%s",
-                        user_id,
-                        entered_at,
-                        sent_at,
-                        (entered_at - sent_at) if sent_at else -1,
-                        resend_count,
-                        code_hash_preview,
-                        client_session,
-                        masked_code,
-                    )
-                    # Admin-only: log the full normalized code for debugging
-                    try:
-                        if user_id == ADMIN_USER_ID:
-                            logger.info("Admin sign-in code (normalized) for user=%s: %s", user_id, norm_code)
-                    except Exception:
-                        pass
-                except Exception:
-                    pass
-
-                # Do NOT add pre-wait delay; attempt sign_in immediately to minimize
-                # time lost. Telegram's code validity window can be extremely short
-                # from send time. Every millisecond counts.
-
-                # Use stored phone_code_hash when available to match the
-                # send_code_request response. If the hash is stale (e.g. after
-                # DC migration), try without it before giving up.
-                code_hash = context.user_data.get("login_code_hash")
-
-                # Single attempt only - retrying an expired code is wasteful.
-                # If the code expired, we auto-resend a fresh one below.
-                if code_hash:
-                    try:
-                        await client.sign_in(phone=phone, code=norm_code, phone_code_hash=code_hash)
-                    except ValueError as ve:
-                        # Hash may be stale after DC migration and Telethon raises ValueError.
-                        # Try without hash as fallback.
-                        if "phone_code_hash" in str(ve):
-                            try:
-                                await client.sign_in(code=norm_code)
-                            except TypeError:
-                                await client.sign_in(phone=phone, code=norm_code)
-                        else:
-                            raise
-                else:
-                    # No stored hash (e.g. resumed session, older flow).
-                    try:
-                        await client.sign_in(code=norm_code)
-                    except TypeError:
-                        await client.sign_in(phone=phone, code=norm_code)
-
-                if await client.is_user_authorized():
-                    session_path = context.user_data.get("login_session_path")
-                    await update.message.reply_text(
-                        "✅ Telethon userbot login successful. Session saved locally."
-                        + (f"\nSaved session: {session_path}" if session_path else "")
-                    )
-                    await client.disconnect()
-                    _clear_login_flow(user_id, context)
-                    return
-                else:
-                    await update.message.reply_text(
-                        "Login code accepted but the session is not authorized. Please reply with your password if 2FA is enabled."
-                    )
-                    context.user_data["awaiting_login_password"] = True
-                    context.user_data.pop("awaiting_login_code", None)
-                    return
-            except Exception as exc:
-                # Detect Telethon-specific exceptions and give actionable messages
-                try:
-                    from telethon.errors import (
-                        SessionPasswordNeededError,
-                        PhoneCodeInvalidError,
-                        PhoneCodeExpiredError,
-                        FloodWaitError,
-                    )
-                except Exception:
-                    SessionPasswordNeededError = PhoneCodeInvalidError = PhoneCodeExpiredError = FloodWaitError = None
-
-                # 2FA required
-                if SessionPasswordNeededError and isinstance(exc, SessionPasswordNeededError):
-                    await update.message.reply_text(
-                        "Two-step verification is enabled. Please reply with your account password."
-                    )
-                    context.user_data["awaiting_login_password"] = True
-                    context.user_data.pop("awaiting_login_code", None)
-                    return
-
-                # Specific error responses
-                friendly = None
-                try:
-                    if PhoneCodeInvalidError and isinstance(exc, PhoneCodeInvalidError):
-                        friendly = "The code you entered is invalid. Please request a new code and try again."
-                    elif PhoneCodeExpiredError and isinstance(exc, PhoneCodeExpiredError):
-                        # Code expired — auto-resend ONCE with force_sms for longer TTL.
-                        # The Telethon client is already connected to the correct DC,
-                        # so resending is fast (< 1s). If user can't enter it in time,
-                        # tell them to restart /login rather than looping forever.
-                        resend_count = context.user_data.get("login_resend_count", 0)
-                        if resend_count >= 1:
-                            logger.warning(
-                                "PhoneCodeExpiredError for %s after %s resends; giving up",
-                                phone, resend_count,
-                            )
-                            friendly = (
-                                "Your login codes keep expiring. This usually happens when the code is "
-                                "delivered via Telegram app with a very short timeout.\n\n"
-                                "Please run /login again and be ready to enter the code immediately.\n"
-                                "If this keeps happening, try using a phone number with SMS delivery."
-                            )
-                        else:
-                            logger.warning(
-                                "PhoneCodeExpiredError for %s (resend #%s); auto-resending with force_sms...",
-                                phone, resend_count + 1,
-                            )
-                            try:
-                                # Resend with force_sms=True to get longer-lived code
-                                try:
-                                    sent = await client.send_code_request(phone, force_sms=True)
-                                except TypeError:
-                                    sent = await client.send_code_request(phone)
-                                new_hash = getattr(sent, "phone_code_hash", None)
-                                if new_hash:
-                                    context.user_data["login_code_hash"] = new_hash
-                                context.user_data["login_code_sent_at"] = time.time()
-                                context.user_data["login_code_sent_repr"] = repr(sent)
-                                context.user_data["login_resend_count"] = resend_count + 1
-                                # Refresh code type info
-                                try:
-                                    sent_type = getattr(sent, "type", None)
-                                    st_name = sent_type.__class__.__name__ if sent_type is not None else None
-                                    context.user_data["login_code_type"] = st_name
-                                except Exception:
-                                    pass
-                                await update.message.reply_text(
-                                    "Your previous login code expired. A new SMS code has been sent. "
-                                    "Reply with the NEW code as quickly as possible."
-                                )
-                                # Stay in awaiting_login_code state — do not clear the flow
-                                return
-                            except Exception as resend_exc:
-                                logger.exception("Auto-resend after PhoneCodeExpiredError failed: %s", resend_exc)
-                                friendly = (
-                                    "Your login code expired and I couldn't auto-send a new one.\n\n"
-                                    "Please run /login again to restart the process."
-                                )
-                    elif FloodWaitError and isinstance(exc, FloodWaitError):
-                        wait = getattr(exc, 'seconds', None) or getattr(exc, 'timeout', None) or 60
-                        until = time.time() + int(wait)
-                        context.user_data["login_flood_wait_until"] = until
-                        friendly = f"Too many attempts; please wait {int(wait)} seconds before retrying."
-                except Exception:
-                    friendly = None
-
-                # Log detailed exception information for debugging
-                logger.exception("/login code step failed (user=%s): %s", user_id, exc)
-
-                # Reply with a helpful message to admin users; others get a generic prompt
-                try:
-                    if friendly:
-                        await update.message.reply_text(friendly)
-                    else:
-                        if user_id == ADMIN_USER_ID:
-                            await update.message.reply_text(
-                                f"Sign-in error: {exc.__class__.__name__}: {exc}\nSee logs for details."
-                            )
-                        else:
-                            await update.message.reply_text(
-                                "Failed to complete Telethon login. Please make sure the code is correct and try /login again."
-                            )
-                except Exception:
-                    pass
-
-                try:
-                    await client.disconnect()
-                except Exception:
-                    pass
-                _clear_login_flow(user_id, context)
                 return
-
-        if context.user_data.get("awaiting_login_password"):
-            password = update.message.text.strip()
-            client = context.user_data.get("login_client")
-            if client is None:
+            except Exception as exc:
+                logger.exception("Failed to resolve pending future for user=%s: %s", user_id, exc)
+                try:
+                    if not pending_future.done():
+                        pending_future.set_exception(exc)
+                except Exception:
+                    pass
                 await update.message.reply_text(
-                    "Session state lost. Please run /login again to start a fresh login."
+                    "Failed to send your input to the login process. Please run /login again."
                 )
-                _clear_login_flow(user_id, context)
                 return
 
-            # Track password retries to prevent infinite loop
-            retry_count = context.user_data.get("login_password_retry_count", 0)
-
-            try:
-                await client.sign_in(password=password)
-                if await client.is_user_authorized():
-                    session_path = context.user_data.get("login_session_path")
-                    await update.message.reply_text(
-                        "✅ Telethon userbot login successful. Session saved locally."
-                        + (f"\\nSaved session: {session_path}" if session_path else "")
-                    )
-                    await client.disconnect()
-                    _clear_login_flow(user_id, context)
-                else:
-                    await update.message.reply_text(
-                        "Password accepted but the session is not authorized. Please run /login again."
-                    )
-                    await client.disconnect()
-                    _clear_login_flow(user_id, context)
-            except Exception as exc:
-                try:
-                    from telethon.errors import PasswordHashInvalidError, FloodWaitError
-
-                    if isinstance(exc, PasswordHashInvalidError):
-                        retry_count += 1
-                        context.user_data["login_password_retry_count"] = retry_count
-                        if retry_count >= 3:
-                            logger.warning("Password retry limit reached for user %s", user_id)
-                            await update.message.reply_text(
-                                "Too many incorrect password attempts. Please run /login again to restart."
-                            )
-                            await client.disconnect()
-                            _clear_login_flow(user_id, context)
-                        else:
-                            remaining = 3 - retry_count
-                            await update.message.reply_text(
-                                f"Incorrect password. You have {remaining} attempt(s) remaining.\\n"
-                                "Please send the correct password."
-                            )
-                            # Keep client connected — stay in awaiting_login_password state
-                            return
-                    elif isinstance(exc, FloodWaitError):
-                        wait = getattr(exc, "seconds", None) or getattr(exc, "timeout", None) or 60
-                        until = time.time() + int(wait)
-                        context.user_data["login_flood_wait_until"] = until
-                        await update.message.reply_text(
-                            f"Too many attempts. Please wait {int(wait)} seconds before retrying."
-                        )
-                        await client.disconnect()
-                        _clear_login_flow(user_id, context)
-                    else:
-                        # Unknown error during password sign-in
-                        logger.exception("/login password step failed: %s", exc)
-                        await update.message.reply_text(
-                            "Failed to complete Telethon login with password. Please try /login again."
-                        )
-                        await client.disconnect()
-                        _clear_login_flow(user_id, context)
-                except Exception:
-                    # Fallback if Telethon error types are not importable
-                    logger.exception("/login password step failed: %s", exc)
-                    await update.message.reply_text(
-                        "Failed to complete Telethon login with password. Please try /login again."
-                    )
-                    await client.disconnect()
-                    _clear_login_flow(user_id, context)
-            return
-            return
-
+        # Single cleanup point: reached only when no active login flow exists.
         _clear_login_flow(user_id, context)
         return
 
