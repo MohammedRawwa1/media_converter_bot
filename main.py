@@ -1001,54 +1001,95 @@ def setup_handlers(application: Application) -> None:
                 # the user's input, bridging the gap between Telethon's blocking
                 # authentication flow and Telegram's chat-based message flow.
 
+
                 async def _do_start():
+                    from telethon.errors import SessionPasswordNeededError, PhoneCodeExpiredError, FloodWaitError
+
                     try:
-                        # Define callbacks that communicate via asyncio.Future
-                        async def code_callback():
-                            loop = asyncio.get_running_loop()
-                            future = loop.create_future()
-                            context.user_data["login_pending_future"] = future
-                            context.user_data["login_pending_type"] = "code"
-                            await context.bot.send_message(
-                                chat_id=update.effective_chat.id,
-                                text="Please enter the login code you received on your Telegram app:",
-                            )
-                            code = await future
-                            # Normalize code (handle unicode digits, remove non-digits)
-                            try:
-                                trans = str.maketrans({
-                                    "٠": "0", "١": "1", "٢": "2", "٣": "3", "٤": "4",
-                                    "٥": "5", "٦": "6", "٧": "7", "٨": "8", "٩": "9",
-                                    "۰": "0", "۱": "1", "۲": "2", "۳": "3", "۴": "4",
-                                    "۵": "5", "۶": "6", "۷": "7", "۸": "8", "۹": "9",
-                                })
-                                code = (code or "").translate(trans)
-                                code = "".join(c for c in code if c.isdigit())
-                            except Exception:
-                                pass
-                            return code
+                        loop = asyncio.get_running_loop()
 
-                        async def password_callback():
-                            loop = asyncio.get_running_loop()
-                            future = loop.create_future()
-                            context.user_data["login_pending_future"] = future
-                            context.user_data["login_pending_type"] = "password"
-                            await context.bot.send_message(
-                                chat_id=update.effective_chat.id,
-                                text="Two-step verification is enabled. Please enter your account password:",
-                            )
-                            return await future
+                        # Manual sign_in flow with explicit phone_code_hash.
+                        # This avoids Telethon's broken internal _phone_code_hash dict,
+                        # which gets cleared during DC migration or PhoneCodeExpiredError handling.
+                        sent = await client.send_code_request(phone)
+                        phone_code_hash = sent.phone_code_hash
+                        logger.info("Login code requested for %s; hash obtained", phone)
 
-                        await client.start(
-                            phone=phone,
-                            code_callback=code_callback,
-                            password=password_callback,
+                        # Future-based code callback
+                        code_future = loop.create_future()
+                        context.user_data["login_pending_future"] = code_future
+                        context.user_data["login_pending_type"] = "code"
+                        await context.bot.send_message(
+                            chat_id=update.effective_chat.id,
+                            text="Please enter the login code you received on your Telegram app:",
                         )
+                        code = await code_future
+
+                        # Normalize code (Unicode digits -> ASCII)
+                        try:
+                            trans = str.maketrans({
+                                "\u0660": "0", "\u0661": "1", "\u0662": "2", "\u0663": "3", "\u0664": "4",
+                                "\u0665": "5", "\u0666": "6", "\u0667": "7", "\u0668": "8", "\u0669": "9",
+                                "\u06F0": "0", "\u06F1": "1", "\u06F2": "2", "\u06F3": "3", "\u06F4": "4",
+                                "\u06F5": "5", "\u06F6": "6", "\u06F7": "7", "\u06F8": "8", "\u06F9": "9",
+                            })
+                            code = (code or "").translate(trans)
+                            code = "".join(c for c in code if c.isdigit())
+                        except Exception:
+                            pass
+
+                        # Retry loop: sign_in with explicit hash. On PhoneCodeExpiredError, retry once.
+                        for attempt in range(2):
+                            if attempt == 1:
+                                # Fresh code request for retry
+                                sent = await client.send_code_request(phone)
+                                phone_code_hash = sent.phone_code_hash
+                                logger.info("Retry code requested for %s after expiry", phone)
+                                new_future = loop.create_future()
+                                context.user_data["login_pending_future"] = new_future
+                                context.user_data["login_pending_type"] = "code"
+                                await context.bot.send_message(
+                                    chat_id=update.effective_chat.id,
+                                    text="The previous code expired. A new code has been sent. "
+                                         "Please enter the NEW code immediately:",
+                                )
+                                code = await new_future
+                                # Re-normalize
+                                try:
+                                    code = (code or "").translate(trans)
+                                    code = "".join(c for c in code if c.isdigit())
+                                except Exception:
+                                    pass
+
+                            try:
+                                await client.sign_in(
+                                    phone=phone,
+                                    code=code,
+                                    phone_code_hash=phone_code_hash,
+                                )
+                                break  # Success
+                            except SessionPasswordNeededError:
+                                # 2FA required
+                                pw_future = loop.create_future()
+                                context.user_data["login_pending_future"] = pw_future
+                                context.user_data["login_pending_type"] = "password"
+                                await context.bot.send_message(
+                                    chat_id=update.effective_chat.id,
+                                    text="Two-step verification is enabled. Please enter your account password:",
+                                )
+                                password = await pw_future
+                                await client.sign_in(password=password)
+                                break  # Password accepted
+                            except PhoneCodeExpiredError:
+                                logger.warning("Code expired for %s (attempt %s)", phone, attempt)
+                                if attempt == 0:
+                                    continue  # Retry once
+                                raise  # Already retried
 
                         if await client.is_user_authorized():
                             await context.bot.send_message(
                                 chat_id=update.effective_chat.id,
-                                text=f"✅ Telethon userbot login successful. Session saved locally.\nSaved session: {session_path}",
+                                text=f"\u2705 Telethon userbot login successful. Session saved locally.\nSaved session: {session_path}",
                             )
                             logger.info("Telethon login successful for %s (session: %s)", phone, session_path)
                         else:
@@ -1058,9 +1099,8 @@ def setup_handlers(application: Application) -> None:
                             )
 
                     except Exception as start_exc:
-                        logger.exception("client.start() failed: %s", start_exc)
+                        logger.exception("_do_start() failed: %s", start_exc)
                         try:
-                            from telethon.errors import FloodWaitError
                             if isinstance(start_exc, FloodWaitError):
                                 wait = getattr(start_exc, "seconds", None) or getattr(start_exc, "timeout", None) or 60
                                 await context.bot.send_message(
@@ -1077,12 +1117,13 @@ def setup_handlers(application: Application) -> None:
                                 chat_id=update.effective_chat.id,
                                 text="Login failed unexpectedly. Please run /login again."
                             )
+
                     finally:
                         try:
                             await client.disconnect()
                         except Exception:
                             pass
-                        # Ensure pending future is cleared
+                        # Clear pending future
                         try:
                             fut = context.user_data.get("login_pending_future")
                             if fut and not fut.done():
@@ -1090,24 +1131,6 @@ def setup_handlers(application: Application) -> None:
                         except Exception:
                             pass
                         _clear_login_flow(user_id, context)
-
-                # Store the background task so _clear_login_flow can cancel it
-                login_task = asyncio.create_task(_do_start())
-                context.user_data["login_start_task"] = login_task
-                context.user_data["login_phone"] = phone
-                context.user_data["login_client"] = client
-                context.user_data["login_session_path"] = session_path
-
-                # Store login_pending for the message handler to know to listen
-                # (has a pending future to resolve)
-                LOGIN_PENDING_USERS.add(user_id)
-
-                # Inform the user that we're starting the flow
-                await update.message.reply_text(
-                    "Connecting to Telegram and requesting login code..."
-                )
-                return
-
             except Exception as exc:
                 logger.exception("/login phone step failed: %s", exc)
                 await update.message.reply_text(

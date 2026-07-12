@@ -1137,7 +1137,7 @@ async def handle_job(job: dict):
                                                             os.remove(_temp_thumb)
                                                     except Exception:
                                                         pass
-                                                elif kind == "video":
+                                            elif kind == "video":
                                                 # Try to attach thumbnail (thumb) when available
                                                 thumb_path = None
                                                 _temp_thumb = None
