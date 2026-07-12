@@ -959,17 +959,23 @@ def setup_handlers(application: Application) -> None:
             try:
                 await client.connect()
                 if not await client.is_user_authorized():
-                    # Capture the returned object from send_code_request so we can
-                    # provide the phone_code_hash to sign_in when required by
-                    # certain Telethon/server variants.
+                    # Request a login code. Prefer SMS delivery (longer TTL ~5 min)
+                    # over in-app delivery (~30s TTL) since the user must switch
+                    # chats to retrieve and enter the code through the bot.
                     try:
-                        # Request a login code. Avoid using deprecated `force_sms`.
+                        sent = await client.send_code_request(phone, force_sms=True)
+                    except TypeError:
+                        # Older Telethon may not accept force_sms keyword
                         try:
                             sent = await client.send_code_request(phone)
                         except TypeError:
-                            # Older Telethon signatures may differ; try fallback.
                             sent = await client.send_code_request(phone)
                     except Exception as e:
+                        # Fallback if force_sms is rejected
+                        try:
+                            sent = await client.send_code_request(phone)
+                        except TypeError:
+                            sent = await client.send_code_request(phone)
                         # Detect FloodWaitError specifically to inform the user
                         try:
                             from telethon.errors import FloodWaitError
@@ -993,44 +999,14 @@ def setup_handlers(application: Application) -> None:
                         # Final fallback (rare) — attempt raw call once more.
                         sent = await client.send_code_request(phone)
 
-                    # Debug: record when the code was requested and returned hash
+                    # Determine a simple human-friendly delivery type name
                     try:
                         sent_type = getattr(sent, "type", None)
-                        # If code was sent to app (SentCodeTypeApp), immediately request
-                        # again to force SMS delivery. App-delivered codes have a very
-                        # short expiry window (~15-30s), making them impractical for
-                        # bot-based login where the user must switch chats.
-                        if sent_type_name and "App" in sent_type_name:
-                            logger.info(
-                                "Phone %s got SentCodeTypeApp; re-requesting to force SMS delivery",
-                                phone,
-                            )
-                            try:
-                                sent = await client.send_code_request(phone)
-                                # Refresh all sent data after the re-request
-                                new_sent_type = getattr(sent, "type", None)
-                                try:
-                                    new_st_name = new_sent_type.__class__.__name__ if new_sent_type is not None else None
-                                    sent_type_name = new_st_name
-                                    context.user_data["login_code_type"] = new_st_name
-                                except Exception:
-                                    pass
-                                new_hash = getattr(sent, "phone_code_hash", None)
-                                if new_hash:
-                                    context.user_data["login_code_hash"] = new_hash
-                                context.user_data["login_code_sent_at"] = time.time()
-                                context.user_data["login_code_sent_repr"] = repr(sent)
-                                logger.info(
-                                    "Re-requested code for %s; now got type=%s (replacing SentCodeTypeApp)",
-                                    phone, sent_type_name,
-                                )
-                            except Exception:
-                                logger.exception("Failed to re-request code for SMS forcing")
-                        # Determine a simple human-friendly type name
                         try:
                             sent_type_name = sent_type.__class__.__name__ if sent_type is not None else None
                         except Exception:
                             sent_type_name = repr(sent_type)
+                        context.user_data["login_code_type"] = sent_type_name
 
                         logger.info(
                             "Requested login code for %s; sent_obj=%s sent_type=%s",
@@ -1054,15 +1030,22 @@ def setup_handlers(application: Application) -> None:
                     if code_hash:
                         context.user_data["login_code_hash"] = code_hash
 
-                    # Inform the user where the code was delivered (app, SMS, flash call)
+                    # Inform the user where the code was delivered and warn about short TTL
                     try:
                         st = context.user_data.get("login_code_type")
                         if st and "App" in st:
-                            user_msg = "A login code was sent to your Telegram app. Open your Telegram app or desktop client and reply with the code."
+                            user_msg = (
+                                "A login code was sent to your Telegram app (Desktop/Phone).\n\n"
+                                "⚠️ App-delivered codes expire quickly (~30 seconds). "
+                                "Reply with the code AS SOON AS you receive it."
+                            )
                         elif st and ("Sms" in st or "SMS" in st):
                             user_msg = "A login code was sent via SMS. Reply with the code you receive by SMS."
                         elif st and "Flash" in st:
-                            user_msg = "A login code was sent via flash call. Check the incoming call for the code and reply with it."
+                            user_msg = (
+                                "A login code was sent via flash call. Check the incoming call for the "
+                                "last digits and reply with them."
+                            )
                         else:
                             user_msg = "A login code has been sent. Please reply with the code you receive."
                     except Exception:
@@ -1236,28 +1219,33 @@ def setup_handlers(application: Application) -> None:
                     if PhoneCodeInvalidError and isinstance(exc, PhoneCodeInvalidError):
                         friendly = "The code you entered is invalid. Please request a new code and try again."
                     elif PhoneCodeExpiredError and isinstance(exc, PhoneCodeExpiredError):
-                        # Code expired — auto-resend a new one immediately.
+                        # Code expired — auto-resend ONCE with force_sms for longer TTL.
                         # The Telethon client is already connected to the correct DC,
-                        # so resending is fast (< 1s). This avoids restarting /login.
-                        # Cap auto-resends at 3 to prevent infinite loops.
+                        # so resending is fast (< 1s). If user can't enter it in time,
+                        # tell them to restart /login rather than looping forever.
                         resend_count = context.user_data.get("login_resend_count", 0)
-                        if resend_count >= 3:
+                        if resend_count >= 1:
                             logger.warning(
                                 "PhoneCodeExpiredError for %s after %s resends; giving up",
                                 phone, resend_count,
                             )
                             friendly = (
-                                "Your login codes keep expiring even after multiple resends.\n\n"
-                                "Please run /login again to restart the process.\n"
-                                "If this keeps happening, your account may have a very strict code timeout."
+                                "Your login codes keep expiring. This usually happens when the code is "
+                                "delivered via Telegram app with a very short timeout.\n\n"
+                                "Please run /login again and be ready to enter the code immediately.\n"
+                                "If this keeps happening, try using a phone number with SMS delivery."
                             )
                         else:
                             logger.warning(
-                                "PhoneCodeExpiredError for %s (resend #%s); auto-resending...",
+                                "PhoneCodeExpiredError for %s (resend #%s); auto-resending with force_sms...",
                                 phone, resend_count + 1,
                             )
                             try:
-                                sent = await client.send_code_request(phone)
+                                # Resend with force_sms=True to get longer-lived code
+                                try:
+                                    sent = await client.send_code_request(phone, force_sms=True)
+                                except TypeError:
+                                    sent = await client.send_code_request(phone)
                                 new_hash = getattr(sent, "phone_code_hash", None)
                                 if new_hash:
                                     context.user_data["login_code_hash"] = new_hash
@@ -1272,7 +1260,8 @@ def setup_handlers(application: Application) -> None:
                                 except Exception:
                                     pass
                                 await update.message.reply_text(
-                                    "Your previous login code expired. A new one has been sent. Please reply with the new code."
+                                    "Your previous login code expired. A new SMS code has been sent. "
+                                    "Reply with the NEW code as quickly as possible."
                                 )
                                 # Stay in awaiting_login_code state — do not clear the flow
                                 return

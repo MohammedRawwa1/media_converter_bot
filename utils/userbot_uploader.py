@@ -1,5 +1,9 @@
 import os
+import json
+import asyncio
 import logging
+import shutil
+import tempfile
 from typing import Union, Optional, Callable
 
 try:
@@ -77,11 +81,85 @@ async def _send_with_telethon(
             pass
 
 
+async def _probe_video_metadata(path: str) -> dict:
+    """Probe a video file with ffprobe and return parsed metadata dict.
+
+    Returns a dict with keys: duration (int seconds), width (int), height (int).
+    Missing or unreadable keys are omitted. Returns empty dict on any failure.
+    """
+    ffprobe_bin = "ffprobe"
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            ffprobe_bin, "-v", "quiet", "-print_format", "json",
+            "-show_entries", "stream=width,height,codec_type:format=duration",
+            path,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=30)
+        if proc.returncode != 0:
+            return {}
+        data = json.loads(stdout.decode())
+    except Exception:
+        return {}
+
+    meta = {}
+    # First video stream carries the dimensions
+    streams = data.get("streams", [])
+    for s in streams:
+        if s.get("codec_type") == "video":
+            if "width" in s:
+                meta["width"] = s["width"]
+            if "height" in s:
+                meta["height"] = s["height"]
+            break
+    # Duration from format section
+    fmt = data.get("format", {})
+    if fmt.get("duration"):
+        try:
+            meta["duration"] = int(float(fmt["duration"]))
+        except (ValueError, TypeError):
+            pass
+    return meta
+
+
+async def _generate_video_thumbnail(path: str) -> Optional[str]:
+    """Extract a single frame thumbnail from the video at ~1 second mark.
+
+    Returns the path to a JPEG thumbnail file, or None on failure.
+    The caller is responsible for cleaning up the returned file.
+    """
+    ffmpeg_bin = "ffmpeg"
+    # Use a named temp file so we can return the path
+    tmp_dir = tempfile.mkdtemp(prefix="pyro_thumb_")
+    thumb_path = os.path.join(tmp_dir, "thumb.jpg")
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            ffmpeg_bin, "-y", "-ss", "00:00:01", "-i", path,
+            "-vframes", "1", "-q:v", "2", thumb_path,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        await asyncio.wait_for(proc.communicate(), timeout=30)
+        if proc.returncode == 0 and os.path.exists(thumb_path) and os.path.getsize(thumb_path) > 0:
+            # Keep the temp dir; caller must clean up
+            return thumb_path
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+        return None
+    except Exception:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+        return None
+
+
 async def _send_with_pyrogram(
     chat_id: Union[int, str], file_path: str, caption: Optional[str] = None,
     progress_callback: Optional[Callable[[int, int], None]] = None,
 ) -> bool:
     """Send a file using Pyrogram (session string fallback).
+
+    Probes the video for duration / dimensions and extracts a thumbnail
+    frame so the resulting Telegram message shows proper metadata instead
+    of a "violet" unknown-video placeholder.
 
     Args:
         chat_id: Target chat ID or username.
@@ -100,19 +178,51 @@ async def _send_with_pyrogram(
     if client is None:
         return False
 
+    # Pre-fetch video metadata and thumbnail before connecting to Telegram
+    # so we can bail early if the file is problematic.
+    video_meta = await _probe_video_metadata(file_path)
+    thumb_path = await _generate_video_thumbnail(file_path)
+
+    _temp_cleanup = None
+    if thumb_path:
+        _temp_cleanup = os.path.dirname(thumb_path)
+
     try:
         await client.start()
         target = await _normalize_target(chat_id)
-        kwargs = {"caption": caption or "", "supports_streaming": True}
+        kwargs = {
+            "caption": caption or "",
+            "supports_streaming": True,
+        }
         if progress_callback is not None:
             kwargs["progress"] = progress_callback
+
+        # Pass probed metadata so Telegram displays proper video info
+        if "duration" in video_meta:
+            kwargs["duration"] = video_meta["duration"]
+        if "width" in video_meta:
+            kwargs["width"] = video_meta["width"]
+        if "height" in video_meta:
+            kwargs["height"] = video_meta["height"]
+        if thumb_path is not None:
+            kwargs["thumb"] = thumb_path
+
         await client.send_video(target, file_path, **kwargs)
-        logger.info("userbot: Pyrogram sent video %s to %s", file_path, target)
+        logger.info(
+            "userbot: Pyrogram sent video %s to %s (meta=%s, thumb=%s)",
+            file_path, target, video_meta, bool(thumb_path),
+        )
         return True
     except Exception:
         logger.exception("userbot: Pyrogram failed to send file %s", file_path)
         return False
     finally:
+        # Clean up temp thumbnail directory
+        if _temp_cleanup:
+            try:
+                shutil.rmtree(_temp_cleanup, ignore_errors=True)
+            except Exception:
+                pass
         try:
             await client.stop()
         except Exception:

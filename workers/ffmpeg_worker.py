@@ -969,10 +969,15 @@ async def handle_job(job: dict):
                                 try:
                                     # Determine media kind. Prefer probing the output file for a video stream
                                     kind = "doc"
+                                    # Always-bounded sentinel for video metadata extracted during probe
+                                    _vid_duration = None
+                                    _vid_width = None
+                                    _vid_height = None
                                     try:
                                         if out and os.path.exists(out):
                                             # prefer ffprobe if available to detect real video streams
                                             ffprobe_bin = getattr(config, "FFPROBE_PATH", None) or getattr(config, "FFMPEG_PATH", "ffmpeg").replace("ffmpeg", "ffprobe")
+                                            ffmpeg_bin = getattr(config, "FFMPEG_PATH", "ffmpeg")
 
                                             # Try cache first for ffprobe results
                                             probe_info = None
@@ -1016,6 +1021,20 @@ async def handle_job(job: dict):
                                                             kind = "video"
                                                         else:
                                                             kind = "doc"
+                                                    # Extract video metadata for richer send_video payload
+                                                    for s in streams:
+                                                        if s.get("codec_type") == "video":
+                                                            if "width" in s:
+                                                                _vid_width = s["width"]
+                                                            if "height" in s:
+                                                                _vid_height = s["height"]
+                                                            break
+                                                    fmt = probe_info.get("format", {})
+                                                    if fmt.get("duration"):
+                                                        try:
+                                                            _vid_duration = int(float(fmt["duration"]))
+                                                        except (ValueError, TypeError):
+                                                            pass
                                                 except Exception:
                                                     # probe parse failed -> extension fallback
                                                     if str(out).lower().endswith(".zip"):
@@ -1118,7 +1137,7 @@ async def handle_job(job: dict):
                                                             os.remove(_temp_thumb)
                                                     except Exception:
                                                         pass
-                                            elif kind == "video":
+                                                elif kind == "video":
                                                 # Try to attach thumbnail (thumb) when available
                                                 thumb_path = None
                                                 _temp_thumb = None
@@ -1173,6 +1192,26 @@ async def handle_job(job: dict):
                                                                 await r.close()
                                                         except Exception:
                                                             pass
+
+                                                    # Auto-generate thumbnail from video if none provided
+                                                    if not thumb_path:
+                                                        try:
+                                                            _auto_thumb_dir = tempfile.mkdtemp(prefix="auto_thumb_")
+                                                            _auto_thumb_path = os.path.join(_auto_thumb_dir, "thumb.jpg")
+                                                            _thumb_proc = await asyncio.create_subprocess_exec(
+                                                                ffmpeg_bin, "-y", "-ss", "00:00:01", "-i", out,
+                                                                "-vframes", "1", "-q:v", "2", _auto_thumb_path,
+                                                                stdout=asyncio.subprocess.PIPE,
+                                                                stderr=asyncio.subprocess.PIPE,
+                                                            )
+                                                            await asyncio.wait_for(_thumb_proc.communicate(), timeout=30)
+                                                            if _thumb_proc.returncode == 0 and os.path.exists(_auto_thumb_path) and os.path.getsize(_auto_thumb_path) > 0:
+                                                                thumb_path = _auto_thumb_path
+                                                                _temp_thumb = _auto_thumb_path
+                                                            else:
+                                                                shutil.rmtree(_auto_thumb_dir, ignore_errors=True)
+                                                        except Exception:
+                                                            pass
                                                 except Exception:
                                                     thumb_path = None
 
@@ -1180,18 +1219,36 @@ async def handle_job(job: dict):
                                                 try:
                                                     with open(out, "rb") as fh:
                                                         fh = _ProgressFileWrapper(fh, file_size, _bot_up_cb) if file_size else fh
+                                                        # Build send_video kwargs with available metadata
+                                                        _send_kwargs = {
+                                                            "chat_id": chat_id,
+                                                            "video": fh,
+                                                            "caption": caption,
+                                                            "supports_streaming": True,
+                                                        }
+                                                        if _vid_duration is not None:
+                                                            _send_kwargs["duration"] = _vid_duration
+                                                        if _vid_width is not None:
+                                                            _send_kwargs["width"] = _vid_width
+                                                        if _vid_height is not None:
+                                                            _send_kwargs["height"] = _vid_height
                                                         if thumb_path:
                                                             try:
                                                                 with open(thumb_path, "rb") as tf:
-                                                                    await bot.send_video(chat_id=chat_id, video=fh, caption=caption, supports_streaming=True, thumb=tf)
+                                                                    _send_kwargs["thumb"] = tf
+                                                                    await bot.send_video(**_send_kwargs)
                                                             except Exception:
-                                                                await bot.send_video(chat_id=chat_id, video=fh, caption=caption, supports_streaming=True)
+                                                                await bot.send_video(**_send_kwargs)
                                                         else:
-                                                            await bot.send_video(chat_id=chat_id, video=fh, caption=caption, supports_streaming=True)
+                                                            await bot.send_video(**_send_kwargs)
                                                 finally:
                                                     try:
                                                         if _temp_thumb and os.path.exists(_temp_thumb):
-                                                            os.remove(_temp_thumb)
+                                                            try:
+                                                                _d = os.path.dirname(_temp_thumb)
+                                                                shutil.rmtree(_d, ignore_errors=True)
+                                                            except Exception:
+                                                                os.remove(_temp_thumb)
                                                     except Exception:
                                                         pass
                                             else:
