@@ -1018,14 +1018,13 @@ def setup_handlers(application: Application) -> None:
                     _clear_login_flow(user_id, context)
                     return
 
-                # Start a background task that calls client.start() with Future-based
-                # callbacks. Telethon handles ALL the complexity internally: DC migration,
+                # Start a background task that runs client.start() with an async
+                # code_callback. Telethon handles ALL the complexity internally: DC migration,
                 # phone_code_hash management, code retries, TOS acceptance, and 2FA.
                 #
-                # The callbacks create asyncio.Future objects stored in context.user_data.
-                # The PTB message handler detects these futures and resolves them with
-                # the user's input, bridging the gap between Telethon's blocking
-                # authentication flow and Telegram's chat-based message flow.
+                # Telethon's _run_code_callback() properly awaits async callbacks by
+                # checking iscoroutinefunction(). The async callback creates an asyncio.Future
+                # that the PTB message handler resolves with the user's input.
 
 
                 async def _do_start():
@@ -1034,97 +1033,83 @@ def setup_handlers(application: Application) -> None:
                     try:
                         loop = asyncio.get_running_loop()
 
-                        # Call send_code_request in the background task so
-                        # DC migration happens in the same context as sign_in.
-                        sent = await client.send_code_request(phone)
-                        phone_code_hash = sent.phone_code_hash
-                        context.user_data["login_code_hash"] = phone_code_hash
+                        # Use Telethon's built-in client.start() which handles
+                        # DC migration, phone_code_hash management, and the
+                        # send_code_request -> code_callback -> sign_in flow
+                        # internally. Telethon's _run_code_callback properly
+                        # awaits async callbacks.
+
                         context.user_data["login_phone"] = phone
                         context.user_data["login_client"] = client
                         context.user_data["login_session_path"] = session_path
                         context.user_data["awaiting_login_code"] = True
-                        _sent_type_name = type(sent).__name__
-                        _sent_timeout = getattr(sent, "timeout", None)
-                        logger.info(
-                            "Login code requested for %s; hash=%s type=%s timeout=%s",
-                            phone, str(phone_code_hash)[:8] if phone_code_hash else "None",
-                            _sent_type_name, _sent_timeout,
-                        )
 
-                        # Future-based code callback
-                        code_future = loop.create_future()
-                        context.user_data["login_pending_future"] = code_future
-                        context.user_data["login_pending_type"] = "code"
-                        await context.bot.send_message(
-                            chat_id=update.effective_chat.id,
-                            text="Please enter the login code you received on your Telegram app:",
-                        )
-                        code = await code_future
+                        async def _code_callback():
+                            """Async callback for client.start() code prompt."""
+                            _future = loop.create_future()
+                            context.user_data["login_pending_future"] = _future
+                            context.user_data["login_pending_type"] = "code"
+                            await context.bot.send_message(
+                                chat_id=update.effective_chat.id,
+                                text="Please enter the login code you received on your Telegram app:",
+                            )
+                            _code = await _future
+                            # Normalize code (Unicode digits -> ASCII)
+                            try:
+                                _trans = str.maketrans({
+                                    "\u0660": "0", "\u0661": "1", "\u0662": "2", "\u0663": "3", "\u0664": "4",
+                                    "\u0665": "5", "\u0666": "6", "\u0667": "7", "\u0668": "8", "\u0669": "9",
+                                    "\u06F0": "0", "\u06F1": "1", "\u06F2": "2", "\u06F3": "3", "\u06F4": "4",
+                                    "\u06F5": "5", "\u06F6": "6", "\u06F7": "7", "\u06F8": "8", "\u06F9": "9",
+                                })
+                                _code = (_code or "").translate(_trans)
+                                _code = "".join(c for c in _code if c.isdigit())
+                            except Exception:
+                                pass
+                            return _code
 
-                        # Normalize code (Unicode digits -> ASCII)
-                        try:
-                            trans = str.maketrans({
-                                "\u0660": "0", "\u0661": "1", "\u0662": "2", "\u0663": "3", "\u0664": "4",
-                                "\u0665": "5", "\u0666": "6", "\u0667": "7", "\u0668": "8", "\u0669": "9",
-                                "\u06F0": "0", "\u06F1": "1", "\u06F2": "2", "\u06F3": "3", "\u06F4": "4",
-                                "\u06F5": "5", "\u06F6": "6", "\u06F7": "7", "\u06F8": "8", "\u06F9": "9",
-                            })
-                            code = (code or "").translate(trans)
-                            code = "".join(c for c in code if c.isdigit())
-                        except Exception:
-                            pass
-
-                        # Sign in with the hash returned by send_code_request.
-                        # Both calls happen in the same task context, so DC
-                        # migration state is consistent.
-                        # On PhoneCodeExpiredError, retry once with a fresh code.
-                        try:
-                            for _attempt in range(2):
-                                try:
-                                    await client.sign_in(
-                                        phone=phone,
-                                        code=code,
-                                        phone_code_hash=phone_code_hash,
-                                    )
-                                    break  # Success
-                                except PhoneCodeExpiredError:
-                                    if _attempt == 1:
-                                        raise  # Already retried
-                                    logger.warning("Code expired for %s; requesting fresh code", phone)
-                                    # Send a new code request to invalidate any pending code
-                                    sent = await client.send_code_request(phone)
-                                    phone_code_hash = sent.phone_code_hash
-                                    context.user_data["login_code_hash"] = phone_code_hash
-                                    _sent_type_name = type(sent).__name__
-                                    _sent_timeout = getattr(sent, "timeout", None)
-                                    logger.info("Fresh code requested for %s; hash=%s type=%s timeout=%s", phone, str(phone_code_hash)[:8], _sent_type_name, _sent_timeout)
-                                    new_future = loop.create_future()
-                                    context.user_data["login_pending_future"] = new_future
-                                    context.user_data["login_pending_type"] = "code"
-                                    await context.bot.send_message(
-                                        chat_id=update.effective_chat.id,
-                                        text="The previous code expired. A new code has been sent. "
-                                             "Please enter the NEW code immediately:",
-                                    )
-                                    code = await new_future
-                                    # Re-normalize
-                                    try:
-                                        code = (code or "").translate(trans)
-                                        code = "".join(c for c in code if c.isdigit())
-                                    except Exception:
-                                        pass
-                                    continue
-                        except SessionPasswordNeededError:
-                            # 2FA required - prompt for password
-                            pw_future = loop.create_future()
-                            context.user_data["login_pending_future"] = pw_future
+                        async def _password_callback():
+                            """Async callback for client.start() 2FA password prompt."""
+                            _pw_future = loop.create_future()
+                            context.user_data["login_pending_future"] = _pw_future
                             context.user_data["login_pending_type"] = "password"
                             await context.bot.send_message(
                                 chat_id=update.effective_chat.id,
                                 text="Two-step verification is enabled. Please enter your account password:",
                             )
-                            password = await pw_future
-                            await client.sign_in(password=password)
+                            return await _pw_future
+
+                        for _attempt in range(2):
+                            try:
+                                logger.info(
+                                    "Login via client.start() for %s (attempt %d/2)", phone, _attempt + 1,
+                                )
+                                await client.start(
+                                    phone=phone,
+                                    code_callback=_code_callback,
+                                )
+                                logger.info("Login successful for %s via client.start()", phone)
+                                # Store phone_code_hash for /loginstatus diagnostics
+                                try:
+                                    _stored_hash = client._phone_code_hash.get(phone)
+                                    if _stored_hash:
+                                        context.user_data["login_code_hash"] = _stored_hash
+                                except Exception:
+                                    pass
+                                break  # Success
+                            except PhoneCodeExpiredError:
+                                if _attempt == 1:
+                                    raise  # Already retried
+                                logger.warning("Code expired for %s; waiting 5s then retrying with fresh code", phone)
+                                # Wait before retry to give Telegram's server time to
+                                # invalidate the pending code and issue a fresh one.
+                                await asyncio.sleep(5)
+                                continue
+                            except SessionPasswordNeededError:
+                                # 2FA required - prompt for password and complete sign_in
+                                _password = await _password_callback()
+                                await client.sign_in(password=_password)
+                                break  # 2FA handled
 
                         if await client.is_user_authorized():
                             # Save session string to MongoDB for persistence
@@ -1186,8 +1171,8 @@ def setup_handlers(application: Application) -> None:
 
 
                 # Start the background task that handles the entire login flow.
-                # _do_start() calls send_code_request and sign_in in one task,
-                # ensuring consistent DC migration state.
+                # _do_start() uses client.start() which manages the full auth
+                # flow internally (send_code_request, DC migration, sign_in).
                 context.user_data["login_phone"] = phone
                 context.user_data["login_client"] = client
                 context.user_data["login_session_path"] = session_path
