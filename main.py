@@ -982,13 +982,6 @@ def setup_handlers(application: Application) -> None:
 
             client = TelegramClient(session_path, api_id, api_hash)
             try:
-                # Delete stale session files to ensure a completely
-                # fresh authentication flow.
-                for _suff in ("", ".session", ".session-journal", ".session.lock"):
-                    try:
-                        os.remove(session_path + _suff)
-                    except FileNotFoundError:
-                        pass
                 await client.connect()
 
                 if await client.is_user_authorized():
@@ -1015,9 +1008,8 @@ def setup_handlers(application: Application) -> None:
                     try:
                         loop = asyncio.get_running_loop()
 
-                        # Call send_code_request in the background task.
-                        # Session files are cleaned before connect, so this
-                        # starts fresh with no stale auth state.
+                        # Call send_code_request in the background task so
+                        # DC migration happens in the same context as sign_in.
                         sent = await client.send_code_request(phone)
                         phone_code_hash = sent.phone_code_hash
                         context.user_data["login_code_hash"] = phone_code_hash
