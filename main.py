@@ -1008,10 +1008,18 @@ def setup_handlers(application: Application) -> None:
                     try:
                         loop = asyncio.get_running_loop()
 
-                        # phone_code_hash was already obtained in the phone handler.
-                        phone_code_hash = context.user_data.get("login_code_hash")
+                        # Call send_code_request directly in the background task.
+                        # This ensures DC migration and sign_in happen in the same
+                        # task context, avoiding stale DC state errors.
+                        sent = await client.send_code_request(phone)
+                        phone_code_hash = sent.phone_code_hash
+                        context.user_data["login_code_hash"] = phone_code_hash
+                        context.user_data["login_phone"] = phone
+                        context.user_data["login_client"] = client
+                        context.user_data["login_session_path"] = session_path
+                        context.user_data["awaiting_login_code"] = True
                         logger.info(
-                            "Using pre-obtained phone_code_hash for %s; hash=%s",
+                            "Login code requested for %s; hash=%s",
                             phone, str(phone_code_hash)[:8] if phone_code_hash else "None",
                         )
 
@@ -1038,58 +1046,26 @@ def setup_handlers(application: Application) -> None:
                         except Exception:
                             pass
 
-                        # Retry loop: sign_in with explicit hash. On PhoneCodeExpiredError, retry once.
-                        for attempt in range(2):
-                            if attempt == 1:
-                                # Fresh code request for retry (still in handler-safe context)
-                                logger.info("Sending retry code request for %s...", phone)
-                                sent = await asyncio.wait_for(
-                                    client.send_code_request(phone),
-                                    timeout=30.0,
-                                )
-                                phone_code_hash = sent.phone_code_hash
-                                context.user_data["login_code_hash"] = phone_code_hash
-                                logger.info("Retry code requested for %s after expiry", phone)
-                                new_future = loop.create_future()
-                                context.user_data["login_pending_future"] = new_future
-                                context.user_data["login_pending_type"] = "code"
-                                await context.bot.send_message(
-                                    chat_id=update.effective_chat.id,
-                                    text="The previous code expired. A new code has been sent. "
-                                         "Please enter the NEW code immediately:",
-                                )
-                                code = await new_future
-                                # Re-normalize
-                                try:
-                                    code = (code or "").translate(trans)
-                                    code = "".join(c for c in code if c.isdigit())
-                                except Exception:
-                                    pass
-
-                            try:
-                                await client.sign_in(
-                                    phone=phone,
-                                    code=code,
-                                    phone_code_hash=phone_code_hash,
-                                )
-                                break  # Success
-                            except SessionPasswordNeededError:
-                                # 2FA required
-                                pw_future = loop.create_future()
-                                context.user_data["login_pending_future"] = pw_future
-                                context.user_data["login_pending_type"] = "password"
-                                await context.bot.send_message(
-                                    chat_id=update.effective_chat.id,
-                                    text="Two-step verification is enabled. Please enter your account password:",
-                                )
-                                password = await pw_future
-                                await client.sign_in(password=password)
-                                break  # Password accepted
-                            except PhoneCodeExpiredError:
-                                logger.warning("Code expired for %s (attempt %s)", phone, attempt)
-                                if attempt == 0:
-                                    continue  # Retry once
-                                raise  # Already retried
+                        # Sign in with the hash returned by send_code_request.
+                        # Both calls happen in the same task context, so DC
+                        # migration state is consistent.
+                        try:
+                            await client.sign_in(
+                                phone=phone,
+                                code=code,
+                                phone_code_hash=phone_code_hash,
+                            )
+                        except SessionPasswordNeededError:
+                            # 2FA required - prompt for password
+                            pw_future = loop.create_future()
+                            context.user_data["login_pending_future"] = pw_future
+                            context.user_data["login_pending_type"] = "password"
+                            await context.bot.send_message(
+                                chat_id=update.effective_chat.id,
+                                text="Two-step verification is enabled. Please enter your account password:",
+                            )
+                            password = await pw_future
+                            await client.sign_in(password=password)
 
                         if await client.is_user_authorized():
                             await context.bot.send_message(
@@ -1137,17 +1113,15 @@ def setup_handlers(application: Application) -> None:
                             pass
                         _clear_login_flow(user_id, context)
 
-                # Call send_code_request directly in the PTB handler context.
-                # (Handler context proven to work; background task context hangs.)
-                sent = await client.send_code_request(phone)
-                phone_code_hash = sent.phone_code_hash
-                context.user_data["login_code_hash"] = phone_code_hash
+
+
+                # Start the background task that handles the entire login flow.
+                # _do_start() calls send_code_request and sign_in in one task,
+                # ensuring consistent DC migration state.
                 context.user_data["login_phone"] = phone
                 context.user_data["login_client"] = client
                 context.user_data["login_session_path"] = session_path
                 context.user_data["awaiting_login_code"] = True
-
-                # Start the background task that awaits the code and signs in.
                 login_task = asyncio.create_task(_do_start())
                 context.user_data["login_start_task"] = login_task
                 logger.info("Login background task started for %s", phone)
