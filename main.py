@@ -1032,7 +1032,6 @@ def setup_handlers(application: Application) -> None:
 
                     try:
                         loop = asyncio.get_running_loop()
-
                         # Use Telethon's built-in client.start() which handles
                         # DC migration, phone_code_hash management, and the
                         # send_code_request -> code_callback -> sign_in flow
@@ -1090,12 +1089,6 @@ def setup_handlers(application: Application) -> None:
                                 )
                                 logger.info("Login successful for %s via client.start()", phone)
                                 # Store phone_code_hash for /loginstatus diagnostics
-                                try:
-                                    _stored_hash = client._phone_code_hash.get(phone)
-                                    if _stored_hash:
-                                        context.user_data["login_code_hash"] = _stored_hash
-                                except Exception:
-                                    pass
                                 break  # Success
                             except PhoneCodeExpiredError:
                                 if _attempt == 1:
@@ -1176,7 +1169,6 @@ def setup_handlers(application: Application) -> None:
                 context.user_data["login_phone"] = phone
                 context.user_data["login_client"] = client
                 context.user_data["login_session_path"] = session_path
-                context.user_data["awaiting_login_code"] = True
                 login_task = asyncio.create_task(_do_start())
                 context.user_data["login_start_task"] = login_task
                 logger.info("Login background task started for %s", phone)
