@@ -1011,7 +1011,11 @@ def setup_handlers(application: Application) -> None:
                         # Manual sign_in flow with explicit phone_code_hash.
                         # This avoids Telethon's broken internal _phone_code_hash dict,
                         # which gets cleared during DC migration or PhoneCodeExpiredError handling.
-                        sent = await client.send_code_request(phone)
+                        logger.info("Sending code request for %s...", phone)
+                        sent = await asyncio.wait_for(
+                            client.send_code_request(phone),
+                            timeout=30.0,
+                        )
                         phone_code_hash = sent.phone_code_hash
                         logger.info("Login code requested for %s; hash obtained", phone)
 
@@ -1042,7 +1046,11 @@ def setup_handlers(application: Application) -> None:
                         for attempt in range(2):
                             if attempt == 1:
                                 # Fresh code request for retry
-                                sent = await client.send_code_request(phone)
+                                logger.info("Sending retry code request for %s...", phone)
+                                sent = await asyncio.wait_for(
+                                    client.send_code_request(phone),
+                                    timeout=30.0,
+                                )
                                 phone_code_hash = sent.phone_code_hash
                                 logger.info("Retry code requested for %s after expiry", phone)
                                 new_future = loop.create_future()

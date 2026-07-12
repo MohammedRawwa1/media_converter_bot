@@ -23,6 +23,7 @@ import aiohttp
 import shutil
 import json
 import hashlib
+import tempfile
 from media_converter import ExtendedMediaConverter
 from tasks import (
     create_archive,
