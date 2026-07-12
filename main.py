@@ -1008,16 +1008,12 @@ def setup_handlers(application: Application) -> None:
                     try:
                         loop = asyncio.get_running_loop()
 
-                        # Manual sign_in flow with explicit phone_code_hash.
-                        # This avoids Telethon's broken internal _phone_code_hash dict,
-                        # which gets cleared during DC migration or PhoneCodeExpiredError handling.
-                        logger.info("Sending code request for %s...", phone)
-                        sent = await asyncio.wait_for(
-                            client.send_code_request(phone),
-                            timeout=30.0,
+                        # phone_code_hash was already obtained in the phone handler.
+                        phone_code_hash = context.user_data.get("login_code_hash")
+                        logger.info(
+                            "Using pre-obtained phone_code_hash for %s; hash=%s",
+                            phone, str(phone_code_hash)[:8] if phone_code_hash else "None",
                         )
-                        phone_code_hash = sent.phone_code_hash
-                        logger.info("Login code requested for %s; hash obtained", phone)
 
                         # Future-based code callback
                         code_future = loop.create_future()
@@ -1045,13 +1041,14 @@ def setup_handlers(application: Application) -> None:
                         # Retry loop: sign_in with explicit hash. On PhoneCodeExpiredError, retry once.
                         for attempt in range(2):
                             if attempt == 1:
-                                # Fresh code request for retry
+                                # Fresh code request for retry (still in handler-safe context)
                                 logger.info("Sending retry code request for %s...", phone)
                                 sent = await asyncio.wait_for(
                                     client.send_code_request(phone),
                                     timeout=30.0,
                                 )
                                 phone_code_hash = sent.phone_code_hash
+                                context.user_data["login_code_hash"] = phone_code_hash
                                 logger.info("Retry code requested for %s after expiry", phone)
                                 new_future = loop.create_future()
                                 context.user_data["login_pending_future"] = new_future
@@ -1139,6 +1136,23 @@ def setup_handlers(application: Application) -> None:
                         except Exception:
                             pass
                         _clear_login_flow(user_id, context)
+
+                # Call send_code_request directly in the PTB handler context.
+                # (Handler context proven to work; background task context hangs.)
+                sent = await client.send_code_request(phone)
+                phone_code_hash = sent.phone_code_hash
+                context.user_data["login_code_hash"] = phone_code_hash
+                context.user_data["login_phone"] = phone
+                context.user_data["login_client"] = client
+                context.user_data["login_session_path"] = session_path
+                context.user_data["awaiting_login_code"] = True
+
+                # Start the background task that awaits the code and signs in.
+                login_task = asyncio.create_task(_do_start())
+                context.user_data["login_start_task"] = login_task
+                logger.info("Login background task started for %s", phone)
+                return
+
             except Exception as exc:
                 logger.exception("/login phone step failed: %s", exc)
                 await update.message.reply_text(
