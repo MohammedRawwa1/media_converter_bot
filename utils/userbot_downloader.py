@@ -293,6 +293,242 @@ async def _download_bytes_via_raw_api(
     return data
 
 
+# ---------------------------------------------------------------------------
+# Recovery helpers: forward to Saved Messages, 1-byte probe, session recycle
+# ---------------------------------------------------------------------------
+
+async def _forward_to_saved_messages(client, chat_id, message_id: int) -> Optional[int]:
+    """Forward a message to Saved Messages to get a fresh ``file_reference``.
+
+    Telegram assigns a new ``file_reference`` to the forwarded copy, which
+    may route to a different (healthy) storage node and bypass persistent
+    ``-503 Timeout`` errors on the original.
+
+    Returns the forwarded message ID, or ``None`` on failure.
+    """
+    try:
+        me = await client.get_me()
+        forwarded = await client.forward_messages(
+            chat_id=me.id,
+            from_chat_id=chat_id,
+            message_ids=[message_id],
+        )
+        if forwarded:
+            fwd_msg = forwarded[0] if isinstance(forwarded, list) else forwarded
+            logger.info(
+                "userbot: forwarded %s/%s to Saved Messages -> msg %s",
+                chat_id, message_id, getattr(fwd_msg, "id", None),
+            )
+            return fwd_msg.id
+    except Exception as exc:
+        logger.warning(
+            "userbot: forward to Saved Messages failed for %s/%s: %s",
+            chat_id, message_id, exc,
+        )
+    return None
+
+
+async def _probe_file_wakeup(client, msg) -> bool:
+    """Try ``upload.GetFile`` with **1 byte** at offset 0 to "wake up"
+    a sluggish storage node.
+
+    A tiny request is more likely to get through than a full chunk.  If
+    it succeeds, the node is responsive and a subsequent full download may
+    work while the node is "warm".
+
+    Returns ``True`` if the probe succeeded.
+    """
+    from pyrogram import raw
+
+    try:
+        location, _ = await _get_raw_file_location(msg)
+        if location is None:
+            return False
+
+        result = await client.invoke(
+            raw.functions.upload.GetFile(
+                location=location,
+                offset=0,
+                limit=1,  # just 1 byte
+            )
+        )
+        got_bytes = len(result.bytes) if hasattr(result, "bytes") else 0
+        logger.info(
+            "userbot: 1-byte probe succeeded (%d bytes) — storage node is responsive",
+            got_bytes,
+        )
+        return True
+    except Exception as exc:
+        logger.warning(
+            "userbot: 1-byte probe failed (node unresponsive): %s", exc,
+        )
+        return False
+
+
+async def _recycle_client_session(client) -> bool:
+    """Disconnect and reconnect the Pyrogram client to potentially land on a
+    different Telegram DC or a different storage node within the same DC.
+
+    Returns ``True`` if the session was recycled successfully.
+    """
+    try:
+        logger.info("userbot: recycling Pyrogram session (stop \u2192 start)")
+        await client.stop()
+        await asyncio.sleep(3)
+        await client.start()
+        logger.info("userbot: Pyrogram session recycled successfully")
+        return True
+    except Exception as exc:
+        logger.warning("userbot: session recycling failed: %s", exc)
+        return False
+
+
+async def _attempt_recovery_download(
+    client,
+    chat_id,
+    message_id: int,
+    dest_path: str,
+) -> bool:
+    """Attempt to recover a download that failed with persistent ``-503 Timeout``.
+
+    Recovery sequence:
+        1. Get the message again (needed for probe / forward).
+        2. Try a **1-byte probe** \u2014 if it succeeds immediately retry full download.
+        3. Try **forward to Saved Messages** \u2014 gets a fresh ``file_reference``
+           that may route to a healthy storage node, then retry download.
+        4. Try **session recycling** \u2014 disconnect/reconnect, then retry one more
+           time on the original message.
+
+    Returns ``True`` on success, ``False`` if all recovery methods failed.
+    """
+    from pyrogram import raw
+
+    logger.info(
+        "userbot: starting recovery download for %s/%s -> %s",
+        chat_id, message_id, dest_path,
+    )
+
+    # Resolve the peer (same approach as _download_with_pyrogram)
+    target = await _normalize_target(chat_id)
+    candidates = [target]
+    _bot_token = os.getenv("BOT_TOKEN", "")
+    if _bot_token and ":" in _bot_token:
+        try:
+            _bot_id = int(_bot_token.split(":")[0])
+            if _bot_id != target:
+                candidates.append(_bot_id)
+        except (ValueError, IndexError):
+            pass
+
+    # ---- Step 1: Find the message ----
+    msg = None
+    used_raw_peer = None
+    for _peer in candidates:
+        try:
+            messages = await client.get_messages(_peer, message_ids=[message_id])
+            if messages:
+                _m = messages[0] if isinstance(messages, list) else messages
+                if _m and getattr(_m, "media", None):
+                    msg = _m
+                    break
+        except ValueError as e:
+            if "Peer id invalid" in str(e) and isinstance(_peer, int) and _is_large_bot_api_channel(_peer):
+                channel_peer = await _resolve_bot_api_channel_raw(client, _peer)
+                if channel_peer is not None:
+                    _m = await _get_messages_via_raw_channel_api(
+                        client, channel_peer, message_id,
+                    )
+                    if _m is not None and getattr(_m, "media", None):
+                        msg = _m
+                        used_raw_peer = channel_peer
+                        break
+        except Exception:
+            continue
+
+    if msg is None:
+        logger.warning(
+            "userbot: recovery could not find message %s/%s", chat_id, message_id,
+        )
+        return False
+
+    # ---- Step 2: 1-byte probe + retry ----
+    probe_ok = await _probe_file_wakeup(client, msg)
+    if probe_ok:
+        logger.info("userbot: recovery \u2014 probe succeeded, retrying download immediately")
+        if await _download_and_ensure_path(client, msg, dest_path):
+            return True
+        logger.info("userbot: recovery \u2014 probe retry still failed, continuing...")
+    else:
+        logger.info("userbot: recovery \u2014 probe failed, trying forward + retry")
+
+    # ---- Step 3: Forward to Saved Messages + retry with fresh file_reference ----
+    fwd_msg_id = None
+    if used_raw_peer is not None:
+        # Large channel: use raw MTProto forward
+        try:
+            r = await client.invoke(
+                raw.functions.messages.ForwardMessages(
+                    from_peer=used_raw_peer,
+                    id=[message_id],
+                    to_peer=raw.types.InputPeerSelf(),
+                    random_id=[client.rnd_id()],
+                )
+            )
+            if r and r.updates:
+                for update in r.updates:
+                    if hasattr(update, "message") and hasattr(update.message, "id"):
+                        fwd_msg_id = update.message.id
+                        break
+                    if hasattr(update, "id"):
+                        fwd_msg_id = update.id
+                        break
+            if fwd_msg_id is not None:
+                # Brief delay so Telegram indexes the forwarded message
+                await asyncio.sleep(1)
+                logger.info(
+                    "userbot: recovery \u2014 raw API forwarded to Saved Messages -> msg %s",
+                    fwd_msg_id,
+                )
+        except Exception as exc:
+            logger.warning("userbot: recovery \u2014 raw API forward failed: %s", exc)
+    else:
+        # Normal peer: use Pyrogram's high-level forward
+        fwd_msg_id = await _forward_to_saved_messages(client, target, message_id)
+        if fwd_msg_id is not None:
+            # Brief delay so Telegram indexes the forwarded message
+            await asyncio.sleep(1)
+
+    if fwd_msg_id is not None:
+        me = await client.get_me()
+        try:
+            fwd_msgs = await client.get_messages(me.id, message_ids=[fwd_msg_id])
+            if fwd_msgs:
+                fwd_msg = fwd_msgs[0] if isinstance(fwd_msgs, list) else fwd_msgs
+                if fwd_msg and getattr(fwd_msg, "media", None):
+                    logger.info(
+                        "userbot: recovery \u2014 retrying download from forwarded copy (%s/%s)",
+                        me.id, fwd_msg_id,
+                    )
+                    if await _download_and_ensure_path(client, fwd_msg, dest_path):
+                        return True
+        except Exception as exc:
+            logger.warning(
+                "userbot: recovery \u2014 forward+retry download failed: %s", exc,
+            )
+
+    # ---- Step 4: Session recycling + final retry ----
+    recycled = await _recycle_client_session(client)
+    if recycled:
+        logger.info("userbot: recovery \u2014 session recycled, final retry on original msg")
+        if await _download_and_ensure_path(client, msg, dest_path):
+            return True
+
+    logger.warning(
+        "userbot: all recovery methods exhausted for %s/%s", chat_id, message_id,
+    )
+    return False
+
+
 async def _download_with_telethon(
     chat_id: Union[int, str],
     message_id: int,
@@ -736,10 +972,34 @@ async def _download_bytes_with_pyrogram(
                     _peer, message_id, e,
                 )
 
+        # ---- Final recovery: try recovery for in-memory path via temp file ----
         logger.warning(
-            "userbot: Pyrogram in-memory download failed for %s/%s",
+            "userbot: Pyrogram in-memory download failed for %s/%s, "
+            "trying recovery via temp file...",
             chat_id, message_id,
         )
+        _tmp_path = os.path.join(
+            os.getenv("TEMP_PATH", "/tmp"),
+            f"recovery_{chat_id}_{message_id}.tmp",
+        )
+        try:
+            if await _attempt_recovery_download(client, chat_id, message_id, _tmp_path):
+                with open(_tmp_path, "rb") as _fh:
+                    data = _fh.read()
+                logger.info(
+                    "userbot: recovery in-memory download succeeded: %d bytes",
+                    len(data),
+                )
+                return data
+        except Exception as exc:
+            logger.warning("userbot: recovery in-memory download failed: %s", exc)
+        finally:
+            try:
+                if os.path.exists(_tmp_path):
+                    os.remove(_tmp_path)
+            except Exception:
+                pass
+
         return None
     finally:
         try:
@@ -972,6 +1232,22 @@ async def _download_with_pyrogram(
                 "userbot: Pyrogram could not find message %s in any candidate peer (%s)",
                 message_id, _candidates,
             )
+
+        # ---- Final recovery: attempt advanced techniques for persistent -503 ----
+        _abs_dest = os.path.abspath(dest_path)
+        if not os.path.exists(_abs_dest) or os.path.getsize(_abs_dest) == 0:
+            logger.info(
+                "userbot: all standard download methods failed for %s/%s, "
+                "trying recovery (forward+probe+recycle)...",
+                chat_id, message_id,
+            )
+            if await _attempt_recovery_download(client, chat_id, message_id, dest_path):
+                logger.info(
+                    "userbot: recovery download succeeded for %s/%s",
+                    chat_id, message_id,
+                )
+                return True
+
         return False
     finally:
         try:
