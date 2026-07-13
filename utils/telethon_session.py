@@ -84,6 +84,11 @@ def get_pyrogram_session_string() -> Optional[str]:
 def build_pyrogram_client(api_id: int, api_hash: str) -> Optional[object]:
     """Build a Pyrogram client from a session string env var.
 
+    Reads the following env vars for retry/timeout configuration:
+      - PYROGRAM_SLEEP_THRESHOLD (default 30): seconds to sleep before retrying
+        on flood-wait or transient server errors.
+      - PYROGRAM_MAX_RETRIES (default 10): max RPC retries per request.
+
     Returns a started Pyrogram Client if PYROGRAM_SESSION is set, otherwise None.
     The caller must call client.start() before using it.
     """
@@ -95,6 +100,16 @@ def build_pyrogram_client(api_id: int, api_hash: str) -> Optional[object]:
     if not session_str:
         return None
 
+    # Read retry/timeout configuration from env vars
+    try:
+        sleep_threshold = int(os.getenv("PYROGRAM_SLEEP_THRESHOLD", "30"))
+    except (TypeError, ValueError):
+        sleep_threshold = 30
+    try:
+        max_retries = int(os.getenv("PYROGRAM_MAX_RETRIES", "10"))
+    except (TypeError, ValueError):
+        max_retries = 10
+
     try:
         client = PyrogramClient(
             "pyrogram_userbot_session",
@@ -102,6 +117,13 @@ def build_pyrogram_client(api_id: int, api_hash: str) -> Optional[object]:
             api_hash=api_hash,
             session_string=session_str,
             in_memory=True,
+            sleep_threshold=sleep_threshold,
+        )
+        # Increase the session-level RPC retry limit
+        client.MAX_RETRIES = max_retries
+        logger.info(
+            "userbot: Pyrogram client configured with sleep_threshold=%s max_retries=%s",
+            sleep_threshold, max_retries,
         )
         return client
     except Exception:

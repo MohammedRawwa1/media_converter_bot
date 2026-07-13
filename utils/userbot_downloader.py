@@ -55,6 +55,244 @@ async def _ffprobe_ok(path: str) -> bool:
     return False
 
 
+# ---------------------------------------------------------------------------
+# Helper: read DOWNLOAD_CHUNK_SIZE_KB env var (default 256 KB)
+# ---------------------------------------------------------------------------
+def get_download_chunk_size_kb() -> int:
+    """Return the configured download chunk size in KB.
+
+    Reads the ``DOWNLOAD_CHUNK_SIZE_KB`` env var (default 256).
+    Smaller values (e.g. 64) reduce per-request data and may help
+    avoid ``-503 Timeout`` errors on unreliable networks; larger
+    values (e.g. 512 or 1024) improve throughput on stable connections.
+
+    For Telethon this is passed directly as ``part_size_kb`` to
+    ``download_media()``.  For Pyrogram a raw-MTProto chunked download
+    is used when the env var is set (see ``_download_bytes_via_raw_api``).
+    """
+    try:
+        return int(os.getenv("DOWNLOAD_CHUNK_SIZE_KB", "256"))
+    except (TypeError, ValueError):
+        return 256
+
+
+# ---------------------------------------------------------------------------
+# Helper: detect -503 Timeout / InternalServerError from any MTProto client
+# ---------------------------------------------------------------------------
+def _is_503_timeout(exc: Exception) -> bool:
+    """Return True when *exc* is a Telegram -503 (internal timeout) error."""
+    err_str = str(exc)
+    if "503" in err_str and "Timeout" in err_str:
+        return True
+    if "-503" in err_str:
+        return True
+    if "InternalServerError" in type(exc).__name__:
+        return True
+    return False
+
+
+# ---------------------------------------------------------------------------
+# Retry wrapper: calls a download coroutine with exponential backoff on -503
+# ---------------------------------------------------------------------------
+async def _download_media_with_retry(
+    client,
+    msg,
+    max_retries: int = 5,
+    **dl_kwargs,
+):
+    """Call ``client.download_media(msg, **dl_kwargs)`` retrying on
+    ``-503 Timeout`` with exponential backoff.
+
+    Retry delays: 5s, 15s, 45s, 120s, 300s (capped at 300s).
+
+    Returns the download_media result on success.
+    Raises the last exception if all retries are exhausted.
+    """
+    delays = [5, 15, 45, 120, 300]
+
+    for attempt in range(max_retries):
+        try:
+            return await client.download_media(msg, **dl_kwargs)
+        except Exception as exc:
+            if not _is_503_timeout(exc):
+                raise  # non-timeout error, propagate immediately
+
+            if attempt >= max_retries - 1:
+                logger.warning(
+                    "userbot: download_media exhausted %d retries (-503): %s",
+                    max_retries, exc,
+                )
+                raise  # last retry exhausted
+
+            wait = delays[min(attempt, len(delays) - 1)]
+            logger.warning(
+                "userbot: download_media attempt %d/%d failed (-503), "
+                "retrying in %ds: %s",
+                attempt + 1, max_retries, wait, exc,
+            )
+            await asyncio.sleep(wait)
+
+
+# ---------------------------------------------------------------------------
+# Raw-MTProto chunked download for Pyrogram (supports configurable chunk size)
+# ---------------------------------------------------------------------------
+async def _get_raw_file_location(msg):
+    """Extract the file ``InputFileLocation`` and total size from a Pyrogram
+    message's media, so we can call ``upload.GetFile`` directly.
+
+    Returns ``(location, total_size)`` or ``(None, 0)`` if the message
+    does not carry downloadable media (video, audio, photo, document).
+    """
+    from pyrogram import raw
+
+    media = getattr(msg, "media", None)
+    if media is None:
+        return None, 0
+
+    # Document media (video, audio, document files)
+    doc = getattr(media, "document", None)
+    if doc is not None:
+        try:
+            loc = raw.types.InputDocumentFileLocation(
+                id=doc.id,
+                access_hash=doc.access_hash,
+                file_reference=doc.file_reference,
+                thumb_size="",  # empty = full file
+            )
+            return loc, doc.size
+        except Exception:
+            pass
+
+    # Photo media
+    photo = getattr(media, "photo", None)
+    if photo is not None:
+        try:
+            thumb_size = "m"
+            sizes = getattr(photo, "sizes", [])
+            if sizes:
+                thumb_size = getattr(sizes[-1], "type", "m")
+            loc = raw.types.InputPhotoFileLocation(
+                id=photo.id,
+                access_hash=photo.access_hash,
+                file_reference=photo.file_reference,
+                thumb_size=thumb_size,
+            )
+            return loc, 0  # photo size not known upfront
+        except Exception:
+            pass
+
+    return None, 0
+
+
+async def _download_bytes_via_raw_api(
+    client,
+    msg,
+    chunk_size_kb: Optional[int] = None,
+    progress_callback=None,
+) -> Optional[bytes]:
+    """Download media bytes using raw ``upload.GetFile`` with configurable
+    chunk size and per-chunk retry with exponential backoff.
+
+    Each chunk is retried independently so a ``-503`` mid-download does
+    not lose already-transferred data.
+
+    Args:
+        client: An active Pyrogram client.
+        msg: A Pyrogram ``Message`` with media.
+        chunk_size_kb: Chunk size in KB (default from env var or 256).
+        progress_callback: Optional ``(current, total)`` callback.
+
+    Returns:
+        Complete file bytes, or ``None`` on failure.
+    """
+    from pyrogram import raw
+
+    if chunk_size_kb is None:
+        chunk_size_kb = get_download_chunk_size_kb()
+    chunk_size = chunk_size_kb * 1024
+
+    location, total_size = await _get_raw_file_location(msg)
+    if location is None:
+        logger.warning("userbot: raw API download skipped (no extractable file location)")
+        return None
+
+    logger.info(
+        "userbot: raw API chunked download starting (chunk_size=%dKB, total_size=%d)",
+        chunk_size_kb, total_size,
+    )
+
+    chunks = []
+    offset = 0
+    max_chunk_retries = 5
+    chunk_delays = [1, 3, 10, 30, 60]
+
+    while True:
+        chunk_data = None
+        for chunk_attempt in range(max_chunk_retries):
+            try:
+                result = await client.invoke(
+                    raw.functions.upload.GetFile(
+                        location=location,
+                        offset=offset,
+                        limit=chunk_size,
+                    )
+                )
+                # result.bytes carries the chunk payload
+                chunk_data = result.bytes if hasattr(result, "bytes") else None
+                break
+            except Exception as exc:
+                if not _is_503_timeout(exc):
+                    logger.warning(
+                        "userbot: raw API chunk at offset %d failed with "
+                        "non-retryable error: %s",
+                        offset, exc,
+                    )
+                    return None  # non-retryable, bail out
+
+                if chunk_attempt >= max_chunk_retries - 1:
+                    logger.warning(
+                        "userbot: raw API chunk at offset %d exhausted %d "
+                        "retries (-503): %s",
+                        offset, max_chunk_retries, exc,
+                    )
+                    return None
+
+                wait = chunk_delays[min(chunk_attempt, len(chunk_delays) - 1)]
+                logger.warning(
+                    "userbot: raw API chunk at offset %d attempt %d/%d, "
+                    "retrying in %ds",
+                    offset, chunk_attempt + 1, max_chunk_retries, wait,
+                )
+                await asyncio.sleep(wait)
+
+        if chunk_data is None:
+            break
+
+        chunks.append(chunk_data)
+        offset += len(chunk_data)
+
+        if progress_callback and total_size > 0:
+            try:
+                progress_callback(offset, total_size)
+            except Exception:
+                pass
+
+        # If we received less than the requested limit, it's the last chunk
+        if len(chunk_data) < chunk_size:
+            break
+
+    if not chunks:
+        logger.warning("userbot: raw API download returned no chunks")
+        return None
+
+    data = b"".join(chunks)
+    logger.info(
+        "userbot: raw API download complete: %d bytes in %d chunks (chunk_size=%dKB)",
+        len(data), len(chunks), chunk_size_kb,
+    )
+    return data
+
+
 async def _download_with_telethon(
     chat_id: Union[int, str],
     message_id: int,
@@ -68,6 +306,8 @@ async def _download_with_telethon(
         return False
 
     from utils.telethon_session import build_telethon_client, get_userbot_credentials
+
+    chunk_size_kb = get_download_chunk_size_kb()
     api_id, api_hash = get_userbot_credentials()
 
     client = build_telethon_client(api_id, api_hash)
@@ -96,7 +336,7 @@ async def _download_with_telethon(
                 for attempt in range(3):
                     try:
                         logger.debug("userbot: download attempt %s for %s/%s -> %s", attempt + 1, target, getattr(msg, 'id', None), dest_path)
-                        await client.download_media(msg, file=dest_path)
+                        await client.download_media(msg, file=dest_path, part_size_kb=chunk_size_kb)
                         if os.path.exists(dest_path) and os.path.getsize(dest_path) > 0:
                             ok = await _ffprobe_ok(dest_path)
                             if ok:
@@ -126,7 +366,7 @@ async def _download_with_telethon(
                         if getattr(m, "media", None):
                             for attempt in range(3):
                                 try:
-                                    await client.download_media(m, file=dest_path)
+                                    await client.download_media(m, file=dest_path, part_size_kb=chunk_size_kb)
                                     if os.path.exists(dest_path) and os.path.getsize(dest_path) > 0:
                                         ok = await _ffprobe_ok(dest_path)
                                         if ok:
@@ -145,7 +385,7 @@ async def _download_with_telethon(
                     if getattr(m, "media", None):
                         for attempt in range(3):
                             try:
-                                await client.download_media(m, file=dest_path)
+                                await client.download_media(m, file=dest_path, part_size_kb=chunk_size_kb)
                                 if os.path.exists(dest_path) and os.path.getsize(dest_path) > 0:
                                     ok = await _ffprobe_ok(dest_path)
                                     if ok:
@@ -260,9 +500,20 @@ async def _download_and_ensure_path(client, msg, dest_path):
     ``self.PARENT_DIR`` and returns an absolute path.  The caller's ``dest_path``
     is often relative.  This helper reconciles the two.
 
+    Uses ``_download_media_with_retry`` so that transient ``-503 Timeout``
+    errors are automatically retried with exponential backoff.
+
     Returns ``True`` on success, ``False`` otherwise.
     """
-    _dl = await client.download_media(msg, file_name=dest_path)
+    try:
+        _dl = await _download_media_with_retry(client, msg, file_name=dest_path)
+    except Exception as exc:
+        logger.warning(
+            "userbot: download_media_with_retry failed for %s: %s",
+            dest_path, exc,
+        )
+        return False
+
     logger.info(
         "userbot: download_media dest_path=%s returned=%s",
         dest_path, _dl,
@@ -308,11 +559,15 @@ async def _download_bytes_with_pyrogram(
 ) -> Optional[bytes]:
     """Download a message's media into memory (bytes) using Pyrogram.
 
-    Uses ``download_media(..., in_memory=True)`` to get raw bytes without
-    writing to disk. Returns ``None`` on any failure.
+    Uses ``download_media(..., in_memory=True)`` (with retry on ``-503``)
+    to get raw bytes without writing to disk.  Falls back to raw-MTProto
+    chunked download when ``DOWNLOAD_CHUNK_SIZE_KB`` is explicitly set
+    (see ``_download_bytes_via_raw_api``).
+
+    Returns ``None`` on any failure.
 
     If ``progress_callback`` is provided, it will be called with
-    ``(current_bytes, total_bytes)`` during download (Pyrogram ``progress`` kwarg).
+    ``(current_bytes, total_bytes)`` during download.
     """
     if PyrogramClient is None:
         logger.info("userbot: Pyrogram not installed; cannot do in-memory download")
@@ -325,6 +580,16 @@ async def _download_bytes_with_pyrogram(
     if client is None:
         logger.info("userbot: Pyrogram session string not configured; cannot do in-memory download")
         return None
+
+    # Decide whether to use the raw-MTProto chunked path (preferred when
+    # DOWNLOAD_CHUNK_SIZE_KB is set explicitly)
+    _explicit_chunk_size = None
+    _raw_chunk_override = os.getenv("DOWNLOAD_CHUNK_SIZE_KB", "")
+    if _raw_chunk_override:
+        try:
+            _explicit_chunk_size = int(_raw_chunk_override)
+        except (TypeError, ValueError):
+            pass
 
     try:
         await client.start()
@@ -361,7 +626,39 @@ async def _download_bytes_with_pyrogram(
                         dl_kwargs = {"in_memory": True}
                         if progress_callback is not None:
                             dl_kwargs["progress"] = progress_callback
-                        data = await client.download_media(msg, **dl_kwargs)
+
+                        # ── Try raw-MTProto chunked download when chunk size is configured ──
+                        if _explicit_chunk_size is not None:
+                            raw_data = await _download_bytes_via_raw_api(
+                                client, msg,
+                                chunk_size_kb=_explicit_chunk_size,
+                                progress_callback=progress_callback,
+                            )
+                            if raw_data is not None:
+                                logger.info(
+                                    "userbot: raw API chunked download succeeded: %d bytes from %s/%s",
+                                    len(raw_data), _peer, message_id,
+                                )
+                                return raw_data
+                            logger.info(
+                                "userbot: raw API chunked download failed for %s/%s, "
+                                "falling back to download_media",
+                                _peer, message_id,
+                            )
+
+                        # ── Fallback: download_media with -503 retry ──
+                        try:
+                            data = await _download_media_with_retry(
+                                client, msg, **dl_kwargs,
+                            )
+                        except Exception as exc:
+                            logger.warning(
+                                "userbot: in-memory download_media with retry failed "
+                                "for %s/%s: %s",
+                                _peer, message_id, exc,
+                            )
+                            data = None
+
                         if data is not None and isinstance(data, bytes) and len(data) > 0:
                             logger.info(
                                 "userbot: Pyrogram in-memory download succeeded: %d bytes from %s/%s",
@@ -396,7 +693,32 @@ async def _download_bytes_with_pyrogram(
                             dl_kwargs = {"in_memory": True}
                             if progress_callback is not None:
                                 dl_kwargs["progress"] = progress_callback
-                            data = await client.download_media(msg, **dl_kwargs)
+
+                            # ── Raw-MTProto chunked download for raw-API resolved messages ──
+                            if _explicit_chunk_size is not None:
+                                raw_data = await _download_bytes_via_raw_api(
+                                    client, msg,
+                                    chunk_size_kb=_explicit_chunk_size,
+                                    progress_callback=progress_callback,
+                                )
+                                if raw_data is not None:
+                                    logger.info(
+                                        "userbot: raw API (large channel) chunked download "
+                                        "succeeded: %d bytes",
+                                        len(raw_data),
+                                    )
+                                    return raw_data
+
+                            try:
+                                data = await _download_media_with_retry(
+                                    client, msg, **dl_kwargs,
+                                )
+                            except Exception as exc:
+                                logger.warning(
+                                    "userbot: raw-API resolved download_media failed: %s", exc,
+                                )
+                                data = None
+
                             if data is not None and isinstance(data, bytes) and len(data) > 0:
                                 logger.info(
                                     "userbot: raw API in-memory download succeeded: %d bytes",
@@ -770,6 +1092,7 @@ async def download_bytes_via_userbot(
         try:
             from utils.telethon_session import build_telethon_client, get_userbot_credentials as _get_creds
 
+            chunk_size_kb = get_download_chunk_size_kb()
             _api_id, _api_hash = _get_creds()
             _client = build_telethon_client(_api_id, _api_hash)
             if _client is not None:
@@ -780,15 +1103,15 @@ async def download_bytes_via_userbot(
                     msg = msgs[0] if isinstance(msgs, (list, tuple)) else msgs
                     if getattr(msg, "media", None):
                         buf = io.BytesIO()
-                        dl_kwargs = {"file": buf}
+                        dl_kwargs = {"file": buf, "part_size_kb": chunk_size_kb}
                         if progress_callback is not None:
                             dl_kwargs["progress_callback"] = progress_callback
                         await _client.download_media(msg, **dl_kwargs)
                         data = buf.getvalue()
                         if data and len(data) > 0:
                             logger.info(
-                                "userbot: in-memory download via Telethon succeeded: %d bytes",
-                                len(data),
+                                "userbot: in-memory download via Telethon succeeded: %d bytes (chunk_size=%dKB)",
+                                len(data), chunk_size_kb,
                             )
                             return data
                 await _client.disconnect()
