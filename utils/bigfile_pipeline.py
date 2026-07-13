@@ -26,7 +26,7 @@ import os
 import time
 import uuid
 from dataclasses import dataclass
-from typing import Any, Optional
+from typing import Any, Optional, Callable
 
 logger = logging.getLogger(__name__)
 
@@ -94,6 +94,7 @@ class BigFilePipeline:
         original_filename: Optional[str] = None,
         ffmpeg_args: Optional[list] = None,
         conversion_type: Optional[str] = None,
+        progress_callback: Optional[Callable[[int, int], None]] = None,
     ) -> IngestResult:
         """Download a large file via Pyrogram userbot, upload to S3, enqueue a processing job.
 
@@ -106,6 +107,7 @@ class BigFilePipeline:
             original_filename: Original filename if known.
             ffmpeg_args: Custom FFmpeg arguments for processing.
             conversion_type: Type of conversion (e.g., "ffmpeg", "compress", "to_mp3").
+            progress_callback: Optional callable(current_bytes, total_bytes) for download progress.
 
         Returns:
             IngestResult with job_id and s3_key on success.
@@ -133,7 +135,44 @@ class BigFilePipeline:
             and file_size <= IN_MEMORY_MAX_BYTES
         )
 
-        if _use_in_memory:
+        # ── Check Redis byte cache before downloading ──
+        _cache_hit = False
+        if _use_in_memory and self._cache and file_unique_id:
+            try:
+                cached_data = await self._cache.get_cached_file_bytes(file_unique_id)
+                if cached_data is not None and len(cached_data) > 0:
+                    logger.info(
+                        "BigFilePipeline: cache HIT for file_unique_id=%s (%dMB), uploading to S3",
+                        file_unique_id, len(cached_data) // (1024 * 1024),
+                    )
+                    actual_size = len(cached_data)
+                    await self._storage.upload_bytes(cached_data, s3_key)
+                    _in_memory_success = True
+                    _cache_hit = True
+                    # Cache file metadata
+                    if self._cache:
+                        try:
+                            await self._cache.cache_file_info(
+                                file_unique_id,
+                                {
+                                    "job_id": job_id,
+                                    "size": actual_size,
+                                    "path": s3_key,
+                                    "chat_id": chat_id,
+                                    "message_id": message_id,
+                                },
+                                ttl=86400,
+                            )
+                        except Exception:
+                            pass
+                    logger.info(
+                        "BigFilePipeline: cache pipeline succeeded for %s/%s (%d bytes)",
+                        chat_id, message_id, actual_size,
+                    )
+            except Exception as e:
+                logger.debug("BigFilePipeline: cache check failed: %s", e)
+
+        if not _cache_hit and _use_in_memory:
             try:
                 from utils.userbot_downloader import download_bytes_via_userbot
 
@@ -141,7 +180,7 @@ class BigFilePipeline:
                     "BigFilePipeline: in-memory download chat=%s msg=%s size=%dMB",
                     chat_id, message_id, file_size // (1024 * 1024),
                 )
-                data = await download_bytes_via_userbot(chat_id, message_id)
+                data = await download_bytes_via_userbot(chat_id, message_id, progress_callback=progress_callback)
                 if data is not None and len(data) > 0:
                     actual_size = len(data)
                     logger.info(
@@ -151,6 +190,17 @@ class BigFilePipeline:
                     await self._storage.upload_bytes(data, s3_key)
                     logger.info("BigFilePipeline: S3 upload via bytes complete")
                     _in_memory_success = True
+
+                    # Cache the raw file bytes in Redis for future use
+                    if self._cache and file_unique_id:
+                        try:
+                            await self._cache.cache_file_bytes(file_unique_id, data)
+                            logger.info(
+                                "BigFilePipeline: cached %d bytes for file_unique_id=%s",
+                                actual_size, file_unique_id,
+                            )
+                        except Exception as cache_err:
+                            logger.debug("BigFilePipeline: failed to cache file bytes: %s", cache_err)
 
                     # Cache file info
                     if self._cache and file_unique_id:

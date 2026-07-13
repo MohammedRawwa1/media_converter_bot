@@ -184,8 +184,110 @@ class RedisCache:
             await self.set(key, result, ttl=ttl)
         return result
 
+    # ── Binary-safe methods (store raw bytes, e.g. for large file caching) ──
+
+    async def _get_binary_client(self) -> Optional[aioredis.Redis]:
+        """Lazy-init a dedicated Redis connection with ``decode_responses=False``.
+
+        The main client uses ``decode_responses=True`` for JSON convenience, but
+        that breaks retrieval of arbitrary binary data.  This separate connection
+        is used exclusively for ``set_binary`` / ``get_binary``.
+        """
+        if getattr(self, "_binary_client", None) is not None:
+            return self._binary_client
+        if not self._redis_url or aioredis is None:
+            return None
+        try:
+            bc = aioredis.from_url(
+                self._redis_url,
+                decode_responses=False,  # binary-safe
+                max_connections=5,
+                socket_connect_timeout=5,
+                socket_timeout=5,
+            )
+            await bc.ping()
+            self._binary_client = bc
+            return bc
+        except Exception as e:
+            logger.warning("Binary Redis client connection failed: %s", e)
+            self._binary_client = None
+            return None
+
+    async def set_binary(self, key: str, data: bytes, ttl: int = DEFAULT_TTL) -> bool:
+        """Store raw bytes in Redis (binary-safe).
+
+        Uses the dedicated ``_binary_client`` with ``decode_responses=False``
+        so the bytes are stored and retrieved exactly as-is.
+        """
+        client = await self._get_binary_client()
+        if client is None:
+            # Fallback: try the main client (may raise on retrieval if data is not valid UTF-8)
+            logger.debug("Binary client unavailable, falling back to main client for set_binary")
+            main = await self._get_client()
+            if main is None:
+                return False
+            try:
+                await main.setex(key, ttl, data)
+                return True
+            except Exception as e:
+                logger.debug("Cache SET_BINARY (fallback) failed for %s: %s", key, e)
+                return False
+        try:
+            await client.setex(key, ttl, data)
+            return True
+        except Exception as e:
+            logger.debug("Cache SET_BINARY failed for %s: %s", key, e)
+            return False
+
+    async def get_binary(self, key: str) -> Optional[bytes]:
+        """Retrieve raw bytes from Redis (binary-safe)."""
+        client = await self._get_binary_client()
+        if client is None:
+            # Fallback: try the main client, but bytes that are not valid UTF-8 will fail.
+            logger.debug("Binary client unavailable, falling back to main client for get_binary")
+            main = await self._get_client()
+            if main is None:
+                return None
+            try:
+                raw = await main.get(key)
+                if raw is None:
+                    return None
+                if isinstance(raw, str):
+                    # Decode back to bytes; latin-1 maps every byte 0x00-0xFF losslessly.
+                    return raw.encode("latin-1")
+                return raw
+            except (UnicodeDecodeError, Exception) as e:
+                logger.debug("Cache GET_BINARY (fallback) failed for %s: %s", key, e)
+                return None
+        try:
+            raw = await client.get(key)
+            if raw is None:
+                return None
+            return raw
+        except Exception as e:
+            logger.debug("Cache GET_BINARY failed for %s: %s", key, e)
+            return None
+
+    async def cache_file_bytes(self, file_key: str, data: bytes, ttl: int = LONG_TTL) -> bool:
+        """Cache raw file bytes by a unique file key (e.g. file_unique_id).
+
+        This allows re-using previously downloaded file bytes without hitting
+        Telegram's API again.  Use ``BIGFILE_CACHE_TTL`` env var to override
+        the default 24-hour TTL.
+        """
+        try:
+            ttl = int(os.getenv("BIGFILE_CACHE_TTL", str(ttl)))
+        except Exception:
+            pass
+        return await self.set_binary(f"{PREFIX_FILE}bytes:{file_key}", data, ttl=ttl)
+
+    async def get_cached_file_bytes(self, file_key: str) -> Optional[bytes]:
+        """Retrieve previously cached file bytes by file key."""
+        return await self.get_binary(f"{PREFIX_FILE}bytes:{file_key}")
+
     async def close(self):
-        """Close the Redis connection."""
+        """Close the Redis connections (main + binary)."""
+        # Close the main (decode_responses=True) client
         if self._client is not None:
             try:
                 await self._client.aclose()
@@ -195,6 +297,17 @@ class RedisCache:
                 except Exception:
                     pass
             self._client = None
+        # Close the binary (decode_responses=False) client if present
+        bc = getattr(self, "_binary_client", None)
+        if bc is not None:
+            try:
+                await bc.aclose()
+            except Exception:
+                try:
+                    await bc.close()
+                except Exception:
+                    pass
+            self._binary_client = None
 
     # ── Convenience methods for common patterns ──
 
