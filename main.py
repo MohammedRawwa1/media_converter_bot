@@ -525,11 +525,20 @@ def setup_handlers(application: Application) -> None:
 
         # ── Telethon session availability ──
         telethon_ready = False
+        telethon_status = {"ready": False, "source": "missing", "details": "No Telethon session configured or persisted"}
         try:
-            from utils.telethon_session import has_usable_telethon_session
-            telethon_ready = has_usable_telethon_session()
+            from utils.telethon_session import get_telethon_session_status
+            telethon_status = await get_telethon_session_status(
+                user_id=user_id,
+                db_model=context.application.bot_data.get("db_model"),
+            )
+            telethon_ready = bool(telethon_status.get("ready", False))
         except Exception:
-            pass
+            try:
+                from utils.telethon_session import has_usable_telethon_session
+                telethon_ready = has_usable_telethon_session()
+            except Exception:
+                pass
 
         # ── Pyrogram session string ──
         pyrogram_ready = False
@@ -571,7 +580,11 @@ def setup_handlers(application: Application) -> None:
             f"**Userbot enabled:** {'\u2705 Yes' if userbot_enabled else '\u274c No'}",
             f"**API credentials:** {'\u2705 Set' if has_api_id and has_api_hash else '\u26a0\ufe0f Missing API_ID/API_HASH'}",
             "",
-            "**Telethon session:** " + ("\u2705 Available" if telethon_ready else "\u274c Not configured"),
+            "**Telethon session:** " + (
+                f"\u2705 Available ({telethon_status.get('source', 'unknown')})"
+                if telethon_ready
+                else "\u274c Not configured"
+            ),
             "**Pyrogram session:** " + ("\u2705 Available" if pyrogram_ready else "\u274c Not configured"),
             "",
             "**Active login flow:**",

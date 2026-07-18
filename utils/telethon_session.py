@@ -47,6 +47,64 @@ def get_telethon_session_path() -> str:
     return os.path.join(session_dir, get_telethon_session_name())
 
 
+async def get_telethon_session_status(user_id: Optional[int] = None, db_model: Optional[object] = None) -> dict:
+    """Return a diagnostic summary for Telethon session availability.
+
+    Checks the same sources the bot can actually use for login fallback:
+    - explicit session string in env vars
+    - a local .session file on disk
+    - a MongoDB-persisted session for a specific user when db_model is provided
+    """
+    session_path = get_telethon_session_path()
+    session_str = _get_env_value(
+        "API_SESSION",
+        "SESSION",
+        "api_session",
+        "USERBOT_SESSION",
+        "userbot_session",
+        "TELETHON_SESSION",
+        "telethon_session",
+    )
+
+    if session_str:
+        return {
+            "ready": True,
+            "source": "env",
+            "session_path": session_path,
+            "details": "Telethon session string configured in environment",
+        }
+
+    if os.path.exists(session_path) or os.path.exists(session_path + ".session"):
+        return {
+            "ready": True,
+            "source": "file",
+            "session_path": session_path,
+            "details": "Telethon session file exists on disk",
+        }
+
+    if user_id is not None and db_model is not None:
+        try:
+            saved_session = await db_model.load_session(user_id)
+        except Exception as exc:
+            logger.warning("Failed to inspect MongoDB Telethon session for user %s: %s", user_id, exc)
+            saved_session = None
+
+        if isinstance(saved_session, dict) and saved_session.get("string_session"):
+            return {
+                "ready": True,
+                "source": "mongodb",
+                "session_path": session_path,
+                "details": "Telethon session persisted in MongoDB",
+            }
+
+    return {
+        "ready": False,
+        "source": "missing",
+        "session_path": session_path,
+        "details": "No Telethon session configured or persisted",
+    }
+
+
 def build_telethon_client(api_id: int, api_hash: str):
     if TelegramClient is None:
         raise RuntimeError("Telethon is not installed. Install telethon to use userbot fallback.")
