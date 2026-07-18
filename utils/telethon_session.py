@@ -61,12 +61,19 @@ def build_telethon_client(api_id: int, api_hash: str):
         "telethon_session",
     )
 
-    if session_str and StringSession is not None:
-        try:
-            return TelegramClient(StringSession(session_str), api_id, api_hash)
-        except Exception:
-            logger.exception("Failed to load StringSession from env; falling back to file-based session")
+    if session_str:
+        # A session string env var is explicitly configured — always use it.
+        # Never silently fall back to a stale file-based .session file.
+        # If the string is invalid/expired, let the exception propagate so
+        # callers know the session needs to be regenerated.
+        if StringSession is None:
+            raise RuntimeError(
+                "Telethon StringSession is not available but a session string "
+                "environment variable is set. Ensure telethon is installed."
+            )
+        return TelegramClient(StringSession(session_str), api_id, api_hash)
 
+    # No session string env var — use file-based session as fallback.
     session_path = get_telethon_session_path()
     return TelegramClient(session_path, api_id, api_hash)
 

@@ -513,7 +513,7 @@ def setup_handlers(application: Application) -> None:
     application.add_handler(CommandHandler("cancel", latency_wrapper(cancel_command, "cancel_command")))
 
     async def loginstatus_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        """Admin-only diagnostic: show current login flow context (masked)."""
+        """Admin-only diagnostic: show userbot session configuration status (Telethon + Pyrogram)."""
         try:
             user_id = update.effective_user.id
         except Exception:
@@ -523,6 +523,28 @@ def setup_handlers(application: Application) -> None:
             await update.message.reply_text("Unauthorized")
             return
 
+        # ── Telethon session availability ──
+        telethon_ready = False
+        try:
+            from utils.telethon_session import has_usable_telethon_session
+            telethon_ready = has_usable_telethon_session()
+        except Exception:
+            pass
+
+        # ── Pyrogram session string ──
+        pyrogram_ready = False
+        try:
+            from utils.telethon_session import get_pyrogram_session_string
+            pyrogram_ready = bool(get_pyrogram_session_string())
+        except Exception:
+            pass
+
+        # ── Credentials check ──
+        has_api_id = bool(os.getenv("API_ID") or os.getenv("USERBOT_API_ID") or os.getenv("api_id") or os.getenv("userbot_api_id"))
+        has_api_hash = bool(os.getenv("API_HASH") or os.getenv("USERBOT_API_HASH") or os.getenv("api_hash") or os.getenv("userbot_api_hash"))
+        userbot_enabled = os.environ.get("ENABLE_USERBOT", "").lower() in ("1", "true", "yes")
+
+        # ── Active login flow context ──
         data = context.user_data
         sent_at = data.get("login_code_sent_at")
         sent_repr = data.get("login_code_sent_repr")
@@ -544,14 +566,22 @@ def setup_handlers(application: Application) -> None:
             masked_hash = None
 
         lines = [
-            f"awaiting: {awaiting}",
-            f"sent_at: {sent_at}",
-            f"resend_count: {resend_count}",
-            f"code_hash: {masked_hash}",
-            f"sent_repr: {str(sent_repr)[:200] if sent_repr else None}",
-            f"session_path: {session_path}",
+            "\U0001f510 **Login Status**",
+            "",
+            f"**Userbot enabled:** {'\u2705 Yes' if userbot_enabled else '\u274c No'}",
+            f"**API credentials:** {'\u2705 Set' if has_api_id and has_api_hash else '\u26a0\ufe0f Missing API_ID/API_HASH'}",
+            "",
+            "**Telethon session:** " + ("\u2705 Available" if telethon_ready else "\u274c Not configured"),
+            "**Pyrogram session:** " + ("\u2705 Available" if pyrogram_ready else "\u274c Not configured"),
+            "",
+            "**Active login flow:**",
+            f"  awaiting: {awaiting}",
+            f"  sent_at: `{sent_at}`",
+            f"  resend_count: `{resend_count}`",
+            f"  code_hash: `{masked_hash}`",
+            f"  session_path: `{session_path}`",
         ]
-        await update.message.reply_text("\n".join(lines))
+        await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
     application.add_handler(CommandHandler("loginstatus", latency_wrapper(loginstatus_command, "loginstatus_command")))
 
