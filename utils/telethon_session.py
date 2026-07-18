@@ -47,16 +47,8 @@ def get_telethon_session_path() -> str:
     return os.path.join(session_dir, get_telethon_session_name())
 
 
-async def get_telethon_session_status(user_id: Optional[int] = None, db_model: Optional[object] = None) -> dict:
-    """Return a diagnostic summary for Telethon session availability.
-
-    Checks the same sources the bot can actually use for login fallback:
-    - explicit session string in env vars
-    - a local .session file on disk
-    - a MongoDB-persisted session for a specific user when db_model is provided
-    """
-    session_path = get_telethon_session_path()
-    session_str = _get_env_value(
+def _get_configured_session_string() -> Optional[str]:
+    return _get_env_value(
         "API_SESSION",
         "SESSION",
         "api_session",
@@ -66,12 +58,51 @@ async def get_telethon_session_status(user_id: Optional[int] = None, db_model: O
         "telethon_session",
     )
 
+
+async def get_telethon_session_string_for_user(user_id: Optional[int] = None, db_model: Optional[object] = None) -> Optional[str]:
+    """Return a usable Telethon session string for the given user, if available.
+
+    Checks env vars first, then a MongoDB-persisted session when db_model is supplied.
+    """
+    session_str = _get_configured_session_string()
     if session_str:
+        return session_str
+
+    if user_id is not None and db_model is not None:
+        try:
+            saved_session = await db_model.load_session(user_id)
+        except Exception as exc:
+            logger.warning("Failed to inspect MongoDB Telethon session for user %s: %s", user_id, exc)
+            saved_session = None
+
+        if isinstance(saved_session, dict):
+            session_value = saved_session.get("string_session") or saved_session.get("session_string")
+            if session_value:
+                return str(session_value)
+
+    return None
+
+
+async def get_telethon_session_status(user_id: Optional[int] = None, db_model: Optional[object] = None) -> dict:
+    """Return a diagnostic summary for Telethon session availability.
+
+    Checks the same sources the bot can actually use for login fallback:
+    - explicit session string in env vars
+    - a local .session file on disk
+    - a MongoDB-persisted session for a specific user when db_model is provided
+    """
+    session_path = get_telethon_session_path()
+    session_str = await get_telethon_session_string_for_user(user_id=user_id, db_model=db_model)
+
+    if session_str:
+        env_session = _get_configured_session_string()
         return {
             "ready": True,
-            "source": "env",
+            "source": "env" if env_session else "mongodb",
             "session_path": session_path,
-            "details": "Telethon session string configured in environment",
+            "details": "Telethon session string configured in environment"
+            if env_session
+            else "Telethon session string persisted in MongoDB",
         }
 
     if os.path.exists(session_path) or os.path.exists(session_path + ".session"):
@@ -105,21 +136,13 @@ async def get_telethon_session_status(user_id: Optional[int] = None, db_model: O
     }
 
 
-def build_telethon_client(api_id: int, api_hash: str):
+def build_telethon_client(api_id: int, api_hash: str, session_str: Optional[str] = None):
     if TelegramClient is None:
         raise RuntimeError("Telethon is not installed. Install telethon to use userbot fallback.")
 
-    session_str = _get_env_value(
-        "API_SESSION",
-        "SESSION",
-        "api_session",
-        "USERBOT_SESSION",
-        "userbot_session",
-        "TELETHON_SESSION",
-        "telethon_session",
-    )
+    resolved_session = session_str or _get_configured_session_string()
 
-    if session_str:
+    if resolved_session:
         # A session string env var is explicitly configured — always use it.
         # Never silently fall back to a stale file-based .session file.
         # If the string is invalid/expired, let the exception propagate so
@@ -129,7 +152,7 @@ def build_telethon_client(api_id: int, api_hash: str):
                 "Telethon StringSession is not available but a session string "
                 "environment variable is set. Ensure telethon is installed."
             )
-        return TelegramClient(StringSession(session_str), api_id, api_hash)
+        return TelegramClient(StringSession(resolved_session), api_id, api_hash)
 
     # No session string env var — use file-based session as fallback.
     session_path = get_telethon_session_path()

@@ -541,12 +541,18 @@ async def _download_with_telethon(
         logger.debug("Telethon not installed; skipping Telethon download")
         return False
 
-    from utils.telethon_session import build_telethon_client, get_userbot_credentials
+    from utils.telethon_session import build_telethon_client, get_userbot_credentials, get_telethon_session_string_for_user
 
     chunk_size_kb = get_download_chunk_size_kb()
     api_id, api_hash = get_userbot_credentials()
 
-    client = build_telethon_client(api_id, api_hash)
+    session_str = None
+    try:
+        session_str = await get_telethon_session_string_for_user(user_id=None, db_model=None)
+    except Exception:
+        session_str = None
+
+    client = build_telethon_client(api_id, api_hash, session_str=session_str)
     try:
         logger.info("userbot: starting Telethon client for download")
         await client.start()

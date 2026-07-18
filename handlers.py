@@ -651,6 +651,15 @@ class EnhancedMediaHandler:
         if size and size > max_size:
             raise Exception(f"File too large ({size//1024//1024}MB). Max allowed: {max_size//1024//1024}MB")
 
+        # Preserve the original source identifiers for userbot fallback and the
+        # big-file pipeline so we can reuse the real chat/message pair when the
+        # bot API download fails.
+        current_file.setdefault("chat_id", current_file.get("forward", {}).get("chat_id"))
+        current_file.setdefault("msg_id", current_file.get("msg_id") or current_file.get("message_id"))
+        current_file.setdefault("message_id", current_file.get("msg_id") or current_file.get("message_id"))
+        current_file.setdefault("forward_chat_id", current_file.get("forward", {}).get("chat_id"))
+        current_file.setdefault("forward_message_id", current_file.get("forward", {}).get("message_id"))
+
         # Prepare extension and paths early so fallback download (userbot) can use them
         ext = ""
         t = current_file.get("type")

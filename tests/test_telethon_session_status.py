@@ -32,3 +32,16 @@ def test_async_telethon_status_uses_mongodb_session(monkeypatch):
 
     assert status["ready"] is True
     assert status["source"] == "mongodb"
+
+
+def test_get_telethon_session_string_for_user_uses_mongodb(monkeypatch):
+    monkeypatch.delenv("API_SESSION", raising=False)
+    monkeypatch.delenv("SESSION", raising=False)
+    monkeypatch.delenv("TELETHON_SESSION", raising=False)
+    monkeypatch.delenv("USERBOT_SESSION", raising=False)
+
+    session_str = asyncio.run(
+        telethon_session.get_telethon_session_string_for_user(user_id=42, db_model=FakeDbModel({"string_session": "abc"}))
+    )
+
+    assert session_str == "abc"
