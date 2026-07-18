@@ -70,6 +70,31 @@ except Exception:
 logger = logging.getLogger(__name__)
 
 
+def _extract_large_file_source(current_file: Optional[dict]) -> tuple[Optional[int], Optional[int]]:
+    """Return (chat_id, message_id) for the source message used by the big-file pipeline.
+
+    The bot stores this metadata in several shapes depending on the incoming file type:
+    - current_file["chat_id"] / current_file["msg_id"] for regular messages
+    - current_file["forward"]["chat_id"] / current_file["forward"]["message_id"]
+      when the incoming file was forwarded
+    """
+    if not current_file:
+        return None, None
+
+    try:
+        forward = current_file.get("forward") or {}
+        forward_chat = forward.get("chat_id")
+        forward_msg = forward.get("message_id")
+        if forward_chat and forward_msg:
+            return forward_chat, forward_msg
+    except Exception:
+        pass
+
+    chat_id = current_file.get("chat_id") or current_file.get("forward_chat_id")
+    message_id = current_file.get("msg_id") or current_file.get("message_id") or current_file.get("forward_message_id")
+    return chat_id, message_id
+
+
 def _parse_time_to_seconds(tstr: str) -> float:
     """Parse time strings like HH:MM:SS(.ms), MM:SS(.ms) or plain seconds -> seconds (float)."""
     try:
@@ -652,13 +677,7 @@ class EnhancedMediaHandler:
             bot_api_max_mb = int(os.environ.get("BOT_API_MAX_MB", "50"))
             file_size = current_file.get("size") or 0
             if file_size and file_size > bot_api_max_mb * 1024 * 1024 and _bigfile_pipeline is not None:
-                _bot_chat = None
-                _bot_msg = None
-                try:
-                    _bot_chat = current_file.get("bot_chat") or current_file.get("forward_chat_id")
-                    _bot_msg = current_file.get("bot_msg") or current_file.get("forward_message_id")
-                except Exception:
-                    pass
+                _bot_chat, _bot_msg = _extract_large_file_source(current_file)
                 if _bot_chat and _bot_msg:
                     try:
                         _ingest = await _bigfile_pipeline.ingest_large_file(
