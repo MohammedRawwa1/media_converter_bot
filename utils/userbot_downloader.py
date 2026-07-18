@@ -383,6 +383,73 @@ async def _recycle_client_session(client) -> bool:
         return False
 
 
+async def _try_relay_fallback(
+    client,
+    chat_id: Union[int, str],
+    message_id: int,
+    dest_path: str,
+    relay_chat_id: Optional[Union[int, str]] = None,
+    client_type: str = "pyrogram",
+) -> bool:
+    """Try a relay-group fallback by forwarding the original message to a trusted chat
+    and retrying the download from the forwarded copy.
+
+    This is used when direct peer/message resolution fails for the original
+    source chat, which is common for large channels and stale peer state.
+    """
+    if not relay_chat_id:
+        return False
+
+    try:
+        relay_chat_id = int(relay_chat_id)
+    except (TypeError, ValueError):
+        relay_chat_id = str(relay_chat_id)
+
+    try:
+        logger.info(
+            "userbot: relay fallback trying %s/%s -> relay %s",
+            chat_id,
+            message_id,
+            relay_chat_id,
+        )
+        forwarded = await client.forward_messages(
+            chat_id=relay_chat_id,
+            from_chat_id=chat_id,
+            message_ids=[message_id],
+        )
+        forwarded_msg = None
+        if forwarded:
+            forwarded_msg = forwarded[0] if isinstance(forwarded, list) else forwarded
+        if forwarded_msg is None:
+            logger.warning("userbot: relay fallback forward returned no message")
+            return False
+
+        relay_msg_id = getattr(forwarded_msg, "id", None)
+        if relay_msg_id is None:
+            logger.warning("userbot: relay fallback forward message has no id")
+            return False
+
+        logger.info(
+            "userbot: relay fallback forwarded to %s/%s, retrying download",
+            relay_chat_id,
+            relay_msg_id,
+        )
+        relay_msgs = await client.get_messages(relay_chat_id, message_ids=[relay_msg_id])
+        if relay_msgs:
+            relay_msg = relay_msgs[0] if isinstance(relay_msgs, list) else relay_msgs
+            if relay_msg and getattr(relay_msg, "media", None):
+                if await _download_and_ensure_path(client, relay_msg, dest_path):
+                    return True
+        logger.warning(
+            "userbot: relay fallback download from %s/%s failed",
+            relay_chat_id,
+            relay_msg_id,
+        )
+    except Exception as exc:
+        logger.warning("userbot: relay fallback failed for %s/%s: %s", chat_id, message_id, exc)
+    return False
+
+
 async def _attempt_recovery_download(
     client,
     chat_id,
@@ -563,9 +630,20 @@ async def _download_with_telethon(
 
     try:
         target = await _normalize_target(chat_id, client)
+        logger.info(
+            "userbot: Telethon direct lookup started for chat=%s msg=%s target=%s",
+            chat_id,
+            message_id,
+            target,
+        )
 
         # Try direct fetch by id first
         try:
+            logger.info(
+                "userbot: Telethon trying get_messages(target=%s, ids=%s)",
+                target,
+                message_id,
+            )
             msgs = await client.get_messages(target, ids=message_id)
         except Exception as e:
             logger.exception("userbot: get_messages direct by id failed: %s", e)
@@ -573,6 +651,12 @@ async def _download_with_telethon(
 
         if msgs:
             msg = msgs[0] if isinstance(msgs, (list, tuple)) else msgs
+            logger.info(
+                "userbot: Telethon direct lookup resolved target=%s msg_id=%s media=%s",
+                target,
+                getattr(msg, "id", None),
+                bool(getattr(msg, "media", None)),
+            )
             if getattr(msg, "media", None):
                 logger.info("userbot: message found; downloading %s/%s to %s", target, message_id, dest_path)
                 for attempt in range(3):
@@ -604,6 +688,11 @@ async def _download_with_telethon(
             if dt is not None:
                 logger.debug("userbot: searching around date %s in %s", msg_date, target)
                 try:
+                    logger.info(
+                        "userbot: Telethon date-scan started for target=%s around=%s",
+                        target,
+                        msg_date,
+                    )
                     async for m in client.iter_messages(target, limit=100, offset_date=dt):
                         if getattr(m, "media", None):
                             for attempt in range(3):
@@ -623,6 +712,10 @@ async def _download_with_telethon(
         # Scan recent messages
         if not search_done:
             try:
+                logger.info(
+                    "userbot: Telethon recent-history scan started for target=%s",
+                    target,
+                )
                 async for m in client.iter_messages(target, limit=200):
                     if getattr(m, "media", None):
                         for attempt in range(3):
@@ -636,6 +729,23 @@ async def _download_with_telethon(
                                 pass
             except Exception:
                 pass
+
+        relay_chat_id = os.getenv("RELAY_CHAT_ID")
+        if relay_chat_id:
+            logger.info(
+                "userbot: Telethon direct resolution failed; trying relay fallback for %s/%s",
+                chat_id,
+                message_id,
+            )
+            if await _try_relay_fallback(
+                client,
+                chat_id,
+                message_id,
+                dest_path,
+                relay_chat_id=relay_chat_id,
+                client_type="telethon",
+            ):
+                return True
 
         return False
     finally:
@@ -841,6 +951,12 @@ async def _download_bytes_with_pyrogram(
 
         # Collect candidate peers: provided chat_id first, then bot's user ID
         _candidates = [target]
+        logger.info(
+            "userbot: in-memory download started for chat=%s msg=%s candidates=%s",
+            chat_id,
+            message_id,
+            _candidates,
+        )
         _bot_token = os.getenv("BOT_TOKEN", "")
         if _bot_token and ":" in _bot_token:
             try:
@@ -864,6 +980,12 @@ async def _download_bytes_with_pyrogram(
                         logger.info(
                             "userbot: Pyrogram in-memory downloading %s/%s (peer=%s)",
                             _peer, message_id, _peer,
+                        )
+                        logger.info(
+                            "userbot: resolved message payload for in-memory download: peer=%s msg_id=%s media=%s",
+                            _peer,
+                            getattr(msg, "id", None),
+                            bool(getattr(msg, "media", None)),
                         )
                         dl_kwargs = {"in_memory": True}
                         if progress_callback is not None:
@@ -1054,6 +1176,12 @@ async def _download_with_pyrogram(
         logger.info("userbot: Pyrogram client started for download")
 
         target = await _normalize_target(chat_id)
+        logger.info(
+            "userbot: disk download started for chat=%s msg=%s target=%s",
+            chat_id,
+            message_id,
+            target,
+        )
 
         # Collect candidate peers to try: the provided chat_id first, plus the bot's
         # own user ID (from BOT_TOKEN) as a fallback. This covers the common case
@@ -1092,6 +1220,12 @@ async def _download_with_pyrogram(
                         logger.info(
                             "userbot: Pyrogram downloading %s/%s -> %s (peer=%s)",
                             _peer, message_id, dest_path, _peer,
+                        )
+                        logger.info(
+                            "userbot: resolved message payload for disk download: peer=%s msg_id=%s media=%s",
+                            _peer,
+                            getattr(msg, "id", None),
+                            bool(getattr(msg, "media", None)),
                         )
                         if await _download_and_ensure_path(client, msg, dest_path):
                             return True
@@ -1247,10 +1381,38 @@ async def _download_with_pyrogram(
                 "userbot: Pyrogram could not find message %s in any candidate peer (%s)",
                 message_id, _candidates,
             )
+            logger.info(
+                "userbot: disk download failed to resolve any message for chat=%s msg=%s",
+                chat_id,
+                message_id,
+            )
 
-        # ---- Final recovery: attempt advanced techniques for persistent -503 ----
         _abs_dest = os.path.abspath(dest_path)
+        relay_chat_id = os.getenv("RELAY_CHAT_ID")
         if not os.path.exists(_abs_dest) or os.path.getsize(_abs_dest) == 0:
+            if relay_chat_id:
+                logger.info(
+                    "userbot: trying relay fallback for %s/%s via %s",
+                    chat_id,
+                    message_id,
+                    relay_chat_id,
+                )
+                if await _try_relay_fallback(
+                    client,
+                    chat_id,
+                    message_id,
+                    dest_path,
+                    relay_chat_id=relay_chat_id,
+                    client_type="pyrogram",
+                ):
+                    logger.info(
+                        "userbot: relay fallback download succeeded for %s/%s",
+                        chat_id,
+                        message_id,
+                    )
+                    return True
+
+            # ---- Final recovery: attempt advanced techniques for persistent -503 ----
             logger.info(
                 "userbot: all standard download methods failed for %s/%s, "
                 "trying recovery (forward+probe+recycle)...",

@@ -1,4 +1,5 @@
 import unittest
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 from utils import userbot_downloader as mod
@@ -19,6 +20,27 @@ class UserbotDownloaderTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(result)
         pyrogram_mock.assert_awaited_once()
         telethon_mock.assert_not_awaited()
+
+    async def test_relay_fallback_retries_download_from_forwarded_message(self):
+        forwarded_msg = SimpleNamespace(id=789, media=object())
+        client = AsyncMock()
+        client.forward_messages = AsyncMock(return_value=[forwarded_msg])
+        client.get_messages = AsyncMock(return_value=[forwarded_msg])
+
+        with patch.object(mod, "_download_and_ensure_path", AsyncMock(return_value=True)) as download_mock:
+            result = await mod._try_relay_fallback(
+                client,
+                123,
+                456,
+                "/tmp/file",
+                relay_chat_id=-100111,
+                client_type="pyrogram",
+            )
+
+        self.assertTrue(result)
+        client.forward_messages.assert_awaited_once()
+        client.get_messages.assert_awaited_once()
+        download_mock.assert_awaited_once()
 
 
 if __name__ == "__main__":
