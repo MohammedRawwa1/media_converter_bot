@@ -244,3 +244,58 @@ async def cancel_job(job_id: str) -> None:
         await r.hset(f"ffmpeg:job:{job_id}", mapping={"cancel": "1"})
     finally:
         await r.close()
+
+
+async def release_input_lock(lock_key: str, owner_job_id: str, redis_client=None) -> bool:
+    """Delete a Redis input lock if it is still owned by the provided job.
+
+    This is intentionally defensive: it uses a Lua script when possible and falls
+    back to a simple get/delete sequence if the client does not support eval.
+    """
+    if not lock_key or not owner_job_id:
+        return False
+
+    close_client = False
+    client = redis_client
+    if client is None:
+        try:
+            client = await get_redis()
+            close_client = True
+        except Exception:
+            return False
+
+    try:
+        script = """
+        local current = redis.call('get', KEYS[1])
+        if current == ARGV[1] then
+            redis.call('del', KEYS[1])
+            return 1
+        end
+        return 0
+        """
+        try:
+            result = await client.eval(script, 1, lock_key, owner_job_id)
+            if result:
+                logging.getLogger(__name__).info("Released input lock %s for job %s", lock_key, owner_job_id)
+                return True
+        except Exception:
+            pass
+
+        try:
+            current = await client.get(lock_key)
+            if isinstance(current, bytes):
+                current = current.decode()
+            if current == owner_job_id:
+                await client.delete(lock_key)
+                logging.getLogger(__name__).info("Released input lock %s for job %s", lock_key, owner_job_id)
+                return True
+        except Exception:
+            pass
+
+        return False
+    finally:
+        if close_client and client is not None:
+            try:
+                await client.close()
+            except Exception:
+                pass

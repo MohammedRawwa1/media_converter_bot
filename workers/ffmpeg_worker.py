@@ -9,7 +9,7 @@ import time
 import subprocess
 from typing import Optional
 
-from utils.job_queue import pop_job, publish_update, get_redis, JOB_LIST, close_redis
+from utils.job_queue import pop_job, publish_update, get_redis, JOB_LIST, close_redis, release_input_lock
 from utils.ffmpeg_runner import run_ffmpeg
 try:
     from utils.cache import get_cache
@@ -1637,19 +1637,10 @@ async def handle_job(job: dict):
     finally:
         # release the input lock if we acquired one
         try:
-            if lock_key and redis_lock_client:
-                try:
-                    cur = await redis_lock_client.get(lock_key)
-                    if cur:
-                        try:
-                            if isinstance(cur, bytes):
-                                cur = cur.decode()
-                        except Exception:
-                            pass
-                        if cur == job_id:
-                            await redis_lock_client.delete(lock_key)
-                except Exception:
-                    pass
+            if lock_key and lock_acquired and job_id:
+                await release_input_lock(lock_key, job_id, redis_client=redis_lock_client)
+        except Exception:
+            logger.warning("Failed to release input lock %s for job %s", lock_key, job_id)
         finally:
             try:
                 if redis_lock_client:
