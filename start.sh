@@ -6,8 +6,14 @@ if [ -f ./scripts/check_env.py ]; then
   python ./scripts/check_env.py || exit 1
 fi
 
-# Optional: gate starting the background worker with START_WORKER (default: true)
-START_WORKER="${START_WORKER:-true}"
+# NOTE: The in-process ffmpeg worker task in main.py handles job processing.
+# We do NOT start a separate worker process here because:
+# 1. Render free tier has only ~512MB RAM — two ffmpeg processes would exhaust it
+# 2. The in-process worker inside uvicorn/main.py already picks and processes jobs
+# 3. A separate dedicated ffmpeg-worker service is defined in render.yaml for scaling
+# To re-enable the separate worker, set START_WORKER=true as an env var.
+# See render.yaml for the dedicated ffmpeg-worker service definition.
+START_WORKER="${START_WORKER:-false}"
 
 if [ "$START_WORKER" = "true" ]; then
   echo "Starting ffmpeg worker in background with supervision..."
@@ -45,7 +51,7 @@ if [ "$START_WORKER" = "true" ]; then
   
   echo "Worker supervisor started (monitor PID: $MONITOR_PID)"
 else
-  echo "START_WORKER not true; skipping ffmpeg worker start."
+  echo "START_WORKER not true; skipping separate ffmpeg worker to save memory."
 fi
 
 echo "Starting web server (uvicorn)..."

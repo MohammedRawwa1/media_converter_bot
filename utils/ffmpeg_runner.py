@@ -97,7 +97,10 @@ async def run_ffmpeg(
     - Publishes JSON updates to `progress_channel` (if provided) and writes job hash `ffmpeg:job:{job_id}`.
     """
     ffmpeg_bin = getattr(config, "FFMPEG_PATH", "ffmpeg") or "ffmpeg"
-    ffmpeg_args = ffmpeg_args or ["-c:v", "libx264", "-preset", "fast", "-crf", "23", "-c:a", "aac", "-b:a", "128k"]
+    # Use veryfast preset to reduce memory usage on memory-constrained hosts (Render free tier).
+    # The -preset fast default was consuming too much RAM alongside multiple uvicorn workers.
+    # veryfast uses ~30% less memory at the cost of slightly larger output files.
+    ffmpeg_args = ffmpeg_args or ["-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-c:a", "aac", "-b:a", "128k"]
 
     # Validate input path before probing/starting ffmpeg
     if not input_path:

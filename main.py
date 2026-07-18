@@ -2212,7 +2212,7 @@ try:
                 if action == "reencode":
                     dst = payload.get("out") or os.path.join(os.getcwd(), "storage", "output", os.path.splitext(os.path.basename(target_path))[0] + "_reencoded.mp4")
                     os.makedirs(os.path.dirname(dst), exist_ok=True)
-                    cmd = [ffmpeg, "-y", "-hide_banner", "-loglevel", "error", "-fflags", "+genpts", "-i", target_path, "-c:v", "libx264", "-preset", "fast", "-crf", "23", "-c:a", "aac", "-b:a", "128k", dst]
+                    cmd = [ffmpeg, "-y", "-hide_banner", "-loglevel", "error", "-fflags", "+genpts", "-i", target_path, "-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-c:a", "aac", "-b:a", "128k", dst]
                     out["dst"] = dst
                     out["result"] = await _run(cmd, timeout=1800)
                     return out

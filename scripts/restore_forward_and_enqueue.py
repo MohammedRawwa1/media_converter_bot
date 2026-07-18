@@ -100,7 +100,7 @@ if __name__ == '__main__':
             'output_path': output_path,
             'original_filename': data.get('name') or os.path.basename(dest_path),
             'output_filename': os.path.basename(output_path),
-            'ffmpeg_args': ["-c:v", "libx264", "-preset", "fast", "-crf", "23", "-c:a", "aac", "-b:a", "128k"],
+            'ffmpeg_args': ["-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-c:a", "aac", "-b:a", "128k"],
             'progress_channel': f"ffmpeg:progress:{job_id}",
             'cleanup_input': True,
         }

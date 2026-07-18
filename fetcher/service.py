@@ -101,7 +101,7 @@ async def process_forward_hash(forward_hash: str):
             "output_path": output_path,
             "original_filename": meta.get("name") or os.path.basename(input_path),
             "output_filename": os.path.basename(output_path),
-            "ffmpeg_args": ["-c:v", "libx264", "-preset", "fast", "-crf", "23", "-c:a", "aac", "-b:a", "128k"],
+            "ffmpeg_args": ["-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-c:a", "aac", "-b:a", "128k"],
             "progress_channel": f"ffmpeg:progress:{job_id}",
             "chat_id": meta.get("chat_id"),
             "cleanup_input": True,

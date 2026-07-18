@@ -28,7 +28,7 @@ def convert_video(input_path: str, output_path: str, job_id: str, duration: floa
     # Basic x264/aac conversion with progress parsing via -progress pipe:1
     cmd = [
         'ffmpeg', '-y', '-i', input_path,
-        '-c:v', 'libx264', '-preset', 'fast', '-crf', '23',
+        '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '23',
         '-c:a', 'aac', '-b:a', '128k',
         '-progress', 'pipe:1', '-nostats', output_path
     ]

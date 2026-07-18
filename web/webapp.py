@@ -191,7 +191,7 @@ def upload():
                                     "output_path": os.path.join(OUTPUT_DIR, f"{j_id}.mp4"),
                                     "original_filename": m.get("name") or os.path.basename(inp_path),
                                     "output_filename": f"{j_id}.mp4",
-                                    "ffmpeg_args": ["-c:v", "libx264", "-preset", "fast", "-crf", "23", "-c:a", "aac", "-b:a", "128k"],
+                                    "ffmpeg_args": ["-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-c:a", "aac", "-b:a", "128k"],
                                     "progress_channel": f"ffmpeg:progress:{j_id}",
                                     "cleanup_input": True,
                                 }
@@ -205,7 +205,7 @@ def upload():
                                 "output_path": os.path.join(OUTPUT_DIR, f"{j_id}.mp4"),
                                 "original_filename": m.get("name") or os.path.basename(inp_path),
                                 "output_filename": f"{j_id}.mp4",
-                                "ffmpeg_args": ["-c:v", "libx264", "-preset", "fast", "-crf", "23", "-c:a", "aac", "-b:a", "128k"],
+                                "ffmpeg_args": ["-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-c:a", "aac", "-b:a", "128k"],
                                 "progress_channel": f"ffmpeg:progress:{j_id}",
                                 "cleanup_input": True,
                             }
@@ -296,7 +296,7 @@ def upload():
                             "output_path": os.path.join(OUTPUT_DIR, f"{j_id}.mp4"),
                             "original_filename": meta_obj.get("name") or os.path.basename(inp_path),
                             "output_filename": f"{j_id}.mp4",
-                            "ffmpeg_args": ["-c:v", "libx264", "-preset", "fast", "-crf", "23", "-c:a", "aac", "-b:a", "128k"],
+                            "ffmpeg_args": ["-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-c:a", "aac", "-b:a", "128k"],
                             "progress_channel": f"ffmpeg:progress:{j_id}",
                             "cleanup_input": True,
                         }
@@ -308,7 +308,7 @@ def upload():
                             "output_path": os.path.join(OUTPUT_DIR, f"{j_id}.mp4"),
                             "original_filename": meta_obj.get("name") or os.path.basename(inp_path),
                             "output_filename": f"{j_id}.mp4",
-                            "ffmpeg_args": ["-c:v", "libx264", "-preset", "fast", "-crf", "23", "-c:a", "aac", "-b:a", "128k"],
+                            "ffmpeg_args": ["-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-c:a", "aac", "-b:a", "128k"],
                             "progress_channel": f"ffmpeg:progress:{j_id}",
                             "cleanup_input": True,
                         }
@@ -319,7 +319,7 @@ def upload():
                         "output_path": os.path.join(OUTPUT_DIR, f"{j_id}.mp4"),
                         "original_filename": meta_obj.get("name") or os.path.basename(inp_path),
                         "output_filename": f"{j_id}.mp4",
-                        "ffmpeg_args": ["-c:v", "libx264", "-preset", "fast", "-crf", "23", "-c:a", "aac", "-b:a", "128k"],
+                        "ffmpeg_args": ["-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-c:a", "aac", "-b:a", "128k"],
                         "progress_channel": f"ffmpeg:progress:{j_id}",
                         "cleanup_input": True,
                     }
@@ -392,7 +392,7 @@ def upload():
                             "output_path": os.path.join(OUTPUT_DIR, f"{j_id}.mp4"),
                             "original_filename": meta_obj.get("name") or os.path.basename(inp_path),
                             "output_filename": f"{j_id}.mp4",
-                            "ffmpeg_args": ["-c:v", "libx264", "-preset", "fast", "-crf", "23", "-c:a", "aac", "-b:a", "128k"],
+                            "ffmpeg_args": ["-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-c:a", "aac", "-b:a", "128k"],
                             "progress_channel": f"ffmpeg:progress:{j_id}",
                             "cleanup_input": True,
                         }
@@ -404,7 +404,7 @@ def upload():
                             "output_path": os.path.join(OUTPUT_DIR, f"{j_id}.mp4"),
                             "original_filename": meta_obj.get("name") or os.path.basename(inp_path),
                             "output_filename": f"{j_id}.mp4",
-                            "ffmpeg_args": ["-c:v", "libx264", "-preset", "fast", "-crf", "23", "-c:a", "aac", "-b:a", "128k"],
+                            "ffmpeg_args": ["-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-c:a", "aac", "-b:a", "128k"],
                             "progress_channel": f"ffmpeg:progress:{j_id}",
                             "cleanup_input": True,
                         }
@@ -415,7 +415,7 @@ def upload():
                         "output_path": os.path.join(OUTPUT_DIR, f"{j_id}.mp4"),
                         "original_filename": meta_obj.get("name") or os.path.basename(inp_path),
                         "output_filename": f"{j_id}.mp4",
-                        "ffmpeg_args": ["-c:v", "libx264", "-preset", "fast", "-crf", "23", "-c:a", "aac", "-b:a", "128k"],
+                        "ffmpeg_args": ["-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-c:a", "aac", "-b:a", "128k"],
                         "progress_channel": f"ffmpeg:progress:{j_id}",
                         "cleanup_input": True,
                     }
@@ -464,7 +464,7 @@ def upload():
         "output_path": output_path,
         "original_filename": original_filename,
         "output_filename": os.path.basename(output_path),
-        "ffmpeg_args": ["-c:v", "libx264", "-preset", "fast", "-crf", "23", "-c:a", "aac", "-b:a", "128k"],
+        "ffmpeg_args": ["-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-c:a", "aac", "-b:a", "128k"],
         "progress_channel": f"ffmpeg:progress:{job_id}",
         "cleanup_input": True,
         "cleanup_output": False,
@@ -772,7 +772,7 @@ def enqueue_from_url():
         "output_path": output_path,
         "original_filename": original_filename or output_filename,
         "output_filename": output_filename,
-        "ffmpeg_args": ["-c:v", "libx264", "-preset", "fast", "-crf", "23", "-c:a", "aac", "-b:a", "128k"],
+        "ffmpeg_args": ["-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-c:a", "aac", "-b:a", "128k"],
         "progress_channel": f"ffmpeg:progress:{job_id}",
         "cleanup_input": True,
     }
