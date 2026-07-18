@@ -1002,6 +1002,15 @@ async def _download_bytes_with_pyrogram(
 
         return None
     finally:
+        # Give the internal dispatcher a moment to finish processing any
+        # pending updates before closing the SQLite storage, otherwise we get
+        # ``sqlite3.ProgrammingError: Cannot operate on a closed database``
+        # when ``handle_updates -> fetch_peers -> storage.update_peers``
+        # is still in flight.
+        try:
+            await asyncio.sleep(1)
+        except Exception:
+            pass
         try:
             await client.stop()
         except Exception:
@@ -1250,6 +1259,15 @@ async def _download_with_pyrogram(
 
         return False
     finally:
+        # Give the internal dispatcher a moment to finish processing any
+        # pending updates before closing the SQLite storage, otherwise we get
+        # ``sqlite3.ProgrammingError: Cannot operate on a closed database``
+        # when ``handle_updates -> fetch_peers -> storage.update_peers``
+        # is still in flight.
+        try:
+            await asyncio.sleep(1)
+        except Exception:
+            pass
         try:
             await client.stop()
         except Exception:

@@ -69,6 +69,11 @@ from utils.error_handler import (
 from utils.rate_limiter import ConversionRateLimiter, TelegramAPIRateLimiter, ConversionRateLimiterRedis
 from utils.webhook_monitor import WebhookRecoveryManager
 from utils.job_queue import cancel_job
+from utils.session_healthcheck import (
+    start_session_healthcheck,
+    stop_session_healthcheck,
+    get_session_healthchecker,
+)
 try:
     from workers.ffmpeg_worker import create_worker_task
 except Exception:
@@ -265,6 +270,7 @@ Available slash commands (exact):
 /admin add|remove|list <user_id> - Manage allowed users (admin only)
 /addthumb - Add default thumbnail (if enabled)
 /delthumb - Remove default thumbnail (if enabled)
+/sessionstatus - Show userbot session health (admin only)
 
 Send me a file to get started! 🚀
 """
@@ -863,6 +869,32 @@ def setup_handlers(application: Application) -> None:
 
     application.add_handler(CommandHandler("clearflood", latency_wrapper(clearflood_command, "clearflood_command")))
 
+    async def sessionstatus_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Admin-only: show current session health status."""
+        try:
+            user_id = update.effective_user.id
+        except Exception:
+            await update.message.reply_text("Could not determine user id")
+            return
+        if ADMIN_USER_ID and user_id != ADMIN_USER_ID:
+            await update.message.reply_text("Unauthorized")
+            return
+
+        try:
+            checker = get_session_healthchecker()
+            if not checker.last_health:
+                await update.message.reply_text(
+                    "🩺 Running session health check... (please wait a moment)"
+                )
+                await checker.run_once()
+            text = checker.format_status_text()
+            await update.message.reply_text(text, parse_mode="Markdown")
+        except Exception as e:
+            logger.exception("/sessionstatus failed: %s", e)
+            await update.message.reply_text(f"❌ Failed to check session health: {e}")
+
+    application.add_handler(CommandHandler("sessionstatus", latency_wrapper(sessionstatus_command, "sessionstatus_command")))
+
     def _clear_login_flow(user_id, context):
         try:
             LOGIN_PENDING_USERS.discard(user_id)
@@ -1402,6 +1434,17 @@ async def main(background: bool = False) -> None:
     except Exception as e:
         logger.error(f"Failed to start cleanup manager: {e}")
 
+    # Start session healthcheck
+    try:
+        _shc_task = start_session_healthcheck(
+            admin_user_id=ADMIN_USER_ID,
+            bot_app=application,
+            check_interval=int(os.environ.get("SESSION_HEALTHCHECK_INTERVAL", "3600")),
+        )
+        logger.info("Session healthcheck started (interval=%ss)", os.environ.get("SESSION_HEALTHCHECK_INTERVAL", "3600"))
+    except Exception as e:
+        logger.error(f"Failed to start session healthcheck: {e}")
+
     # Check FFmpeg (binary) availability and ffmpeg-python binding; warn if missing
     try:
         available = await check_ffmpeg_available()
@@ -1718,6 +1761,12 @@ async def main(background: bool = False) -> None:
                     logger.info("Cleanup manager stop requested")
                 except Exception as e:
                     logger.error(f"Error stopping cleanup manager: {e}")
+
+                try:
+                    stop_session_healthcheck()
+                    logger.info("Session healthcheck stop requested")
+                except Exception as e:
+                    logger.error(f"Error stopping session healthcheck: {e}")
 
                 if polling_task:
                     try:
