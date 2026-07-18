@@ -272,7 +272,8 @@ async def run_ffmpeg(
                         return False, "cancelled"
                 except Exception:
                     pass
-            elif key == "progress" and val == "end":
+            # Check for progress=end marker (separate if, not elif of redis check)
+            if key == "progress" and val == "end":
                 # finish marker
                 break
 
