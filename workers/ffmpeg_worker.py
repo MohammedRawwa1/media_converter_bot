@@ -489,13 +489,37 @@ async def handle_job(job: dict):
     if job_type in ("ffmpeg", None) or job.get("ffmpeg_args"):
         try:
             redis_lock_client = await get_redis()
-            lock_name = (input_path or job.get("source_url") or job_id) or job_id
+            # Use the canonical remote key (input_key) as the lock name when available,
+            # so BigFilePipeline jobs sharing the same S3 input collide on the same lock.
+            # This prevents duplicate processing of the same remote file.
+            lock_name = (job.get("input_key") or input_path or job.get("source_url") or job_id) or job_id
             lock_hash = hashlib.sha256(str(lock_name).encode()).hexdigest()
             lock_key = f"ffmpeg:lock:{lock_hash}"
             lock_ttl = int(os.environ.get("JOB_LOCK_SECONDS", str(6 * 3600)))
             lock_acquired = await redis_lock_client.set(lock_key, job_id, nx=True, ex=lock_ttl)
         except Exception:
             lock_acquired = True
+
+    if not lock_acquired:
+        # Check if we already own this lock from a previous attempt.
+        # If the existing lock value matches our job_id, the lock was set
+        # by an earlier run of this same job and is still valid — treat as
+        # acquired rather than entering an infinite requeue loop.
+        try:
+            current_val = await redis_lock_client.get(lock_key)
+            if current_val:
+                if isinstance(current_val, bytes):
+                    current_val = current_val.decode()
+                if current_val == job_id:
+                    lock_acquired = True
+                    logger.info("Input lock already owned by this job %s, reusing", job_id)
+                    # Refresh the TTL so the lock doesn't expire during processing
+                    try:
+                        await redis_lock_client.expire(lock_key, lock_ttl)
+                    except Exception:
+                        pass
+        except Exception:
+            pass
 
     if not lock_acquired:
         logger.info("Input already locked for job %s, requeueing", job_id)
