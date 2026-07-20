@@ -267,12 +267,23 @@ class MediaConversionModel:
 
     # -------- Session helpers --------
     async def save_session(self, user_id: int, session_data: Dict[str, Any]) -> bool:
-        """Save a minimal session document for quick recovery across restarts."""
+        """Save a minimal session document for quick recovery across restarts.
+
+        Uses individual ``session.<key>`` paths in ``$set`` so multiple callers
+        can update distinct keys within the ``session`` sub-document without
+        clobbering each other — critical when saves run in parallel (e.g.
+        the healthchecker checks both Telethon and Pyrogram concurrently).
+        """
         try:
-            doc = {"user_id": user_id, "session": session_data, "updated_at": datetime.utcnow()}
+            set_fields = {"updated_at": datetime.utcnow()}
+            for key, value in session_data.items():
+                set_fields[f"session.{key}"] = value
+            query = {"user_id": user_id}
             if self.bot_id is not None:
-                doc["bot_id"] = self.bot_id
-            await self.sessions.update_one({"user_id": user_id, **({"bot_id": self.bot_id} if self.bot_id is not None else {})}, {"$set": doc}, upsert=True)
+                query["bot_id"] = self.bot_id
+                set_fields["bot_id"] = self.bot_id
+            set_fields["user_id"] = user_id
+            await self.sessions.update_one(query, {"$set": set_fields}, upsert=True)
             return True
         except Exception as e:
             # Allow quieter logging during Mongo outages. Set QUIET_MONGO_SESSION_ERRORS=1

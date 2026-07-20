@@ -362,20 +362,31 @@ class SessionHealthChecker:
             from utils.telethon_session import (
                 build_pyrogram_client,
                 get_userbot_credentials,
+                _load_session_string_from_file_async,
+                _get_env_value,
             )
         except ImportError as exc:
             h.error = f"import failed: {exc}"
             return h
 
-        # Only proceed if a session string is actually configured
-        try:
-            from utils.telethon_session import get_pyrogram_session_string
-            if not get_pyrogram_session_string():
-                h.alive = False
-                h.error = "PYROGRAM_SESSION not configured"
+        # Check env vars first (fast, no I/O) — skip the file read if set
+        env_str = _get_env_value(
+            "PYROGRAM_SESSION", "pyrogram_session",
+            "USERBOT_PYROGRAM_SESSION", "userbot_pyrogram_session",
+        )
+        if env_str:
+            session_str = env_str
+        else:
+            # Read the persisted JSON file async to avoid blocking the event loop
+            try:
+                session_str = await _load_session_string_from_file_async(client_type="pyrogram")
+            except Exception as exc:
+                h.error = f"config check failed: {exc}"
                 return h
-        except Exception as exc:
-            h.error = f"config check failed: {exc}"
+
+        if not session_str:
+            h.alive = False
+            h.error = "PYROGRAM_SESSION not configured"
             return h
 
         try:
@@ -384,7 +395,7 @@ class SessionHealthChecker:
             h.error = str(exc)
             return h
 
-        client = build_pyrogram_client(api_id, api_hash)
+        client = build_pyrogram_client(api_id, api_hash, session_str=session_str)
         if client is None:
             h.error = "build_pyrogram_client returned None"
             return h
@@ -435,12 +446,33 @@ class SessionHealthChecker:
         from utils.telethon_session import (
             build_telethon_client,
             get_userbot_credentials,
-            has_usable_telethon_session,
+            _load_session_string_from_file_async,
+            _get_env_value,
+            get_telethon_session_path,
         )
 
-        if not has_usable_telethon_session():
-            h.error = "Telethon session not configured"
-            return h
+        # Check env vars first (fast, no I/O)
+        session_str = _get_env_value(
+            "API_SESSION", "SESSION", "api_session", "USERBOT_SESSION",
+            "userbot_session", "TELETHON_SESSION", "telethon_session",
+        )
+        if not session_str:
+            # Read the persisted JSON file async to avoid blocking the event loop
+            try:
+                session_str = await _load_session_string_from_file_async(client_type="telethon")
+            except Exception as exc:
+                h.error = f"config check failed: {exc}"
+                return h
+
+        if not session_str:
+            # Fall back to checking for a file-based .session on disk
+            session_path = get_telethon_session_path()
+            if os.path.exists(session_path) or os.path.exists(session_path + ".session"):
+                # File-based session exists — let build_telethon_client find it
+                pass  # proceed with build below (session_str stays None)
+            else:
+                h.error = "Telethon session not configured"
+                return h
 
         try:
             api_id, api_hash = get_userbot_credentials()
@@ -449,7 +481,7 @@ class SessionHealthChecker:
             return h
 
         try:
-            client = build_telethon_client(api_id, api_hash)
+            client = build_telethon_client(api_id, api_hash, session_str=session_str)
         except Exception as exc:
             h.error = f"build_telethon_client failed: {exc}"
             return h
@@ -505,18 +537,24 @@ class SessionHealthChecker:
             # Save to local JSON file (bridges StringSession -> file fallback)
             saved_file = False
             try:
-                from utils.telethon_session import save_session_string_to_file
-                saved_file = save_session_string_to_file(session_str, client_type="telethon")
+                from utils.telethon_session import save_session_string_to_file_async
+                saved_file = await save_session_string_to_file_async(session_str, client_type="telethon")
             except Exception:
                 pass
 
-            # Save to MongoDB (for login flow and diagnostics)
+            # Save to MongoDB (for login flow and diagnostics).
+            # Use distinct keys so Telethon and Pyrogram session strings
+            # don't clobber each other. Keep "string_session" for backward
+            # compatibility with sessions saved before the split.
             saved_mongo = False
             if self.db_model is not None and self.admin_user_id is not None:
                 try:
                     await self.db_model.save_session(
                         self.admin_user_id,
-                        {"string_session": session_str},
+                        {
+                            "telethon_session": session_str,
+                            "string_session": session_str,  # backward compat
+                        },
                     )
                     saved_mongo = True
                 except Exception as exc:
@@ -553,18 +591,24 @@ class SessionHealthChecker:
             # Save to local JSON file (bridges in-memory session -> file fallback)
             saved_file = False
             try:
-                from utils.telethon_session import save_session_string_to_file
-                saved_file = save_session_string_to_file(session_str, client_type="pyrogram")
+                from utils.telethon_session import save_session_string_to_file_async
+                saved_file = await save_session_string_to_file_async(session_str, client_type="pyrogram")
             except Exception:
                 pass
 
-            # Save to MongoDB (for login flow and diagnostics)
+            # Save to MongoDB (for login flow and diagnostics).
+            # Use distinct keys so Pyrogram and Telethon session strings
+            # don't clobber each other. Keep "string_session" for backward
+            # compatibility with sessions saved before the split.
             saved_mongo = False
             if self.db_model is not None and self.admin_user_id is not None:
                 try:
                     await self.db_model.save_session(
                         self.admin_user_id,
-                        {"string_session": session_str},
+                        {
+                            "pyrogram_session": session_str,
+                            "string_session": session_str,  # backward compat
+                        },
                     )
                     saved_mongo = True
                 except Exception as exc:

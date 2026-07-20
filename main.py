@@ -523,6 +523,20 @@ def setup_handlers(application: Application) -> None:
             await update.message.reply_text("Unauthorized")
             return
 
+        # ── Persisted JSON file check (async, non-blocking) ──
+        json_session = None
+        json_file_exists = False
+        try:
+            from utils.telethon_session import _get_persisted_session_path, _load_all_sessions_from_file_async
+            _p = _get_persisted_session_path()
+            json_file_exists = os.path.exists(_p)
+            json_session = await _load_all_sessions_from_file_async()
+        except Exception:
+            pass
+
+        tele_from_json = bool(json_session and json_session.get("telethon_session")) if json_session else False
+        pyro_from_json = bool(json_session and json_session.get("pyrogram_session")) if json_session else False
+
         # ── Telethon session availability ──
         telethon_ready = False
         telethon_status = {"ready": False, "source": "missing", "details": "No Telethon session configured or persisted"}
@@ -587,10 +601,14 @@ def setup_handlers(application: Application) -> None:
             ),
             "**Pyrogram session:** " + ("\u2705 Available" if pyrogram_ready else "\u274c Not configured"),
             "",
+            "**Persisted JSON file:** " + ("\u2705 Exists" if json_file_exists else "\u274c Not found"),
+            f"  Telethon in JSON: {'\u2705' if tele_from_json else '\u274c'}",
+            f"  Pyrogram in JSON: {'\u2705' if pyro_from_json else '\u274c'}",
+            "",
             "**Active login flow:**",
             f"  awaiting: {awaiting}",
             f"  sent_at: `{sent_at}`",
-            f"  resend_count: `{resend_count}`",
+            f"  resend_count: {resend_count}",
             f"  code_hash: `{masked_hash}`",
             f"  session_path: `{session_path}`",
         ]
@@ -1065,21 +1083,49 @@ def setup_handlers(application: Application) -> None:
             os.makedirs(session_dir, exist_ok=True)
             session_path = os.path.join(session_dir, session_name)
 
-            # Try to load an existing Telethon session from MongoDB
+            # Try to load an existing Telethon session from available sources.
+            # Resolution order:
+            # 1. Persisted JSON file (written by healthchecker — async, non-blocking)
+            # 2. MongoDB (for backward compat with sessions saved before JSON bridge)
             saved_session_str = None
+
+            # 1. Check the persisted JSON file first
             try:
-                db_model_l = context.application.bot_data.get("db_model")
-                if db_model_l is not None:
-                    sess_data = await db_model_l.load_session(user_id)
-                    if sess_data and isinstance(sess_data, dict):
-                        saved_session_str = sess_data.get("string_session")
-            except Exception as load_err:
-                logger.warning("Failed to load Telethon session from MongoDB: %s", load_err)
-                saved_session_str = None
+                from utils.telethon_session import _load_session_string_from_file_async
+                saved_session_str = await _load_session_string_from_file_async(client_type="telethon")
+            except Exception:
+                pass
+
+            # 2. Fall back to MongoDB if JSON file had nothing
+            if not saved_session_str:
+                try:
+                    db_model_l = context.application.bot_data.get("db_model")
+                    if db_model_l is not None:
+                        sess_data = await db_model_l.load_session(user_id)
+                        if sess_data and isinstance(sess_data, dict):
+                            saved_session_str = (
+                                sess_data.get("telethon_session")
+                                or sess_data.get("string_session")
+                            )
+                except Exception as load_err:
+                    logger.warning("Failed to load Telethon session from MongoDB: %s", load_err)
+                    saved_session_str = None
 
             if saved_session_str:
-                client = TelegramClient(StringSession(saved_session_str), api_id, api_hash)
-                logger.info("Loaded saved Telethon session from MongoDB for user=%s", user_id)
+                try:
+                    client = TelegramClient(StringSession(saved_session_str), api_id, api_hash)
+                    logger.info(
+                        "Loaded saved Telethon session from MongoDB for user=%s (%d chars)",
+                        user_id, len(saved_session_str),
+                    )
+                except Exception as session_err:
+                    logger.warning(
+                        "Stored Telethon session string is invalid for user=%s: %s; "
+                        "starting fresh login",
+                        user_id, session_err,
+                    )
+                    saved_session_str = None
+                    client = TelegramClient(StringSession(), api_id, api_hash)
             else:
                 client = TelegramClient(StringSession(), api_id, api_hash)
             try:
@@ -1184,19 +1230,25 @@ def setup_handlers(application: Application) -> None:
                             session_str = client.session.save()
                             saved_to = []
 
-                            # Save to MongoDB (for login flow and diagnostics)
+                            # Save to MongoDB (for login flow and diagnostics).
+                            # Use "telethon_session" key for consistency with
+                            # the healthchecker's save format; keep
+                            # "string_session" for backward compatibility.
                             try:
                                 db_model_login = context.application.bot_data.get("db_model")
                                 if db_model_login is not None:
-                                    await db_model_login.save_session(user_id, {"string_session": session_str})
+                                    await db_model_login.save_session(user_id, {
+                                        "telethon_session": session_str,
+                                        "string_session": session_str,
+                                    })
                                     saved_to.append("MongoDB")
                             except Exception:
                                 pass
 
                             # Save to local JSON file (bridges to downloader/uploader fallback chain)
                             try:
-                                from utils.telethon_session import save_session_string_to_file
-                                if save_session_string_to_file(str(session_str), client_type="telethon"):
+                                from utils.telethon_session import save_session_string_to_file_async
+                                if await save_session_string_to_file_async(str(session_str), client_type="telethon"):
                                     saved_to.append("JSON file")
                             except Exception:
                                 pass

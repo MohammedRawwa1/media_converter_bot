@@ -1,5 +1,8 @@
+import asyncio
 import json
 import os
+import time
+import threading
 import logging
 from typing import Optional, Union
 
@@ -64,6 +67,46 @@ def get_telethon_session_path() -> str:
 _KEY_TELETHON = "telethon_session"
 _KEY_PYROGRAM = "pyrogram_session"
 
+# ── In-memory cache for session file reads ────────────────────────
+#
+# Both Telethon and Pyrogram checks in the healthchecker read the same
+# JSON file.  To avoid redundant disk I/O within a single cycle, the
+# file contents are cached in-memory with a short TTL.  The cache is
+# invalidated whenever a write occurs.
+#
+# A ``threading.Lock`` protects access to the module-level globals
+# because the cache functions are called from thread pool workers
+# (via ``asyncio.to_thread``) when the async readers are used.
+# ------------------------------------------------------------------
+_SESSION_CACHE_DATA = None
+_SESSION_CACHE_EXPIRES = 0.0
+_SESSION_CACHE_TTL = 60  # seconds
+_SESSION_CACHE_LOCK = threading.Lock()
+
+
+def _get_cached_sessions() -> Optional[dict]:
+    """Return cached session dict if still fresh, else None."""
+    with _SESSION_CACHE_LOCK:
+        if _SESSION_CACHE_DATA is not None and time.time() < _SESSION_CACHE_EXPIRES:
+            return _SESSION_CACHE_DATA
+        return None
+
+
+def _set_cached_sessions(data: dict):
+    """Cache session data with the module-level TTL."""
+    with _SESSION_CACHE_LOCK:
+        global _SESSION_CACHE_DATA, _SESSION_CACHE_EXPIRES
+        _SESSION_CACHE_DATA = data
+        _SESSION_CACHE_EXPIRES = time.time() + _SESSION_CACHE_TTL
+
+
+def _invalidate_session_cache():
+    """Clear the in-memory cache after a write."""
+    with _SESSION_CACHE_LOCK:
+        global _SESSION_CACHE_DATA, _SESSION_CACHE_EXPIRES
+        _SESSION_CACHE_DATA = None
+        _SESSION_CACHE_EXPIRES = 0.0
+
 
 def _get_persisted_session_path() -> str:
     """Return the path to the JSON file used for session string persistence.
@@ -75,30 +118,58 @@ def _get_persisted_session_path() -> str:
 
 
 def _load_all_sessions_from_file() -> dict:
-    """Read the full persisted JSON dict from disk.
+    """Read the full persisted JSON dict from disk (synchronous).
 
     Returns a dict (possibly empty) on success, or an empty dict on failure.
+
+    Results are cached in-memory for ``_SESSION_CACHE_TTL`` seconds to
+    avoid redundant reads within a single healthcheck cycle.
+
+    For async contexts, prefer ``_load_all_sessions_from_file_async``
+    which runs the I/O in a thread to avoid blocking the event loop.
     """
+    # Check in-memory cache first to avoid redundant disk I/O
+    cached = _get_cached_sessions()
+    if cached is not None:
+        return cached
+
     path = _get_persisted_session_path()
     if not os.path.exists(path):
+        _set_cached_sessions({})
         return {}
     try:
         with open(path, "r") as f:
             data = json.load(f)
-        return data if isinstance(data, dict) else {}
+        result = data if isinstance(data, dict) else {}
+        _set_cached_sessions(result)
+        return result
     except Exception as exc:
         logger.debug("session: failed to read persisted session file %s: %s", path, exc)
+        _set_cached_sessions({})
         return {}
 
 
+async def _load_all_sessions_from_file_async() -> dict:
+    """Async version of ``_load_all_sessions_from_file``.
+
+    Runs the sync file I/O in a thread via ``asyncio.to_thread`` so the
+    event loop is not blocked during disk reads.  Intended for callers
+    in async contexts (healthchecker).
+    """
+    return await asyncio.to_thread(_load_all_sessions_from_file)
+
+
 def save_session_string_to_file(session_str: str, client_type: str = "telethon") -> bool:
-    """Persist a session string to a shared JSON file.
+    """Persist a session string to a shared JSON file (synchronous).
 
     Both Telethon and Pyrogram session strings are stored in the same file
     under different keys (``telethon_session`` / ``pyrogram_session``).
     The ``client_type`` parameter determines which key is updated.
 
     Best-effort: returns True on success, False on failure (logged).
+
+    For async contexts, prefer ``save_session_string_to_file_async``
+    which runs the I/O in a thread to avoid blocking the event loop.
     """
     path = _get_persisted_session_path()
     try:
@@ -114,6 +185,8 @@ def save_session_string_to_file(session_str: str, client_type: str = "telethon")
             "session: persisted %s session string to %s (%d chars)",
             client_type, path, len(session_str),
         )
+        # Invalidate in-memory cache so subsequent reads see the new data
+        _invalidate_session_cache()
         return True
     except Exception as exc:
         logger.debug(
@@ -123,8 +196,22 @@ def save_session_string_to_file(session_str: str, client_type: str = "telethon")
         return False
 
 
+async def save_session_string_to_file_async(session_str: str, client_type: str = "telethon") -> bool:
+    """Async version of ``save_session_string_to_file``.
+
+    Runs the sync file I/O in a thread via ``asyncio.to_thread`` so the
+    event loop is not blocked during disk writes.  Intended for callers
+    in async contexts (healthchecker, login flow).
+    """
+    return await asyncio.to_thread(
+        save_session_string_to_file,
+        session_str,
+        client_type=client_type,
+    )
+
+
 def _load_session_string_from_file(client_type: str = "telethon") -> Optional[str]:
-    """Load a session string previously persisted by the healthchecker.
+    """Load a session string previously persisted by the healthchecker (synchronous).
 
     Parameters
     ----------
@@ -132,8 +219,32 @@ def _load_session_string_from_file(client_type: str = "telethon") -> Optional[st
         ``"telethon"`` (default) or ``"pyrogram"``.
 
     Returns the string or None if the file is missing or the key not found.
+
+    For async contexts, prefer ``_load_session_string_from_file_async``
+    which runs the I/O in a thread to avoid blocking the event loop.
     """
     data = _load_all_sessions_from_file()
+    if not data:
+        return None
+    key = _KEY_TELETHON if client_type == "telethon" else _KEY_PYROGRAM
+    session_str = data.get(key)
+    if session_str:
+        logger.info(
+            "session: loaded %s session string from %s (%d chars)",
+            client_type, _get_persisted_session_path(), len(session_str),
+        )
+        return session_str
+    return None
+
+
+async def _load_session_string_from_file_async(client_type: str = "telethon") -> Optional[str]:
+    """Async version of ``_load_session_string_from_file``.
+
+    Runs the sync file I/O in a thread via ``asyncio.to_thread`` so the
+    event loop is not blocked during disk reads.  Intended for callers
+    in async contexts (healthchecker).
+    """
+    data = await _load_all_sessions_from_file_async()
     if not data:
         return None
     key = _KEY_TELETHON if client_type == "telethon" else _KEY_PYROGRAM
@@ -375,22 +486,38 @@ def get_pyrogram_session_string() -> Optional[str]:
     return None
 
 
-def build_pyrogram_client(api_id: int, api_hash: str) -> Optional[object]:
-    """Build a Pyrogram client from a session string env var.
+def build_pyrogram_client(api_id: int, api_hash: str, session_str: Optional[str] = None) -> Optional[object]:
+    """Build a Pyrogram client from a session string.
+
+    Parameters
+    ----------
+    api_id:
+        Telegram API ID.
+    api_hash:
+        Telegram API hash.
+    session_str:
+        Optional explicit session string.  If not provided, the function
+        resolves the session from env vars -> persisted JSON file
+        (same resolution as ``get_pyrogram_session_string()``).
+
+    When ``session_str`` is provided explicitly, the internal resolution
+    is skipped entirely, avoiding redundant file I/O — useful when the
+    caller has already loaded the session string asynchronously.
 
     Reads the following env vars for retry/timeout configuration:
       - PYROGRAM_SLEEP_THRESHOLD (default 30): seconds to sleep before retrying
         on flood-wait or transient server errors.
       - PYROGRAM_MAX_RETRIES (default 10): max RPC retries per request.
 
-    Returns a started Pyrogram Client if PYROGRAM_SESSION is set, otherwise None.
-    The caller must call client.start() before using it.
+    Returns a Pyrogram Client ready for ``client.start()``, or None if no
+    session string is available (or Pyrogram is not installed).
     """
     if PyrogramClient is None:
         logger.debug("Pyrogram is not installed; cannot use Pyrogram session string.")
         return None
 
-    session_str = get_pyrogram_session_string()
+    if session_str is None:
+        session_str = get_pyrogram_session_string()
     if not session_str:
         return None
 
