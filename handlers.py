@@ -654,11 +654,19 @@ class EnhancedMediaHandler:
         # Preserve the original source identifiers for userbot fallback and the
         # big-file pipeline so we can reuse the real chat/message pair when the
         # bot API download fails.
-        current_file.setdefault("chat_id", current_file.get("forward", {}).get("chat_id"))
+        #
+        # NOTE: current_file["forward"] may be explicitly None (stored as such by
+        # handle_document/handle_video when the message is not a forward), so we
+        # MUST use ``current_file.get("forward") or {}`` instead of the seemingly
+        # equivalent ``current_file.get("forward", {})`` — the latter returns None
+        # when the key exists but its value is None, which would cause a
+        # ``'NoneType' object has no attribute 'get'`` crash on the next .get() call.
+        _forward = current_file.get("forward") or {}
+        current_file.setdefault("chat_id", _forward.get("chat_id"))
         current_file.setdefault("msg_id", current_file.get("msg_id") or current_file.get("message_id"))
         current_file.setdefault("message_id", current_file.get("msg_id") or current_file.get("message_id"))
-        current_file.setdefault("forward_chat_id", current_file.get("forward", {}).get("chat_id"))
-        current_file.setdefault("forward_message_id", current_file.get("forward", {}).get("message_id"))
+        current_file.setdefault("forward_chat_id", _forward.get("chat_id"))
+        current_file.setdefault("forward_message_id", _forward.get("message_id"))
 
         # Prepare extension and paths early so fallback download (userbot) can use them
         ext = ""
