@@ -145,7 +145,12 @@ def _load_all_sessions_from_file() -> dict:
         return result
     except Exception as exc:
         logger.debug("session: failed to read persisted session file %s: %s", path, exc)
-        _set_cached_sessions({})
+        # DO NOT cache the empty result here!  A transient read error (e.g. temporary
+        # file lock, incomplete write from another process, or a JSON decode glitch)
+        # would otherwise poison the in-memory cache with {} for the next 60 seconds.
+        # Any call to ``save_session_string_to_file`` during that window would then
+        # read the cached {}, update only one key, and silently drop the other — which
+        # is exactly how ``telethon_session`` kept disappearing from the JSON file.
         return {}
 
 
@@ -170,11 +175,32 @@ def save_session_string_to_file(session_str: str, client_type: str = "telethon")
 
     For async contexts, prefer ``save_session_string_to_file_async``
     which runs the I/O in a thread to avoid blocking the event loop.
+
+    Important
+    ---------
+    This function reads existing session data **directly from disk**,
+    bypassing the in-memory ``_SESSION_CACHE``.  This avoids a subtle
+    clobbering bug: if ``_load_all_sessions_from_file`` cached ``{}``
+    after a transient read error, a subsequent write here would
+    silently drop the other session key written by the other client.
     """
     path = _get_persisted_session_path()
     try:
-        # Read existing data to preserve the other session type
-        existing = _load_all_sessions_from_file()
+        # Read existing data directly from disk, bypassing the in-memory cache.
+        # Using the cache here is dangerous: if a transient read error poisoned
+        # the cache with {}, we would silently drop the other session key.
+        existing = {}
+        if os.path.exists(path):
+            try:
+                with open(path, "r") as f:
+                    _raw = json.load(f)
+                if isinstance(_raw, dict):
+                    existing = _raw
+            except Exception as exc:
+                logger.debug(
+                    "session: failed to read existing data from %s before write: %s",
+                    path, exc,
+                )
         key = _KEY_TELETHON if client_type == "telethon" else _KEY_PYROGRAM
         existing[key] = session_str
 
