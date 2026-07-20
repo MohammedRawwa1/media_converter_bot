@@ -83,6 +83,11 @@ class SessionHealth:
 class SessionHealthChecker:
     """Periodically checks userbot session health.
 
+    When a session is confirmed healthy during a check, the current session
+    string is extracted and persisted to MongoDB (via ``db_model``). This
+    ensures long-lived sessions are preserved across restarts even when the
+    original env var or ``.session`` file is lost.
+
     Important
     ---------
     This checker runs as a background asyncio task.  It connects to Telegram
@@ -98,11 +103,13 @@ class SessionHealthChecker:
         check_interval: int = 3600,          # every hour
         admin_user_id: Optional[int] = None,
         bot_app=None,                         # PTB Application
+        db_model=None,                        # MongoDB model (MediaConversionModel)
         max_consecutive_failures: int = 3,
     ):
         self.check_interval = check_interval
         self.admin_user_id = admin_user_id
         self.bot_app = bot_app
+        self.db_model = db_model
         self.max_consecutive_failures = max_consecutive_failures
 
         self.is_running = False
@@ -344,7 +351,11 @@ class SessionHealthChecker:
             return False
 
     async def _check_pyrogram(self) -> SessionHealth:
-        """Check if the Pyrogram session string is still valid."""
+        """Check if the Pyrogram session string is still valid.
+
+        On success, persists the current session string to MongoDB so that
+        long-lived sessions survive restarts (see ``_save_pyrogram_session``).
+        """
         h = SessionHealth("pyrogram")
 
         try:
@@ -393,6 +404,8 @@ class SessionHealthChecker:
                     h.dc_id = client.storage.dc_id() if hasattr(client.storage, "dc_id") else None
                 except Exception:
                     pass
+                # Persist session string to MongoDB for long-term survival
+                await self._save_pyrogram_session(client)
             else:
                 h.error = "get_me() returned None (not authorized)"
         except Exception as exc:
@@ -412,7 +425,11 @@ class SessionHealthChecker:
         return h
 
     async def _check_telethon(self) -> SessionHealth:
-        """Check if the Telethon session is still valid."""
+        """Check if the Telethon session is still valid.
+
+        On success, persists the current session string to MongoDB so that
+        long-lived sessions survive restarts (see ``_save_telethon_session``).
+        """
         h = SessionHealth("telethon")
 
         from utils.telethon_session import (
@@ -455,6 +472,8 @@ class SessionHealthChecker:
                     h.dc_id = client.session.dc_id if hasattr(client.session, "dc_id") else None
                 except Exception:
                     pass
+                # Persist session string to MongoDB for long-term survival
+                await self._save_telethon_session(client)
             else:
                 h.error = "Session exists but user is not authorized"
         except Exception as exc:
@@ -468,6 +487,104 @@ class SessionHealthChecker:
                 pass
 
         return h
+
+    # ── Session persistence helpers ────────────────────────────────
+
+    async def _save_telethon_session(self, client):
+        """Extract and persist the current Telethon session string.
+
+        Saves to both MongoDB (for the login flow) and a local JSON file
+        (for the downloader/uploader fallback chain). Best-effort.
+        """
+        try:
+            session_str = client.session.save()
+            if not session_str:
+                return
+            session_str = str(session_str)
+
+            # Save to local JSON file (bridges StringSession -> file fallback)
+            saved_file = False
+            try:
+                from utils.telethon_session import save_session_string_to_file
+                saved_file = save_session_string_to_file(session_str, client_type="telethon")
+            except Exception:
+                pass
+
+            # Save to MongoDB (for login flow and diagnostics)
+            saved_mongo = False
+            if self.db_model is not None and self.admin_user_id is not None:
+                try:
+                    await self.db_model.save_session(
+                        self.admin_user_id,
+                        {"string_session": session_str},
+                    )
+                    saved_mongo = True
+                except Exception as exc:
+                    logger.debug(
+                        "SessionHealthChecker: failed to persist Telethon session to MongoDB: %s", exc,
+                    )
+
+            if saved_file or saved_mongo:
+                logger.info(
+                    "SessionHealthChecker: persisted Telethon session (file=%s, mongo=%s)",
+                    saved_file, saved_mongo,
+                )
+            else:
+                logger.debug(
+                    "SessionHealthChecker: skipped Telethon session persistence (no targets configured)",
+                )
+        except Exception as exc:
+            logger.debug(
+                "SessionHealthChecker: failed to extract Telethon session string: %s", exc,
+            )
+
+    async def _save_pyrogram_session(self, client):
+        """Export and persist the current Pyrogram session string.
+
+        Saves to both MongoDB (for the login flow) and a local JSON file
+        (for the downloader/uploader fallback chain). Best-effort.
+        """
+        try:
+            session_str = await client.export_session_string()
+            if not session_str:
+                return
+            session_str = str(session_str)
+
+            # Save to local JSON file (bridges in-memory session -> file fallback)
+            saved_file = False
+            try:
+                from utils.telethon_session import save_session_string_to_file
+                saved_file = save_session_string_to_file(session_str, client_type="pyrogram")
+            except Exception:
+                pass
+
+            # Save to MongoDB (for login flow and diagnostics)
+            saved_mongo = False
+            if self.db_model is not None and self.admin_user_id is not None:
+                try:
+                    await self.db_model.save_session(
+                        self.admin_user_id,
+                        {"string_session": session_str},
+                    )
+                    saved_mongo = True
+                except Exception as exc:
+                    logger.debug(
+                        "SessionHealthChecker: failed to persist Pyrogram session to MongoDB: %s", exc,
+                    )
+
+            if saved_file or saved_mongo:
+                logger.info(
+                    "SessionHealthChecker: persisted Pyrogram session (file=%s, mongo=%s)",
+                    saved_file, saved_mongo,
+                )
+            else:
+                logger.debug(
+                    "SessionHealthChecker: skipped Pyrogram session persistence (no targets configured)",
+                )
+        except Exception as exc:
+            logger.debug(
+                "SessionHealthChecker: failed to export Pyrogram session string: %s", exc,
+            )
 
     # ── Admin alerts ────────────────────────────────────────────────
 
@@ -576,9 +693,13 @@ def get_session_healthchecker() -> SessionHealthChecker:
 def start_session_healthcheck(
     admin_user_id: Optional[int] = None,
     bot_app=None,
+    db_model=None,
     check_interval: int = 3600,
 ) -> asyncio.Task:
     """Start the session healthcheck background loop.
+
+    When a session is confirmed healthy, its session string is automatically
+    persisted to MongoDB (via ``db_model``) so it survives restarts.
 
     Parameters
     ----------
@@ -586,6 +707,9 @@ def start_session_healthcheck(
         Telegram user ID to receive alerts when a session becomes unhealthy.
     bot_app:
         The PTB ``Application`` instance (needed to send admin messages).
+    db_model:
+        MongoDB model (e.g. ``MediaConversionModel``) with ``save_session`` method.
+        When provided, session strings are persisted after successful health checks.
     check_interval:
         Seconds between health checks (default 3600 = 1 hour).
 
@@ -596,6 +720,8 @@ def start_session_healthcheck(
         checker.admin_user_id = admin_user_id
     if bot_app is not None:
         checker.bot_app = bot_app
+    if db_model is not None:
+        checker.db_model = db_model
     checker.check_interval = check_interval
     return checker.start()
 

@@ -732,7 +732,7 @@ def setup_handlers(application: Application) -> None:
                     removed.append(session_path)
                 except Exception:
                     pass
-            for suffix in (".session", ".session-journal", ".session.lock"):
+            for suffix in (".session", ".session-journal", ".session.lock", ".session.json"):
                 path_with_suffix = session_path + suffix
                 if os.path.exists(path_with_suffix):
                     try:
@@ -1180,17 +1180,28 @@ def setup_handlers(application: Application) -> None:
                                 break  # 2FA handled
 
                         if await client.is_user_authorized():
-                            # Save session string to MongoDB for persistence
+                            # Save session string to MongoDB and JSON file for persistence
                             session_str = client.session.save()
+                            saved_to = []
+
+                            # Save to MongoDB (for login flow and diagnostics)
                             try:
                                 db_model_login = context.application.bot_data.get("db_model")
                                 if db_model_login is not None:
                                     await db_model_login.save_session(user_id, {"string_session": session_str})
-                                    session_saved = "MongoDB"
-                                else:
-                                    session_saved = "memory (no db_model)"
+                                    saved_to.append("MongoDB")
                             except Exception:
-                                session_saved = "memory (save failed)"
+                                pass
+
+                            # Save to local JSON file (bridges to downloader/uploader fallback chain)
+                            try:
+                                from utils.telethon_session import save_session_string_to_file
+                                if save_session_string_to_file(str(session_str), client_type="telethon"):
+                                    saved_to.append("JSON file")
+                            except Exception:
+                                pass
+
+                            session_saved = ", ".join(saved_to) if saved_to else "memory (all saves failed)"
                             await context.bot.send_message(
                                 chat_id=update.effective_chat.id,
                                 text=f"\u2705 Telethon userbot login successful.\nSession saved to: {session_saved}",
@@ -1477,14 +1488,20 @@ async def main(background: bool = False) -> None:
     except Exception as e:
         logger.error(f"Failed to start cleanup manager: {e}")
 
-    # Start session healthcheck
+    # Start session healthcheck (with MongoDB persistence for session strings)
     try:
+        _shc_db_model = application.bot_data.get("db_model")
         _shc_task = start_session_healthcheck(
             admin_user_id=ADMIN_USER_ID,
             bot_app=application,
+            db_model=_shc_db_model,
             check_interval=int(os.environ.get("SESSION_HEALTHCHECK_INTERVAL", "3600")),
         )
-        logger.info("Session healthcheck started (interval=%ss)", os.environ.get("SESSION_HEALTHCHECK_INTERVAL", "3600"))
+        logger.info(
+            "Session healthcheck started (interval=%ss, db_model=%s)",
+            os.environ.get("SESSION_HEALTHCHECK_INTERVAL", "3600"),
+            "yes" if _shc_db_model else "no",
+        )
     except Exception as e:
         logger.error(f"Failed to start session healthcheck: {e}")
 
