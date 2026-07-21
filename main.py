@@ -1231,16 +1231,20 @@ def setup_handlers(application: Application) -> None:
                             saved_to = []
 
                             # Save to MongoDB (for login flow and diagnostics).
-                            # Use "telethon_session" key for consistency with
-                            # the healthchecker's save format; keep
-                            # "string_session" for backward compatibility.
+                            # Use "telethon_session" and "pyrogram_session" keys
+                            # for consistency with the healthchecker's save format;
+                            # keep "string_session" for backward compatibility.
                             try:
                                 db_model_login = context.application.bot_data.get("db_model")
                                 if db_model_login is not None:
-                                    await db_model_login.save_session(user_id, {
+                                    _mongo_save = {
                                         "telethon_session": session_str,
                                         "string_session": session_str,
-                                    })
+                                    }
+                                    _mongo_pyro = os.getenv("PYROGRAM_SESSION")
+                                    if _mongo_pyro:
+                                        _mongo_save["pyrogram_session"] = _mongo_pyro
+                                    await db_model_login.save_session(user_id, _mongo_save)
                                     saved_to.append("MongoDB")
                             except Exception:
                                 pass
@@ -1250,6 +1254,22 @@ def setup_handlers(application: Application) -> None:
                                 from utils.telethon_session import save_session_string_to_file_async
                                 if await save_session_string_to_file_async(str(session_str), client_type="telethon"):
                                     saved_to.append("JSON file")
+                            except Exception:
+                                pass
+
+                            # Also eagerly persist Pyrogram session from env var to JSON
+                            # so both sessions are in the file right after /login.
+                            try:
+                                from utils.telethon_session import save_session_string_to_file_async as _pyro_save
+                                _pyro_env = os.getenv("PYROGRAM_SESSION")
+                                if _pyro_env:
+                                    if await _pyro_save(
+                                        _pyro_env, client_type="pyrogram"
+                                    ):
+                                        saved_to.append("Pyrogram JSON")
+                                        logger.info(
+                                            "Eagerly persisted PYROGRAM_SESSION to JSON (during /login)"
+                                        )
                             except Exception:
                                 pass
 
@@ -1556,6 +1576,74 @@ async def main(background: bool = False) -> None:
         )
     except Exception as e:
         logger.error(f"Failed to start session healthcheck: {e}")
+
+    # ── Eagerly persist env var session strings to JSON file on startup ──
+    # After a rebuild on Render the persisted JSON file is empty, so the
+    # "/loginstatus" command shows "Pyrogram in JSON: ❌" even though the
+    # PYROGRAM_SESSION env var is set and usable.  The healthchecker would
+    # eventually write it (after ~1 hour), but we do it here immediately
+    # so the JSON file is populated right away.
+    try:
+        from utils.telethon_session import (
+            save_session_string_to_file_async,
+            _load_all_sessions_from_file_async,
+        )
+
+        existing_json = await _load_all_sessions_from_file_async()
+
+        # Persist Pyrogram session from env var if different from JSON
+        pyro_env = os.getenv("PYROGRAM_SESSION")
+        if pyro_env and existing_json.get("pyrogram_session") != pyro_env:
+            saved = await save_session_string_to_file_async(
+                pyro_env, client_type="pyrogram"
+            )
+            if saved:
+                logger.info(
+                    "Eagerly persisted PYROGRAM_SESSION env var to JSON file"
+                )
+                # Update the in-memory snapshot so the check below sees it
+                existing_json = await _load_all_sessions_from_file_async()
+
+        # Persist Telethon session from env var if different from JSON
+        telethon_env = None
+        for _k in (
+            "API_SESSION", "SESSION", "api_session",
+            "USERBOT_SESSION", "userbot_session",
+            "TELETHON_SESSION", "telethon_session",
+        ):
+            _v = os.getenv(_k)
+            if _v:
+                telethon_env = _v
+                break
+        if telethon_env and existing_json.get("telethon_session") != telethon_env:
+            saved = await save_session_string_to_file_async(
+                telethon_env, client_type="telethon"
+            )
+            if saved:
+                logger.info(
+                    "Eagerly persisted Telethon session env var to JSON file"
+                )
+    except Exception as exc:
+        logger.debug("Eager env-var-to-JSON persistence skipped: %s", exc)
+
+    # ── Eagerly persist PYROGRAM_SESSION to MongoDB at startup ──
+    # Full redundancy: JSON file + MongoDB, both populated immediately
+    # after a rebuild so the session survives restarts no matter which
+    # persistence layer is available at recovery time.
+    try:
+        _mongo_db = application.bot_data.get("db_model")
+        if _mongo_db is not None:
+            _mongo_pyro = os.getenv("PYROGRAM_SESSION")
+            if _mongo_pyro:
+                await _mongo_db.save_session(
+                    ADMIN_USER_ID,
+                    {"pyrogram_session": _mongo_pyro},
+                )
+                logger.info(
+                    "Eagerly persisted PYROGRAM_SESSION to MongoDB (at startup)"
+                )
+    except Exception as exc:
+        logger.debug("Eager Pyrogram->MongoDB persistence skipped: %s", exc)
 
     # Check FFmpeg (binary) availability and ffmpeg-python binding; warn if missing
     try:
