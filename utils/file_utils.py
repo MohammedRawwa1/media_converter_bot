@@ -6,7 +6,6 @@ File utilities for media conversion bot.
 import asyncio
 import logging
 import os
-from typing import Dict, List, Tuple
 
 # Optional async file operations
 try:
@@ -20,7 +19,7 @@ logger = logging.getLogger(__name__)
 class AsyncFileLock:
     """Async file locking mechanism to prevent concurrent access."""
 
-    _locks: Dict[str, asyncio.Lock] = {}
+    _locks: dict[str, asyncio.Lock] = {}
     _lock_pool_lock = asyncio.Lock()
 
     @classmethod
@@ -62,7 +61,7 @@ class AsyncFileLock:
         return len(cls._locks)
 
 
-async def download_file(file_path: str, download_path: str) -> Tuple[bool, str]:
+async def download_file(file_path: str, download_path: str) -> tuple[bool, str]:
     """Download file asynchronously."""
     try:
         if not os.path.exists(file_path):
@@ -90,7 +89,7 @@ async def download_file(file_path: str, download_path: str) -> Tuple[bool, str]:
         return False, str(e)
 
 
-async def save_uploaded_file(file_content: bytes, file_path: str) -> Tuple[bool, str]:
+async def save_uploaded_file(file_content: bytes, file_path: str) -> tuple[bool, str]:
     """Save uploaded file asynchronously."""
     try:
         os.makedirs(os.path.dirname(file_path) or ".", exist_ok=True)
@@ -111,7 +110,7 @@ async def save_uploaded_file(file_content: bytes, file_path: str) -> Tuple[bool,
         return False, str(e)
 
 
-async def cleanup_file(file_path: str) -> Tuple[bool, str]:
+async def cleanup_file(file_path: str) -> tuple[bool, str]:
     """Delete a file asynchronously."""
     try:
         if os.path.exists(file_path):
@@ -125,7 +124,7 @@ async def cleanup_file(file_path: str) -> Tuple[bool, str]:
         return False, str(e)
 
 
-async def cleanup_directory(dir_path: str, recursive: bool = True) -> Tuple[bool, int]:
+async def cleanup_directory(dir_path: str, recursive: bool = True) -> tuple[bool, int]:
     """Delete all files in a directory asynchronously."""
     try:
         if not os.path.exists(dir_path):
@@ -173,7 +172,7 @@ async def cleanup_directory(dir_path: str, recursive: bool = True) -> Tuple[bool
         return False, 0
 
 
-async def get_file_info(file_path: str) -> Dict[str, any]:
+async def get_file_info(file_path: str) -> dict[str, any]:
     """Get file information asynchronously."""
     try:
         if not os.path.exists(file_path):
@@ -196,10 +195,10 @@ async def get_file_info(file_path: str) -> Dict[str, any]:
 
     except Exception as e:
         logger.error(f"Error getting file info: {e}")
-        return {"error": str(e)}
+        return {"error": "Failed to get file info"}
 
 
-async def ensure_directories(*paths: str) -> Tuple[bool, str]:
+async def ensure_directories(*paths: str) -> tuple[bool, str]:
     """Ensure directories exist asynchronously."""
     try:
         for path in paths:
@@ -243,7 +242,7 @@ async def get_output_path(input_path: str, operation: str, output_extension: str
         return None
 
 
-async def list_files(directory: str, extension: str = None) -> List[str]:
+async def list_files(directory: str, extension: str = None) -> list[str]:
     """List files in directory asynchronously."""
     try:
         if not os.path.exists(directory):
@@ -252,9 +251,8 @@ async def list_files(directory: str, extension: str = None) -> List[str]:
         files = []
         for file in os.listdir(directory):
             file_path = os.path.join(directory, file)
-            if os.path.isfile(file_path):
-                if extension is None or file.endswith(extension):
-                    files.append(file_path)
+            if os.path.isfile(file_path) and (extension is None or file.endswith(extension)):
+                files.append(file_path)
 
         return sorted(files)
 
@@ -263,7 +261,7 @@ async def list_files(directory: str, extension: str = None) -> List[str]:
         return []
 
 
-async def move_file(source: str, destination: str) -> Tuple[bool, str]:
+async def move_file(source: str, destination: str) -> tuple[bool, str]:
     """Move file asynchronously."""
     try:
         os.makedirs(os.path.dirname(destination), exist_ok=True)
@@ -294,7 +292,7 @@ async def move_file(source: str, destination: str) -> Tuple[bool, str]:
         return False, str(e)
 
 
-async def copy_file(source: str, destination: str) -> Tuple[bool, str]:
+async def copy_file(source: str, destination: str) -> tuple[bool, str]:
     """Copy file asynchronously."""
     try:
         os.makedirs(os.path.dirname(destination), exist_ok=True)
@@ -325,7 +323,7 @@ async def get_directory_size(directory: str) -> int:
     try:
         total_size = 0
 
-        for dirpath, dirnames, filenames in os.walk(directory):
+        for dirpath, _dirnames, filenames in os.walk(directory):
             for filename in filenames:
                 filepath = os.path.join(dirpath, filename)
                 total_size += os.path.getsize(filepath)
@@ -337,7 +335,7 @@ async def get_directory_size(directory: str) -> int:
         return 0
 
 
-async def validate_file_extension(file_path: str, allowed_extensions: List[str]) -> bool:
+async def validate_file_extension(file_path: str, allowed_extensions: list[str]) -> bool:
     """Validate file extension."""
     try:
         _, ext = os.path.splitext(file_path)
@@ -429,8 +427,8 @@ async def detect_filename(input_path: str, message=None) -> str:
         if probe is None:
             # fallback to ffprobe CLI executed in a thread to avoid blocking
             try:
-                import subprocess
                 import json
+                import subprocess
 
                 def _run_probe():
                     return subprocess.run(

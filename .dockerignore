@@ -1,0 +1,24 @@
+# .dockerignore - prevent secrets and build artifacts from leaking into Docker images
+.git
+.gitignore
+.env
+.env.*
+*.pyc
+__pycache__/
+.venv/
+venv/
+env/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.log
+logs/
+storage/
+.DS_Store
+.vscode/
+.idea/
+*.session
+*.session-journal
+*.session.lock
+*.session.json
+*.whl

@@ -7,14 +7,13 @@ into the existing Mongo model used by the application. Enabled via
 This module is best-effort and will not raise if Mongo or dependencies
 are missing.
 """
-import os
 import logging
-from typing import Optional
+import os
 
 logger = logging.getLogger(__name__)
 
 
-async def save_telethon_forward(metadata: dict) -> Optional[str]:
+async def save_telethon_forward(metadata: dict) -> str | None:
     """Save Telethon ingestion metadata to MongoDB using MediaConversionModel.
 
     Returns inserted id string on success or None on failure.
@@ -37,6 +36,7 @@ async def save_telethon_forward(metadata: dict) -> Optional[str]:
 
     try:
         from motor.motor_asyncio import AsyncIOMotorClient
+
         from models import MediaConversionModel
     except Exception as e:
         logger.debug("Mongo dependencies not available for Telethon bridge: %s", e)

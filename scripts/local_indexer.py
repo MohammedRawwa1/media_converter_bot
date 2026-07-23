@@ -22,13 +22,11 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
-import os
 import re
 import subprocess
-import sys
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any
 
 # --- Tokenizer (adapted from tg-index project notes) ---------------------------------
 _sep_re = re.compile(r"[\.\-_\[\]\(\)]+")
@@ -42,11 +40,11 @@ _release_junk = set([
 ])
 
 
-def _split_camel(s: str) -> List[str]:
+def _split_camel(s: str) -> list[str]:
     return _camel_re.sub(' ', s).split()
 
 
-def normalize_and_classify(filename: str) -> Dict[str, Any]:
+def normalize_and_classify(filename: str) -> dict[str, Any]:
     base = filename.rsplit('/', 1)[-1]
     s = base
     s = s.replace('\n', ' ')
@@ -57,11 +55,11 @@ def normalize_and_classify(filename: str) -> Dict[str, Any]:
 
     parts = s.split(' ')
 
-    title_tokens: List[str] = []
-    quality_tokens: List[str] = []
-    codec_tokens: List[str] = []
-    year: Optional[int] = None
-    other: List[str] = []
+    title_tokens: list[str] = []
+    quality_tokens: list[str] = []
+    codec_tokens: list[str] = []
+    year: int | None = None
+    other: list[str] = []
 
     for p in parts:
         if not p:
@@ -82,9 +80,9 @@ def normalize_and_classify(filename: str) -> Dict[str, Any]:
             continue
         other.append(p)
 
-    def uniq(seq: List[str]) -> List[str]:
+    def uniq(seq: list[str]) -> list[str]:
         seen = set()
-        out: List[str] = []
+        out: list[str] = []
         for x in seq:
             if x not in seen:
                 seen.add(x)
@@ -100,7 +98,7 @@ def normalize_and_classify(filename: str) -> Dict[str, Any]:
     }
 
 
-def tokenize_query(query: str) -> List[str]:
+def tokenize_query(query: str) -> list[str]:
     q = _sep_re.sub(' ', query)
     q = ' '.join(_split_camel(q))
     q = q.lower().strip()
@@ -111,7 +109,7 @@ def tokenize_query(query: str) -> List[str]:
 # --- FFprobe / FFmpeg helpers --------------------------------------------------------
 
 
-def ffprobe_info(path: Path) -> Dict[str, Optional[Any]]:
+def ffprobe_info(path: Path) -> dict[str, Any | None]:
     """Return dict with duration (seconds), width, height, codec_name or empty dict on failure."""
     try:
         cmd = [
@@ -166,14 +164,14 @@ def create_thumbnail(path: Path, thumb_path: Path, time_offset: str = '00:00:01'
 
 def make_id(path: Path) -> str:
     st = path.stat()
-    key = f"{str(path.resolve())}:{int(st.st_mtime)}".encode('utf8')
-    return hashlib.sha1(key).hexdigest()[:12]
+    key = f"{str(path.resolve())}:{int(st.st_mtime)}".encode()
+    return hashlib.sha256(key).hexdigest()[:12]
 
 
 # --- Indexing / Searching logic ------------------------------------------------------
 
 
-def save_index(index_path: Path, docs: List[Dict[str, Any]]) -> None:
+def save_index(index_path: Path, docs: list[dict[str, Any]]) -> None:
     payload = {
         'generated_at': datetime.utcnow().isoformat() + 'Z',
         'count': len(docs),
@@ -184,16 +182,16 @@ def save_index(index_path: Path, docs: List[Dict[str, Any]]) -> None:
         json.dump(payload, fh, ensure_ascii=False, indent=2)
 
 
-def load_index(index_path: Path) -> Dict[str, Any]:
+def load_index(index_path: Path) -> dict[str, Any]:
     if not index_path.exists():
         return {'generated_at': None, 'count': 0, 'files': []}
-    with open(index_path, 'r', encoding='utf8') as fh:
+    with open(index_path, encoding='utf8') as fh:
         return json.load(fh)
 
 
 def scan_directory(root: Path, index_path: Path, thumbs_dir: Path, recursive: bool = True) -> None:
     exts = {'.mp4', '.mkv', '.webm', '.avi', '.mov'}
-    files: List[Dict[str, Any]] = []
+    files: list[dict[str, Any]] = []
     if recursive:
         iterator = root.rglob('*')
     else:
@@ -243,14 +241,14 @@ def scan_directory(root: Path, index_path: Path, thumbs_dir: Path, recursive: bo
     print(f"Indexed {len(files)} files -> {index_path}")
 
 
-def search_index(index_path: Path, query: str, page: int = 1, per_page: int = 10) -> Dict[str, Any]:
+def search_index(index_path: Path, query: str, page: int = 1, per_page: int = 10) -> dict[str, Any]:
     idx = load_index(index_path)
     docs = idx.get('files', [])
     tokens = tokenize_query(query)
     if not tokens:
         return {'results': [], 'total': 0}
 
-    results: List[Dict[str, Any]] = []
+    results: list[dict[str, Any]] = []
     qlower = query.lower()
     for doc in docs:
         score = 0.0
@@ -309,7 +307,7 @@ def make_tg_message_link(chat_id: int, message_id: int) -> str:
     return f'https://t.me/c/{base}/{message_id}'
 
 
-def export_markdown(index_path: Path, query: Optional[str] = None, output: Optional[Path] = None, per_page: int = 100) -> str:
+def export_markdown(index_path: Path, query: str | None = None, output: Path | None = None, per_page: int = 100) -> str:
     """Export matching index entries as a Markdown list of links.
 
     - If `query` is provided we run a search and export results.
@@ -324,7 +322,7 @@ def export_markdown(index_path: Path, query: Optional[str] = None, output: Optio
         docs = res.get('results', [])
     else:
         docs = idx.get('files', [])
-    lines: List[str] = []
+    lines: list[str] = []
     for doc in docs:
         title_tokens = doc.get('title_tokens') or []
         display = ' '.join(title_tokens) if title_tokens else doc.get('filename', '')
@@ -353,7 +351,7 @@ def export_markdown(index_path: Path, query: Optional[str] = None, output: Optio
     return block
 
 
-def main(argv: Optional[List[str]] = None) -> int:
+def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(description='Local video indexer and search')
     sub = p.add_subparsers(dest='cmd')
 

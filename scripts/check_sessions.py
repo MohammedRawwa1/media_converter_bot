@@ -3,8 +3,8 @@
 Run from project root in venv:
 .venv\Scripts\python.exe scripts\check_sessions.py
 """
-import os
 import json
+import os
 
 BASE = os.path.join(os.path.dirname(__file__), "..")
 SESS_DIR = os.path.join(BASE, "storage", "temp_sessions")
@@ -21,7 +21,7 @@ def main():
     for fn in files:
         path = os.path.join(SESS_DIR, fn)
         try:
-            with open(path, 'r', encoding='utf-8') as fh:
+            with open(path, encoding='utf-8') as fh:
                 data = json.load(fh)
             print(f"\n== {fn} ==")
             print("current_file:", data.get('current_file'))

@@ -4,10 +4,9 @@ Provide a single function to build a media filter (video|audio|document)
 defensively so the code works across PTB versions and import variants.
 """
 
-from typing import Optional
 
 
-def build_media_filter(filters_module) -> Optional[object]:
+def build_media_filter(filters_module) -> object | None:
     """Return a combined media filter (video|audio|document) or
     `filters_module.ALL` if specific filters aren't available.
 

@@ -1,10 +1,15 @@
 #!/usr/bin/env python3
-import os, sys, json, uuid, asyncio, traceback
+import asyncio
+import json
+import os
+import sys
+import traceback
+import uuid
 
 # load .env
 env_path = os.path.join(os.path.dirname(__file__), '..', '.env')
 if os.path.exists(env_path):
-    with open(env_path, 'r', encoding='utf-8') as f:
+    with open(env_path, encoding='utf-8') as f:
         for line in f:
             line=line.strip()
             if not line or line.startswith('#'):
@@ -22,15 +27,16 @@ if proj_root not in sys.path:
     sys.path.insert(0, proj_root)
 
 try:
-    from utils.userbot_downloader import download_forward_via_userbot
     from utils.job_queue import enqueue_job
+    from utils.userbot_downloader import download_forward_via_userbot
 except Exception:
     print('Failed importing project helpers; ensure you run this from the project root and dependencies are installed')
     traceback.print_exc()
     sys.exit(2)
 
 try:
-    import boto3, botocore
+    import boto3
+    import botocore
 except Exception:
     print('boto3 is required for this helper')
     traceback.print_exc()
@@ -71,7 +77,7 @@ def download_forward_json_from_s3(key: str, bucket: str, endpoint: str, region: 
         body = resp['Body'].read()
         with open(local_path, 'wb') as fh:
             fh.write(body)
-        with open(local_path, 'r', encoding='utf-8') as fh:
+        with open(local_path, encoding='utf-8') as fh:
             return json.load(fh), fid, local_path
     except botocore.exceptions.ClientError as e:
         code = e.response.get('Error', {}).get('Code')

@@ -1,9 +1,9 @@
 # tasks/conversion_tasks.py
 import asyncio
+import contextlib
 import logging
 import os
 import tempfile
-from typing import Dict, List, Tuple
 
 import config
 
@@ -28,7 +28,7 @@ except ImportError:
         try:
             stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=timeout_seconds)
             return stdout, stderr, process.returncode
-        except asyncio.TimeoutError:
+        except TimeoutError:
             process.kill()
             raise
 
@@ -55,7 +55,7 @@ async def _spawn_process(*cmd, **kwargs):
     return await asyncio.create_subprocess_exec(*cmd, **kwargs)
 
 
-def _validate_input_file(input_path: str) -> Tuple[bool, str]:
+def _validate_input_file(input_path: str) -> tuple[bool, str]:
     """Validate input file exists and is readable."""
     if not input_path:
         return False, "Input path cannot be empty"
@@ -72,7 +72,7 @@ def _validate_input_file(input_path: str) -> Tuple[bool, str]:
     return True, ""
 
 
-def _validate_output_path(output_path: str) -> Tuple[bool, str]:
+def _validate_output_path(output_path: str) -> tuple[bool, str]:
     """Validate output path is writable."""
     if not output_path:
         return False, "Output path cannot be empty"
@@ -89,7 +89,7 @@ def _validate_output_path(output_path: str) -> Tuple[bool, str]:
 
 async def convert_video_to_mp3(
     input_path: str, output_path: str, bitrate: str = "192k", timeout_seconds: int = 18000
-) -> Tuple[bool, str]:
+) -> tuple[bool, str]:
     """Convert video file to MP3 audio asynchronously."""
     # Validate inputs
     valid, error = _validate_input_file(input_path)
@@ -125,12 +125,12 @@ async def convert_video_to_mp3(
         try:
             # Timeout protection - FFmpeg can hang if ffprobe crashes
             stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=timeout_seconds)
-        except asyncio.TimeoutError:
+        except TimeoutError:
             logger.warning(f"FFmpeg timeout after {timeout_seconds}s, killing process")
             process.kill()
             try:
                 await asyncio.wait_for(process.wait(), timeout=5)
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 logger.error("Failed to kill FFmpeg process")
             return False, f"Conversion timeout (> {timeout_seconds}s)"
 
@@ -144,10 +144,8 @@ async def convert_video_to_mp3(
 
     except asyncio.CancelledError:
         logger.error("Conversion was cancelled")
-        try:
+        with contextlib.suppress(Exception):
             process.kill()
-        except Exception:
-            pass
         return False, "Conversion was cancelled"
     except Exception as e:
         logger.error(f"Exception in convert_video_to_mp3: {e}")
@@ -156,7 +154,7 @@ async def convert_video_to_mp3(
 
 async def compress_video(
     input_path: str, output_path: str, preset: str = "medium", crf: int = 23, timeout_seconds: int = 18000
-) -> Tuple[bool, str]:
+) -> tuple[bool, str]:
     """Compress video asynchronously using preset."""
     # Validate inputs
     valid, error = _validate_input_file(input_path)
@@ -198,12 +196,12 @@ async def compress_video(
         try:
             # Timeout protection
             stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=timeout_seconds)
-        except asyncio.TimeoutError:
+        except TimeoutError:
             logger.warning(f"Compression timeout after {timeout_seconds}s")
             process.kill()
             try:
                 await asyncio.wait_for(process.wait(), timeout=5)
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 logger.error("Failed to kill compression process")
             return False, f"Compression timeout (> {timeout_seconds}s)"
 
@@ -216,10 +214,8 @@ async def compress_video(
 
     except asyncio.CancelledError:
         logger.error("Compression was cancelled")
-        try:
+        with contextlib.suppress(Exception):
             process.kill()
-        except Exception:
-            pass
         return False, "Compression was cancelled"
     except Exception as e:
         logger.error(f"Exception in compress_video: {e}")
@@ -228,7 +224,7 @@ async def compress_video(
 
 async def extract_audio(
     input_path: str, output_path: str, format: str = "mp3", bitrate: str = "192k", timeout_seconds: int = 18000
-) -> Tuple[bool, str]:
+) -> tuple[bool, str]:
     """Extract audio from video asynchronously with timeout protection."""
     # Validate inputs
     valid, error = _validate_input_file(input_path)
@@ -270,7 +266,7 @@ async def extract_audio(
         return False, str(e)
 
 
-async def merge_videos(video_paths: List[str], output_path: str, timeout_seconds: int = 18000) -> Tuple[bool, str]:
+async def merge_videos(video_paths: list[str], output_path: str, timeout_seconds: int = 18000) -> tuple[bool, str]:
     """Merge multiple videos asynchronously with timeout protection."""
     # Validate inputs
     if not video_paths:
@@ -320,13 +316,11 @@ async def merge_videos(video_paths: List[str], output_path: str, timeout_seconds
         return False, str(e)
     finally:
         if concat_file and os.path.exists(concat_file):
-            try:
+            with contextlib.suppress(Exception):
                 os.unlink(concat_file)
-            except Exception:
-                pass
 
 
-async def merge_audios(audio_paths: List[str], output_path: str, timeout_seconds: int = 18000) -> Tuple[bool, str]:
+async def merge_audios(audio_paths: list[str], output_path: str, timeout_seconds: int = 18000) -> tuple[bool, str]:
     """Merge multiple audio files asynchronously with timeout protection."""
     # Validate inputs
     if not audio_paths:
@@ -379,13 +373,11 @@ async def merge_audios(audio_paths: List[str], output_path: str, timeout_seconds
         return False, str(e)
     finally:
         if concat_file and os.path.exists(concat_file):
-            try:
+            with contextlib.suppress(Exception):
                 os.unlink(concat_file)
-            except Exception:
-                pass
 
 
-async def take_screenshot(input_path: str, output_path: str, time: str = "00:00:01") -> Tuple[bool, str]:
+async def take_screenshot(input_path: str, output_path: str, time: str = "00:00:01") -> tuple[bool, str]:
     """Take screenshot from video asynchronously."""
     # Validate inputs
     valid, error = _validate_input_file(input_path)
@@ -417,7 +409,7 @@ async def take_screenshot(input_path: str, output_path: str, time: str = "00:00:
         return False, str(e)
 
 
-async def change_resolution(input_path: str, output_path: str, width: int, height: int) -> Tuple[bool, str]:
+async def change_resolution(input_path: str, output_path: str, width: int, height: int) -> tuple[bool, str]:
     """Change video resolution asynchronously."""
     # Validate inputs
     valid, error = _validate_input_file(input_path)
@@ -458,7 +450,7 @@ async def change_resolution(input_path: str, output_path: str, width: int, heigh
         return False, str(e)
 
 
-async def trim_media(input_path: str, output_path: str, start_time: str, end_time: str) -> Tuple[bool, str]:
+async def trim_media(input_path: str, output_path: str, start_time: str, end_time: str) -> tuple[bool, str]:
     """Trim video or audio asynchronously."""
     try:
         duration_parts = end_time.split(":")
@@ -485,7 +477,7 @@ async def trim_media(input_path: str, output_path: str, start_time: str, end_tim
         return False, str(e)
 
 
-async def repair_video(input_path: str, output_path: str) -> Tuple[bool, str]:
+async def repair_video(input_path: str, output_path: str) -> tuple[bool, str]:
     """Repair corrupted video asynchronously."""
     try:
         cmd = ["ffmpeg", "-y", "-i", input_path, "-c", "copy", output_path]
@@ -506,7 +498,7 @@ async def repair_video(input_path: str, output_path: str) -> Tuple[bool, str]:
         return False, str(e)
 
 
-async def optimize_video(input_path: str, output_path: str, preset: str = "slow", crf: int = 23) -> Tuple[bool, str]:
+async def optimize_video(input_path: str, output_path: str, preset: str = "slow", crf: int = 23) -> tuple[bool, str]:
     """Optimize video for web asynchronously."""
     try:
         cmd = [
@@ -545,7 +537,7 @@ async def optimize_video(input_path: str, output_path: str, preset: str = "slow"
         return False, str(e)
 
 
-async def create_thumbnail_grid(input_path: str, output_path: str, rows: int = 3, cols: int = 3) -> Tuple[bool, str]:
+async def create_thumbnail_grid(input_path: str, output_path: str, rows: int = 3, cols: int = 3) -> tuple[bool, str]:
     """Create thumbnail grid asynchronously."""
     try:
         cmd = [
@@ -576,7 +568,7 @@ async def create_thumbnail_grid(input_path: str, output_path: str, rows: int = 3
         return False, str(e)
 
 
-async def generate_sample(input_path: str, output_path: str, duration: int = 30) -> Tuple[bool, str]:
+async def generate_sample(input_path: str, output_path: str, duration: int = 30) -> tuple[bool, str]:
     """Generate sample/preview asynchronously."""
     try:
         # For mp4 outputs, re-encode to H.264/AAC and add movflags for streaming
@@ -621,7 +613,7 @@ async def generate_sample(input_path: str, output_path: str, duration: int = 30)
         return False, str(e)
 
 
-async def extract_streams(input_path: str, output_dir: str) -> Tuple[bool, Dict[str, str]]:
+async def extract_streams(input_path: str, output_dir: str) -> tuple[bool, dict[str, str]]:
     """Extract all streams asynchronously."""
     try:
         # Validate input path before probing
@@ -675,7 +667,7 @@ async def extract_streams(input_path: str, output_dir: str) -> Tuple[bool, Dict[
 
 async def convert_audio_format(
     input_path: str, output_path: str, target_format: str = "mp3", bitrate: str = "192k"
-) -> Tuple[bool, str]:
+) -> tuple[bool, str]:
     """Convert audio format asynchronously."""
     try:
         codec_map = {"mp3": "libmp3lame", "wav": "pcm_s16le", "aac": "aac", "flac": "flac", "ogg": "libvorbis"}
@@ -712,7 +704,7 @@ async def convert_audio_format(
 
 async def adjust_bitrate(
     input_path: str, output_path: str, video_bitrate: str = "5000k", audio_bitrate: str = "128k"
-) -> Tuple[bool, str]:
+) -> tuple[bool, str]:
     """Adjust video and audio bitrate asynchronously."""
     try:
         cmd = [
@@ -747,7 +739,7 @@ async def adjust_bitrate(
         return False, str(e)
 
 
-async def normalize_audio(input_path: str, output_path: str) -> Tuple[bool, str]:
+async def normalize_audio(input_path: str, output_path: str) -> tuple[bool, str]:
     """Normalize audio volume asynchronously."""
     try:
         cmd = [
@@ -778,7 +770,7 @@ async def normalize_audio(input_path: str, output_path: str) -> Tuple[bool, str]
         return False, str(e)
 
 
-async def extract_subtitles(input_path: str, output_path: str) -> Tuple[bool, str]:
+async def extract_subtitles(input_path: str, output_path: str) -> tuple[bool, str]:
     """Extract subtitles from video asynchronously."""
     try:
         cmd = ["ffmpeg", "-y", "-i", input_path, "-map", "0:s:0", "-c:s", "srt", output_path]
@@ -799,7 +791,7 @@ async def extract_subtitles(input_path: str, output_path: str) -> Tuple[bool, st
         return False, str(e)
 
 
-async def edit_metadata(input_path: str, output_path: str, metadata: Dict[str, str]) -> Tuple[bool, str]:
+async def edit_metadata(input_path: str, output_path: str, metadata: dict[str, str]) -> tuple[bool, str]:
     """Edit media metadata asynchronously."""
     try:
         cmd = ["ffmpeg", "-y", "-i", input_path, "-c", "copy", "-map_metadata", "-1"]
@@ -825,7 +817,7 @@ async def edit_metadata(input_path: str, output_path: str, metadata: Dict[str, s
         return False, str(e)
 
 
-async def create_archive(file_paths: List[str], output_path: str) -> Tuple[bool, str]:
+async def create_archive(file_paths: list[str], output_path: str) -> tuple[bool, str]:
     """Create ZIP archive of files asynchronously."""
     try:
         import zipfile

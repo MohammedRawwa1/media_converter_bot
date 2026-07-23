@@ -1,5 +1,4 @@
 import asyncio
-import os
 from unittest.mock import patch
 
 from utils import telethon_session

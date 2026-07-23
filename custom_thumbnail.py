@@ -1,12 +1,12 @@
+import contextlib
 import os
-import shutil
+
 import aiofiles
-from PIL import Image
 from telegram import Update
 from telegram.ext import CallbackContext, CommandHandler
-from database.mongo_handler import MongoDB
-from handlers.db_connection import get_db
+
 import config
+
 
 async def add_thumb(update: Update, context: CallbackContext):
     user_id = update.effective_user.id
@@ -16,10 +16,8 @@ async def add_thumb(update: Update, context: CallbackContext):
         file_bytes = await file.download_as_bytearray()
         # Use configured thumbnail path if available, else fallback
         thumb_dir = getattr(config, "THUMBNAIL_PATH", "storage/thumbnails")
-        try:
+        with contextlib.suppress(Exception):
             os.makedirs(thumb_dir, exist_ok=True)
-        except Exception:
-            pass
         thumb_path = os.path.join(thumb_dir, f"{user_id}.jpg")
         async with aiofiles.open(thumb_path, 'wb') as f:
             await f.write(file_bytes)
@@ -32,10 +30,8 @@ async def del_thumb(update: Update, context: CallbackContext):
     thumb_dir = getattr(config, "THUMBNAIL_PATH", "storage/thumbnails")
     thumb_path = os.path.join(thumb_dir, f"{user_id}.jpg")
     if os.path.exists(thumb_path):
-        try:
+        with contextlib.suppress(Exception):
             os.remove(thumb_path)
-        except Exception:
-            pass
         await update.message.reply_text("Thumbnail deleted successfully!")
     else:
         await update.message.reply_text("You don't have a custom thumbnail set.")

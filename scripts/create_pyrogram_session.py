@@ -25,10 +25,10 @@ Requirements:
     - API_ID and API_HASH from https://my.telegram.org/apps
 """
 
-import os
-import sys
 import asyncio
+import os
 import pathlib
+import sys
 
 # Ensure project root is on sys.path
 _ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -71,14 +71,14 @@ async def create_session(api_id: int, api_hash: str, session_name: str = "pyrogr
         sys.exit(1)
 
     print(f"\n{'='*60}")
-    print(f"Pyrogram Session Creator")
+    print("Pyrogram Session Creator")
     print(f"{'='*60}")
     print(f"\nCreating session: {session_name}")
     print(f"API_ID: {api_id}")
-    print(f"\nYou will be prompted to enter:")
-    print(f"  1. Your phone number (international format, e.g. +1234567890)")
-    print(f"  2. The login code sent to your Telegram app or SMS")
-    print(f"  3. Your 2FA password (if enabled)")
+    print("\nYou will be prompted to enter:")
+    print("  1. Your phone number (international format, e.g. +1234567890)")
+    print("  2. The login code sent to your Telegram app or SMS")
+    print("  3. Your 2FA password (if enabled)")
     print(f"\n{'='*60}\n")
 
     client = Client(session_name, api_id=api_id, api_hash=api_hash, in_memory=True)
@@ -86,7 +86,7 @@ async def create_session(api_id: int, api_hash: str, session_name: str = "pyrogr
     try:
         await client.start()
         print(f"\n{'='*60}")
-        print(f"✅ Login successful!")
+        print("✅ Login successful!")
         print(f"{'='*60}")
 
         # Get the session string
@@ -98,13 +98,13 @@ async def create_session(api_id: int, api_hash: str, session_name: str = "pyrogr
         print(f"Phone: +{me.phone_number if hasattr(me, 'phone_number') else 'unknown'}")
 
         print(f"\n{'='*60}")
-        print(f"📋 SESSION STRING (copy this):")
+        print("📋 SESSION STRING (copy this):")
         print(f"{'='*60}")
         print(session_string)
         print(f"{'='*60}")
-        print(f"\nSet this as an environment variable on your server:")
+        print("\nSet this as an environment variable on your server:")
         print(f"  PYROGRAM_SESSION='{session_string[:50]}...'")
-        print(f"\nOr if using Render, add it as a secret environment variable.")
+        print("\nOr if using Render, add it as a secret environment variable.")
         print(f"\nThe session string is also saved to: {session_name}.txt")
 
         # Also save to a text file for convenience
@@ -144,7 +144,7 @@ async def export_from_file(api_id: int, api_hash: str, session_file: str):
         session_string = await client.export_session_string()
         
         print(f"\n{'='*60}")
-        print(f"📋 SESSION STRING:")
+        print("📋 SESSION STRING:")
         print(f"{'='*60}")
         print(session_string)
         print(f"{'='*60}")
@@ -164,13 +164,9 @@ async def main():
     
     # Parse flags
     from_file = None
-    export_mode = False
     
     for i, arg in enumerate(args):
-        if arg == "--from-file" and i + 1 < len(args):
-            from_file = args[i + 1]
-        elif arg == "--export" and i + 1 < len(args):
-            export_mode = True
+        if arg == "--from-file" and i + 1 < len(args) or arg == "--export" and i + 1 < len(args):
             from_file = args[i + 1]
     
     api_id, api_hash = get_credentials()

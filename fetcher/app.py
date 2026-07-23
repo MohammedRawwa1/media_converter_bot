@@ -1,13 +1,12 @@
-import os
 import json
-import uuid
-import time
 import logging
-from urllib.parse import urlparse
+import os
+import time
+import uuid
 
-from flask import Flask, request, jsonify
-import redis
 import boto3
+import redis
+from flask import Flask, jsonify, request
 
 app = Flask(__name__)
 logger = logging.getLogger("fetcher")
@@ -144,4 +143,5 @@ def presign():
 
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8000)))
+    flask_host = os.environ.get("FLASK_HOST", "127.0.0.1")
+    app.run(host=flask_host, port=int(os.environ.get("PORT", 8000)))

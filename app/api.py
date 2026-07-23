@@ -1,18 +1,47 @@
-from fastapi import FastAPI, Query, HTTPException
-from fastapi.responses import JSONResponse, FileResponse, PlainTextResponse
-from fastapi.staticfiles import StaticFiles
-import os
-from motor.motor_asyncio import AsyncIOMotorClient
-from app.config.settings import settings
-from app.services.tokenizer import tokenize_query
-import sys
-import httpx
-import html
-from app.utils.logger import logger
 import asyncio
+import contextlib
+import html
+import os
+import re
+import sys
 from asyncio.subprocess import PIPE
 
+import httpx
+from app.config.settings import settings
+from app.services.tokenizer import tokenize_query
+from app.utils.logger import logger
+from fastapi import FastAPI, Query, Request
+from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
+from fastapi.staticfiles import StaticFiles
+from motor.motor_asyncio import AsyncIOMotorClient
+
+# Go-style standardized responses with consistent envelope
+from utils.response import error, ok, paginated
+
+# Route caching (read-through cache for GET responses)
+from utils.route_cache import route_cache
+
+# ── Go/Laravel-style security patterns ──
+# Rate limiting for DoS/DDoS protection
+from utils.web_rate_limiter import get_client_ip, make_rate_limit_response, web_rate_limiter
+
+# Go-style middleware chain with built-in middleware
+from web.middleware import (
+    MiddlewareChain,
+    RequestContext,
+    with_request_id,
+    with_request_logging,
+)
+
 app = FastAPI(title="TG File Index API")
+
+# ── Go-style middleware chain (order matters: first = outermost) ──
+# Rate limiting is handled per-endpoint (inline) to preserve different limits
+# per route. The chain handles cross-cutting concerns:
+chain = MiddlewareChain()
+chain.use(with_request_id)            # unique request ID per call
+chain.use(with_request_logging)        # log every request/response with timing
+# with_rate_limit and with_cache are handled per-endpoint for granularity
 
 # mount static for favicon
 static_dir = os.path.join(os.path.dirname(__file__), "static")
@@ -47,10 +76,8 @@ async def startup():
         logger.info("Connected to MongoDB")
     except Exception as exc:
         logger.warning("MongoDB not reachable at startup, continuing without DB: {}", exc)
-        try:
+        with contextlib.suppress(Exception):
             client.close()
-        except Exception:
-            pass
         app.state.db = None
 
 
@@ -58,33 +85,43 @@ async def startup():
 async def shutdown():
     mongo_client = getattr(app.state, "mongo_client", None)
     if mongo_client:
-        try:
+        with contextlib.suppress(Exception):
             mongo_client.close()
-        except Exception:
-            pass
 
 
 @app.get("/favicon.ico")
-async def favicon():
+@chain("/favicon.ico", methods=["GET"], framework="fastapi")
+async def favicon(ctx: RequestContext, request: Request = None):
+    """Favicon endpoint (Go-style: middleware + standardized response)."""
+    client_ip = get_client_ip(request)
+    if not web_rate_limiter.check_limit("health", client_ip):
+        body, status_code, headers = make_rate_limit_response("health", client_ip)
+        return JSONResponse(status_code=status_code, content=body, headers=headers)
     path = os.path.join(os.path.dirname(__file__), "static", "favicon.ico")
     if os.path.exists(path):
         return FileResponse(path)
-    raise HTTPException(status_code=404)
+    return error("not_found", "Favicon not found", 404)
 
 
 @app.get("/")
-async def root_get():
-    return {"ok": True, "service": "tg-index-search-bot"}
+@chain("/", methods=["GET"], framework="fastapi")
+async def root_get(ctx: RequestContext, request: Request):
+    """Root health check (Go-style: middleware + consistent envelope)."""
+    client_ip = get_client_ip(request)
+    if not web_rate_limiter.check_limit("search", client_ip):
+        return make_rate_limit_response("search", client_ip)
+    return ok({"service": "tg-index-search-bot"}, message="healthy")
 
 
 @app.post("/")
-async def root_post(payload: dict = None):
-    # If Telegram sends updates to the root path (no token in URL),
-    # forward to the webhook handler using the configured bot token
-    # when available. Otherwise, acknowledge.
+@chain("/", methods=["POST"], framework="fastapi")
+async def root_post(ctx: RequestContext, request: Request = None, payload: dict = None):
+    """Root POST endpoint - forwards Telegram updates to webhook handler."""
+    client_ip = get_client_ip(request)
+    if not web_rate_limiter.check_limit("webhook", client_ip):
+        return make_rate_limit_response("webhook", client_ip)
     logger.debug("root_post received payload keys: {}", list(payload.keys()) if isinstance(payload, dict) else type(payload))
     if payload and ("message" in payload or "edited_message" in payload):
-        # try to find a configured bot token
         token = None
         for c in settings.API_CREDENTIALS:
             if c.get("bot_token"):
@@ -92,76 +129,66 @@ async def root_post(payload: dict = None):
                 break
         if token:
             try:
-                logger.info("Forwarding root POST update to webhook handler using configured bot token (background)")
-                # schedule the webhook handler in background and return immediately
+                logger.info("Forwarding root POST update to webhook handler (background)")
                 try:
                     asyncio.create_task(telegram_webhook(token, payload))
                 except Exception:
-                    # fallback: call without scheduling if loop unavailable
                     await telegram_webhook(token, payload)
-                return {"ok": True}
-            except Exception as exc:
-                logger.exception("Error forwarding root POST to webhook: {}", exc)
-                # swallow errors to ensure Telegram gets 200
-                return {"ok": True}
-    # Basic acknowledgement for other POSTs
-    return {"ok": True}
+                return ok(None, message="forwarded")
+            except Exception:
+                logger.exception("Error forwarding root POST to webhook")
+                return ok(None, message="acknowledged")
+    return ok(None, message="acknowledged")
 
 
 
 @app.post("/webhook/{token}")
-async def telegram_webhook(token: str, update: dict):
+@chain("/webhook/{token}", methods=["POST"], framework="fastapi")
+async def telegram_webhook(ctx: RequestContext, token: str, update: dict, request: Request = None):
     """Process Telegram Bot API webhook updates for configured bot tokens.
-
-    Supports a minimal subset: responds to `/search <query>` by running the
-    same search logic and sending a message via the Bot HTTP API.
+    
+    Go-style: middleware + standardized envelope. Rate limiting per-endpoint.
     """
-    # validate token exists in configured credentials
+    client_ip = get_client_ip(request)
+    if not web_rate_limiter.check_limit("webhook", client_ip):
+        return make_rate_limit_response("webhook", client_ip)
     creds = [c for c in settings.API_CREDENTIALS if c.get("bot_token") == token]
     if not creds:
         logger.warning("Received webhook for unknown token")
-        return JSONResponse(status_code=404, content={"ok": False, "error": "unknown token"})
+        return error("unknown_token", "Unknown bot token", 404)
 
-    # find message payload
     message = update.get("message") or update.get("edited_message") or {}
     update_id = update.get("update_id")
     text = (message.get("text") or message.get("caption") or "").strip()
     chat_id = (message.get("chat") or {}).get("id")
     text_trunc = (text[:120] + "...") if len(text) > 120 else text
     logger.info("webhook token={} update_id={} chat={} text={}", "[REDACTED]", update_id, chat_id, text_trunc)
+    
     if not text:
         logger.debug("No text/caption in incoming update, ignoring")
-        return {"ok": True}
+        return ok(None, message="ignored")
 
-    # handle /search command
+    cmd = text.split(maxsplit=1)[0].split("@", 1)[0]
+
     if text.startswith("/search"):
         parts = text.split(maxsplit=1)
         if len(parts) < 2:
-            # Escape angle brackets to avoid Telegram HTML parse errors
-            reply_text = "Usage: /search &lt;query&gt;"
+            await _send_tg(token, chat_id, "Usage: /search &lt;query&gt;")
         else:
             query = parts[1].strip()
-            # schedule search+reply in background so webhook returns quickly
             try:
                 asyncio.create_task(_process_search_and_send(token, chat_id, query))
             except Exception:
-                # if loop not available, run inline (rare)
                 await _process_search_and_send(token, chat_id, query)
-            # acknowledge immediately
-            return {"ok": True}
+        return ok(None, message="search_scheduled")
 
-    # handle other commands
-    # normalize command without botname suffix
-    cmd = text.split(maxsplit=1)[0].split("@", 1)[0]
     if cmd == "/start":
-        welcome = "Hi — I can search indexed files. Use /search <query> to search."
-        await _send_tg(token, chat_id, welcome)
-        return {"ok": True}
+        await _send_tg(token, chat_id, "Hi — I can search indexed files. Use /search <query> to search.")
+        return ok(None, message="started")
 
     if cmd == "/help":
-        help_text = "Commands:\n/search <query> — Search files\n/stats — Indexed file counts\n/reindex <chat_id> — Backfill chat history\n/health — DB health"
-        await _send_tg(token, chat_id, help_text)
-        return {"ok": True}
+        await _send_tg(token, chat_id, "Commands: /search <query>, /stats, /reindex <chat_id>, /health")
+        return ok(None, message="help_sent")
 
     if cmd == "/stats":
         db = getattr(app.state, "db", None)
@@ -170,65 +197,47 @@ async def telegram_webhook(token: str, update: dict):
         else:
             try:
                 total = await db.get_collection("files").estimated_document_count()
-                dups = await db.get_collection("files").count_documents({"is_duplicate": True})
-                await _send_tg(token, chat_id, f"Total files: {total}\nDuplicates: {dups}")
-            except Exception as exc:
-                logger.exception("/stats handler failed: {}", exc)
+                await _send_tg(token, chat_id, f"Total files: {total}")
+            except Exception:
+                logger.exception("/stats handler failed")
                 await _send_tg(token, chat_id, "Stats: error")
-        return {"ok": True}
+        return ok(None, message="stats_sent")
 
     if cmd == "/health":
         mongo_client = getattr(app.state, "mongo_client", None)
-        db = getattr(app.state, "db", None)
-        if mongo_client is None or db is None:
-            await _send_tg(token, chat_id, "Health: DB unavailable")
-        else:
+        if mongo_client is not None:
             try:
                 await mongo_client.admin.command("ping")
                 await _send_tg(token, chat_id, "Health: OK")
-            except Exception as exc:
-                logger.exception("/health handler failed: {}", exc)
-                await _send_tg(token, chat_id, f"Health: error: {exc}")
-        return {"ok": True}
+            except Exception:
+                logger.exception("/health handler failed")
+                await _send_tg(token, chat_id, "Health: error")
+        else:
+            await _send_tg(token, chat_id, "Health: DB unavailable")
+        return ok(None, message="health_sent")
 
     if cmd == "/reindex":
-        # /reindex <chat_id> optionally. We'll spawn scripts/backfill.py as a subprocess
         parts = text.split(maxsplit=1)
         if len(parts) < 2:
             await _send_tg(token, chat_id, "Usage: /reindex <chat_id>")
-            return {"ok": True}
+            return ok(None, message="usage_sent")
         target = parts[1].strip()
         try:
             target_chat_id = int(target)
         except Exception:
             await _send_tg(token, chat_id, "Invalid chat id")
-            return {"ok": True}
+            return ok(None, message="invalid_chat_id")
 
-        # spawn backfill script in background using same python executable
         try:
             cmd = [sys.executable, "scripts/backfill.py"]
-            # pass target via env var TARGET_CHAT_ID for the script
             env = os.environ.copy()
             env["TARGET_CHAT_ID"] = str(target_chat_id)
-            # Ensure subprocess can import local package `app`
             project_root = os.path.dirname(os.path.dirname(__file__))
             prev = env.get("PYTHONPATH", "")
             env["PYTHONPATH"] = project_root + (os.pathsep + prev if prev else "")
 
             async def _spawn_and_log(cmd, env, cwd):
                 proc = await asyncio.create_subprocess_exec(*cmd, env=env, cwd=cwd, stdout=PIPE, stderr=PIPE)
-
-                # notify owner immediately that the subprocess has started
-                try:
-                    owner = settings.OWNER_ID
-                    if owner and int(owner) != int(chat_id):
-                        try:
-                            await _send_tg(token, int(owner), f"Backfill subprocess started for {target_chat_id} (requested by {chat_id})")
-                        except Exception:
-                            pass
-                except Exception:
-                    pass
-
                 async def _drain(stream, level="info"):
                     try:
                         while True:
@@ -238,39 +247,20 @@ async def telegram_webhook(token: str, update: dict):
                             text = line.decode(errors="replace").rstrip()
                             if not text:
                                 continue
-                            if level == "info":
-                                logger.info("[backfill] {}", text)
-                            else:
-                                logger.error("[backfill] {}", text)
+                            (logger.info if level == "info" else logger.error)("[backfill] {}", text)
                     except Exception:
                         logger.exception("Error reading subprocess stream")
-
-                # schedule draining stdout and stderr
                 asyncio.create_task(_drain(proc.stdout, "info"))
                 asyncio.create_task(_drain(proc.stderr, "error"))
-                # don't await proc here; let it run independently
 
             asyncio.create_task(_spawn_and_log(cmd, env, project_root))
             await _send_tg(token, chat_id, f"Reindex scheduled for {target_chat_id}")
-            # notify owner that reindex was scheduled
-            try:
-                owner = settings.OWNER_ID
-                if owner and int(owner) != int(chat_id):
-                    await _send_tg(token, int(owner), f"Reindex scheduled for {target_chat_id} by {chat_id}")
-            except Exception:
-                pass
-        except Exception as exc:
-            logger.exception("Failed to schedule reindex: {}", exc)
+        except Exception:
+            logger.exception("Failed to schedule reindex")
             await _send_tg(token, chat_id, "Failed to schedule reindex")
-            try:
-                owner = settings.OWNER_ID
-                if owner:
-                    await _send_tg(token, int(owner), f"Failed to schedule reindex for {target}: {exc}")
-            except Exception:
-                pass
-        return {"ok": True}
+        return ok(None, message="reindex_scheduled")
 
-    return {"ok": True}
+    return ok(None, message="acknowledged")
 
 
 async def _process_search_and_send(token: str, chat_id: int, query: str) -> None:
@@ -307,6 +297,51 @@ async def _process_search_and_send(token: str, chat_id: int, query: str) -> None
             logger.exception("Failed to POST to Telegram API (background): {}", exc)
 
 
+def _score_search_results(docs: list, tokens: list, query: str, fallback: bool = False) -> list:
+    """Score search results by relevance (pure function, no side effects)."""
+    results = []
+    qlower = query.lower()
+    for doc in docs:
+        score = 0
+        doc_titles = [t.lower() for t in doc.get("title_tokens", [])]
+
+        if fallback:
+            matched = sum(1 for t in tokens if any(tt.startswith(t.lower()) for tt in doc_titles))
+            score += matched * 8
+            if qlower and qlower in doc.get("filename", "").lower():
+                score += 2
+            fname_len = len(doc.get("filename", ""))
+            score -= fname_len / 300.0
+        else:
+            matched = sum(1 for t in tokens if t.lower() in doc_titles)
+            score += matched * 10
+            for qt in doc.get("quality_tokens", []):
+                if qt and any(qt == t.lower() for t in tokens):
+                    score += 6
+            for cd in doc.get("codec_tokens", []):
+                if cd and any(cd == t.lower() for t in tokens):
+                    score += 5
+            if doc.get("year") and any(str(doc.get("year")) == t for t in tokens):
+                score += 8
+            if qlower and qlower in doc.get("filename", "").lower():
+                score += 3
+            fname_len = len(doc.get("filename", ""))
+            score -= fname_len / 200.0
+
+        doc["_score"] = score
+        results.append(doc)
+    return results
+
+
+def _make_tg_link(chat_id, message_id) -> str:
+    """Generate a Telegram message link from chat_id and message_id."""
+    if not chat_id or not message_id:
+        return ""
+    s = str(chat_id)
+    base = s[4:] if s.startswith("-100") else s.lstrip("-")
+    return f"https://t.me/c/{base}/{message_id}"
+
+
 async def _send_tg(token: str, chat_id: int, text: str, parse_mode: str | None = None) -> None:
     """Utility to send a message via Telegram Bot API."""
     if chat_id is None:
@@ -334,132 +369,120 @@ async def _send_tg(token: str, chat_id: int, text: str, parse_mode: str | None =
 
 
 @app.get("/health")
-async def health():
+@chain("/health", methods=["GET"], framework="fastapi")
+async def health(ctx: RequestContext, request: Request):
+    """Health check endpoint (Go-style: middleware + cache + envelope)."""
+    client_ip = get_client_ip(request)
+    if not web_rate_limiter.check_limit("health", client_ip):
+        return make_rate_limit_response("health", client_ip)
+    cache_key = "health"
+    cached = await route_cache.aget(cache_key)
+    if cached is not None:
+        return cached
+
     mongo_client = getattr(app.state, "mongo_client", None)
     db = getattr(app.state, "db", None)
     try:
         if mongo_client is None or db is None:
-            raise Exception("MongoDB not configured")
+            return error("service_unavailable", "Database not configured", status=503)
         await mongo_client.admin.command("ping")
         files = await db.get_collection("files").estimated_document_count()
-        return {"ok": True, "files": files}
-    except Exception as e:
-        return JSONResponse(status_code=500, content={"ok": False, "error": str(e)})
+        result = ok({"files": files}, message="healthy")
+        await route_cache.aset(cache_key, result, ttl=30)
+        return result
+    except Exception:
+        logger.exception("Health check failed")
+        return error("health_check_failed", "Health check failed", status=500)
 
 
 @app.get("/search")
+@chain("/search", methods=["GET"], framework="fastapi")
 async def api_search(
+    ctx: RequestContext,
     q: str = Query(..., min_length=1, max_length=128),
     page: int = 1,
     per_page: int = 5,
     output_format: str = Query("json"),
+    request: Request = None,
 ):
+    """
+    Go-style search endpoint with:
+    - Per-endpoint rate limiting
+    - Read-through route cache
+    - Go-style standardized response envelope
+    - Parameterized DB queries (no interpolation)
+    - Fillable projection (no SELECT *)
+    - Regex injection prevention (re.escape)
+    """
+    client_ip = get_client_ip(request)
+    if not web_rate_limiter.check_limit("search", client_ip):
+        return make_rate_limit_response("search", client_ip)
+    cache_key = route_cache.make_search_key(q, page, per_page)
+    cached = await route_cache.aget(cache_key)
+    if cached is not None:
+        return cached
+
     tokens = tokenize_query(q)
     if not tokens:
-        return {"results": [], "total": 0}
+        result = ok({"results": [], "total": 0}, message="no tokens")
+        await route_cache.aset(cache_key, result, ttl=30)
+        return result
 
     db = getattr(app.state, "db", None)
     if db is None:
-        logger.warning("api_search: MongoDB unavailable, returning empty results for query=%s", q)
-        return {"results": [], "total": 0}
+        logger.warning("api_search: DB unavailable for query=%s", q)
+        return ok({"results": [], "total": 0}, message="db_unavailable")
 
     try:
         coll = db.get_collection("files")
-    except Exception as exc:
-        logger.exception("api_search: failed to get collection: {}", exc)
-        return {"results": [], "total": 0}
+    except Exception:
+        logger.exception("api_search: failed to get collection")
+        return ok({"results": [], "total": 0}, message="collection_error")
 
-    # strict match
-    strict_filter = {"title_tokens": {"$all": tokens}}
-    projection = {
-        "_id": 0,
-        "chat_id": 1,
-        "message_id": 1,
-        "filename": 1,
-        "timestamp": 1,
-        "title_tokens": 1,
-        "quality_tokens": 1,
-        "codec_tokens": 1,
-        "year": 1,
+    # Fillable projection: only whitelisted fields (like SELECT specific columns)
+    FILLABLE_PROJECTION = {
+        "_id": 0, "chat_id": 1, "message_id": 1, "filename": 1,
+        "timestamp": 1, "title_tokens": 1, "quality_tokens": 1,
+        "codec_tokens": 1, "year": 1,
     }
+
+    # Parameterized query (prepared-statement pattern)
+    strict_filter = {"title_tokens": {"$all": tokens}}
     try:
-        docs = await coll.find(strict_filter, projection).to_list(length=1000)
-    except Exception as exc:
-        logger.exception("api_search: DB query failed: {}", exc)
-        return {"results": [], "total": 0}
+        docs = await coll.find(strict_filter, FILLABLE_PROJECTION).to_list(length=1000)
+    except Exception:
+        logger.exception("api_search: DB query failed")
+        return ok({"results": [], "total": 0}, message="query_error")
 
-    results = []
-    qlower = q.lower()
-    for doc in docs:
-        score = 0
-        doc_titles = [t.lower() for t in doc.get("title_tokens", [])]
-        matched = sum(1 for t in tokens if t.lower() in doc_titles)
-        score += matched * 10
-        for qt in doc.get("quality_tokens", []):
-            if qt and any(qt == t.lower() for t in tokens):
-                score += 6
-        for cd in doc.get("codec_tokens", []):
-            if cd and any(cd == t.lower() for t in tokens):
-                score += 5
-        if doc.get("year") and any(str(doc.get("year")) == t for t in tokens):
-            score += 8
-        if qlower and qlower in doc.get("filename", "").lower():
-            score += 3
-        fname_len = len(doc.get("filename", ""))
-        score -= fname_len / 200.0
-        doc["_score"] = score
-        results.append(doc)
+    results = _score_search_results(docs, tokens, q)
 
-    # fallback
     if not results:
         or_clauses = []
         for t in tokens:
-            or_clauses.append({"title_tokens": {"$elemMatch": {"$regex": f'^{t}', "$options": "i"}}})
-            or_clauses.append({"filename": {"$regex": f'{t}', "$options": "i"}})
+            escaped = re.escape(t)
+            or_clauses.append({"title_tokens": {"$elemMatch": {"$regex": f'^{escaped}', "$options": "i"}}})
+            or_clauses.append({"filename": {"$regex": f'{escaped}', "$options": "i"}})
         try:
-            docs2 = await coll.find({"$or": or_clauses}, projection).to_list(length=500)
-        except Exception as exc:
-            logger.exception("api_search: fallback DB query failed: {}", exc)
-            return {"results": [], "total": 0}
-        for doc in docs2:
-            score = 0
-            doc_titles = [t.lower() for t in doc.get("title_tokens", [])]
-            matched = sum(1 for t in tokens if any(tt.startswith(t.lower()) for tt in doc_titles))
-            score += matched * 8
-            if qlower and qlower in doc.get("filename", "").lower():
-                score += 2
-            fname_len = len(doc.get("filename", ""))
-            score -= fname_len / 300.0
-            doc["_score"] = score
-            results.append(doc)
+            docs2 = await coll.find({"$or": or_clauses}, FILLABLE_PROJECTION).to_list(length=500)
+            results2 = _score_search_results(docs2, tokens, q, fallback=True)
+            results.extend(results2)
+        except Exception:
+            logger.exception("api_search: fallback query failed")
 
     results.sort(key=lambda r: (r.get("_score", 0), r.get("timestamp")), reverse=True)
     total = len(results)
     start = (page - 1) * per_page
     end = start + per_page
-
     page_results = results[start:end]
 
     if str(output_format).lower() in ("md", "markdown"):
         lines = []
         for r in page_results:
-            fname = r.get("filename", "-")
-            display = str(fname).replace("\n", " ").strip()
-            url = ""
-            try:
-                chat_id = r.get("chat_id")
-                message_id = r.get("message_id")
-                if chat_id and message_id:
-                    s = str(chat_id)
-                    base = s[4:] if s.startswith("-100") else s.lstrip("-")
-                    url = f"https://t.me/c/{base}/{message_id}"
-            except Exception:
-                url = ""
-            if url:
-                lines.append(f"[{display}]({url})")
-            else:
-                lines.append(f"- {display}")
-        md_text = "\n".join(lines)
-        return PlainTextResponse(md_text, media_type="text/markdown")
+            display = str(r.get("filename", "-")).replace("\n", " ").strip()
+            url = _make_tg_link(r.get("chat_id"), r.get("message_id"))
+            lines.append(f"[{display}]({url})" if url else f"- {display}")
+        return PlainTextResponse("\n".join(lines), media_type="text/markdown")
 
-    return {"results": page_results, "total": total, "page": page, "per_page": per_page}
+    result = paginated(page_results, total=total, page=page, per_page=per_page, message="search_results")
+    await route_cache.aset(cache_key, result, ttl=30)
+    return result

@@ -1,7 +1,8 @@
-import sys
-import os
 import asyncio
+import os
+import sys
 import traceback
+import urllib.parse
 
 # Ensure project root is on sys.path so local `utils` package is imported
 repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
@@ -64,7 +65,12 @@ if __name__ == "__main__":
                     print('requests.get failed:', e)
             else:
                 try:
-                    resp = _ur.urlopen(url, timeout=30)
+                    # Validate URL scheme to prevent SSRF via file:// or internal IPs
+                    parsed_url = urllib.parse.urlparse(url)
+                    if parsed_url.scheme not in ("http", "https"):
+                        print(f"Blocked urlopen with scheme={parsed_url.scheme}")
+                        raise ValueError(f"Unsupported URL scheme: {parsed_url.scheme}")
+                    resp = _ur.urlopen(url, timeout=30)  # nosec # noqa: S310 - URL validated above
                     print('HTTP GET status:', resp.getcode())
                     print('Headers:', dict(resp.getheaders()))
                 except Exception as e:

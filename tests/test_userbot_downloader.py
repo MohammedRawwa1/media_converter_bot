@@ -1,3 +1,5 @@
+import os
+import tempfile
 import unittest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
@@ -15,7 +17,7 @@ class UserbotDownloaderTests(unittest.IsolatedAsyncioTestCase):
         ), patch("utils.userbot_downloader.PyrogramClient", object()), patch(
             "utils.telethon_session.get_pyrogram_session_string", return_value="session-string"
         ):
-            result = await mod.download_forward_via_userbot(123, 456, "/tmp/file")
+            result = await mod.download_forward_via_userbot(123, 456, os.path.join(tempfile.gettempdir(), "test_file"))
 
         self.assertTrue(result)
         pyrogram_mock.assert_awaited_once()
@@ -32,7 +34,7 @@ class UserbotDownloaderTests(unittest.IsolatedAsyncioTestCase):
                 client,
                 123,
                 456,
-                "/tmp/file",
+                os.path.join(tempfile.gettempdir(), "test_file"),
                 relay_chat_id=-100111,
                 client_type="pyrogram",
             )

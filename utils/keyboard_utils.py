@@ -3,7 +3,6 @@
 Keyboard menu builders for Telegram bot.
 """
 
-from typing import List
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
@@ -11,52 +10,41 @@ from .callbacks import (
     ADD_AUDIO,
     BITRATE_PREFIX,
     CANCEL,
+    CAPTION_EDITOR,
     COMPRESS_MENU,
     CONFIRM,
+    CONVERT_FORMAT_MENU,
+    CREATE_ARCHIVE,
     EDIT_METADATA,
+    FADE_BOTH,
     FADE_IN,
     FADE_OUT,
-    FADE_BOTH,
     FORMAT_PREFIX,
     INFO,
-    HELP,
+    MANUAL_SHOTS,
+    MEDIA_FORWARDER,
     MENU_MAIN,
-    MERGE_MENU,
     MERGE_ADD,
     MERGE_CLEAR,
+    MERGE_MENU,
     MERGE_VIDEOS_START,
-    MERGE_AUDIOS_START,
     MERGE_VIEW,
     OPTIMIZE_MENU,
     REMOVE_AUDIO,
     RESOLUTION_MENU,
     SAMPLE,
     SCREENSHOTS_MENU,
-    CONVERT_FORMAT_MENU,
-    THUMBNAIL_GRID,
-    THUMBNAIL_EXTRACTOR,
-    CAPTION_EDITOR,
-    MEDIA_FORWARDER,
-    STREAM_REMOVER,
     STREAM_EXTRACTOR,
-    VIDEOS_SPLITTER,
-    MANUAL_SHOTS,
-    VIDEO_TO_AUDIO,
+    STREAM_REMOVER,
     SUBTITLE_MERGER,
-    VIDEO_RENAMER,
-    CREATE_ARCHIVE,
+    THUMBNAIL_EXTRACTOR,
+    THUMBNAIL_GRID,
     TRIM_VIDEO,
-    TRIM_MENU,
     TRIMMER_1,
     TRIMMER_2,
-    BULK_MENU,
-    VIDEO_REORDER,
-    CONVERT_TO_FILE,
-    CONVERT_TO_VIDEO,
-    MP3_TAG_EDITOR,
-    FORMAT_M4V,
-    FORMAT_OPUS,
-    FORMAT_MP4,
+    VIDEO_RENAMER,
+    VIDEO_TO_AUDIO,
+    VIDEOS_SPLITTER,
 )
 
 
@@ -84,7 +72,7 @@ class MediaMenuBuilder:
 
         split_label = "🔪 Videos Splitter" if is_video else "🔪 Split"
 
-        buttons: List[List[InlineKeyboardButton]] = [
+        buttons: list[list[InlineKeyboardButton]] = [
             row("🖼️ Thumbnail Extractor", THUMBNAIL_EXTRACTOR, "✏️ Caption And Buttons Editor", CAPTION_EDITOR),
             row("📝 Metadata Editor", EDIT_METADATA, "📤 Media Forwarder", MEDIA_FORWARDER),
             row("🔇 Stream Remover", STREAM_REMOVER, "🎵 Stream Extractor", STREAM_EXTRACTOR),
@@ -272,7 +260,7 @@ class MediaMenuBuilder:
         buttons = []
         # build two-toggle rows
         row = []
-        for i, (label, key) in enumerate(items):
+        for _i, (label, key) in enumerate(items):
             val = bool(s.get(key))
             text = f"{label} — {'On' if val else 'Off'}"
             row.append(InlineKeyboardButton(text, callback_data=f"bulk_toggle:{key}"))

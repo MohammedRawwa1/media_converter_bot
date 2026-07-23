@@ -2,7 +2,7 @@
 """Final cleanup: Redis lock, dead code removal, unused import cleanup."""
 
 # ===== PART 1: main.py - Add Redis lock =====
-with open('main.py', 'r', encoding='utf-8') as f:
+with open('main.py', encoding='utf-8') as f:
     content = f.read()
 
 orig_len = len(content)

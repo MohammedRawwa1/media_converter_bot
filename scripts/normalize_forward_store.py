@@ -1,5 +1,5 @@
 p='utils/forward_store.py'
-with open(p,'r',encoding='utf-8') as f:
+with open(p,encoding='utf-8') as f:
     s=f.read()
 # normalize newlines and remove any stray carriage returns
 s=s.replace('\r\n','\n')

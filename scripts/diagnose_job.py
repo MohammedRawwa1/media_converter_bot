@@ -18,8 +18,8 @@ import json
 import os
 import subprocess
 import sys
-import time
-from typing import Dict, Any
+import tempfile
+from typing import Any
 
 try:
     import redis
@@ -27,7 +27,7 @@ except Exception:
     redis = None
 
 
-def run_cmd(cmd, timeout=300) -> Dict[str, Any]:
+def run_cmd(cmd, timeout=300) -> dict[str, Any]:
     try:
         proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
         return {"returncode": proc.returncode, "stdout": proc.stdout, "stderr": proc.stderr}
@@ -35,19 +35,19 @@ def run_cmd(cmd, timeout=300) -> Dict[str, Any]:
         return {"error": str(e)}
 
 
-def ffprobe_file(path: str) -> Dict[str, Any]:
+def ffprobe_file(path: str) -> dict[str, Any]:
     ffprobe = os.getenv("FFPROBE_PATH") or os.getenv("FFMPEG_PATH", "ffmpeg").replace("ffmpeg", "ffprobe")
     cmd = [ffprobe, "-v", "error", "-print_format", "json", "-show_format", "-show_streams", path]
     return run_cmd(cmd, timeout=60)
 
 
-def remux_to_mkv(src: str, dst: str) -> Dict[str, Any]:
+def remux_to_mkv(src: str, dst: str) -> dict[str, Any]:
     ffmpeg = os.getenv("FFMPEG_PATH", "ffmpeg")
     cmd = [ffmpeg, "-y", "-hide_banner", "-loglevel", "error", "-i", src, "-c", "copy", dst]
     return run_cmd(cmd, timeout=600)
 
 
-def reencode(src: str, dst: str) -> Dict[str, Any]:
+def reencode(src: str, dst: str) -> dict[str, Any]:
     ffmpeg = os.getenv("FFMPEG_PATH", "ffmpeg")
     cmd = [
         ffmpeg,
@@ -74,7 +74,7 @@ def reencode(src: str, dst: str) -> Dict[str, Any]:
     return run_cmd(cmd, timeout=1800)
 
 
-def tail_logs(lines: int = 200) -> Dict[str, Any]:
+def tail_logs(lines: int = 200) -> dict[str, Any]:
     logs = {}
     logs_dir = os.path.join(os.getcwd(), "logs")
     try:
@@ -82,23 +82,23 @@ def tail_logs(lines: int = 200) -> Dict[str, Any]:
             for fname in sorted(os.listdir(logs_dir))[-10:]:
                 path = os.path.join(logs_dir, fname)
                 if os.path.isfile(path):
-                    with open(path, "r", encoding="utf-8", errors="replace") as fh:
+                    with open(path, encoding="utf-8", errors="replace") as fh:
                         content = fh.readlines()[-lines:]
                         logs[fname] = "".join(content)
     except Exception as e:
         return {"error": str(e)}
     # include worker log
     try:
-        worker_log = "/tmp/worker.log"
+        worker_log = os.path.join(tempfile.gettempdir(), "worker.log")
         if os.path.isfile(worker_log):
-            with open(worker_log, "r", encoding="utf-8", errors="replace") as fh:
+            with open(worker_log, encoding="utf-8", errors="replace") as fh:
                 logs[os.path.basename(worker_log)] = "".join(fh.readlines()[-(lines * 5):])
     except Exception:
         pass
     return {"logs": logs}
 
 
-def job_info(job_id: str) -> Dict[str, Any]:
+def job_info(job_id: str) -> dict[str, Any]:
     red = os.getenv("REDIS_URL")
     if not red:
         return {"error": "REDIS_URL not set"}
@@ -113,7 +113,7 @@ def job_info(job_id: str) -> Dict[str, Any]:
         return {"error": str(e)}
 
 
-def ps_top(n: int = 20) -> Dict[str, Any]:
+def ps_top(n: int = 20) -> dict[str, Any]:
     cmd = ["ps", "aux", "--sort=-rss"]
     try:
         proc = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
@@ -123,7 +123,7 @@ def ps_top(n: int = 20) -> Dict[str, Any]:
         return {"error": str(e)}
 
 
-def dump_env() -> Dict[str, Any]:
+def dump_env() -> dict[str, Any]:
     try:
         env = dict(os.environ)
         # return only keys to avoid leaking large/secret values unnecessarily

@@ -1,7 +1,7 @@
 import importlib
-import traceback
 import os
 import sys
+import traceback
 
 # ensure project root is on sys.path
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))

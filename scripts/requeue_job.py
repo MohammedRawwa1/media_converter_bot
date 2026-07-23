@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import json
+import contextlib
 import logging
 import os
 import pathlib
@@ -28,7 +28,7 @@ if str(project_root) not in sys.path:
 try:
     from utils.job_queue import enqueue_job, get_redis
     from utils.storage import get_storage_backend_sync
-except Exception as e:
+except Exception:
     print("Failed to import project helpers (utils.*). Ensure you're running this script from the repository root and have installed dependencies.")
     import traceback
 
@@ -63,10 +63,8 @@ async def main(argv: list[str] | None = None) -> int:
     except Exception:
         stored = {}
     finally:
-        try:
+        with contextlib.suppress(Exception):
             await r.close()
-        except Exception:
-            pass
 
     cand_input_path = args.input_path or stored.get("input") or None
     cand_input_key = args.input_key or stored.get("input_key") or None

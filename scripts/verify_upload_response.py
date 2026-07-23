@@ -1,9 +1,12 @@
-import os, sys, json
+import contextlib
+import json
+import os
+import sys
 
 # load .env in project root
 env_path = os.path.join(os.path.dirname(__file__), '..', '.env')
 if os.path.exists(env_path):
-    with open(env_path, 'r', encoding='utf-8') as f:
+    with open(env_path, encoding='utf-8') as f:
         for line in f:
             line = line.strip()
             if not line or line.startswith('#'):
@@ -21,7 +24,7 @@ if not os.path.exists(RESP_FILE):
     print('Response file not found:', RESP_FILE)
     sys.exit(2)
 
-with open(RESP_FILE, 'r', encoding='utf-8') as fh:
+with open(RESP_FILE, encoding='utf-8') as fh:
     try:
         resp = json.load(fh)
     except Exception:
@@ -53,11 +56,9 @@ try:
     decoded = { (k.decode() if isinstance(k, bytes) else k): (v.decode() if isinstance(v, bytes) else v) for k, v in raw.items() }
     print('Job hash content:')
     print(json.dumps(decoded, indent=2))
-    try:
+    with contextlib.suppress(Exception):
         r.close()
-    except Exception:
-        pass
-except Exception as e:
+except Exception:
     print('Failed to query Redis:')
     import traceback
     traceback.print_exc()

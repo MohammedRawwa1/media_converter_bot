@@ -1,4 +1,8 @@
-import os, json, redis
+import json
+import os
+
+import redis
+
 r = redis.from_url(os.environ['REDIS_URL'], decode_responses=True)
 
 # Check delayed set

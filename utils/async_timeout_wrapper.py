@@ -5,9 +5,11 @@ Ensures no operation hangs indefinitely.
 """
 
 import asyncio
+import builtins
 import logging
+from collections.abc import Callable, Coroutine
 from functools import wraps
-from typing import Any, Callable, Coroutine, Optional, Tuple
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
@@ -43,7 +45,7 @@ async def run_with_timeout(
     """
     try:
         return await asyncio.wait_for(coro, timeout=timeout_seconds)
-    except asyncio.TimeoutError as e:
+    except builtins.TimeoutError as e:
         logger.error(
             f"{operation_name} timeout after {timeout_seconds}s - " f"this operation took too long to complete"
         )
@@ -52,7 +54,7 @@ async def run_with_timeout(
 
 async def run_subprocess_with_timeout(
     cmd: list, timeout_seconds: int = DEFAULT_FFMPEG_TIMEOUT, operation_name: str = "Subprocess"
-) -> Tuple[bytes, bytes, int]:
+) -> tuple[bytes, bytes, int]:
     """
     Run a subprocess with timeout protection and process cleanup.
 
@@ -101,7 +103,7 @@ async def run_subprocess_with_timeout(
             stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=timeout_seconds)
             return stdout, stderr, process.returncode
 
-        except asyncio.TimeoutError:
+        except builtins.TimeoutError:
             logger.warning(f"{operation_name} timeout after {timeout_seconds}s - killing process (PID: {process.pid})")
 
             # Attempt graceful termination
@@ -111,19 +113,19 @@ async def run_subprocess_with_timeout(
                     # Give it 5 seconds to terminate gracefully
                     await asyncio.wait_for(process.wait(), timeout=5)
                     logger.info(f"{operation_name} process terminated gracefully")
-                except asyncio.TimeoutError:
+                except builtins.TimeoutError:
                     # Force kill if graceful termination failed
                     logger.warning(f"{operation_name} grace period expired - force killing")
                     if process:
                         process.kill()
                     try:
                         await asyncio.wait_for(process.wait(), timeout=5)
-                    except asyncio.TimeoutError:
+                    except builtins.TimeoutError:
                         logger.error(f"Failed to kill {operation_name} process")
                 except Exception as e:
                     logger.error(f"Error during process termination: {e}")
 
-            raise TimeoutError(f"{operation_name} exceeded {timeout_seconds}s timeout limit")
+            raise TimeoutError(f"{operation_name} exceeded {timeout_seconds}s timeout limit") from None
 
     except asyncio.CancelledError:
         logger.warning(f"{operation_name} was cancelled")
@@ -146,7 +148,7 @@ async def run_subprocess_with_timeout(
         raise
 
 
-def timeout_decorator(timeout_seconds: int = DEFAULT_FFMPEG_TIMEOUT, operation_name: Optional[str] = None):
+def timeout_decorator(timeout_seconds: int = DEFAULT_FFMPEG_TIMEOUT, operation_name: str | None = None):
     """
     Decorator to add timeout protection to async functions.
 

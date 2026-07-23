@@ -19,6 +19,7 @@ lock `ffmpeg:requeue_lock:<job_id>` to avoid duplicates.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import os
@@ -79,12 +80,11 @@ async def _run_once():
                 return 0
 
             fh = _sval("forward_hash") or _sval("fh")
-            if not fh:
-                if isinstance(inp, str) and "forwards/" in inp and inp.endswith('.json'):
-                    try:
-                        fh = os.path.basename(inp).replace('.json', '')
-                    except Exception:
-                        fh = None
+            if not fh and isinstance(inp, str) and "forwards/" in inp and inp.endswith('.json'):
+                try:
+                    fh = os.path.basename(inp).replace('.json', '')
+                except Exception:
+                    fh = None
 
             if not fh:
                 fwd = _sval("forward")
@@ -115,7 +115,7 @@ async def _run_once():
             try:
                 from utils.forward_store import load_forward_metadata
 
-                meta = load_forward_metadata(fh)
+                meta = await load_forward_metadata(fh)
             except Exception:
                 meta = None
 
@@ -166,10 +166,8 @@ async def _run_once():
     try:
         async for key in client.scan_iter(match="ffmpeg:job:*", count=200):
             inc = await _process_key(key)
-            try:
+            with contextlib.suppress(Exception):
                 count += int(inc)
-            except Exception:
-                pass
     except Exception:
         logger.exception("Error scanning Redis keys")
     finally:

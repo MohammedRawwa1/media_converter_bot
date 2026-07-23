@@ -1,12 +1,12 @@
 # handlers.py
 import asyncio
+import contextlib
 import json
 import logging
 import os
 from datetime import datetime
-from typing import Dict, Optional
 
-from telegram import InputMediaPhoto, Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto, Update
 from telegram.error import BadRequest
 from telegram.ext import ContextTypes, ConversationHandler
 
@@ -17,9 +17,10 @@ except ImportError:
     ExtendedMediaConverter = None
 
 try:
-    from utils.keyboard_utils import MediaMenuBuilder
-    from utils.job_queue import enqueue_job
     import uuid
+
+    from utils.job_queue import enqueue_job
+    from utils.keyboard_utils import MediaMenuBuilder
 except ImportError:
     MediaMenuBuilder = None
     try:
@@ -70,7 +71,7 @@ except Exception:
 logger = logging.getLogger(__name__)
 
 
-def _extract_large_file_source(current_file: Optional[dict]) -> tuple[Optional[int], Optional[int]]:
+def _extract_large_file_source(current_file: dict | None) -> tuple[int | None, int | None]:
     """Return (chat_id, message_id) for the source message used by the big-file pipeline.
 
     The bot stores this metadata in several shapes depending on the incoming file type:
@@ -110,8 +111,8 @@ def _parse_time_to_seconds(tstr: str) -> float:
             return m * 60 + s
         else:
             return float(parts[0])
-    except Exception:
-        raise ValueError(f"Invalid time format: {tstr}")
+    except Exception as e:
+        raise ValueError(f"Invalid time format: {tstr}") from e
 
 
 def _format_seconds_to_hhmmss(sec: float) -> str:
@@ -153,8 +154,8 @@ class EnhancedMediaHandler:
         if ExtendedMediaConverter is None:
             raise ImportError("ExtendedMediaConverter not available")
         self.converter = ExtendedMediaConverter()
-        self.user_sessions: Dict[int, Dict] = {}
-        self.session_timeouts: Dict[int, asyncio.TimerHandle] = {}
+        self.user_sessions: dict[int, dict] = {}
+        self.session_timeouts: dict[int, asyncio.TimerHandle] = {}
         self.db_model = None  # Optional MongoDB model
         self._session_timeout_seconds = 3600  # 1 hour inactivity timeout
 
@@ -163,9 +164,9 @@ class EnhancedMediaHandler:
             max_concurrent_conversions
         )
         self._max_conversions = max_concurrent_conversions
-        self.active_conversions: Dict[int, str] = {}  # user_id -> task_name
+        self.active_conversions: dict[int, str] = {}  # user_id -> task_name
         # Telemetry for malformed callbacks
-        self.bad_callback_counts: Dict[str, int] = {}
+        self.bad_callback_counts: dict[str, int] = {}
 
         # Ensure session persistence directory exists for multi-worker setups
         self._session_store_dir = os.path.join(os.path.dirname(__file__), "storage", "temp_sessions")
@@ -181,10 +182,8 @@ class EnhancedMediaHandler:
             if get_cache is not None:
                 # asyncio is already imported at module level
                 loop = None
-                try:
+                with contextlib.suppress(RuntimeError):
                     loop = asyncio.get_running_loop()
-                except RuntimeError:
-                    pass
                 if loop and loop.is_running():
                     asyncio.ensure_future(self._init_cache())
         except Exception:
@@ -213,10 +212,8 @@ class EnhancedMediaHandler:
                 for file_info in session["merge_list"]:
                     temp_path = file_info.get("path")
                     if temp_path and os.path.exists(temp_path):
-                        try:
+                        with contextlib.suppress(Exception):
                             os.remove(temp_path)
-                        except Exception:
-                            pass
         finally:
             # Remove session
             if user_id in self.user_sessions:
@@ -401,10 +398,8 @@ class EnhancedMediaHandler:
                 # remove existing file if session cleared
                 path = self._session_file(user_id)
                 if os.path.exists(path):
-                    try:
+                    with contextlib.suppress(Exception):
                         os.remove(path)
-                    except Exception:
-                        pass
                 return
             minimal = {
                 "current_file": session.get("current_file"),
@@ -425,11 +420,8 @@ class EnhancedMediaHandler:
                         if loop.is_running():
                             asyncio.create_task(self.db_model.save_session(user_id, minimal))
                         else:
-                            try:
+                            with contextlib.suppress(Exception):
                                 loop.run_until_complete(self.db_model.save_session(user_id, minimal))
-                            except Exception:
-                                # best-effort: ignore failures
-                                pass
                     except Exception:
                         logger.exception("Failed scheduling DB session save for %s", user_id)
             except Exception:
@@ -437,7 +429,7 @@ class EnhancedMediaHandler:
         except Exception:
             logger.exception("Failed to persist session for user %s", user_id)
 
-    def _load_persisted_session(self, user_id: int) -> Optional[Dict]:
+    def _load_persisted_session(self, user_id: int) -> dict | None:
         """Load persisted session if available. Returns session dict or None."""
         try:
             path = self._session_file(user_id)
@@ -446,7 +438,9 @@ class EnhancedMediaHandler:
                 try:
                     if getattr(self, "db_model", None):
                         try:
-                            import asyncio as _asyncio, threading, queue
+                            import asyncio as _asyncio
+                            import queue
+                            import threading
 
                             q = queue.Queue()
 
@@ -468,7 +462,7 @@ class EnhancedMediaHandler:
                             return None
                 except Exception:
                     return None
-            with open(path, "r", encoding="utf-8") as fh:
+            with open(path, encoding="utf-8") as fh:
                 data = json.load(fh)
             # Ensure merge_list present
             if "merge_list" not in data:
@@ -489,7 +483,7 @@ class EnhancedMediaHandler:
             finally:
                 self.active_conversions.pop(user_id, None)
 
-    def get_active_conversions(self) -> Dict[int, str]:
+    def get_active_conversions(self) -> dict[int, str]:
         """Get all active conversions."""
         return self.active_conversions.copy()
 
@@ -549,9 +543,9 @@ class EnhancedMediaHandler:
         self,
         reason: str,
         data,
-        user_id: Optional[int] = None,
-        chat_id: Optional[int] = None,
-        message_id: Optional[int] = None,
+        user_id: int | None = None,
+        chat_id: int | None = None,
+        message_id: int | None = None,
     ):
         """Log malformed or unexpected callback events for later inspection.
 
@@ -624,7 +618,7 @@ class EnhancedMediaHandler:
         return True
 
     async def _ensure_current_file_downloaded(
-        self, update: Update, context: ContextTypes.DEFAULT_TYPE, session: Dict
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE, session: dict
     ):
         """Ensure the session's current_file is downloaded locally. Raises Exception on failure."""
         user_id = update.effective_user.id if update and update.effective_user else None
@@ -680,10 +674,8 @@ class EnhancedMediaHandler:
             ext = os.path.splitext(name)[1] or ""
 
         input_dir = getattr(config, "INPUT_PATH", "storage/input")
-        try:
+        with contextlib.suppress(Exception):
             os.makedirs(input_dir, exist_ok=True)
-        except Exception:
-            pass
         file_path = os.path.join(input_dir, f"{user_id}_{file_id}{ext}")
 
         # Attempt to fetch file via Telegram API (bot). If Telegram refuses due to
@@ -769,16 +761,14 @@ class EnhancedMediaHandler:
             # For large-file bot API failures, try the userbot fallback first.
             if enable_userbot and ("file is too big" in err_text.lower() or "too big" in err_text.lower()):
                 forward = current_file.get("forward") if current_file else None
-                if forward and forward.get("chat_id") and forward.get("message_id"):
-                    if await _try_userbot_download(
-                        forward.get("chat_id"), forward.get("message_id"), "origin_forward"
-                    ):
+                if forward and forward.get("chat_id") and forward.get("message_id") and await _try_userbot_download(
+                    forward.get("chat_id"), forward.get("message_id"), "origin_forward"
+                ):
                         return
 
                 bot_chat = current_file.get("chat_id")
                 bot_msg = current_file.get("msg_id") or current_file.get("message_id")
-                if bot_chat and bot_msg:
-                    if await _try_userbot_download(bot_chat, bot_msg, "bot_chat_large_file"):
+                if bot_chat and bot_msg and await _try_userbot_download(bot_chat, bot_msg, "bot_chat_large_file"):
                         return
 
                 # Relay group fallback: forward the file to a shared group/channel
@@ -835,7 +825,7 @@ class EnhancedMediaHandler:
                         "Telegram reports the file is too big to download via the bot. "
                         f"Please either upload the file via the web uploader (POST to {upload_url}) or provide a direct public URL to the file."
                         + (" Configure PYROGRAM_SESSION (preferred) or API_ID/API_HASH + API_SESSION if you want automatic userbot fallback." if enable_userbot else "")
-                    )
+                    ) from None
 
             forward = current_file.get("forward") if current_file else None
             if enable_userbot and forward and forward.get("chat_id") and forward.get("message_id"):
@@ -956,14 +946,14 @@ class EnhancedMediaHandler:
         except Exception:
             logger.debug("Could not persist session after download")
 
-    async def _handle_large_forward(self, update: Update, current_file: Dict, err_text: str, upload_url: str):
+    async def _handle_large_forward(self, update: Update, current_file: dict, err_text: str, upload_url: str):
         """Persist forward metadata, optionally auto-fetch and enqueue, or raise an instruction.
 
         This centralizes the previous inline logic for handling "file is too big" errors
         so handlers can call it non-blockingly and keep the download flow readable.
         """
         try:
-            from utils.forward_store import save_forward_metadata, delete_forward_metadata
+            from utils.forward_store import delete_forward_metadata, save_forward_metadata
 
             metadata = {
                 "chat_id": current_file.get("chat_id"),
@@ -975,20 +965,16 @@ class EnhancedMediaHandler:
                 "type": current_file.get("type"),
                 "registered_at": datetime.utcnow().isoformat(),
             }
-            fh = save_forward_metadata(metadata)
-            try:
+            fh = await save_forward_metadata(metadata)
+            with contextlib.suppress(Exception):
                 logger.info("Saved forward metadata id=%s for file_id=%s", fh, metadata.get("file_id"))
-            except Exception:
-                pass
 
             auto_fetch = os.environ.get("AUTO_FETCH_FORWARDS", "").lower() in ("1", "true", "yes")
             web_upload_url = os.environ.get("WEB_UPLOAD_URL") or os.environ.get("WEBAPP_URL")
 
             # Diagnostic logging to help trace fallback behavior in production
-            try:
+            with contextlib.suppress(Exception):
                 logger.info("_handle_large_forward: fh=%s auto_fetch=%s web_upload_url=%s", fh, auto_fetch, web_upload_url)
-            except Exception:
-                pass
 
             # Extra debug: record which fetch paths we will try
             try:
@@ -1007,10 +993,8 @@ class EnhancedMediaHandler:
                     jid = None
 
                 input_dir = getattr(config, "INPUT_PATH", "storage/input") if config else "storage/input"
-                try:
+                with contextlib.suppress(Exception):
                     os.makedirs(input_dir, exist_ok=True)
-                except Exception:
-                    pass
 
                 ext = os.path.splitext(metadata.get("name") or "")[1] or ".mp4"
                 input_path = os.path.join(input_dir, f"{jid}{ext}") if jid else os.path.join(input_dir, f"{fh}{ext}")
@@ -1064,17 +1048,13 @@ class EnhancedMediaHandler:
                                 resp = requests.post(web_upload_url, data={"forward_hash": fh}, headers=headers, timeout=60)
                                 return resp
                             except Exception as e:
-                                try:
+                                with contextlib.suppress(Exception):
                                     logger.exception("Webapp fetch POST failed (thread): %s", e)
-                                except Exception:
-                                    pass
                                 return None
 
                         resp = await asyncio.get_event_loop().run_in_executor(None, _post_fetch)
-                        try:
+                        with contextlib.suppress(Exception):
                             logger.info("Webapp fetch response for fh=%s: resp=%s", fh, getattr(resp, 'status_code', None))
-                        except Exception:
-                            pass
 
                         if resp is not None and getattr(resp, "status_code", None) == 200:
                             try:
@@ -1088,12 +1068,9 @@ class EnhancedMediaHandler:
                                         await update.message.reply_text(f"✅ Server fetched and queued conversion (job {queued_job}).")
                                 except Exception:
                                     pass
-
                                 # delete saved forward metadata to avoid duplicates
-                                try:
-                                    delete_forward_metadata(fh)
-                                except Exception:
-                                    pass
+                                with contextlib.suppress(Exception):
+                                    await delete_forward_metadata(fh)
                                 return fh
                             except Exception:
                                 logger.exception("Failed to parse webapp enqueue response for %s", fh)
@@ -1107,10 +1084,8 @@ class EnhancedMediaHandler:
 
                         job_id = str(_uuid.uuid4())
                         output_dir = getattr(config, "OUTPUT_PATH", "storage/output") if config else "storage/output"
-                        try:
+                        with contextlib.suppress(Exception):
                             os.makedirs(output_dir, exist_ok=True)
-                        except Exception:
-                            pass
                         base_name = os.path.splitext(metadata.get("name") or os.path.basename(input_path))[0]
                         output_path = os.path.join(output_dir, f"{base_name}_{job_id}.mp4")
                         job = {
@@ -1135,24 +1110,18 @@ class EnhancedMediaHandler:
                                 q = getattr(update, "callback_query", None)
                                 if q is not None:
                                     await self.safe_edit(q, f"✅ Fetched forwarded media and queued conversion (job {job_id}).")
-                                    try:
+                                    with contextlib.suppress(Exception):
                                         asyncio.create_task(self._watch_job_progress(q, job_id))
-                                    except Exception:
-                                        pass
                                 else:
                                     # fallback to replying in chat when no callback_query
                                     if getattr(update, "message", None):
-                                        try:
+                                        with contextlib.suppress(Exception):
                                             await update.message.reply_text(f"✅ Fetched forwarded media and queued conversion (job {job_id}).")
-                                        except Exception:
-                                            pass
                             except Exception:
                                 logger.exception("Failed to notify user after enqueue for %s", fh)
                             # cleanup saved forward metadata
-                            try:
-                                delete_forward_metadata(fh)
-                            except Exception:
-                                pass
+                            with contextlib.suppress(Exception):
+                                await delete_forward_metadata(fh)
                             return fh
                         except Exception:
                             logger.exception("Failed to enqueue job after fetch for %s", fh)
@@ -1194,7 +1163,6 @@ class EnhancedMediaHandler:
         def bool_label(k):
             return "On" if s.get(k) else "Off"
 
-        page = 1
         # If called via callback with page param, the caller will handle; default to page 1
         # Build text and keyboard to match the requested control panel style
         text = "⚙️ <b>Config Bot Settings</b>\n\n"
@@ -1260,10 +1228,8 @@ class EnhancedMediaHandler:
             try:
                 chat_id = None
                 if getattr(update, "callback_query", None):
-                    try:
+                    with contextlib.suppress(Exception):
                         await update.callback_query.answer()
-                    except Exception:
-                        pass
                     if getattr(update.callback_query, "message", None) and getattr(update.callback_query.message, "chat", None):
                         chat_id = update.callback_query.message.chat.id
                 elif getattr(update, "message", None) and getattr(update.message, "chat", None):
@@ -1287,7 +1253,6 @@ class EnhancedMediaHandler:
 
     async def bulk_url_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Enqueue one or more URLs provided as command arguments for processing."""
-        user_id = update.effective_user.id
         if user_settings is None:
             await update.message.reply_text("⚠️ Settings not available (missing module).")
             return
@@ -1326,7 +1291,7 @@ class EnhancedMediaHandler:
         self,
         update: Update,
         context: ContextTypes.DEFAULT_TYPE,
-        session: Dict,
+        session: dict,
         target_format: str,
     ):
         """Convert video to different format."""
@@ -1334,7 +1299,6 @@ class EnhancedMediaHandler:
             return
         query = update.callback_query
         current_file = session.get("current_file")
-        user_id = update.effective_user.id
 
         if not current_file or current_file["type"] != "video":
             await self.safe_edit(query, "❌ No video file found.")
@@ -1358,10 +1322,8 @@ class EnhancedMediaHandler:
         input_path = current_file["path"]
         output_ext = f".{target_format}"
         output_dir = getattr(config, "OUTPUT_PATH", "storage/output") if config else "storage/output"
-        try:
+        with contextlib.suppress(Exception):
             os.makedirs(output_dir, exist_ok=True)
-        except Exception:
-            pass
         output_path = os.path.join(output_dir, f"{current_file['id']}_converted{output_ext}")
         job_id = str(uuid.uuid4())
         job = {
@@ -1384,7 +1346,7 @@ class EnhancedMediaHandler:
             except Exception:
                 job["request_id"] = None
             await enqueue_job(job)
-        except Exception as e:
+        except Exception:
             logger.exception("Failed to enqueue job")
             await self.safe_edit(query, "❌ Failed to queue conversion.")
             return
@@ -1393,10 +1355,8 @@ class EnhancedMediaHandler:
         try:
             kb = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data=f"cancel_job:{job_id}")]])
             await self.safe_edit(query, f"✅ Job queued (ID: {job_id}). I'll send the file when ready.", reply_markup=kb)
-            try:
+            with contextlib.suppress(Exception):
                 asyncio.create_task(self._watch_job_progress(query, job_id))
-            except Exception:
-                pass
         except Exception:
             await self.safe_edit(query, f"✅ Job queued (ID: {job_id}). I'll send the file when ready.")
         return
@@ -1452,12 +1412,10 @@ class EnhancedMediaHandler:
                 return
         except Exception:
             # If ACL check fails for any reason, default to deny-safe
-            try:
+            with contextlib.suppress(Exception):
                 await update.message.reply_text(
                     "Access denied. (ACL check failed)"
                 )
-            except Exception:
-                pass
             return
 
         # Initialize user session
@@ -1489,8 +1447,7 @@ class EnhancedMediaHandler:
             pass
 
         # Clear awaiting_custom_resolution if user sends non-text
-        if getattr(context, "user_data", {}).get("awaiting_custom_resolution"):
-            if not getattr(update.message, "text", None):
+        if getattr(context, "user_data", {}).get("awaiting_custom_resolution") and not getattr(update.message, "text", None):
                 context.user_data.pop("awaiting_custom_resolution", None)
                 await update.message.reply_text(
                     "❌ Cancelled custom resolution. Send text like 1280x720 or send a file.",
@@ -1508,10 +1465,8 @@ class EnhancedMediaHandler:
                     await update.message.reply_text("📥 Downloading thumbnail photo and saving as default...")
                     file = await context.bot.get_file(file_obj.file_id)
                     thumb_dir = config.THUMBNAIL_PATH if hasattr(config, "THUMBNAIL_PATH") else "storage/thumbnails"
-                    try:
+                    with contextlib.suppress(Exception):
                         os.makedirs(thumb_dir, exist_ok=True)
-                    except Exception:
-                        pass
                     thumb_path = os.path.join(thumb_dir, f"{user_id}_{file_obj.file_id}.jpg")
                     await file.download_to_drive(thumb_path)
                     if user_settings:
@@ -1578,10 +1533,8 @@ class EnhancedMediaHandler:
                     file_obj = photos[-1]
                     file = await context.bot.get_file(file_obj.file_id)
                     input_dir = getattr(config, "INPUT_PATH", "storage/input")
-                    try:
+                    with contextlib.suppress(Exception):
                         os.makedirs(input_dir, exist_ok=True)
-                    except Exception:
-                        pass
                     photo_path = os.path.join(input_dir, f"{user_id}_{file_obj.file_id}.jpg")
                     await file.download_to_drive(photo_path)
 
@@ -1602,7 +1555,7 @@ class EnhancedMediaHandler:
                                 # best-effort: finalize immediately
                                 await self._finalize_media_group(user_id, mgid)
                         # reply lightly that album item saved (silent)
-                        await update.message.reply_text(f"➕ Photo added to album buffer (media_group).")
+                        await update.message.reply_text("➕ Photo added to album buffer (media_group).")
                         return
 
                     # Non-album single photo: append directly
@@ -1636,10 +1589,8 @@ class EnhancedMediaHandler:
                 for url in urls:
                     job_id = str(uuid.uuid4())
                     output_dir = getattr(config, "OUTPUT_PATH", "storage/output") if config else "storage/output"
-                    try:
+                    with contextlib.suppress(Exception):
                         os.makedirs(output_dir, exist_ok=True)
-                    except Exception:
-                        pass
                     output_path = os.path.join(output_dir, f"{job_id}.mp4")
                     job = {
                         "job_id": job_id,
@@ -1669,7 +1620,7 @@ class EnhancedMediaHandler:
             )
 
     async def handle_video(
-        self, update: Update, context: ContextTypes.DEFAULT_TYPE, session: Dict
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE, session: dict
     ):
         """Handle incoming video files."""
         video = update.message.video
@@ -1743,10 +1694,8 @@ class EnhancedMediaHandler:
             "file_unique_id": file_unique_id,
         }
 
-        try:
+        with contextlib.suppress(Exception):
             logger.info("registered current_file for user %s id=%s forward=%s size=%s", user_id, file_id, forward_info, video.file_size)
-        except Exception:
-            pass
         try:
             self._persist_session(user_id)
         except Exception:
@@ -1764,7 +1713,7 @@ class EnhancedMediaHandler:
         )
 
     async def handle_audio(
-        self, update: Update, context: ContextTypes.DEFAULT_TYPE, session: Dict
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE, session: dict
     ):
         """Handle incoming audio files."""
         audio = update.message.audio
@@ -1837,10 +1786,8 @@ class EnhancedMediaHandler:
             "file_unique_id": file_unique_id,
         }
 
-        try:
+        with contextlib.suppress(Exception):
             logger.info("registered current_file for user %s id=%s forward=%s size=%s", user_id, audio.file_id, forward_info, audio.file_size)
-        except Exception:
-            pass
 
         await update.message.reply_text(
             f"✅ Audio registered!\n"
@@ -1850,7 +1797,7 @@ class EnhancedMediaHandler:
         )
 
     async def handle_document(
-        self, update: Update, context: ContextTypes.DEFAULT_TYPE, session: Dict
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE, session: dict
     ):
         """Handle document files (could be video/audio)."""
         document = update.message.document
@@ -1869,10 +1816,8 @@ class EnhancedMediaHandler:
             await update.message.reply_text("📥 Downloading subtitle file...")
             file = await context.bot.get_file(document.file_id)
             input_dir = getattr(config, "INPUT_PATH", "storage/input") if config else "storage/input"
-            try:
+            with contextlib.suppress(Exception):
                 os.makedirs(input_dir, exist_ok=True)
-            except Exception:
-                pass
             subtitle_path = os.path.join(input_dir, f"{user_id}_{document.file_id}{file_ext}")
             await file.download_to_drive(subtitle_path)
 
@@ -1884,10 +1829,8 @@ class EnhancedMediaHandler:
 
             video_path = current["path"]
             output_dir = getattr(config, "OUTPUT_PATH", "storage/output") if config else "storage/output"
-            try:
+            with contextlib.suppress(Exception):
                 os.makedirs(output_dir, exist_ok=True)
-            except Exception:
-                pass
             out_path = os.path.join(output_dir, f"{user_id}_subtitled_{os.path.basename(video_path)}")
 
             if awaiting_burn:
@@ -1900,7 +1843,8 @@ class EnhancedMediaHandler:
             if ok and os.path.exists(out_path):
                 await update.message.reply_text("✅ Subtitles applied. Sending file...")
                 try:
-                    await context.bot.send_document(chat_id=update.effective_chat.id, document=open(out_path, "rb"))
+                    with open(out_path, "rb") as doc_file:
+                        await context.bot.send_document(chat_id=update.effective_chat.id, document=doc_file)
                 except Exception:
                     await update.message.reply_text("⚠️ Failed to send file; try downloading from the server.")
             else:
@@ -2009,10 +1953,8 @@ class EnhancedMediaHandler:
         except Exception:
             logger.debug("Could not persist session after registering document")
 
-        try:
+        with contextlib.suppress(Exception):
             logger.info("registered current_file for user %s id=%s forward=%s size=%s", user_id, document.file_id, forward_info, document.file_size)
-        except Exception:
-            pass
 
         await update.message.reply_text(
             f"✅ {file_type.capitalize()} registered!\n"
@@ -2022,7 +1964,7 @@ class EnhancedMediaHandler:
         )
 
     async def _apply_fade(
-        self, update: Update, context: ContextTypes.DEFAULT_TYPE, session: Dict,
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE, session: dict,
         fade_in: float = 0.0, fade_out: float = 0.0,
     ):
         """Apply audio fade-in and/or fade-out to the current file."""
@@ -2057,16 +1999,14 @@ class EnhancedMediaHandler:
             return
         ext = os.path.splitext(input_path)[1] or ".mp3"
         output_dir = getattr(config, "OUTPUT_PATH", "storage/output") if config else "storage/output"
-        try:
+        with contextlib.suppress(Exception):
             os.makedirs(output_dir, exist_ok=True)
-        except Exception:
-            pass
         output_path = os.path.join(output_dir, f"{current_file.get('id', 'unknown')}_faded{ext}")
 
         success = await self.converter.apply_fade(input_path, output_path, fade_in, fade_out)
         if success and os.path.exists(output_path):
             current_file["path"] = output_path
-            await self.safe_edit(query, f"✅ Fade applied! Sending file...",
+            await self.safe_edit(query, "✅ Fade applied! Sending file...",
             reply_markup=MediaMenuBuilder.get_back_button())
             try:
                 with open(output_path, "rb") as f:
@@ -2109,10 +2049,8 @@ class EnhancedMediaHandler:
 
         # Validate callback payload
         if not isinstance(data, str):
-            try:
+            with contextlib.suppress(Exception):
                 await query.answer()
-            except Exception:
-                pass
             await self.safe_edit(query, "⚠️ Invalid button payload.")
             logger.warning(
                 f"Invalid callback data type: {type(data)} data={data}"
@@ -2356,10 +2294,8 @@ class EnhancedMediaHandler:
                     input_path = current_file["path"]
                     ext = os.path.splitext(input_path)[1] or ".mp4"
                     output_dir = getattr(config, "OUTPUT_PATH", "storage/output") if config else "storage/output"
-                    try:
+                    with contextlib.suppress(Exception):
                         os.makedirs(output_dir, exist_ok=True)
-                    except Exception:
-                        pass
                     output_path = os.path.join(output_dir, f"{current_file.get('id', 'unknown')}_optimized{ext}")
                     success = await self.converter.optimize_video(input_path, output_path, preset="medium", crf=23)
                     if success and os.path.exists(output_path):
@@ -2471,10 +2407,8 @@ class EnhancedMediaHandler:
                     query,
                     f"➕ Added to merge list. Total files: {len(session['merge_list'])}",
                 )
-                try:
+                with contextlib.suppress(Exception):
                     await query.answer("Added to merge list")
-                except Exception:
-                    pass
 
             elif isinstance(data, str) and data.startswith("merge_view"):
                 # Support pagination: callback forms: 'merge_view' or 'merge_view:2'
@@ -2523,10 +2457,8 @@ class EnhancedMediaHandler:
                 except Exception:
                     logger.debug("Could not persist session after merge_clear")
                 await self.safe_edit(query, "🗑️ Merge list cleared.")
-                try:
+                with contextlib.suppress(Exception):
                     await query.answer("Merge list cleared")
-                except Exception:
-                    pass
 
             elif data == "framerate_menu":
                 await self.safe_edit(
@@ -2733,10 +2665,8 @@ class EnhancedMediaHandler:
 
                             job_id = str(uuid.uuid4()) if uuid else None
                             output_dir = getattr(config, "OUTPUT_PATH", "storage/output") if config else "storage/output"
-                            try:
+                            with contextlib.suppress(Exception):
                                 os.makedirs(output_dir, exist_ok=True)
-                            except Exception:
-                                pass
                             out_path = os.path.join(output_dir, f"{f.get('id')}_bulk.mp4")
                             job = {
                                 "job_id": job_id,
@@ -2839,10 +2769,8 @@ class EnhancedMediaHandler:
                     try:
                         new = user_settings.toggle_user_setting(user_id, key)
                         await self.safe_edit(query, f"✅ `{key}` set to {new}", parse_mode="Markdown")
-                        try:
+                        with contextlib.suppress(Exception):
                             await query.answer("Setting updated")
-                        except Exception:
-                            pass
                     except Exception:
                         logger.exception("Failed to toggle setting %s for user %s", key, user_id)
                         await self.safe_edit(query, "⚠️ Failed to change setting.")
@@ -2855,10 +2783,8 @@ class EnhancedMediaHandler:
                     try:
                         user_settings.clear_user_settings(user_id)
                         await self.safe_edit(query, "✅ Your settings have been reset to defaults.")
-                        try:
+                        with contextlib.suppress(Exception):
                             await query.answer("Settings reset")
-                        except Exception:
-                            pass
                     except Exception:
                         logger.exception("Failed to reset settings for user %s", user_id)
                         await self.safe_edit(query, "⚠️ Failed to reset settings.")
@@ -2876,10 +2802,8 @@ class EnhancedMediaHandler:
 
                     await cancel_job(job_id)
                     await self.safe_edit(query, f"⏹️ Cancellation requested for job {job_id}.")
-                    try:
+                    with contextlib.suppress(Exception):
                         await query.answer("Cancellation requested")
-                    except Exception:
-                        pass
                 except Exception:
                     logger.exception("Failed to request cancellation for job %s", job_id)
                     await self.safe_edit(query, "⚠️ Failed to request cancellation.")
@@ -2939,10 +2863,8 @@ class EnhancedMediaHandler:
 
             elif data == "noop":
                 # Non-actionable placeholder button pressed; acknowledge silently.
-                try:
+                with contextlib.suppress(Exception):
                     await query.answer()
-                except Exception:
-                    pass
                 return
 
             else:
@@ -3008,7 +2930,7 @@ class EnhancedMediaHandler:
     # ========== IMPLEMENTATION METHODS ==========
 
     async def convert_to_mp3(
-        self, update: Update, context: ContextTypes.DEFAULT_TYPE, session: Dict
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE, session: dict
     ):
         """Convert video to MP3."""
         # Defensive: ensure this was invoked via a callback query
@@ -3056,10 +2978,8 @@ class EnhancedMediaHandler:
         async def do_conversion():
             # Lock the input file to prevent concurrent access
             output_dir = getattr(config, "OUTPUT_PATH", "storage/output") if config else "storage/output"
-            try:
+            with contextlib.suppress(Exception):
                 os.makedirs(output_dir, exist_ok=True)
-            except Exception:
-                pass
             output_path = os.path.join(output_dir, f"{current_file['id']}_audio.mp3")
 
             if AsyncFileLock:
@@ -3169,7 +3089,7 @@ class EnhancedMediaHandler:
         self,
         update: Update,
         context: ContextTypes.DEFAULT_TYPE,
-        session: Dict,
+        session: dict,
         crf: str,
     ):
         """Compress video with specified CRF."""
@@ -3211,10 +3131,8 @@ class EnhancedMediaHandler:
 
         async def do_compression():
             output_dir = getattr(config, "OUTPUT_PATH", "storage/output") if config else "storage/output"
-            try:
+            with contextlib.suppress(Exception):
                 os.makedirs(output_dir, exist_ok=True)
-            except Exception:
-                pass
             output_path = os.path.join(output_dir, f"{current_file['id']}_compressed.mp4")
 
             # Map resolution presets
@@ -3272,7 +3190,7 @@ class EnhancedMediaHandler:
         )
 
     async def merge_videos(
-        self, update: Update, context: ContextTypes.DEFAULT_TYPE, session: Dict
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE, session: dict
     ):
         """Merge multiple videos."""
         if not await self._require_callback(update):
@@ -3295,10 +3213,8 @@ class EnhancedMediaHandler:
         )
 
         output_dir = getattr(config, "OUTPUT_PATH", "storage/output") if config else "storage/output"
-        try:
+        with contextlib.suppress(Exception):
             os.makedirs(output_dir, exist_ok=True)
-        except Exception:
-            pass
         output_path = os.path.join(output_dir, f"merged_{int(datetime.now().timestamp())}.mp4")
         success = await self.converter.merge_videos(
             session["merge_list"], output_path
@@ -3323,7 +3239,7 @@ class EnhancedMediaHandler:
             await self.safe_edit(query, "❌ Merge failed.")
 
     async def merge_audios(
-        self, update: Update, context: ContextTypes.DEFAULT_TYPE, session: Dict
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE, session: dict
     ):
         """Merge multiple audio files."""
         if not await self._require_callback(update):
@@ -3346,10 +3262,8 @@ class EnhancedMediaHandler:
         )
 
         output_dir = getattr(config, "OUTPUT_PATH", "storage/output") if config else "storage/output"
-        try:
+        with contextlib.suppress(Exception):
             os.makedirs(output_dir, exist_ok=True)
-        except Exception:
-            pass
         output_path = os.path.join(output_dir, f"merged_{int(datetime.now().timestamp())}.mp3")
         success = await self.converter.merge_audios(
             session["merge_list"], output_path
@@ -3374,7 +3288,7 @@ class EnhancedMediaHandler:
             await self.safe_edit(query, "❌ Merge failed.")
 
     async def remove_audio(
-        self, update: Update, context: ContextTypes.DEFAULT_TYPE, session: Dict
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE, session: dict
     ):
         """Remove audio from video."""
         if not await self._require_callback(update):
@@ -3401,10 +3315,8 @@ class EnhancedMediaHandler:
                 return
 
         output_dir = getattr(config, "OUTPUT_PATH", "storage/output") if config else "storage/output"
-        try:
+        with contextlib.suppress(Exception):
             os.makedirs(output_dir, exist_ok=True)
-        except Exception:
-            pass
         output_path = os.path.join(output_dir, f"{current_file['id']}_no_audio.mp4")
         success = await self.converter.remove_audio(
             current_file["path"], output_path
@@ -3426,7 +3338,7 @@ class EnhancedMediaHandler:
         self,
         update: Update,
         context: ContextTypes.DEFAULT_TYPE,
-        session: Dict,
+        session: dict,
         resolution: str,
     ):
         """Change video resolution."""
@@ -3481,10 +3393,8 @@ class EnhancedMediaHandler:
                 return
 
         output_dir = getattr(config, "OUTPUT_PATH", "storage/output") if config else "storage/output"
-        try:
+        with contextlib.suppress(Exception):
             os.makedirs(output_dir, exist_ok=True)
-        except Exception:
-            pass
         output_path = os.path.join(output_dir, f"{current_file['id']}_{width}x{height}.mp4")
         success = await self.converter.change_resolution(
             current_file["path"], output_path, width, height
@@ -3506,7 +3416,7 @@ class EnhancedMediaHandler:
         self,
         update: Update,
         context: ContextTypes.DEFAULT_TYPE,
-        session: Dict,
+        session: dict,
         preset: str,
     ):
         """Optimize video for specific use case."""
@@ -3557,10 +3467,8 @@ class EnhancedMediaHandler:
                 return
 
         output_dir = getattr(config, "OUTPUT_PATH", "storage/output") if config else "storage/output"
-        try:
+        with contextlib.suppress(Exception):
             os.makedirs(output_dir, exist_ok=True)
-        except Exception:
-            pass
         output_path = os.path.join(output_dir, f"{current_file['id']}_optimized.mp4")
 
         # Use FFmpeg command for optimization
@@ -3610,10 +3518,8 @@ class EnhancedMediaHandler:
             try:
                 kb = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data=f"cancel_job:{job_id}")]])
                 await self.safe_edit(query, f"✅ Optimization job queued (ID: {job_id}). I'll update you with progress.", reply_markup=kb)
-                try:
+                with contextlib.suppress(Exception):
                     asyncio.create_task(self._watch_job_progress(query, job_id))
-                except Exception:
-                    pass
             except Exception:
                 await self.safe_edit(query, f"✅ Optimization job queued (ID: {job_id}).")
             return
@@ -3634,7 +3540,7 @@ class EnhancedMediaHandler:
             await self.safe_edit(query, "❌ Optimization failed.")
 
     async def repair_video(
-        self, update: Update, context: ContextTypes.DEFAULT_TYPE, session: Dict
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE, session: dict
     ):
         """Attempt to repair corrupted video."""
         if not await self._require_callback(update):
@@ -3663,10 +3569,8 @@ class EnhancedMediaHandler:
         # enqueue repair job
         job_id = str(uuid.uuid4())
         output_dir = getattr(config, "OUTPUT_PATH", "storage/output") if config else "storage/output"
-        try:
+        with contextlib.suppress(Exception):
             os.makedirs(output_dir, exist_ok=True)
-        except Exception:
-            pass
         output_path = os.path.join(output_dir, f"{current_file['id']}_repaired.mp4")
         job = {
             "job_id": job_id,
@@ -3689,10 +3593,8 @@ class EnhancedMediaHandler:
                 job["request_id"] = None
             await enqueue_job(job)
             await self.safe_edit(query, f"✅ Repair job queued (ID: {job_id}). I'll send the file when ready.")
-            try:
+            with contextlib.suppress(Exception):
                 asyncio.create_task(self._watch_job_progress(query, job_id))
-            except Exception:
-                pass
         except Exception:
             logger.exception("Failed to enqueue repair job")
             await self.safe_edit(query, "❌ Failed to queue repair job.")
@@ -3702,7 +3604,7 @@ class EnhancedMediaHandler:
         self,
         update: Update,
         context: ContextTypes.DEFAULT_TYPE,
-        session: Dict,
+        session: dict,
         option: str,
     ):
         """Take screenshot(s) from video."""
@@ -3796,10 +3698,8 @@ class EnhancedMediaHandler:
         await self.safe_edit(query, f"🖼️ Taking screenshot at {time_str}...")
 
         output_dir = getattr(config, "OUTPUT_PATH", "storage/output") if config else "storage/output"
-        try:
+        with contextlib.suppress(Exception):
             os.makedirs(output_dir, exist_ok=True)
-        except Exception:
-            pass
         output_path = os.path.join(output_dir, f"{current_file.get('id', 'unknown')}_screenshot.jpg")
         success = await self.converter.take_screenshot_at_time(
             current_file["path"], output_path, time_str
@@ -3817,7 +3717,7 @@ class EnhancedMediaHandler:
             await self.safe_edit(query, "❌ Failed to take screenshot.")
 
     async def create_thumbnail_grid(
-        self, update: Update, context: ContextTypes.DEFAULT_TYPE, session: Dict
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE, session: dict
     ):
         """Create thumbnail grid from video."""
         if not await self._require_callback(update):
@@ -3841,10 +3741,8 @@ class EnhancedMediaHandler:
         await self.safe_edit(query, "🖼️ Creating thumbnail grid...")
 
         output_dir = getattr(config, "OUTPUT_PATH", "storage/output") if config else "storage/output"
-        try:
+        with contextlib.suppress(Exception):
             os.makedirs(output_dir, exist_ok=True)
-        except Exception:
-            pass
         output_path = os.path.join(output_dir, f"{current_file['id']}_grid.jpg")
         success = await self.converter.extract_thumbnail_grid(
             current_file["path"], output_path, 3, 3
@@ -3863,7 +3761,7 @@ class EnhancedMediaHandler:
             await self.take_screenshot(update, context, session, "middle")
 
     async def extract_streams(
-        self, update: Update, context: ContextTypes.DEFAULT_TYPE, session: Dict
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE, session: dict
     ):
         """Extract all streams from video."""
         if not await self._require_callback(update):
@@ -3893,10 +3791,8 @@ class EnhancedMediaHandler:
         job_id = str(uuid.uuid4())
         out_base = getattr(config, "OUTPUT_PATH", "storage/output") if config else "storage/output"
         out_dir = os.path.join(out_base, f"{current_file['id']}_streams")
-        try:
+        with contextlib.suppress(Exception):
             os.makedirs(out_dir, exist_ok=True)
-        except Exception:
-            pass
         archive_path = f"{out_dir}.zip"
         job = {
             "job_id": job_id,
@@ -3922,17 +3818,15 @@ class EnhancedMediaHandler:
         await enqueue_job(job)
         kb = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data=f"cancel_job:{job_id}")]])
         await self.safe_edit(query, f"⏳ Job queued: {job_id} — extracting streams", reply_markup=kb)
-        try:
+        with contextlib.suppress(Exception):
             asyncio.create_task(self._watch_job_progress(query, job_id))
-        except Exception:
-            pass
         return
 
     async def convert_audio_format(
         self,
         update: Update,
         context: ContextTypes.DEFAULT_TYPE,
-        session: Dict,
+        session: dict,
         format_type: str,
     ):
         """Convert audio to different format."""
@@ -3962,10 +3856,8 @@ class EnhancedMediaHandler:
                 return
 
         output_base = getattr(config, "OUTPUT_PATH", "storage/output") if config else "storage/output"
-        try:
+        with contextlib.suppress(Exception):
             os.makedirs(output_base, exist_ok=True)
-        except Exception:
-            pass
         output_path = os.path.join(output_base, f"{current_file['id']}_converted.{format_type}")
         success = await self.converter.convert_audio_format(
             current_file["path"], output_path, format_type
@@ -3999,7 +3891,7 @@ class EnhancedMediaHandler:
         self,
         update: Update,
         context: ContextTypes.DEFAULT_TYPE,
-        session: Dict,
+        session: dict,
         bitrate: str,
     ):
         """Adjust audio bitrate."""
@@ -4025,10 +3917,8 @@ class EnhancedMediaHandler:
         await self.safe_edit(query, f"🎚️ Setting bitrate to {bitrate}...")
 
         output_base = getattr(config, "OUTPUT_PATH", "storage/output") if config else "storage/output"
-        try:
+        with contextlib.suppress(Exception):
             os.makedirs(output_base, exist_ok=True)
-        except Exception:
-            pass
         output_path = os.path.join(output_base, f"{current_file['id']}_{bitrate}.mp3")
 
         # Convert with specific bitrate
@@ -4060,7 +3950,7 @@ class EnhancedMediaHandler:
             await self.safe_edit(query, "❌ Failed to adjust bitrate.")
 
     async def normalize_audio(
-        self, update: Update, context: ContextTypes.DEFAULT_TYPE, session: Dict
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE, session: dict
     ):
         """Normalize audio volume."""
         if not await self._require_callback(update):
@@ -4078,10 +3968,8 @@ class EnhancedMediaHandler:
         await self.safe_edit(query, "🔊 Normalizing audio...")
 
         output_base = getattr(config, "OUTPUT_PATH", "storage/output") if config else "storage/output"
-        try:
+        with contextlib.suppress(Exception):
             os.makedirs(output_base, exist_ok=True)
-        except Exception:
-            pass
         output_path = os.path.join(output_base, f"{current_file['id']}_normalized.mp3")
 
         # Use loudnorm filter for normalization
@@ -4120,7 +4008,7 @@ class EnhancedMediaHandler:
             await self.safe_edit(query, "❌ Failed to normalize audio.")
 
     async def extract_all_streams(
-        self, update: Update, context: ContextTypes.DEFAULT_TYPE, session: Dict
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE, session: dict
     ):
         """Extract all streams (video, audio, subtitles)."""
         if not await self._require_callback(update):
@@ -4128,7 +4016,7 @@ class EnhancedMediaHandler:
         await self.extract_streams(update, context, session)
 
     async def extract_subtitles(
-        self, update: Update, context: ContextTypes.DEFAULT_TYPE, session: Dict
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE, session: dict
     ):
         """Extract subtitles from video."""
         if not await self._require_callback(update):
@@ -4152,10 +4040,8 @@ class EnhancedMediaHandler:
                 return
 
         output_base = getattr(config, "OUTPUT_PATH", "storage/output") if config else "storage/output"
-        try:
+        with contextlib.suppress(Exception):
             os.makedirs(output_base, exist_ok=True)
-        except Exception:
-            pass
         output_path = os.path.join(output_base, f"{current_file['id']}_subtitles.srt")
         success = await self.converter.extract_subtitles(
             current_file["path"], output_path
@@ -4176,7 +4062,7 @@ class EnhancedMediaHandler:
             )
 
     async def show_full_info(
-        self, update: Update, context: ContextTypes.DEFAULT_TYPE, session: Dict
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE, session: dict
     ):
         """Show full media information."""
         if not await self._require_callback(update):
@@ -4279,7 +4165,7 @@ class EnhancedMediaHandler:
             await self.safe_edit(query, "❌ Failed to analyze media.")
 
     async def create_archive(
-        self, update: Update, context: ContextTypes.DEFAULT_TYPE, session: Dict
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE, session: dict
     ):
         """Create archive of processed files."""
         if not await self._require_callback(update):
@@ -4289,10 +4175,8 @@ class EnhancedMediaHandler:
         # Get all files in output directory for this user
         user_id = update.effective_user.id
         output_dir = getattr(config, "OUTPUT_PATH", "storage/output") if config else "storage/output"
-        try:
+        with contextlib.suppress(Exception):
             os.makedirs(output_dir, exist_ok=True)
-        except Exception:
-            pass
         user_files = [f for f in os.listdir(output_dir) if f.startswith(str(user_id))]
 
         if not user_files:
@@ -4321,13 +4205,11 @@ class EnhancedMediaHandler:
         await enqueue_job(job)
         kb = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data=f"cancel_job:{job_id}")]])
         await self.safe_edit(query, f"⏳ Job queued: {job_id} — creating archive", reply_markup=kb)
-        try:
+        with contextlib.suppress(Exception):
             asyncio.create_task(self._watch_job_progress(query, job_id))
-        except Exception:
-            pass
 
     async def generate_sample(
-        self, update: Update, context: ContextTypes.DEFAULT_TYPE, session: Dict
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE, session: dict
     ):
         """Generate sample/preview of media."""
         if not await self._require_callback(update):
@@ -4354,10 +4236,8 @@ class EnhancedMediaHandler:
 
         job_id = str(uuid.uuid4())
         output_base = getattr(config, "OUTPUT_PATH", "storage/output") if config else "storage/output"
-        try:
+        with contextlib.suppress(Exception):
             os.makedirs(output_base, exist_ok=True)
-        except Exception:
-            pass
         output_path = os.path.join(output_base, f"{current_file['id']}_sample")
         if current_file["type"] == "video":
             output_path += ".mp4"
@@ -4378,20 +4258,18 @@ class EnhancedMediaHandler:
         await enqueue_job(job)
         kb = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data=f"cancel_job:{job_id}")]])
         await self.safe_edit(query, f"⏳ Job queued: {job_id} — generating sample", reply_markup=kb)
-        try:
+        with contextlib.suppress(Exception):
             asyncio.create_task(self._watch_job_progress(query, job_id))
-        except Exception:
-            pass
 
     async def show_media_info(
-        self, update: Update, context: ContextTypes.DEFAULT_TYPE, session: Dict
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE, session: dict
     ):
         """Show basic media information."""
         if not await self._require_callback(update):
             return
         await self.show_full_info(update, context, session)
 
-    async def log_media_to_db(self, user_id: int, file_info: Dict):
+    async def log_media_to_db(self, user_id: int, file_info: dict):
         """Log media processing to MongoDB."""
         try:
             # Prefer an existing, cached model created during application startup
@@ -4427,10 +4305,8 @@ class EnhancedMediaHandler:
                         db_name=os.environ.get("MONGODB_NAME", None) or "media_conversion_bot",
                     )
                     # Cache on the handler so subsequent calls reuse the same model
-                    try:
+                    with contextlib.suppress(Exception):
                         self.db_model = model
-                    except Exception:
-                        pass
 
                     # Ensure indexes asynchronously (best-effort)
                     try:
@@ -4462,16 +4338,8 @@ class EnhancedMediaHandler:
                 logger.error(f"Failed to log to MongoDB: {e}")
 
             else:
-                # Catch-all for any unhandled callback
-                await self.safe_edit(query, "⚠️ Unknown action. Please try again.",
-                reply_markup=MediaMenuBuilder.get_back_button())
-                await self._log_bad_callback(
-                    "unhandled_callback",
-                    data,
-                    user_id,
-                    getattr(update.effective_chat, "id", None),
-                    getattr(getattr(query, "message", None), "message_id", None),
-                )
+                # Catch-all for any unhandled callback (guarded: no update/query/data available here)
+                logger.debug("log_media_to_db: unhandled path for user %s", user_id)
 
         except Exception as e:
             logger.error(f"Failed to log to MongoDB: {e}")
@@ -4525,10 +4393,8 @@ class EnhancedMediaHandler:
                     # Perform trim
                     await update.message.reply_text(f"✂️ Trimming from {start} to {user_input}...")
                     output_base = getattr(config, "OUTPUT_PATH", "storage/output") if config else "storage/output"
-                    try:
+                    with contextlib.suppress(Exception):
                         os.makedirs(output_base, exist_ok=True)
-                    except Exception:
-                        pass
                     output_path = os.path.join(output_base, f"{current_file['id']}_trim_{int(start_s)}_{int(end_s)}.mp4")
                     success = await self.converter.trim_video(current_file["path"], output_path, start, user_input.strip())
 
@@ -4580,10 +4446,8 @@ class EnhancedMediaHandler:
 
                     await update.message.reply_text(f"✂️ Trimming from {start} for duration {user_input} (to {end_str})...")
                     output_base = getattr(config, "OUTPUT_PATH", "storage/output") if config else "storage/output"
-                    try:
+                    with contextlib.suppress(Exception):
                         os.makedirs(output_base, exist_ok=True)
-                    except Exception:
-                        pass
                     output_path = os.path.join(output_base, f"{current_file['id']}_trim_{int(start_s)}_{int(end_s)}.mp4")
                     success = await self.converter.trim_video(current_file["path"], output_path, start, end_str)
 
@@ -4698,10 +4562,8 @@ class EnhancedMediaHandler:
                     )
 
                     output_base = getattr(config, "OUTPUT_PATH", "storage/output") if config else "storage/output"
-                    try:
+                    with contextlib.suppress(Exception):
                         os.makedirs(output_base, exist_ok=True)
-                    except Exception:
-                        pass
                     output_path = os.path.join(output_base, f"{current_file['id']}_{width}x{height}.mp4")
                     success = await self.converter.change_resolution(
                         current_file["path"], output_path, width, height
@@ -4774,10 +4636,8 @@ class EnhancedMediaHandler:
                         # Try to call converter.split if available
                         try:
                             output_base = getattr(config, "OUTPUT_PATH", "storage/output") if config else "storage/output"
-                            try:
+                            with contextlib.suppress(Exception):
                                 os.makedirs(output_base, exist_ok=True)
-                            except Exception:
-                                pass
                             out = os.path.join(output_base, f"{current_file['id']}_split_{int(start)}_{int(end)}.mp4")
                             if hasattr(self.converter, "split_video"):
                                 success = await self.converter.split_video(current_file["path"], start, end, out)
@@ -4907,10 +4767,8 @@ class EnhancedMediaHandler:
                     return
 
                 output_base = getattr(config, "OUTPUT_PATH", "storage/output") if config else "storage/output"
-                try:
+                with contextlib.suppress(Exception):
                     os.makedirs(output_base, exist_ok=True)
-                except Exception:
-                    pass
                 output_path = os.path.join(output_base, f"{current_file['id']}_trimmed.mp4")
                 success = await self.converter.trim_video(
                     current_file["path"], output_path, start_time, end_time
@@ -4935,10 +4793,8 @@ class EnhancedMediaHandler:
             )
 
             output_base = getattr(config, "OUTPUT_PATH", "storage/output") if config else "storage/output"
-            try:
+            with contextlib.suppress(Exception):
                 os.makedirs(output_base, exist_ok=True)
-            except Exception:
-                pass
             output_path = os.path.join(output_base, f"{current_file['id']}_screenshot.jpg")
             success = await self.converter.take_screenshot_at_time(
                 current_file["path"], output_path, user_input
@@ -5011,10 +4867,8 @@ class EnhancedMediaHandler:
                     f"⏱️ Changing framerate to {fps} fps..."
                 )
                 output_base = getattr(config, "OUTPUT_PATH", "storage/output") if config else "storage/output"
-                try:
+                with contextlib.suppress(Exception):
                     os.makedirs(output_base, exist_ok=True)
-                except Exception:
-                    pass
                 output_path = os.path.join(output_base, f"{current_file['id']}_fr_{int(fps)}.mp4")
                 success = await self.converter.change_framerate(
                     current_file["path"], output_path, fps
@@ -5062,10 +4916,8 @@ class EnhancedMediaHandler:
                 )
 
                 output_base = getattr(config, "OUTPUT_PATH", "storage/output") if config else "storage/output"
-                try:
+                with contextlib.suppress(Exception):
                     os.makedirs(output_base, exist_ok=True)
-                except Exception:
-                    pass
                 output_path = os.path.join(output_base, f"{current_file['id']}_optimized.mp4")
                 cmd = [
                     "-c:v",
@@ -5113,10 +4965,8 @@ class EnhancedMediaHandler:
             try:
                 metadata = json.loads(user_input)
                 output_base = getattr(config, "OUTPUT_PATH", "storage/output") if config else "storage/output"
-                try:
+                with contextlib.suppress(Exception):
                     os.makedirs(output_base, exist_ok=True)
-                except Exception:
-                    pass
                 output_path = os.path.join(output_base, f"{current_file['id']}_with_metadata.mp4")
 
                 success = await self.converter.edit_metadata(

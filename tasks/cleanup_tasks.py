@@ -3,6 +3,7 @@ import asyncio
 import logging
 import os
 import time
+
 try:
     import config
 except Exception:
@@ -117,7 +118,7 @@ class CleanupManager:
         for directory in directories:
             try:
                 if os.path.exists(directory):
-                    for root, dirs, files in os.walk(directory, topdown=False):
+                    for root, dirs, _files in os.walk(directory, topdown=False):
                         for dir_name in dirs:
                             dir_path = os.path.join(root, dir_name)
                             try:
@@ -156,7 +157,7 @@ class CleanupManager:
 
             try:
                 if os.path.exists(directory):
-                    for root, dirs, files in os.walk(directory):
+                    for root, _dirs, files in os.walk(directory):
                         for file in files:
                             file_path = os.path.join(root, file)
                             if os.path.exists(file_path):

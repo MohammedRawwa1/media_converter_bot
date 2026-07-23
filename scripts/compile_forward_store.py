@@ -1,4 +1,6 @@
-import py_compile,traceback
+import py_compile
+import traceback
+
 try:
     py_compile.compile('utils/forward_store.py', doraise=True)
     print('compiled ok')

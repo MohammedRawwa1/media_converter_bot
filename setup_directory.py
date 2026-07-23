@@ -1,5 +1,6 @@
-import os
 import logging
+import os
+
 try:
     import config
 except Exception:

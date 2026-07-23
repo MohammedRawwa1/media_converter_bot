@@ -4,11 +4,10 @@ Rate limiting utilities for Telegram API and bot operations.
 """
 
 import asyncio
+import contextlib
 import logging
 import time
 from collections import defaultdict
-from typing import Dict, Tuple
-import os
 
 try:
     # optional redis usage for distributed rate limiting
@@ -37,7 +36,7 @@ class RateLimiter:
         # Use `capacity` for refill cap (was incorrectly using calls_per_second).
         self.capacity = max(1.0, calls_per_second)
         initial_tokens = float(self.capacity)
-        self.buckets: Dict[str, Tuple[float, float]] = defaultdict(lambda: (initial_tokens, time.time()))
+        self.buckets: dict[str, tuple[float, float]] = defaultdict(lambda: (initial_tokens, time.time()))
         self._lock = asyncio.Lock()
 
     async def acquire(self, user_id: str = "global", tokens: float = 1.0) -> bool:
@@ -107,7 +106,7 @@ class RateLimiter:
 
         return waited
 
-    def get_stats(self, user_id: str = None) -> Dict:
+    def get_stats(self, user_id: str = None) -> dict:
         """Get rate limiter statistics."""
         stats = {}
 
@@ -170,7 +169,7 @@ class TelegramAPIRateLimiter:
 
         return global_ok and per_user_ok
 
-    async def wait_if_needed(self, user_id: str = "global") -> Tuple[float, float]:
+    async def wait_if_needed(self, user_id: str = "global") -> tuple[float, float]:
         """
         Wait until rate limit allows the call.
 
@@ -197,7 +196,7 @@ class TelegramAPIRateLimiter:
 
         return (global_wait, per_user_wait)
 
-    def get_stats(self, user_id: str = None) -> Dict:
+    def get_stats(self, user_id: str = None) -> dict:
         """Get rate limiter statistics."""
         return {
             "global": self.global_limiter.get_stats(),
@@ -218,9 +217,9 @@ class ConversionRateLimiter:
         self.conversions_per_hour = conversions_per_hour
         self.per_second = conversions_per_hour / 3600
         self.limiter = RateLimiter(self.per_second, per_user=True)
-        self.conversion_history: Dict[str, list] = defaultdict(list)
+        self.conversion_history: dict[str, list] = defaultdict(list)
 
-    async def can_convert(self, user_id: str) -> Tuple[bool, str]:
+    async def can_convert(self, user_id: str) -> tuple[bool, str]:
         """
         Check if user can start a conversion.
 
@@ -284,7 +283,7 @@ class ConversionRateLimiterRedis:
     def _key(self, user_id: str) -> str:
         return f"{self.prefix}{user_id}"
 
-    async def can_convert(self, user_id: str) -> Tuple[bool, str]:
+    async def can_convert(self, user_id: str) -> tuple[bool, str]:
         """Non-consuming check whether user may convert (does not reserve).
 
         Returns (allowed: bool, message: str)
@@ -298,11 +297,9 @@ class ConversionRateLimiterRedis:
             key = self._key(user_id)
             now = int(time.time())
             cutoff = now - self.window
-            try:
+            with contextlib.suppress(Exception):
                 # remove old entries for accurate count
                 await r.zremrangebyscore(key, 0, cutoff)
-            except Exception:
-                pass
             cnt = await r.zcard(key)
             await r.close()
             if cnt < self.conversions_per_hour:
@@ -364,9 +361,7 @@ class ConversionRateLimiterRedis:
             await r.close()
             return bool(res)
         except Exception:
-            try:
+            with contextlib.suppress(Exception):
                 await r.close()
-            except Exception:
-                pass
             return True
 

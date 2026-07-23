@@ -1,10 +1,15 @@
-import os, json, sys, traceback
+import contextlib
+import json
+import os
+import sys
+import traceback
+
 import botocore
 
 # load .env (simple parser)
 env_path = os.path.join(os.path.dirname(__file__), '..', '.env')
 if os.path.exists(env_path):
-    with open(env_path, 'r', encoding='utf-8') as f:
+    with open(env_path, encoding='utf-8') as f:
         for line in f:
             line=line.strip()
             if not line or line.startswith('#'):
@@ -95,10 +100,8 @@ try:
         print('Updated jobs:', updated)
     else:
         print('No jobs found referencing the placeholder; nothing changed')
-    try:
+    with contextlib.suppress(Exception):
         r.close()
-    except Exception:
-        pass
 except Exception:
     print('Redis update failed:')
     traceback.print_exc()

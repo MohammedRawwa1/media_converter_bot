@@ -1,17 +1,23 @@
-import os
-import uuid
 import asyncio
 import json
 import logging
-from flask import Flask, request, jsonify, send_file, send_from_directory
+import os
+import re
+import subprocess
+import threading
+import traceback
+import uuid
+
+import redis as redis_sync
+from flask import Flask, jsonify, request, send_file, send_from_directory
 from flask_cors import CORS
 
 import config
-import redis as redis_sync
-import threading
-import subprocess
-import traceback
-import re
+from utils.url_validation import _validate_url_safe
+
+# Rate limiting for DoS/DDoS protection (token bucket per-endpoint per-IP)
+from utils.web_rate_limiter import get_client_ip, make_rate_limit_response, web_rate_limiter
+
 try:
     import boto3
 except Exception:
@@ -53,17 +59,34 @@ except Exception:
     get_redis = None
     aioredis_available = False
 
-from utils import file_utils
+import contextlib
+
 from flask import Response, stream_with_context
+
+from utils import file_utils
 
 
 @app.route("/", methods=["GET"])
 def index():
+
+    # Rate limiting: prevent DoS/DDoS
+    client_ip = get_client_ip(request)
+    if not web_rate_limiter.check_limit("index", client_ip):
+        body, status, headers = make_rate_limit_response("index", client_ip)
+        return jsonify(body), status, headers
+
     return send_from_directory(app.static_folder, "index.html")
 
 
 @app.route("/upload", methods=["POST"])
 def upload():
+
+    # Rate limiting: prevent DoS/DDoS
+    client_ip = get_client_ip(request)
+    if not web_rate_limiter.check_limit("upload", client_ip):
+        body, status, headers = make_rate_limit_response("upload", client_ip)
+        return jsonify(body), status, headers
+
     # Optional upload token protection: when `UPLOAD_SECRET` is set in the
     # environment, require callers to include an `X-Upload-Token` header or
     # provide `upload_token` as a form/query parameter with the same value.
@@ -104,14 +127,12 @@ def upload():
         key = f"uploads/{job_id}_{os.path.basename(input_path)}" if use_remote_backend else None
     else:
         # Attempt to fetch forwarded message metadata persisted earlier
-        try:
+        with contextlib.suppress(Exception):
             logger.info("webapp.upload: received forward_hash=%s", forward_hash)
-        except Exception:
-            pass
         try:
-            from utils.forward_store import load_forward_metadata, delete_forward_metadata
-        except Exception as e:
-            return jsonify({"error": "failed to load forward metadata", "detail": str(e)}), 500
+            from utils.forward_store import load_forward_metadata
+        except Exception:
+            return jsonify({"error": "failed to load forward metadata", "detail": "Check server logs for details."}), 500
 
         # Try to load persisted forward metadata. If it's not yet available
         # (e.g. upload to S3 is still in progress), schedule a background
@@ -120,9 +141,9 @@ def upload():
         # HTTP 202 Accepted to indicate the request was accepted for
         # processing but is not complete yet.
         try:
-            meta = load_forward_metadata(forward_hash)
-        except Exception as e:
-            return jsonify({"error": "failed to load forward metadata", "detail": str(e)}), 500
+            meta = asyncio.run(load_forward_metadata(forward_hash))
+        except Exception:
+            return jsonify({"error": "failed to load forward metadata", "detail": "Check server logs for details."}), 500
 
         if not meta:
             # default extension while we wait for metadata to appear
@@ -130,10 +151,11 @@ def upload():
             input_path = os.path.join(INPUT_DIR, f"{job_id}{ext}")
 
             def _poll_and_fetch(fid, inp_path, j_id, req_id, attempts=6, initial_delay=2):
-                import time
                 import asyncio as _asyncio
+                import time
                 try:
-                    from utils.forward_store import load_forward_metadata as _load_forward, delete_forward_metadata as _delete_forward
+                    from utils.forward_store import delete_forward_metadata as _delete_forward
+                    from utils.forward_store import load_forward_metadata as _load_forward
                 except Exception:
                     logger.exception("Background poll: forward_store helpers unavailable")
                     return
@@ -141,7 +163,7 @@ def upload():
                 # Attempt to locate the forward metadata with exponential backoff
                 for attempt in range(attempts):
                     try:
-                        m = _load_forward(fid)
+                        m = _asyncio.run(_load_forward(fid))
                     except Exception:
                         m = None
 
@@ -181,10 +203,8 @@ def upload():
                                 b = get_storage_backend_sync()
                                 _asyncio.run(b.upload_file(inp_path, key_loc))
                                 if os.environ.get("KEEP_LOCAL_UPLOADS", "").lower() not in ("1", "true", "yes"):
-                                    try:
+                                    with contextlib.suppress(Exception):
                                         os.remove(inp_path)
-                                    except Exception:
-                                        pass
                                 job_loc = {
                                     "job_id": j_id,
                                     "input_key": key_loc,
@@ -217,26 +237,20 @@ def upload():
                             logger.exception("Failed to enqueue background fetched job %s", j_id)
 
                         # cleanup forward metadata to avoid duplicates
-                        try:
-                            _delete_forward(fid)
-                        except Exception:
-                            pass
+                        with contextlib.suppress(Exception):
+                            _asyncio.run(_delete_forward(fid))
 
                         return
 
                     # not found yet: backoff then retry
-                    try:
+                    with contextlib.suppress(Exception):
                         time.sleep(initial_delay * (2 ** attempt))
-                    except Exception:
-                        pass
 
                 logger.warning("Forward metadata still not found after %s attempts for %s", attempts, fid)
 
             t = threading.Thread(target=_poll_and_fetch, args=(forward_hash, input_path, job_id, request_id), daemon=True)
-            try:
+            with contextlib.suppress(Exception):
                 logger.info("webapp.upload: starting background poll thread for forward %s -> %s", forward_hash, input_path)
-            except Exception:
-                pass
             t.start()
             return jsonify({"status": "accepted", "detail": "forward metadata not yet available; background fetch scheduled"}), 202
 
@@ -286,106 +300,8 @@ def upload():
                         b = get_storage_backend_sync()
                         _asyncio.run(b.upload_file(inp_path, key_loc))
                         if os.environ.get("KEEP_LOCAL_UPLOADS", "").lower() not in ("1", "true", "yes"):
-                            try:
+                            with contextlib.suppress(Exception):
                                 os.remove(inp_path)
-                            except Exception:
-                                pass
-                        job_loc = {
-                            "job_id": j_id,
-                            "input_key": key_loc,
-                            "output_path": os.path.join(OUTPUT_DIR, f"{j_id}.mp4"),
-                            "original_filename": meta_obj.get("name") or os.path.basename(inp_path),
-                            "output_filename": f"{j_id}.mp4",
-                            "ffmpeg_args": ["-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-c:a", "aac", "-b:a", "128k"],
-                            "progress_channel": f"ffmpeg:progress:{j_id}",
-                            "cleanup_input": True,
-                        }
-                    except Exception:
-                        logger.exception("Background upload failed for fetched forward %s", inp_path)
-                        job_loc = {
-                            "job_id": j_id,
-                            "input_path": inp_path,
-                            "output_path": os.path.join(OUTPUT_DIR, f"{j_id}.mp4"),
-                            "original_filename": meta_obj.get("name") or os.path.basename(inp_path),
-                            "output_filename": f"{j_id}.mp4",
-                            "ffmpeg_args": ["-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-c:a", "aac", "-b:a", "128k"],
-                            "progress_channel": f"ffmpeg:progress:{j_id}",
-                            "cleanup_input": True,
-                        }
-                else:
-                    job_loc = {
-                        "job_id": j_id,
-                        "input_path": inp_path,
-                        "output_path": os.path.join(OUTPUT_DIR, f"{j_id}.mp4"),
-                        "original_filename": meta_obj.get("name") or os.path.basename(inp_path),
-                        "output_filename": f"{j_id}.mp4",
-                        "ffmpeg_args": ["-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-c:a", "aac", "-b:a", "128k"],
-                        "progress_channel": f"ffmpeg:progress:{j_id}",
-                        "cleanup_input": True,
-                    }
-
-                job_loc["request_id"] = req_id
-                try:
-                    _asyncio.run(enqueue_job(job_loc))
-                except Exception:
-                    logger.exception("Failed to enqueue background fetched job %s", j_id)
-            except Exception:
-                logger.exception("Unexpected error in background fetch/enqueue for forward %s", meta_obj.get("chat_id"))
-
-        t = threading.Thread(target=_bg_fetch_and_enqueue, args=(meta, input_path, job_id, request_id), daemon=True)
-        t.start()
-        return jsonify({"job_id": job_id})
-
-        # Determine extension from original metadata or fallback to .mp4
-        filename = meta.get("name") or ""
-        ext = os.path.splitext(filename)[1] or ".mp4"
-        input_path = os.path.join(INPUT_DIR, f"{job_id}{ext}")
-
-        # Try to download using an opt-in userbot (Telethon) if available
-        try:
-            from utils.userbot_downloader import download_forward_via_userbot
-        except Exception:
-            return jsonify({"error": "userbot_downloader not available on server"}), 500
-
-        # Schedule a background thread to download the forwarded media via
-        # the opt-in userbot and then enqueue a metadata-only job. Keep this
-        # implementation simple to avoid deep nested try/except blocks which
-        # previously caused indentation/syntax issues.
-        def _bg_fetch_and_enqueue(meta_obj, inp_path, j_id, req_id):
-            import asyncio as _asyncio
-            try:
-                ok_loc = False
-                try:
-                    ok_loc = _asyncio.run(
-                        download_forward_via_userbot(
-                            meta_obj.get("chat_id"),
-                            meta_obj.get("message_id") or meta_obj.get("msg_id"),
-                            inp_path,
-                            msg_date=meta_obj.get("registered_at") or meta_obj.get("created_at"),
-                            file_unique_id=meta_obj.get("file_unique_id"),
-                        )
-                    )
-                except Exception:
-                    logger.exception("Background userbot download failed for forward %s", meta_obj.get("chat_id"))
-                    return
-
-                if not ok_loc or not os.path.exists(inp_path):
-                    logger.error("Background userbot download did not produce file: %s", inp_path)
-                    return
-
-                # If configured, upload the input to remote storage and enqueue
-                backend_name_loc = (os.getenv("STORAGE_BACKEND") or getattr(config, "STORAGE_BACKEND", "local")).lower()
-                use_remote_loc = backend_name_loc in ("s3", "r2") and get_storage_backend_sync is not None
-                key_loc = f"uploads/{j_id}_{os.path.basename(inp_path)}" if use_remote_loc else None
-                if use_remote_loc and key_loc:
-                    try:
-                        b = get_storage_backend_sync()
-                        _asyncio.run(b.upload_file(inp_path, key_loc))
-                        if os.environ.get("KEEP_LOCAL_UPLOADS", "").lower() not in ("1", "true", "yes"):
-                            try:
-                                os.remove(inp_path)
-                            except Exception:
-                                pass
                         job_loc = {
                             "job_id": j_id,
                             "input_key": key_loc,
@@ -482,10 +398,8 @@ def upload():
 
                         _asyncio.run(b.upload_file(input_path, key))
                         if os.environ.get("KEEP_LOCAL_UPLOADS", "").lower() not in ("1", "true", "yes"):
-                            try:
+                            with contextlib.suppress(Exception):
                                 os.remove(input_path)
-                            except Exception:
-                                pass
                     except Exception:
                         logger.exception("Background upload failed for %s", input_path)
                         # fallthrough; enqueue with local path as a fallback
@@ -526,10 +440,8 @@ def upload():
                         # Use optimize_video as a sensible default to produce MP4 preview
                         success = loop.run_until_complete(conv.optimize_video(j["input_path"], j["output_path"]))
                     finally:
-                        try:
+                        with contextlib.suppress(Exception):
                             loop.close()
-                        except Exception:
-                            pass
 
                     if success and os.path.exists(j["output_path"]):
                         JOB_STORE[jid]["progress"] = 100.0
@@ -547,14 +459,21 @@ def upload():
 
             t = threading.Thread(target=_worker, args=(job,), daemon=True)
             t.start()
-        except Exception as e:
-            return jsonify({"error": "job queue not available on server", "detail": str(e)}), 503
+        except Exception:
+            return jsonify({"error": "job queue not available on server", "detail": "Internal error. Check server logs."}), 503
     return jsonify({"job_id": job_id})
 
 
 @app.route("/debug/telethon-log", methods=["GET"])
 def telethon_log():
-    """Fetch the most recent Telethon ingest log from configured storage.
+    """
+    # Rate limiting: prevent DoS/DDoS
+    client_ip = get_client_ip(request)
+    if not web_rate_limiter.check_limit("debug_log", client_ip):
+        body, status, headers = make_rate_limit_response("debug_log", client_ip)
+        return jsonify(body), status, headers
+
+Fetch the most recent Telethon ingest log from configured storage.
 
     Protected by `DEBUG_SECRET` if present in env. Returns plain text log
     or 404 if not found.
@@ -578,6 +497,7 @@ def telethon_log():
         # Try to import async factory and instantiate it via asyncio
         try:
             import asyncio as _asyncio
+
             from utils.storage import get_storage_backend as _get_async_backend
 
             try:
@@ -668,7 +588,14 @@ def telethon_log():
 
 @app.route("/presign", methods=["POST"])
 def presign():
-    """Return a presigned S3 POST (or PUT) for client direct upload.
+    """
+    # Rate limiting: prevent DoS/DDoS
+    client_ip = get_client_ip(request)
+    if not web_rate_limiter.check_limit("presign", client_ip):
+        body, status, headers = make_rate_limit_response("presign", client_ip)
+        return jsonify(body), status, headers
+
+Return a presigned S3 POST (or PUT) for client direct upload.
 
     Request JSON or form data: `filename`.
     Requires `UPLOAD_SECRET` when configured.
@@ -732,12 +659,20 @@ def presign():
         get_url = s3.generate_presigned_url("get_object", Params={"Bucket": bucket, "Key": key}, ExpiresIn=3600 * 24)
         return jsonify({"method": "POST", "url": post["url"], "fields": post["fields"], "key": key, "get_url": get_url})
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        logger.exception("Presign failed: %s", e)
+    return jsonify({"error": "Presign failed. Check server logs."}), 500
 
 
 @app.route("/enqueue_from_url", methods=["POST"])
 def enqueue_from_url():
-    """Enqueue a job that downloads from a public or presigned URL.
+    """
+    # Rate limiting: prevent DoS/DDoS
+    client_ip = get_client_ip(request)
+    if not web_rate_limiter.check_limit("enqueue_url", client_ip):
+        body, status, headers = make_rate_limit_response("enqueue_url", client_ip)
+        return jsonify(body), status, headers
+
+Enqueue a job that downloads from a public or presigned URL.
 
     Request JSON: `source_url` (required), `original_filename` (optional).
     Requires `UPLOAD_SECRET` when configured.
@@ -761,6 +696,12 @@ def enqueue_from_url():
 
     if not source_url:
         return jsonify({"error": "source_url required"}), 400
+
+    # SSRF protection: validate URL against private/loopback IPs
+    if not _validate_url_safe(source_url):
+        logger.warning("SSRF blocked: source_url=%s", source_url[:120] if source_url else "None")
+        return jsonify({"error": "invalid source_url", "detail": "URL blocked for security reasons"}), 400
+
 
     job_id = str(uuid.uuid4())
     output_filename = (os.path.splitext(original_filename or job_id)[0] + ".mp4") if original_filename else f"{job_id}.mp4"
@@ -815,6 +756,13 @@ async def _get_job_hash(job_id: str):
 
 @app.route("/status/<job_id>", methods=["GET"])
 def status(job_id):
+
+    # Rate limiting: prevent DoS/DDoS
+    client_ip = get_client_ip(request)
+    if not web_rate_limiter.check_limit("status", client_ip):
+        body, status, headers = make_rate_limit_response("status", client_ip)
+        return jsonify(body), status, headers
+
     # Try to read Redis job hash
     try:
         job_hash = asyncio.run(_get_job_hash(job_id)) if aioredis_available else None
@@ -914,6 +862,13 @@ def status(job_id):
 
 @app.route("/download/<job_id>", methods=["GET"])
 def download(job_id):
+
+    # Rate limiting: prevent DoS/DDoS
+    client_ip = get_client_ip(request)
+    if not web_rate_limiter.check_limit("download", client_ip):
+        body, status, headers = make_rate_limit_response("download", client_ip)
+        return jsonify(body), status, headers
+
     # Check Redis for output path
     try:
         job_hash = asyncio.run(_get_job_hash(job_id)) if aioredis_available else None
@@ -983,7 +938,14 @@ def download(job_id):
 
 @app.route('/events/<job_id>')
 def events(job_id):
-    """Server-Sent Events endpoint that streams Redis progress pubsub messages
+    """
+    # Rate limiting: prevent DoS/DDoS
+    client_ip = get_client_ip(request)
+    if not web_rate_limiter.check_limit("events", client_ip):
+        body, status, headers = make_rate_limit_response("events", client_ip)
+        return jsonify(body), status, headers
+
+Server-Sent Events endpoint that streams Redis progress pubsub messages
     published on channel `ffmpeg:progress:{job_id}` to the browser.
     """
     def gen():
@@ -1036,7 +998,14 @@ def events(job_id):
 
 @app.route("/get_input", methods=["GET"]) 
 def get_input():
-    """Temporary token-protected endpoint to download files from the input folder.
+    """
+    # Rate limiting: prevent DoS/DDoS
+    client_ip = get_client_ip(request)
+    if not web_rate_limiter.check_limit("get_input", client_ip):
+        body, status, headers = make_rate_limit_response("get_input", client_ip)
+        return jsonify(body), status, headers
+
+Temporary token-protected endpoint to download files from the input folder.
     Protection: prefer `DIAG_TOKEN` (header `X-DIAG-TOKEN` or `?token=`),
     fallback to `UPLOAD_SECRET` (header `X-Upload-Token` or `?upload_token=`).
     Use only for short-term debugging; remove after use.
@@ -1077,12 +1046,20 @@ def get_input():
         except TypeError:
             return send_file(path, as_attachment=True, attachment_filename=safe_name)
     except Exception as e:
-        return jsonify({"error": "failed to send file", "detail": str(e)}), 500
+        logger.exception("Failed to send file: %s", e)
+    return jsonify({"error": "Failed to send file. Check server logs."}), 500
 
 
 @app.route("/internal/diag", methods=["GET", "POST"]) 
 def internal_diag():
-    """Token-protected diagnostic endpoint.
+    """
+    # Rate limiting: prevent DoS/DDoS
+    client_ip = get_client_ip(request)
+    if not web_rate_limiter.check_limit("diag", client_ip):
+        body, status, headers = make_rate_limit_response("diag", client_ip)
+        return jsonify(body), status, headers
+
+Token-protected diagnostic endpoint.
     Set `DIAG_TOKEN` in the environment (random string). Call with header
     `X-DIAG-TOKEN: <token>` or `?token=<token>`.
     Returns masked env, Redis health, sample job list, optional job hash,
@@ -1142,7 +1119,7 @@ def internal_diag():
             for fname in sorted(os.listdir(logs_dir))[-10:]:
                 path = os.path.join(logs_dir, fname)
                 if os.path.isfile(path):
-                    with open(path, "r", encoding="utf-8", errors="replace") as fh:
+                    with open(path, encoding="utf-8", errors="replace") as fh:
                         lines = fh.readlines()[-500:]
                         result["logs"][fname] = "".join(lines)
     except Exception:
@@ -1150,7 +1127,7 @@ def internal_diag():
 
     # process listing (best-effort)
     try:
-        ps_out = subprocess.check_output(["ps", "aux"], stderr=subprocess.STDOUT, text=True)
+        ps_out = subprocess.check_output(["/bin/ps", "aux"], stderr=subprocess.STDOUT, text=True)
         result["ps"] = "\n".join(ps_out.splitlines()[:200])
     except Exception:
         result["ps"] = None
@@ -1164,11 +1141,13 @@ if __name__ == "__main__":
         from web.ws_server import start_in_thread
 
         try:
-            start_in_thread(host="0.0.0.0", port=int(os.environ.get("WS_PORT", "6789")))
+            ws_host = os.environ.get("WS_HOST", "127.0.0.1")
+            start_in_thread(host=ws_host, port=int(os.environ.get("WS_PORT", "6789")))
         except Exception:
             logger.exception("Failed to start WS server in thread")
     except Exception:
         logger.debug("WebSocket server module not available")
 
     debug_mode = os.environ.get("FLASK_DEBUG", "0").lower() in ("1", "true", "yes")
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", "5000")), debug=debug_mode)
+    flask_host = os.environ.get("FLASK_HOST", "127.0.0.1")
+    app.run(host=flask_host, port=int(os.environ.get("PORT", "5000")), debug=debug_mode)

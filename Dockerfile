@@ -19,8 +19,11 @@ RUN pip install --upgrade pip setuptools wheel && pip install -r requirements.tx
 # Environment defaults
 ENV FFMPEG_PATH=/usr/bin/ffmpeg FFPROBE_PATH=/usr/bin/ffprobe PORT=10000
 
+RUN useradd -m botuser && chown -R botuser /app
+
 EXPOSE 10000
 
 # Ensure start script is executable and use it as the container entrypoint.
 RUN chmod +x /app/start.sh || true
+USER botuser
 CMD ["/app/start.sh"]

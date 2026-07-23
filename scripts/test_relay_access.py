@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Test if the Pyrogram userbot can access the relay group."""
 
+import asyncio
 import os
 import sys
-import asyncio
 
 # Ensure project root is on sys.path
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -12,8 +12,8 @@ if _ROOT not in sys.path:
 
 from utils.telethon_session import (
     build_pyrogram_client,
-    get_userbot_credentials,
     get_pyrogram_session_string,
+    get_userbot_credentials,
 )
 
 OK = "[OK]"
@@ -71,15 +71,15 @@ async def test_relay_access():
             print(f"   Members: {getattr(chat, 'members_count', 'N/A')}")
         except Exception as e:
             print(f"{FAIL} get_chat({relay_chat_id}) -> {e}")
-            print(f"")
-            print(f"   The userbot is NOT a member of the relay group.")
-            print(f"")
-            print(f"   Fix: Add the userbot account (phone number used for")
+            print("")
+            print("   The userbot is NOT a member of the relay group.")
+            print("")
+            print("   Fix: Add the userbot account (phone number used for")
             print(f"   PYROGRAM_SESSION) as a member of group {relay_chat_id}")
             return False
 
         # Try to get messages from the relay chat
-        print(f"\n--> Fetching recent messages...")
+        print("\n--> Fetching recent messages...")
         try:
             messages = await client.get_chat_history(relay_chat_id_int, limit=5)
             count = 0
@@ -92,8 +92,8 @@ async def test_relay_access():
         print(f"\n{'='*60}")
         print(f"{OK} RELAY GROUP ACCESS: WORKING")
         print(f"{'='*60}")
-        print(f"\nThe userbot can access the relay group.")
-        print(f"Large file downloads should work now.")
+        print("\nThe userbot can access the relay group.")
+        print("Large file downloads should work now.")
         return True
 
     except Exception as e:

@@ -1,11 +1,10 @@
 """Configuration helpers that read environment variables and persist ACL changes."""
 
-import os
 import json
 import logging
-from typing import Set, Optional
-from urllib.parse import urlparse
+import os
 import re
+from urllib.parse import urlparse
 
 ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -15,7 +14,7 @@ except Exception:  # pragma: no cover - optional dependency
     load_dotenv = None
 
 
-def _load_environment_file(env_path: Optional[str] = None) -> None:
+def _load_environment_file(env_path: str | None = None) -> None:
     """Load values from a .env file when available, without overriding existing env vars."""
     if load_dotenv is None:
         return
@@ -88,8 +87,8 @@ REDIS_URL = os.getenv("REDIS_URL", "")
 # Admin and ACL
 _allowed_file = os.path.join(STORAGE_PATH, "allowed_users.json")
 
-def _load_allowed_users() -> Set[int]:
-    s: Set[int] = set()
+def _load_allowed_users() -> set[int]:
+    s: set[int] = set()
     # First, read from ALLOWED_USER_IDS env var if present
     env_val = os.getenv("ALLOWED_USER_IDS", "")
     if env_val:
@@ -103,7 +102,7 @@ def _load_allowed_users() -> Set[int]:
     # Next, read persisted file if exists
     try:
         if os.path.exists(_allowed_file):
-            with open(_allowed_file, "r", encoding="utf-8") as fh:
+            with open(_allowed_file, encoding="utf-8") as fh:
                 data = json.load(fh)
                 if isinstance(data, list):
                     for v in data:
@@ -118,7 +117,7 @@ def _load_allowed_users() -> Set[int]:
     return s
 
 
-ALLOWED_USER_IDS: Set[int] = _load_allowed_users()
+ALLOWED_USER_IDS: set[int] = _load_allowed_users()
 
 def persist_allowed_users() -> None:
     """Persist current `ALLOWED_USER_IDS` to the storage file.
@@ -134,7 +133,7 @@ def persist_allowed_users() -> None:
         pass
 
 
-def _parse_optional_int(val: Optional[str]) -> Optional[int]:
+def _parse_optional_int(val: str | None) -> int | None:
     try:
         if val is None or val == "":
             return None
@@ -167,7 +166,7 @@ def is_user_allowed(user_id: int) -> bool:
 # like "$MONGO_URI" which are not expanded by the platform. Resolve
 # simple $VAR or ${VAR} references so the canonical value is usable.
 
-def _resolve_env_reference(val: Optional[str]) -> Optional[str]:
+def _resolve_env_reference(val: str | None) -> str | None:
     if not val:
         return val
     v = val.strip()
@@ -226,9 +225,8 @@ def validate_env() -> None:
 
     # Storage backend requirements
     backend = os.getenv("STORAGE_BACKEND", STORAGE_BACKEND).lower() if "STORAGE_BACKEND" in globals() else os.getenv("STORAGE_BACKEND", "local")
-    if backend in ("s3", "r2"):
-        if not os.getenv("S3_BUCKET") or not os.getenv("S3_ENDPOINT"):
-            missing.append("S3_BUCKET/S3_ENDPOINT")
+    if backend in ("s3", "r2") and (not os.getenv("S3_BUCKET") or not os.getenv("S3_ENDPOINT")):
+        missing.append("S3_BUCKET/S3_ENDPOINT")
 
     # Quick Redis URL sanity check
     red = os.getenv("REDIS_URL")

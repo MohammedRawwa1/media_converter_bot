@@ -1,9 +1,13 @@
 import asyncio
-import os
+import contextlib
 import json
 import logging
+import os
 import uuid
+
 from aiohttp import web
+
+import config
 
 try:
     import redis.asyncio as aioredis
@@ -11,9 +15,9 @@ except Exception:
     aioredis = None
 
 try:
-    from utils.forward_store import load_forward_metadata, delete_forward_metadata
-    from utils.userbot_downloader import download_forward_via_userbot
+    from utils.forward_store import delete_forward_metadata, load_forward_metadata
     from utils.job_queue import enqueue_job
+    from utils.userbot_downloader import download_forward_via_userbot
 except Exception:
     load_forward_metadata = None
     download_forward_via_userbot = None
@@ -32,15 +36,13 @@ async def process_forward_hash(forward_hash: str):
         logger.error("fetcher: forward_store not available")
         return False
 
-    meta = load_forward_metadata(forward_hash)
+    meta = await load_forward_metadata(forward_hash)
     if not meta:
         logger.error("fetcher: no metadata for forward_hash %s", forward_hash)
         return False
 
-    try:
+    with contextlib.suppress(Exception):
         logger.info("fetcher: processing forward %s meta_chat=%s meta_msg=%s", forward_hash, meta.get("chat_id"), meta.get("message_id") or meta.get("msg_id"))
-    except Exception:
-        pass
 
     input_dir = os.environ.get("INPUT_PATH") or os.path.join(os.path.dirname(os.path.dirname(__file__)), "storage", "input")
     os.makedirs(input_dir, exist_ok=True)
@@ -69,7 +71,7 @@ async def process_forward_hash(forward_hash: str):
     # Optionally upload the fetched input to remote storage (S3/R2/MinIO)
     input_key = None
     try:
-        backend_name = (os.getenv("STORAGE_BACKEND") or getattr(__import__("config"), "STORAGE_BACKEND", "local")).lower()
+        backend_name = (os.getenv("STORAGE_BACKEND") or getattr(config, "STORAGE_BACKEND", "local")).lower()
         if backend_name in ("s3", "r2") and get_storage_backend is not None:
             try:
                 backend = await get_storage_backend()
@@ -77,10 +79,8 @@ async def process_forward_hash(forward_hash: str):
                 await backend.upload_file(input_path, key)
                 # remove local copy unless KEEP_LOCAL_UPLOADS set
                 if os.environ.get("KEEP_LOCAL_UPLOADS", "").lower() not in ("1", "true", "yes"):
-                    try:
+                    with contextlib.suppress(Exception):
                         os.remove(input_path)
-                    except Exception:
-                        pass
                 input_key = key
             except Exception:
                 logger.exception("fetcher: failed to upload fetched input to storage for %s", forward_hash)
@@ -118,10 +118,8 @@ async def process_forward_hash(forward_hash: str):
         logger.exception("fetcher: failed to create/enqueue job for %s", forward_hash)
         return False
 
-    try:
-        delete_forward_metadata(forward_hash)
-    except Exception:
-        pass
+    with contextlib.suppress(Exception):
+        await delete_forward_metadata(forward_hash)
 
     return True
 
@@ -189,7 +187,7 @@ def main():
     app.on_startup.append(on_startup)
     app.on_cleanup.append(on_cleanup)
 
-    host = os.environ.get("FETCHER_HOST", "0.0.0.0")
+    host = os.environ.get("FETCHER_HOST", "127.0.0.1")
     port = int(os.environ.get("FETCHER_PORT", "8765"))
     web.run_app(app, host=host, port=port)
 

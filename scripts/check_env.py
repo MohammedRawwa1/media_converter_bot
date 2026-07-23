@@ -5,8 +5,8 @@ Checks for: BOT_TOKEN, ffmpeg binary availability, ffmpeg-python import,
 and optional MongoDB URL.
 """
 import os
-import sys
 import subprocess
+import sys
 
 from dotenv import load_dotenv
 

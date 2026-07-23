@@ -7,9 +7,10 @@ Provides user-friendly error messages while logging technical details.
 import asyncio
 import logging
 import traceback
+from collections.abc import Callable
 from datetime import datetime
 from functools import wraps
-from typing import Any, Callable, Dict, Optional
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
@@ -46,7 +47,7 @@ class BotErrorHandler:
         self.max_log_size = 1000
 
     @staticmethod
-    def categorize_error(exception: Exception, context: Optional[str] = None) -> str:
+    def categorize_error(exception: Exception, context: str | None = None) -> str:
         """Categorize exception to determine user-friendly message."""
         exc_str = str(exception).lower()
 
@@ -80,9 +81,9 @@ class BotErrorHandler:
         exception: Exception,
         context: str,
         severity: str = "error",
-        user_id: Optional[int] = None,
-        additional_info: Optional[Dict[str, Any]] = None,
-    ) -> Dict[str, Any]:
+        user_id: int | None = None,
+        additional_info: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         """
         Log an error with full context.
 
@@ -156,9 +157,9 @@ async def handle_conversion_error(
     exception: Exception,
     context: str,
     update=None,
-    user_id: Optional[int] = None,
-    send_user_message: Optional[Callable] = None,
-) -> Dict[str, Any]:
+    user_id: int | None = None,
+    send_user_message: Callable | None = None,
+) -> dict[str, Any]:
     """
     Handle conversion errors with logging and user notification.
 
@@ -194,7 +195,7 @@ async def handle_conversion_error(
     return error_info
 
 
-def async_error_handler(context: str, send_user_message_callback: Optional[Callable] = None, re_raise: bool = False):
+def async_error_handler(context: str, send_user_message_callback: Callable | None = None, re_raise: bool = False):
     """
     Decorator for async functions to handle errors gracefully.
 
@@ -290,7 +291,7 @@ def setup_comprehensive_logging(
     # Optional remote integrations
     # 1) Sentry (DSN via SENTRY_DSN env var)
     try:
-        sentry_dsn = __import__("os").environ.get("SENTRY_DSN")
+        sentry_dsn = os.environ.get("SENTRY_DSN")
         if sentry_dsn:
             try:
                 from sentry_sdk import init as sentry_init
@@ -307,7 +308,7 @@ def setup_comprehensive_logging(
 
     # 2) AWS CloudWatch via watchtower (LOG_GROUP via AWS_LOG_GROUP env var)
     try:
-        env = __import__("os").environ
+        env = os.environ
         cw_group = env.get("AWS_LOG_GROUP")
         if cw_group:
             try:

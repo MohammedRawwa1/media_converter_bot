@@ -26,6 +26,7 @@ Environment:
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import os
@@ -64,7 +65,7 @@ async def _process_forward(fid, payload: dict, client) -> None:
     try:
         from utils.forward_store import load_forward_metadata
 
-        meta = load_forward_metadata(fid)
+        meta = await load_forward_metadata(fid)
         if not remote_key and meta:
             # common fields that may indicate a remote key
             remote_key = meta.get("remote_key") or meta.get("input_key") or meta.get("s3_key") or meta.get("key")
@@ -94,7 +95,7 @@ async def _process_forward(fid, payload: dict, client) -> None:
                 if not stored:
                     continue
                 # normalize stored values to strings
-                def _sval(k):
+                def _sval(k, stored=stored):
                     v = stored.get(k)
                     if isinstance(v, (bytes, bytearray)):
                         try:
@@ -213,10 +214,8 @@ async def _async_run():
             if fid:
                 await _process_forward(fid, payload, client)
     finally:
-        try:
+        with contextlib.suppress(Exception):
             await pub.unsubscribe(FORWARD_CHANNEL)
-        except Exception:
-            pass
         try:
             aclose = getattr(client, "aclose", None)
             if aclose:

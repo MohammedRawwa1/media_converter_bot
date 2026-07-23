@@ -1,4 +1,8 @@
-import os, sys, json, traceback
+import json
+import os
+import sys
+import traceback
+
 repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if repo_root not in sys.path:
     sys.path.insert(0, repo_root)
@@ -17,7 +21,7 @@ try:
             obj = json.loads(raw)
             print('\n--- job list item', i)
             print(json.dumps(obj, indent=2))
-        except Exception as e:
+        except Exception:
             print('raw:', raw[:200])
 except Exception as e:
     print('failed to read redis:', e)

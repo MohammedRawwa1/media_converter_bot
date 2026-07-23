@@ -1,0 +1,71 @@
+# Ruff linter configuration
+# https://docs.astral.sh/ruff/configuration/
+
+# Target Python version
+target-version = "py311"
+line-length = 120
+
+# Exclude directories (in addition to .gitignore)
+exclude = [
+    ".venv",
+    "env",
+    "__pycache__",
+    "node_modules",
+    ".eggs",
+    ".mypy_cache",
+    ".pytest_cache",
+    ".github",
+]
+
+[lint]
+# Select rule categories:
+#   E/W - pycodestyle (errors/warnings)
+#   F   - Pyflakes (logic errors, undefined names, syntax errors)
+#   I   - isort (import sorting)
+#   N   - pep8-naming
+#   S   - flake8-bandit (security rules)
+#   UP  - pyupgrade (modernize Python syntax)
+#   B   - flake8-bugbear (bug detection)
+#   SIM - flake8-simplify (simplification)
+select = [
+    "E4",   # Import warnings
+    "E7",   # Statement warnings
+    "E9",   # Runtime errors (catches syntax errors)
+    "F",    # Pyflakes (undefined names, syntax errors)
+    "I",    # Import sorting
+    "N",    # Naming conventions
+    "S",    # Bandit security rules
+    "UP",   # Python upgrade
+    "B",    # flake8-bugbear bug detection
+    "SIM",  # Simplify expressions
+]
+
+# Ignore specific rules (customize as needed)
+ignore = [
+    "S101",  # Allow asserts in non-test files
+    "S110",  # Allow try-except-pass (intentional error swallowing)
+    "S112",  # Allow try-except-continue (intentional pattern)
+    "N802",  # Allow lower-case function names in non-PEP8 contexts
+    "N803",  # Allow argument name overrides
+    "N806",  # Allow non-lower-case variable names
+    "SIM108", # Allow ternary simplification (sometimes less readable)
+]
+
+[lint.per-file-ignores]
+# ── Scripts & helper tools: intentional lazy imports & subprocess calls ──
+"scripts/*.py" = ["E402", "S603", "S607"]
+"tools/*.py" = ["E402", "S603", "S607"]
+"workers/*.py" = ["E402", "S603", "S607"]
+# ── Core modules: intentional patterns ──
+"web/webapp.py" = ["E402"]
+"models.py" = ["E402"]
+"handlers.py" = ["B018"]
+"main.py" = ["S603", "S607", "SIM112"]
+"utils/file_utils.py" = ["S603", "S607"]
+"utils/job_queue.py" = ["B025"]
+"utils/telethon_session.py" = ["SIM112"]
+"utils/forward_store.py" = ["SIM105"]
+"tools/telethon_ingest.py" = ["SIM105"]
+"web/ffmpeg_worker.py" = ["S603"]
+"web/middleware.py" = ["B023"]
+"workers/ffmpeg_worker.py" = ["B023", "B025", "SIM117", "S607"]

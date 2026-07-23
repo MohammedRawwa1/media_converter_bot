@@ -1,7 +1,7 @@
-import sys
-import os
-import json
 import asyncio
+import json
+import os
+import sys
 import traceback
 from uuid import uuid4
 
@@ -11,6 +11,7 @@ if repo_root not in sys.path:
     sys.path.insert(0, repo_root)
 
 import boto3
+
 from utils.storage import get_storage_backend_sync
 
 if __name__ == '__main__':

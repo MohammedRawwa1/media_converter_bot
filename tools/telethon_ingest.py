@@ -16,14 +16,13 @@ Run: `python tools/telethon_ingest.py` (ensure TELETHON env vars present).
 """
 
 import asyncio
-import os
-import logging
-import uuid
-import time
-from typing import Optional
-import sys
-from pathlib import Path
 import json
+import logging
+import os
+import sys
+import time
+import uuid
+from pathlib import Path
 
 try:
     from telethon import TelegramClient, events
@@ -73,14 +72,17 @@ try:
 except Exception:
     download_forward_via_userbot = None
 
+import contextlib
+
 import config
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("telethon_ingest")
 # Per-run file logger for Telethon debug info
 try:
+    import tempfile as _tempfile
     from logging.handlers import RotatingFileHandler
-    LOG_PATH = Path(os.environ.get("TELETHON_LOG_PATH", "/tmp/telethon_ingest.log"))
+    LOG_PATH = Path(os.environ.get("TELETHON_LOG_PATH", os.path.join(_tempfile.gettempdir(), "telethon_ingest.log")))
     LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
     fh = RotatingFileHandler(str(LOG_PATH), maxBytes=5_000_000, backupCount=3)
     fh.setLevel(logging.DEBUG)
@@ -150,10 +152,8 @@ async def _start_aiohttp_debug_server():
                             r = aioredis.from_url(redis_url, decode_responses=True)
                             pong = await r.ping()
                             status["redis"] = "ok" if pong else "pong_failed"
-                            try:
+                            with contextlib.suppress(Exception):
                                 await r.close()
-                            except Exception:
-                                pass
                         except Exception:
                             status["redis"] = "error"
             except Exception:
@@ -171,16 +171,15 @@ async def _start_aiohttp_debug_server():
     runner = _web.AppRunner(app)
     try:
         await runner.setup()
-        site = _web.TCPSite(runner, "0.0.0.0", port)
+        bind_host = os.environ.get("TELETHON_DEBUG_HOST", "127.0.0.1")
+        site = _web.TCPSite(runner, bind_host, port)
         await site.start()
-        logger.info("telethon_ingest: debug HTTP server started on 0.0.0.0:%s", port)
+        logger.info("telethon_ingest: debug HTTP server started on %s:%s", bind_host, port)
         return runner
     except Exception:
         logger.exception("telethon_ingest: failed to start debug HTTP server")
-        try:
+        with contextlib.suppress(Exception):
             await runner.cleanup()
-        except Exception:
-            pass
         return None
 
 
@@ -202,7 +201,8 @@ async def _get_backend_instance():
             pass
     # Last-ditch: attempt on-the-fly import
     try:
-        from utils.storage import get_storage_backend as _g, get_storage_backend_sync as _gs
+        from utils.storage import get_storage_backend as _g
+        from utils.storage import get_storage_backend_sync as _gs
 
         get_storage_backend = _g
         get_storage_backend_sync = _gs
@@ -233,7 +233,7 @@ async def upload_telethon_log(suffix: str = "telethon_ingest.log"):
             logger.debug("telethon_ingest: no storage backend for log upload")
             return None
         ts_key = f"telethon/{int(time.time())}_{suffix}"
-        latest_key = f"telethon/telethon_ingest.latest.log"
+        latest_key = "telethon/telethon_ingest.latest.log"
         try:
             await backend.upload_file(str(LOG_PATH), ts_key)
             logger.info("telethon_ingest: uploaded log to %s", ts_key)
@@ -260,7 +260,7 @@ async def upload_telethon_log(suffix: str = "telethon_ingest.log"):
         return None
 
 
-async def _upload_and_enqueue(local_path: str, original_name: str, chat_id: Optional[int], message_id: Optional[int]):
+async def _upload_and_enqueue(local_path: str, original_name: str, chat_id: int | None, message_id: int | None):
     job_id = uuid.uuid4().hex
     size = None
     try:
@@ -300,7 +300,7 @@ async def _upload_and_enqueue(local_path: str, original_name: str, chat_id: Opti
         # Some storage backends may reject Windows-style paths; copy to a
         # temporary POSIX-like path before uploading to ensure compatibility.
         try:
-            import shutil, tempfile
+            import shutil
             tmp_dir = os.environ.get("TEMP_UPLOAD_DIR") or _Path(getattr(config, "TEMP_PATH", os.path.join(os.path.dirname(os.path.dirname(__file__)), "storage", "temp"))).as_posix()
             os.makedirs(tmp_dir, exist_ok=True)
             tmp_dst = os.path.join(tmp_dir, os.path.basename(abs_path))
@@ -324,10 +324,8 @@ async def _upload_and_enqueue(local_path: str, original_name: str, chat_id: Opti
                 keep_local = False
             try:
                 if upload_src != abs_path and not keep_local:
-                    try:
+                    with contextlib.suppress(Exception):
                         os.remove(upload_src)
-                    except Exception:
-                        pass
             except Exception:
                 pass
         # Only remove local temp copy if operator did NOT request to keep uploads.
@@ -338,10 +336,8 @@ async def _upload_and_enqueue(local_path: str, original_name: str, chat_id: Opti
         except Exception:
             keep_local = False
         if not keep_local:
-            try:
+            with contextlib.suppress(Exception):
                 os.remove(local_path)
-            except Exception:
-                pass
     except Exception:
         logger.exception("Failed to upload to storage for %s", local_path)
 
@@ -407,7 +403,7 @@ async def _process_forward_hash(forward_hash: str):
         logger.error("telethon_ingest: forward_store not available; cannot process %s", forward_hash)
         return False
 
-    meta = load_forward_metadata(forward_hash)
+    meta = await load_forward_metadata(forward_hash)
     if not meta:
         logger.error("telethon_ingest: no metadata for forward_hash %s", forward_hash)
         return False
@@ -445,15 +441,11 @@ async def _process_forward_hash(forward_hash: str):
         return False
 
     # Optionally remove forward metadata (forward_store may handle this elsewhere)
-    try:
+    with contextlib.suppress(Exception):
         from utils.forward_store import delete_forward_metadata
 
-        try:
-            delete_forward_metadata(forward_hash)
-        except Exception:
-            pass
-    except Exception:
-        pass
+    with contextlib.suppress(Exception):
+        await delete_forward_metadata(forward_hash)
 
     return True
 
@@ -522,18 +514,14 @@ async def redis_listener():
                     payload = {}
 
                 # Debug: log received payload (non-sensitive)
-                try:
+                with contextlib.suppress(Exception):
                     logger.info("telethon_ingest: redis payload received: %s", payload)
-                except Exception:
-                    pass
 
                 # Accept either `forward_hash` (preferred) or legacy `fid`/`forward_id`.
                 fh = payload.get("forward_hash") or payload.get("fid") or payload.get("forward_id")
                 if not fh:
-                    try:
+                    with contextlib.suppress(Exception):
                         logger.debug("telethon_ingest: fetch payload missing forward id; payload=%s", payload)
-                    except Exception:
-                        pass
                 else:
                     try:
                         asyncio.create_task(_process_forward_hash(fh))
@@ -556,32 +544,24 @@ async def redis_listener():
     finally:
         try:
             if pub is not None:
-                try:
+                with contextlib.suppress(Exception):
                     await pub.unsubscribe(fetch_channel)
-                except Exception:
-                    pass
-                try:
+                with contextlib.suppress(Exception):
                     await pub.close()
-                except Exception:
-                    pass
         except Exception:
             pass
         try:
             if r is not None:
-                try:
+                with contextlib.suppress(Exception):
                     await r.close()
-                except Exception:
-                    pass
         except Exception:
             pass
 
 
 def _make_temp_path(msg_id: str, ext: str = "") -> str:
     base_dir = getattr(config, "TEMP_PATH", os.path.join(os.path.dirname(os.path.dirname(__file__)), "storage", "temp"))
-    try:
+    with contextlib.suppress(Exception):
         os.makedirs(base_dir, exist_ok=True)
-    except Exception:
-        pass
     return os.path.join(base_dir, f"{msg_id}{ext}")
 
 
@@ -650,11 +630,9 @@ async def main():
     try:
         if not string_session_loaded:
             # Prefer TELETHON_SESSION_DIR, then TEMP_PATH from config, then /tmp
-            session_dir = os.environ.get("TELETHON_SESSION_DIR") or os.environ.get("TEMP_PATH") or getattr(config, "TEMP_PATH", None) or "/tmp"
-            try:
+            session_dir = os.environ.get("TELETHON_SESSION_DIR") or os.environ.get("TEMP_PATH") or getattr(config, "TEMP_PATH", None) or _tempfile.gettempdir()
+            with contextlib.suppress(Exception):
                 os.makedirs(session_dir, exist_ok=True)
-            except Exception:
-                pass
             # Use a path under the session_dir to avoid write-permissions issues on remote
             session_path = os.path.join(session_dir, session_name)
             session = session_path
@@ -691,11 +669,10 @@ async def main():
                     deleted = []
                     # Candidate directories to search for session files: cwd and project root
                     cand_dirs = [os.getcwd(), str(Path(__file__).resolve().parents[1])]
-                    try:
+                    with contextlib.suppress(Exception):
                         cand_dirs.append(str(Path.home()))
-                    except Exception:
-                        pass
-                    import glob, shutil
+                    import glob
+                    import shutil
                     for d in cand_dirs:
                         try:
                             # remove common explicit names and any files starting with session_name
@@ -792,7 +769,7 @@ async def main():
             backend = None
         if backend is not None:
             try:
-                dest_key = f"telethon/telethon_ingest.started"
+                dest_key = "telethon/telethon_ingest.started"
                 await backend.upload_file(marker, dest_key)
                 logger.info("Uploaded telethon_ingest.started to storage: %s", dest_key)
             except Exception:
@@ -828,17 +805,13 @@ async def main():
             try:
                 await client.run_until_disconnected()
             finally:
-                try:
+                with contextlib.suppress(Exception):
                     await client.disconnect()
-                except Exception:
-                    pass
         else:
             # Fetch-only mode: wait on redis listener task, or sleep forever
             if redis_task is not None:
-                try:
+                with contextlib.suppress(asyncio.CancelledError):
                     await redis_task
-                except asyncio.CancelledError:
-                    pass
             else:
                 await asyncio.Future()
     finally:
@@ -857,10 +830,8 @@ async def main():
         # Stop aiohttp debug server if running
         try:
             if http_runner is not None:
-                try:
+                with contextlib.suppress(Exception):
                     await http_runner.cleanup()
-                except Exception:
-                    pass
         except Exception:
             pass
 
@@ -873,9 +844,7 @@ if __name__ == "__main__":
     except Exception:
         try:
             # Best-effort: attempt to upload log before exiting
-            try:
+            with contextlib.suppress(Exception):
                 asyncio.run(upload_telethon_log("telethon_ingest_crash.log"))
-            except Exception:
-                pass
         except Exception:
             pass

@@ -21,12 +21,13 @@ Usage from handlers.py:
 """
 
 import asyncio
+import contextlib
 import logging
 import os
 import time
 import uuid
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any, Optional, Callable
 
 logger = logging.getLogger(__name__)
 
@@ -53,9 +54,9 @@ except Exception:
 class IngestResult:
     """Result of a big file ingestion attempt."""
     ok: bool
-    job_id: Optional[str] = None
-    s3_key: Optional[str] = None
-    error: Optional[str] = None
+    job_id: str | None = None
+    s3_key: str | None = None
+    error: str | None = None
 
 
 class BigFilePipeline:
@@ -89,12 +90,12 @@ class BigFilePipeline:
         chat_id: int,
         message_id: int,
         file_size: int,
-        file_unique_id: Optional[str] = None,
-        user_id: Optional[int] = None,
-        original_filename: Optional[str] = None,
-        ffmpeg_args: Optional[list] = None,
-        conversion_type: Optional[str] = None,
-        progress_callback: Optional[Callable[[int, int], None]] = None,
+        file_unique_id: str | None = None,
+        user_id: int | None = None,
+        original_filename: str | None = None,
+        ffmpeg_args: list | None = None,
+        conversion_type: str | None = None,
+        progress_callback: Callable[[int, int], None] | None = None,
     ) -> IngestResult:
         """Download a large file via Pyrogram userbot, upload to S3, enqueue a processing job.
 
@@ -151,7 +152,7 @@ class BigFilePipeline:
                     _cache_hit = True
                     # Cache file metadata
                     if self._cache:
-                        try:
+                        with contextlib.suppress(Exception):
                             await self._cache.cache_file_info(
                                 file_unique_id,
                                 {
@@ -163,8 +164,6 @@ class BigFilePipeline:
                                 },
                                 ttl=86400,
                             )
-                        except Exception:
-                            pass
                     logger.info(
                         "BigFilePipeline: cache pipeline succeeded for %s/%s (%d bytes)",
                         chat_id, message_id, actual_size,
@@ -204,7 +203,7 @@ class BigFilePipeline:
 
                     # Cache file info
                     if self._cache and file_unique_id:
-                        try:
+                        with contextlib.suppress(Exception):
                             await self._cache.cache_file_info(
                                 file_unique_id,
                                 {
@@ -216,8 +215,6 @@ class BigFilePipeline:
                                 },
                                 ttl=86400,
                             )
-                        except Exception:
-                            pass
 
                     logger.info(
                         "BigFilePipeline: in-memory pipeline succeeded for %s/%s (%d bytes)",
@@ -262,7 +259,7 @@ class BigFilePipeline:
 
                 # Cache file info
                 if self._cache and file_unique_id:
-                    try:
+                    with contextlib.suppress(Exception):
                         await self._cache.cache_file_info(
                             file_unique_id,
                             {
@@ -274,8 +271,6 @@ class BigFilePipeline:
                             },
                             ttl=86400,
                         )
-                    except Exception:
-                        pass
 
             except Exception as e:
                 logger.exception("BigFilePipeline: Pyrogram download error: %s", e)

@@ -4,22 +4,24 @@ Main entry point for media conversion bot - Updated for PTB v20+
 """
 
 import asyncio
-import logging
-import signal
-import time
-import subprocess
-import threading
-import os
-import hashlib
-import json
-import aiohttp
-from urllib.parse import urlparse
 import functools
+import hashlib
 import inspect
+import json
+import logging
+import os
+import signal
+import subprocess
+import tempfile
+import threading
+import time
+from urllib.parse import urlparse
 
-from telegram import Update, Bot
-from telegram.error import TelegramError, TimedOut, Conflict
+import aiohttp
 import httpx
+from telegram import Bot, Update
+from telegram.error import Conflict, TelegramError, TimedOut
+
 # Request location differs across PTB releases; try both locations and
 # fall back to None so the application can continue using default Request.
 # PTB v20+ uses HTTPXRequest; older versions use Request from telegram.request.
@@ -33,6 +35,8 @@ except Exception:
             from telegram.utils.request import Request
         except Exception:
             Request = None
+import contextlib
+
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -48,8 +52,8 @@ from config import (
     ALLOWED_USER_IDS,
     BOT_TOKEN,
     FFMPEG_PATH,
-    WEBHOOK_URL,
     WEBHOOK_SECRET,
+    WEBHOOK_URL,
     is_user_allowed,
     persist_allowed_users,
 )
@@ -59,21 +63,21 @@ from tasks import (
     stop_cleanup_task,
 )
 from utils import (
-    MediaMenuBuilder,
     ensure_directories,
 )
 from utils.error_handler import (
     get_error_handler,
     setup_comprehensive_logging,
 )
-from utils.rate_limiter import ConversionRateLimiter, TelegramAPIRateLimiter, ConversionRateLimiterRedis
-from utils.webhook_monitor import WebhookRecoveryManager
 from utils.job_queue import cancel_job
+from utils.rate_limiter import ConversionRateLimiter, ConversionRateLimiterRedis, TelegramAPIRateLimiter
 from utils.session_healthcheck import (
+    get_session_healthchecker,
     start_session_healthcheck,
     stop_session_healthcheck,
-    get_session_healthchecker,
 )
+from utils.webhook_monitor import WebhookRecoveryManager
+
 try:
     from workers.ffmpeg_worker import create_worker_task
 except Exception:
@@ -89,13 +93,11 @@ logger = logging.getLogger(__name__)
 
 # Ensure directories exist early (important for Render/ASGI import-time logging)
 try:
-    from setup_directory import setup_bot_directories
+    from contextlib import suppress as _suppress
 
-    try:
+    from setup_directory import setup_bot_directories
+    with _suppress(Exception):
         setup_bot_directories()
-    except Exception:
-        # Best-effort; continue if cannot create here
-        pass
 except Exception:
     # setup_directory may not be present or importable in some test environments
     pass
@@ -226,7 +228,7 @@ except Exception as e:
 
 # Initialize Sentry if configured via SENTRY_DSN environment variable
 try:
-    SENTRY_DSN = __import__("os").environ.get("SENTRY_DSN")
+    SENTRY_DSN = os.environ.get("SENTRY_DSN")
     if SENTRY_DSN:
         try:
             import importlib
@@ -455,6 +457,7 @@ def setup_handlers(application: Application) -> None:
         if mongo_uri:
             try:
                 from motor.motor_asyncio import AsyncIOMotorClient
+
                 from models import MediaConversionModel
 
                 # Log which env var was used (only show host, never secrets)
@@ -570,7 +573,7 @@ def setup_handlers(application: Application) -> None:
         # ── Active login flow context ──
         data = context.user_data
         sent_at = data.get("login_code_sent_at")
-        sent_repr = data.get("login_code_sent_repr")
+        data.get("login_code_sent_repr")
         resend_count = data.get("login_resend_count", 0)
         code_hash = data.get("login_code_hash")
         session_path = data.get("login_session_path")
@@ -591,19 +594,19 @@ def setup_handlers(application: Application) -> None:
         lines = [
             "\U0001f510 **Login Status**",
             "",
-            f"**Userbot enabled:** {'\u2705 Yes' if userbot_enabled else '\u274c No'}",
-            f"**API credentials:** {'\u2705 Set' if has_api_id and has_api_hash else '\u26a0\ufe0f Missing API_ID/API_HASH'}",
+            "**Userbot enabled:** " + ("✅ Yes" if userbot_enabled else "❌ No"),
+            "**API credentials:** " + ("✅ Set" if has_api_id and has_api_hash else "⚠️ Missing API_ID/API_HASH"),
             "",
             "**Telethon session:** " + (
-                f"\u2705 Available ({telethon_status.get('source', 'unknown')})"
+                "✅ Available (" + (telethon_status.get('source', 'unknown') if telethon_ready else '') + ")"
                 if telethon_ready
-                else "\u274c Not configured"
+                else "❌ Not configured"
             ),
-            "**Pyrogram session:** " + ("\u2705 Available" if pyrogram_ready else "\u274c Not configured"),
+            "**Pyrogram session:** " + ("✅ Available" if pyrogram_ready else "❌ Not configured"),
             "",
-            "**Persisted JSON file:** " + ("\u2705 Exists" if json_file_exists else "\u274c Not found"),
-            f"  Telethon in JSON: {'\u2705' if tele_from_json else '\u274c'}",
-            f"  Pyrogram in JSON: {'\u2705' if pyro_from_json else '\u274c'}",
+            "**Persisted JSON file:** " + ("✅ Exists" if json_file_exists else "❌ Not found"),
+            f"  Telethon in JSON: {'✅' if tele_from_json else '❌'}",
+            f"  Pyrogram in JSON: {'✅' if pyro_from_json else '❌'}",
             "",
             "**Active login flow:**",
             f"  awaiting: {awaiting}",
@@ -957,10 +960,8 @@ def setup_handlers(application: Application) -> None:
     application.add_handler(CommandHandler("sessionstatus", latency_wrapper(sessionstatus_command, "sessionstatus_command")))
 
     def _clear_login_flow(user_id, context):
-        try:
+        with contextlib.suppress(Exception):
             LOGIN_PENDING_USERS.discard(user_id)
-        except Exception:
-            pass
         if context is not None and getattr(context, "user_data", None) is not None:
             # Cancel the background client.start() task if running
             try:
@@ -1149,7 +1150,7 @@ def setup_handlers(application: Application) -> None:
 
 
                 async def _do_start():
-                    from telethon.errors import SessionPasswordNeededError, PhoneCodeExpiredError, FloodWaitError
+                    from telethon.errors import FloodWaitError, PhoneCodeExpiredError, SessionPasswordNeededError
 
                     try:
                         loop = asyncio.get_running_loop()
@@ -1262,14 +1263,13 @@ def setup_handlers(application: Application) -> None:
                             try:
                                 from utils.telethon_session import save_session_string_to_file_async as _pyro_save
                                 _pyro_env = os.getenv("PYROGRAM_SESSION")
-                                if _pyro_env:
-                                    if await _pyro_save(
-                                        _pyro_env, client_type="pyrogram"
-                                    ):
-                                        saved_to.append("Pyrogram JSON")
-                                        logger.info(
-                                            "Eagerly persisted PYROGRAM_SESSION to JSON (during /login)"
-                                        )
+                                if _pyro_env and await _pyro_save(
+                                    _pyro_env, client_type="pyrogram"
+                                ):
+                                    saved_to.append("Pyrogram JSON")
+                                    logger.info(
+                                        "Eagerly persisted PYROGRAM_SESSION to JSON (during /login)"
+                                    )
                             except Exception:
                                 pass
 
@@ -1297,7 +1297,7 @@ def setup_handlers(application: Application) -> None:
                             else:
                                 await context.bot.send_message(
                                     chat_id=update.effective_chat.id,
-                                    text=f"Login failed: {start_exc.__class__.__name__}.\nPlease run /login again."
+                                    text="Login failed. Check server logs for details. Please run /login again."
                                 )
                         except Exception:
                             await context.bot.send_message(
@@ -1306,10 +1306,8 @@ def setup_handlers(application: Application) -> None:
                             )
 
                     finally:
-                        try:
+                        with contextlib.suppress(Exception):
                             await client.disconnect()
-                        except Exception:
-                            pass
                         # Clear pending future
                         try:
                             fut = context.user_data.get("login_pending_future")
@@ -1337,10 +1335,8 @@ def setup_handlers(application: Application) -> None:
                 await update.message.reply_text(
                     "Failed to start Telethon login. Check API_ID/API_HASH and the phone number."
                 )
-                try:
+                with contextlib.suppress(Exception):
                     await client.disconnect()
-                except Exception:
-                    pass
                 _clear_login_flow(user_id, context)
                 return
 
@@ -1348,7 +1344,7 @@ def setup_handlers(application: Application) -> None:
         pending_future = context.user_data.get("login_pending_future")
         pending_type = context.user_data.get("login_pending_type")
         if pending_future is not None and not pending_future.done():
-            code = update.message.text.strip()
+            update.message.text.strip()
             client = context.user_data.get("login_client")
             phone = context.user_data.get("login_phone")
             if client is None or not phone:
@@ -1585,8 +1581,8 @@ async def main(background: bool = False) -> None:
     # so the JSON file is populated right away.
     try:
         from utils.telethon_session import (
-            save_session_string_to_file_async,
             _load_all_sessions_from_file_async,
+            save_session_string_to_file_async,
         )
 
         existing_json = await _load_all_sessions_from_file_async()
@@ -1698,11 +1694,8 @@ async def main(background: bool = False) -> None:
     except NotImplementedError:
         # Fallback for Windows or event loops that don't support add_signal_handler
         signal.signal(signal.SIGINT, lambda s, f: loop.call_soon_threadsafe(shutdown_event.set))
-        try:
+        with contextlib.suppress(Exception):
             signal.signal(signal.SIGTERM, lambda s, f: loop.call_soon_threadsafe(shutdown_event.set))
-        except Exception:
-            # SIGTERM may not be available on some platforms
-            pass
 
     try:
         # Start the bot with PTB v20+ proper async context
@@ -1715,10 +1708,8 @@ async def main(background: bool = False) -> None:
         if background:
             await application.initialize()
             await application.start()
-            try:
+            with contextlib.suppress(Exception):
                 BOT_READY.set()
-            except Exception:
-                pass
 
             # Auto-fallback: when running under ASGI the PTB dispatcher may
             # not be available in some hosting environments. If webhook mode
@@ -1789,10 +1780,8 @@ async def main(background: bool = False) -> None:
                                     logger.debug("Long-poller: another worker holds the lock; sleeping")
                                     await asyncio.sleep(5)
                                     continue
-                                try:
+                                with contextlib.suppress(Exception):
                                     await _longpoll_redis_lock.renew()
-                                except Exception:
-                                    pass
                             # Use a modest timeout so we can react to shutdown_event
                             sem = globals().get("GET_UPDATES_SEMAPHORE")
                             get_bot = globals().get("GET_UPDATES_BOT")
@@ -1808,10 +1797,8 @@ async def main(background: bool = False) -> None:
                                     updates = await bot.get_updates(offset=offset, timeout=30)
                             finally:
                                 if acquired:
-                                    try:
+                                    with contextlib.suppress(Exception):
                                         sem.release()
-                                    except Exception:
-                                        pass
                             if updates:
                                 for u in updates:
                                     try:
@@ -1835,10 +1822,8 @@ async def main(background: bool = False) -> None:
                         except Conflict as e:
                             logger.warning("Long-poller conflict: %s. Releasing lock and retrying", e)
                             if _longpoll_redis_lock is not None:
-                                try:
+                                with contextlib.suppress(Exception):
                                     await _longpoll_redis_lock.release()
-                                except Exception:
-                                    pass
                             await asyncio.sleep(10)
                             continue
                         except Exception as e:
@@ -1846,10 +1831,8 @@ async def main(background: bool = False) -> None:
                             await asyncio.sleep(1)
                         finally:
                             if _longpoll_redis_lock is not None and _longpoll_redis_lock.is_acquired:
-                                try:
+                                with contextlib.suppress(Exception):
                                     await _longpoll_redis_lock.renew()
-                                except Exception:
-                                    pass
 
                 try:
                     global LONG_POLLER_STARTED
@@ -1884,7 +1867,7 @@ async def main(background: bool = False) -> None:
             # Periodically makes an HTTP GET to our own /health endpoint,
             # which counts as inbound traffic and resets the 15-min inactivity timer.
             keep_alive_task = None
-            _ka_enabled = not (os.environ.get("KEEP_ALIVE_DISABLED", "").lower() in ("1", "true", "yes"))
+            _ka_enabled = os.environ.get("KEEP_ALIVE_DISABLED", "").lower() not in ("1", "true", "yes")
             if _ka_enabled:
                 try:
                     _ka_url = (os.environ.get("KEEP_ALIVE_URL") or os.environ.get("RENDER_EXTERNAL_URL") or "")
@@ -1911,14 +1894,14 @@ async def main(background: bool = False) -> None:
                                         try:
                                             async with _session.get(_health_url, timeout=10) as _resp:
                                                 logger.debug("Keep-alive ping: %s", _resp.status)
-                                        except (asyncio.TimeoutError, aiohttp.ClientError, OSError) as _e:
+                                        except (TimeoutError, aiohttp.ClientError, OSError) as _e:
                                             logger.debug("Keep-alive ping failed (harmless): %s", _e)
 
                                         # Wait for interval or shutdown event
                                         try:
                                             await asyncio.wait_for(shutdown_event.wait(), timeout=_ka_interval)
                                             break  # Shutdown requested
-                                        except asyncio.TimeoutError:
+                                        except TimeoutError:
                                             continue  # Time to ping again
                                         except asyncio.CancelledError:
                                             break
@@ -1975,10 +1958,8 @@ async def main(background: bool = False) -> None:
                     except Exception:
                         pass
                     finally:
-                        try:
+                        with contextlib.suppress(Exception):
                             globals()["LONG_POLLER_STARTED"] = False
-                        except Exception:
-                            pass
 
                 # Cancel the background worker task
                 if worker_task is not None:
@@ -1999,20 +1980,16 @@ async def main(background: bool = False) -> None:
                 try:
                     await application.stop()
                 finally:
-                    try:
+                    with contextlib.suppress(Exception):
                         BOT_READY.clear()
-                    except Exception:
-                        pass
                 # Close dedicated get_updates client if present
                 try:
                     gu = globals().get("GET_UPDATES_BOT")
                     if gu is not None:
                         close_fn = getattr(gu, "close", None)
                         if close_fn:
-                            try:
+                            with contextlib.suppress(Exception):
                                 await close_fn()
-                            except Exception:
-                                pass
                 except Exception:
                     pass
 
@@ -2023,10 +2000,8 @@ async def main(background: bool = False) -> None:
             async with application:
                 await application.initialize()
                 await application.start()
-                try:
+                with contextlib.suppress(Exception):
                     BOT_READY.set()
-                except Exception:
-                    pass
 
                 if WEBHOOK_URL and not force_polling:
                     logger.info(f"🌐 Starting bot in webhook mode: {WEBHOOK_URL}")
@@ -2077,7 +2052,7 @@ if __name__ == "__main__":
 # FastAPI app for webhook handling - PTB v20+ compatible
 try:
     from fastapi import FastAPI, HTTPException, Request
-    from fastapi.responses import Response, FileResponse
+    from fastapi.responses import FileResponse, Response
     from telegram import Update as TgUpdate
 
     app = FastAPI(title="Media Conversion Bot - PTB v20+")
@@ -2085,8 +2060,8 @@ try:
     # Mount legacy Flask-based web UI (if present) under '/flask' so the
     # web uploader and static UI remain available when running under ASGI/uvicorn.
     try:
-        from starlette.middleware.wsgi import WSGIMiddleware
         from fastapi.responses import RedirectResponse
+        from starlette.middleware.wsgi import WSGIMiddleware
 
         import web.webapp as flask_webapp
 
@@ -2131,10 +2106,8 @@ try:
                                     try:
                                         raw = await r.hgetall(f"ffmpeg:job:{job_id}")
                                     finally:
-                                        try:
+                                        with contextlib.suppress(Exception):
                                             await r.close()
-                                        except Exception:
-                                            pass
                                     if raw:
                                         # aioredis returns a dict possibly with bytes; decode keys/values
                                         decoded = {}
@@ -2197,7 +2170,8 @@ try:
                             # 6) Default queued response
                             return {"job_id": job_id, "progress": 0.0, "message": "queued", "status": "queued"}
                         except Exception as e:
-                            return {"error": str(e)}
+                            logger.exception("Diagnostics error: %s", e)
+                            return {"error": "Internal error. Check server logs."}
 
             @app.get("/internal/diag")
             async def root_diag(request: Request, job_id: str | None = None, token: str | None = None):
@@ -2247,10 +2221,8 @@ try:
                                             except Exception:
                                                 result["redis"]["job_hash"] = {}
                                 finally:
-                                    try:
+                                    with contextlib.suppress(Exception):
                                         await r.close()
-                                    except Exception:
-                                        pass
                             except Exception:
                                 # sync fallback
                                 try:
@@ -2285,14 +2257,14 @@ try:
                             for fname in sorted(os.listdir(logs_dir))[-10:]:
                                 path = os.path.join(logs_dir, fname)
                                 if os.path.isfile(path):
-                                    with open(path, "r", encoding="utf-8", errors="replace") as fh:
+                                    with open(path, encoding="utf-8", errors="replace") as fh:
                                         lines = fh.readlines()[-500:]
                                         result["logs"][fname] = "".join(lines)
                         # Also include worker log if present for quick debugging
                         try:
-                            worker_log = "/tmp/worker.log"
+                            worker_log = os.path.join(tempfile.gettempdir(), "worker.log")
                             if os.path.isfile(worker_log):
-                                with open(worker_log, "r", encoding="utf-8", errors="replace") as fh:
+                                with open(worker_log, encoding="utf-8", errors="replace") as fh:
                                     lines = fh.readlines()[-1000:]
                                     result["logs"]["worker.log"] = "".join(lines)
                         except Exception:
@@ -2326,7 +2298,7 @@ try:
                 try:
                     payload = await request.json()
                 except Exception:
-                    raise HTTPException(status_code=400, detail="invalid json")
+                    raise HTTPException(status_code=400, detail="invalid json") from None
 
                 action = payload.get("action")
                 filename = payload.get("file")
@@ -2343,7 +2315,8 @@ try:
                         proc = await asyncio.to_thread(subprocess.run, cmd, capture_output=True, text=True, timeout=timeout)
                         return {"returncode": proc.returncode, "stdout": proc.stdout, "stderr": proc.stderr}
                     except Exception as e:
-                        return {"error": str(e)}
+                        logger.exception("Diagnostic hash fetch error: %s", e)
+                        return {"error": "Failed to fetch job hash"}
 
                 # Sanitize file -> only allow basename under storage/input
                 input_dir = getattr(cfg, "INPUT_PATH", os.path.join(os.getcwd(), "storage", "input"))
@@ -2386,16 +2359,17 @@ try:
                             for fname in sorted(os.listdir(logs_dir))[-10:]:
                                 path = os.path.join(logs_dir, fname)
                                 if os.path.isfile(path):
-                                    with open(path, "r", encoding="utf-8", errors="replace") as fh:
+                                    with open(path, encoding="utf-8", errors="replace") as fh:
                                         logs[fname] = "".join(fh.readlines()[-lines:])
-                        worker_log = "/tmp/worker.log"
+                        worker_log = os.path.join(tempfile.gettempdir(), "worker.log")
                         if os.path.isfile(worker_log):
-                            with open(worker_log, "r", encoding="utf-8", errors="replace") as fh:
+                            with open(worker_log, encoding="utf-8", errors="replace") as fh:
                                 logs[os.path.basename(worker_log)] = "".join(fh.readlines()[-(lines * 5):])
                     except Exception as e:
-                        raise HTTPException(status_code=500, detail=str(e))
-                    out["logs"] = logs
-                    return out
+                        logger.exception("Failed to fetch job metadata: %s", e)
+                        raise HTTPException(status_code=500, detail="Failed to fetch job metadata. Check server logs for details.") from e
+                out["logs"] = logs
+                return out
 
                 # Probe the local webhook loopback to help diagnose webhook timeouts
                 if action == "probe_local_webhook":
@@ -2434,10 +2408,8 @@ try:
                                     vstr = None
                                 locks[kstr] = vstr
                         finally:
-                            try:
+                            with contextlib.suppress(Exception):
                                 await r.close()
-                            except Exception:
-                                pass
                         out["locks"] = locks
                     except Exception as e:
                         out["locks_error"] = str(e)
@@ -2483,10 +2455,8 @@ try:
                                 except Exception:
                                     pass
                         finally:
-                            try:
+                            with contextlib.suppress(Exception):
                                 await r.close()
-                            except Exception:
-                                pass
                         out["removed"] = removed
                         out["removed_count"] = len(removed)
                     except Exception as e:
@@ -2500,7 +2470,7 @@ try:
                         raise HTTPException(status_code=400, detail="job_id required")
                     removed = 0
                     try:
-                        from utils.job_queue import get_redis, JOB_LIST
+                        from utils.job_queue import JOB_LIST, get_redis
 
                         r = await get_redis()
                         try:
@@ -2518,10 +2488,8 @@ try:
                                     except Exception:
                                         pass
                         finally:
-                            try:
+                            with contextlib.suppress(Exception):
                                 await r.close()
-                            except Exception:
-                                pass
                         out["removed_job_instances"] = removed
                     except Exception as e:
                         out["error"] = str(e)
@@ -2538,13 +2506,12 @@ try:
                             job_hash = await r.hgetall(f"ffmpeg:job:{job_id}")
                             out["job_hash"] = job_hash
                         finally:
-                            try:
+                            with contextlib.suppress(Exception):
                                 await r.close()
-                            except Exception:
-                                pass
-                        return out
                     except Exception as e:
-                        raise HTTPException(status_code=500, detail=str(e))
+                        logger.exception("Failed to fetch job metadata: %s", e)
+                        raise HTTPException(status_code=500, detail="Failed to fetch job metadata. Check server logs for details.") from e
+                    return out
 
                 if action == "cancel_job":
                     # Set the cancel flag for a job so running ffmpeg will terminate
@@ -2684,7 +2651,7 @@ try:
             raise
         except Exception:
             logger.exception("Error validating webhook secret token")
-            raise HTTPException(status_code=500, detail="Webhook validation error")
+            raise HTTPException(status_code=500, detail="Webhook validation error") from None
         if not BOT_APPLICATION:
             logger.error("Bot application not initialized")
             raise HTTPException(status_code=503, detail="Bot not initialized")
@@ -2694,7 +2661,7 @@ try:
             logger.debug(f"Received webhook data: {data}")
         except Exception as e:
             logger.error(f"Invalid JSON in webhook: {e}")
-            raise HTTPException(status_code=400, detail="Invalid JSON")
+            raise HTTPException(status_code=400, detail="Invalid JSON") from e
 
         try:
             # Build Update object early so we can retry dispatching even if the
@@ -2705,7 +2672,7 @@ try:
             logger.info(f"Received update {getattr(update, 'update_id', 'unknown')}")
         except Exception as e:
             logger.error(f"Failed to construct Update: {e}")
-            raise HTTPException(status_code=400, detail="Invalid update payload")
+            raise HTTPException(status_code=400, detail="Invalid update payload") from e
 
         # Increment webhook counter
         try:
@@ -2972,10 +2939,8 @@ try:
                                             updates = await bot.get_updates(offset=offset, timeout=30)
                                     finally:
                                         if acquired:
-                                            try:
+                                            with contextlib.suppress(Exception):
                                                 sem.release()
-                                            except Exception:
-                                                pass
                                     if updates:
                                         for u in updates:
                                             try:
@@ -3043,10 +3008,8 @@ try:
         except Exception as e:
             logger.error(f"Error stopping ASGI long-poller: {e}")
         finally:
-            try:
+            with contextlib.suppress(Exception):
                 globals()["LONG_POLLER_STARTED"] = False
-            except Exception:
-                pass
         # Cancel update consumer if present
         try:
             uc = getattr(app.state, "update_consumer", None)
@@ -3065,10 +3028,8 @@ try:
             if gu is not None:
                 close_fn = getattr(gu, "close", None)
                 if close_fn:
-                    try:
+                    with contextlib.suppress(Exception):
                         await close_fn()
-                    except Exception:
-                        pass
         except Exception as e:
             logger.warning(f"Error closing GET_UPDATES_BOT: {e}")
 

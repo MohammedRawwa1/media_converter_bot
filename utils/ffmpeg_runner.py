@@ -1,13 +1,13 @@
 import asyncio
+import contextlib
+import json
+import logging
 import os
 import shlex
-import json
-import subprocess
 import signal
-from typing import Optional, Callable
+from collections.abc import Callable
 
 import config
-import logging
 
 logger = logging.getLogger(__name__)
 
@@ -20,7 +20,7 @@ except Exception:
 CREATE_NEW_PROCESS_GROUP = 0x00000200 if os.name == "nt" else 0
 
 
-async def probe_duration(path: str) -> Optional[float]:
+async def probe_duration(path: str) -> float | None:
     """Probe media duration using ffprobe (sync subprocess wrapped)."""
     # Defensive checks: ensure caller provided a valid path
     if not path:
@@ -85,10 +85,10 @@ async def run_ffmpeg(
     input_path: str,
     output_path: str,
     job_id: str,
-    ffmpeg_args: Optional[list] = None,
-    redis_url: Optional[str] = None,
-    progress_channel: Optional[str] = None,
-    on_progress: Optional[Callable[[float, str], None]] = None,
+    ffmpeg_args: list | None = None,
+    redis_url: str | None = None,
+    progress_channel: str | None = None,
+    on_progress: Callable[[float, str], None] | None = None,
 ):
     """Run ffmpeg asynchronously, publish progress to Redis pubsub and call callback.
 
@@ -180,10 +180,8 @@ async def run_ffmpeg(
         try:
             redis_client = aioredis.from_url(redis_url or os.environ.get("REDIS_URL"))
             # Initialize job hash so status is available immediately
-            try:
+            with contextlib.suppress(Exception):
                 await redis_client.hset(f"ffmpeg:job:{job_id}", mapping={"status": "processing", "progress": 0, "message": "started", "in_bytes": str(in_bytes)})
-            except Exception:
-                pass
         except Exception:
             redis_client = None
 
@@ -241,10 +239,8 @@ async def run_ffmpeg(
                     except Exception:
                         pass
                 if on_progress:
-                    try:
+                    with contextlib.suppress(Exception):
                         on_progress(payload["progress"], message)
-                    except Exception:
-                        pass
             # periodically check for cancel flag in redis
             if redis_client:
                 try:
@@ -264,14 +260,10 @@ async def run_ffmpeg(
                                 except Exception:
                                     proc.kill()
                         except Exception:
-                            try:
+                            with contextlib.suppress(Exception):
                                 proc.kill()
-                            except Exception:
-                                pass
-                        try:
+                        with contextlib.suppress(Exception):
                             await redis_client.hset(f"ffmpeg:job:{job_id}", mapping={"status": "cancelled", "message": "cancelled by user"})
-                        except Exception:
-                            pass
                         return False, "cancelled"
                 except Exception:
                     pass
@@ -316,10 +308,8 @@ async def run_ffmpeg(
             return False, err
 
     except asyncio.CancelledError:
-        try:
+        with contextlib.suppress(Exception):
             proc.kill()
-        except Exception:
-            pass
         raise
     finally:
         try:

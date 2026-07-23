@@ -12,6 +12,7 @@ Run: `python scripts/forward_reenricher.py`
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import os
@@ -72,14 +73,10 @@ async def _async_run():
                 except Exception:
                     logger.exception("Failed to publish fetch request for %s", fid)
     finally:
-        try:
+        with contextlib.suppress(Exception):
             await pub.unsubscribe(FORWARD_CHANNEL)
-        except Exception:
-            pass
-        try:
+        with contextlib.suppress(Exception):
             await client.close()
-        except Exception:
-            pass
     return 0
 
 
@@ -119,14 +116,10 @@ def _sync_run():
                 except Exception:
                     logger.exception("Failed to publish fetch request for %s", fid)
     finally:
-        try:
+        with contextlib.suppress(Exception):
             pub.unsubscribe(FORWARD_CHANNEL)
-        except Exception:
-            pass
-        try:
+        with contextlib.suppress(Exception):
             client.close()
-        except Exception:
-            pass
     return 0
 
 

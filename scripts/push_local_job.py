@@ -6,14 +6,13 @@ Usage:
 
 Creates a job in Redis list `ffmpeg:jobs` and a job hash `ffmpeg:job:<job_id>`.
 """
-import os
-import sys
-import os
-import sys
+import contextlib
 import json
+import os
+import shutil
+import sys
 import time
 import uuid
-import shutil
 
 try:
     import redis
@@ -102,10 +101,8 @@ def main():
             "created_at": str(time.time()),
         }
         # write metadata first to avoid race where worker pops before hash exists
-        try:
+        with contextlib.suppress(Exception):
             r.hset(f"ffmpeg:job:{job_id}", mapping=mapping)
-        except Exception:
-            pass
         r.lpush("ffmpeg:jobs", json.dumps(job))
         print("Enqueued job:", job_id)
         print("Input:", input_path)

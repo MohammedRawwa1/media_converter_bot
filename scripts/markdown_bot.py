@@ -4,11 +4,12 @@ to HTML anchors and sends them (useful to reveal MP4 filenames on mobile).
 
 Set environment variable `TELEGRAM_BOT_TOKEN` before running.
 """
+import html
 import os
 import re
-import html
+
 from telegram import Update
-from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters
+from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, MessageHandler, filters
 
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "<YOUR_BOT_TOKEN>")
 

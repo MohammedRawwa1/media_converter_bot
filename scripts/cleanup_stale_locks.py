@@ -22,7 +22,6 @@ import argparse
 import hashlib
 import os
 import sys
-from typing import Optional
 
 # Ensure repository root is importable when running as a script
 repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))

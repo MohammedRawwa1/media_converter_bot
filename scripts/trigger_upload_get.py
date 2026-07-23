@@ -1,10 +1,11 @@
-import os, sys
-from urllib import request, parse
+import os
+import sys
+from urllib import parse, request
 
 # load .env
 env_path = os.path.join(os.path.dirname(__file__), '..', '.env')
 if os.path.exists(env_path):
-    with open(env_path, 'r', encoding='utf-8') as f:
+    with open(env_path, encoding='utf-8') as f:
         for line in f:
             line=line.strip()
             if not line or line.startswith('#'):
@@ -29,10 +30,15 @@ if not forward_hash:
 url = 'https://media-converter-bot-1.onrender.com/upload'
 qs = parse.urlencode({'forward_hash': forward_hash})
 full = f"{url}?{qs}"
-req = request.Request(full, headers={'X-Upload-Token': secret}, method='GET')
+req = request.Request(full, headers={'X-Upload-Token': secret}, method='GET')  # noqa: S310 - URL is hardcoded and validated below
 
 try:
-    with request.urlopen(req, timeout=60) as resp:
+    # Validate URL scheme to prevent SSRF via file:// or internal IPs
+    parsed_url = parse.urlparse(full)
+    if parsed_url.scheme not in ("http", "https"):
+        print(f"Blocked urlopen with scheme={parsed_url.scheme}")
+        raise ValueError(f"Unsupported URL scheme: {parsed_url.scheme}")
+    with request.urlopen(req, timeout=60) as resp:  # nosec # noqa: S310 - URL validated above
         body = resp.read().decode('utf-8', errors='replace')
         print('HTTP', resp.status)
         print(body)

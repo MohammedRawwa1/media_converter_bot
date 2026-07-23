@@ -2,39 +2,40 @@
 persists job state to MongoDB (if available), and exposes Prometheus metrics.
 """
 import asyncio
+import logging
 import os
 import signal
-import logging
-import time
 import subprocess
-from typing import Optional
+import time
 
-from utils.job_queue import pop_job, publish_update, get_redis, JOB_LIST, close_redis, release_input_lock
 from utils.ffmpeg_runner import run_ffmpeg
+from utils.job_queue import JOB_LIST, close_redis, get_redis, pop_job, publish_update, release_input_lock
+
 try:
     from utils.cache import get_cache
 except Exception:
     get_cache = None
-from utils import job_store
-from utils import file_utils
-from telegram import Bot
-import config
-import aiohttp
-import shutil
-import json
+import contextlib
 import hashlib
+import json
+import shutil
 import tempfile
+
+import aiohttp
+from prometheus_client import Counter, Gauge, Histogram, start_http_server
+from telegram import Bot
+
+import config
 from media_converter import ExtendedMediaConverter
 from tasks import (
     create_archive,
-    merge_videos,
-    merge_audios,
     extract_streams,
     generate_sample,
+    merge_audios,
+    merge_videos,
     trim_media,
 )
-
-from prometheus_client import Counter, Histogram, Gauge, start_http_server
+from utils import file_utils, job_store
 
 logger = logging.getLogger(__name__)
 
@@ -57,10 +58,10 @@ JOB_DURATION = Histogram("media_job_duration_seconds", "Duration of ffmpeg jobs"
 ACTIVE_JOBS = Gauge("media_jobs_active", "Number of active ffmpeg jobs")
 
 # Forward notification event (set by background pubsub listener)
-FORWARD_NOTIFY_EVENT: Optional[asyncio.Event] = None
+FORWARD_NOTIFY_EVENT: asyncio.Event | None = None
 # Redis cache instance shared between worker_loop and handle_job
 _cache = None
-LAST_FORWARD_NOTIFICATION: Optional[dict] = None
+LAST_FORWARD_NOTIFICATION: dict | None = None
 
 
 async def _update_upload_progress(job_id: str, progress_channel: str, pct: int, message: str) -> None:
@@ -79,10 +80,8 @@ async def _update_upload_progress(job_id: str, progress_channel: str, pct: int, 
                 "message": message,
             })
         finally:
-            try:
+            with contextlib.suppress(Exception):
                 await r.close()
-            except Exception:
-                pass
     except Exception:
         pass
 
@@ -144,17 +143,15 @@ class _ProgressFileWrapper:
         if chunk:
             self._sent += len(chunk)
             if self._progress_callback:
-                try:
+                with contextlib.suppress(Exception):
                     self._progress_callback(self._sent, self._total)
-                except Exception:
-                    pass
         return chunk
 
     def __getattr__(self, name):
         return getattr(self._fh, name)
 
 
-async def _forward_pubsub_listener(stop_event: Optional[asyncio.Event], event: asyncio.Event) -> None:
+async def _forward_pubsub_listener(stop_event: asyncio.Event | None, event: asyncio.Event) -> None:
     """Background task: subscribe to forward publish channel and set `event` when a notification arrives.
 
     This is best-effort: failures are logged and the task exits without raising.
@@ -211,19 +208,15 @@ async def _forward_pubsub_listener(stop_event: Optional[asyncio.Event], event: a
             # store last payload and notify waiter(s)
             global LAST_FORWARD_NOTIFICATION
             LAST_FORWARD_NOTIFICATION = payload
-            try:
+            with contextlib.suppress(Exception):
                 event.set()
-            except Exception:
-                pass
     except asyncio.CancelledError:
         pass
     except Exception:
         logger.exception("Exception in forward pubsub listener")
     finally:
-        try:
+        with contextlib.suppress(Exception):
             await pub.unsubscribe(channel)
-        except Exception:
-            pass
         try:
             aclose = getattr(client, "aclose", None)
             if aclose is not None:
@@ -359,10 +352,8 @@ async def handle_job(job: dict):
                 except Exception:
                     pass
 
-                try:
+                with contextlib.suppress(Exception):
                     await publish_update(progress_channel, {"job_id": job_id, "progress": 0, "message": "requeued_missing_input", "attempts": attempts, "backoff": backoff})
-                except Exception:
-                    pass
 
                 if r2 is not None:
                     try:
@@ -375,14 +366,10 @@ async def handle_job(job: dict):
                         pass
                 return
             else:
-                try:
+                with contextlib.suppress(Exception):
                     await publish_update(progress_channel, {"job_id": job_id, "progress": 0, "message": "download_failed", "error": "remote_key_missing_permanent"})
-                except Exception:
-                    pass
-                try:
+                with contextlib.suppress(Exception):
                     await job_store.update_job(job_id, {"status": "error", "error": "remote_key_missing_permanent"})
-                except Exception:
-                    pass
                 if r2 is not None:
                     try:
                         aclose = getattr(r2, "aclose", None)
@@ -424,10 +411,8 @@ async def handle_job(job: dict):
                 except Exception:
                     r2 = None
                 if r2 is not None:
-                    try:
+                    with contextlib.suppress(Exception):
                         await r2.hset(f"ffmpeg:job:{job_id}", mapping={"input": str(job.get("input_path") or ""), "input_from_remote": "1"})
-                    except Exception:
-                        pass
             except Exception:
                 pass
             finally:
@@ -442,14 +427,10 @@ async def handle_job(job: dict):
                         pass
         else:
             logger.exception("Failed to download input from storage for job %s: %s", job_id, last_exc)
-            try:
-                await publish_update(progress_channel, {"job_id": job_id, "progress": 0, "message": "download_failed", "error": str(last_exc)})
-            except Exception:
-                pass
-            try:
+            with contextlib.suppress(Exception):
+                await publish_update(progress_channel, {"job_id": job_id, "progress": 0, "message": "download_failed", "error": "remote_download_failed"})
+            with contextlib.suppress(Exception):
                 await job_store.update_job(job_id, {"status": "error", "error": "remote_download_failed"})
-            except Exception:
-                pass
             return
     # (re)use any job-provided retry count
     retries = int(job.get("retries", 0))
@@ -464,7 +445,7 @@ async def handle_job(job: dict):
             os.makedirs(temp_dir, exist_ok=True)
             temp_input = os.path.join(temp_dir, f"{job_id}_src")
             async with aiohttp.ClientSession() as session:
-                async with session.get(source_url, timeout=60) as resp:
+                async with session.get(source_url, timeout=60, allow_redirects=False) as resp:
                     if resp.status != 200:
                         raise RuntimeError(f"Failed to download source URL: {resp.status}")
                     with open(temp_input, "wb") as fh:
@@ -475,10 +456,8 @@ async def handle_job(job: dict):
             input_path = job.get("input_path")
         except Exception as e:
             logger.exception("Failed to download source URL for job %s: %s", job_id, e)
-            try:
-                await publish_update(progress_channel, {"job_id": job_id, "progress": 0, "message": "download_failed", "error": str(e)})
-            except Exception:
-                pass
+            with contextlib.suppress(Exception):
+                await publish_update(progress_channel, {"job_id": job_id, "progress": 0, "message": "download_failed", "error": "source_url_download_failed"})
             return
 
     # Acquire per-input lock to avoid duplicate processing
@@ -514,19 +493,15 @@ async def handle_job(job: dict):
                     lock_acquired = True
                     logger.info("Input lock already owned by this job %s, reusing", job_id)
                     # Refresh the TTL so the lock doesn't expire during processing
-                    try:
+                    with contextlib.suppress(Exception):
                         await redis_lock_client.expire(lock_key, lock_ttl)
-                    except Exception:
-                        pass
         except Exception:
             pass
 
     if not lock_acquired:
         logger.info("Input already locked for job %s, requeueing", job_id)
-        try:
+        with contextlib.suppress(Exception):
             await publish_update(progress_channel, {"job_id": job_id, "progress": 0, "message": "locked", "note": "input_locked"})
-        except Exception:
-            pass
         try:
             # Push into delayed set with a small backoff to avoid tight requeue loop
             backoff = int(os.environ.get("JOB_LOCK_BACKOFF", "5"))
@@ -565,10 +540,8 @@ async def handle_job(job: dict):
             pass
     except Exception:
         pass
-    try:
+    with contextlib.suppress(Exception):
         await publish_update(progress_channel, {"job_id": job_id, "progress": 0, "message": "started"})
-    except Exception:
-        pass
 
     # prefer original filename for output if provided
     try:
@@ -590,7 +563,7 @@ async def handle_job(job: dict):
         logger.exception("Failed to compute output_path from original_filename")
 
     attempt = 0
-    converter = ExtendedMediaConverter() if ExtendedMediaConverter else None
+    ExtendedMediaConverter() if ExtendedMediaConverter else None
     # optional memory sampler task (helpful for remote debugging)
     memory_sampler_task = None
 
@@ -611,10 +584,8 @@ async def handle_job(job: dict):
         while True:
             try:
                 rss = await _get_rss_bytes()
-                try:
+                with contextlib.suppress(Exception):
                     await publish_update(channel, {"job_id": job_id, "memory_rss": rss})
-                except Exception:
-                    pass
             except Exception:
                 pass
             await asyncio.sleep(interval)
@@ -639,14 +610,10 @@ async def handle_job(job: dict):
                                 ok = await _conv_limiter.mark_conversion_started(user_key)
                                 if not ok:
                                     # inform progress channel and mark job as errored due to rate limit
-                                    try:
+                                    with contextlib.suppress(Exception):
                                         await publish_update(progress_channel, {"job_id": job_id, "progress": 0, "message": "rate_limited", "error": "user rate limit reached"})
-                                    except Exception:
-                                        pass
-                                    try:
+                                    with contextlib.suppress(Exception):
                                         await job_store.update_job(job_id, {"status": "error", "error": "rate_limited"})
-                                    except Exception:
-                                        pass
                                     return
                         except Exception:
                             # on limiter failures, allow processing to continue
@@ -662,10 +629,8 @@ async def handle_job(job: dict):
                         if not has_local_file and not job.get("input_key") and not job.get("source_url"):
                             wait_seconds = int(os.environ.get("JOB_WAIT_SECONDS", "10"))
                             # notify once that we're waiting
-                            try:
+                            with contextlib.suppress(Exception):
                                 await publish_update(progress_channel, {"job_id": job_id, "progress": 0, "message": "waiting_for_input", "wait_seconds": wait_seconds})
-                            except Exception:
-                                pass
 
                             try:
                                 rr = await get_redis()
@@ -707,20 +672,16 @@ async def handle_job(job: dict):
                                             if FORWARD_NOTIFY_EVENT is not None:
                                                 try:
                                                     await asyncio.wait_for(FORWARD_NOTIFY_EVENT.wait(), timeout=1)
-                                                    try:
+                                                    with contextlib.suppress(Exception):
                                                         FORWARD_NOTIFY_EVENT.clear()
-                                                    except Exception:
-                                                        pass
-                                                except asyncio.TimeoutError:
+                                                except TimeoutError:
                                                     pass
                                             else:
                                                 await asyncio.sleep(1)
                                         except Exception:
                                             # on any error, fall back to sleeping briefly
-                                            try:
+                                            with contextlib.suppress(Exception):
                                                 await asyncio.sleep(0.5)
-                                            except Exception:
-                                                pass
                                 finally:
                                     try:
                                         aclose = getattr(rr, "aclose", None)
@@ -734,14 +695,10 @@ async def handle_job(job: dict):
                             # final check after waiting
                             if not has_local_file and not job.get("input_key") and not job.get("source_url"):
                                 logger.error("No input available for job %s after waiting; marking as error", job_id)
-                                try:
+                                with contextlib.suppress(Exception):
                                     await publish_update(progress_channel, {"job_id": job_id, "progress": 0, "message": "error", "error": "no_input_provided"})
-                                except Exception:
-                                    pass
-                                try:
+                                with contextlib.suppress(Exception):
                                     await job_store.update_job(job_id, {"status": "error", "error": "no_input_provided"})
-                                except Exception:
-                                    pass
                                 return
 
                         coro = run_ffmpeg(input_path, output_path, job_id, ffmpeg_args=ffmpeg_args, redis_url=redis_url, progress_channel=progress_channel)
@@ -753,7 +710,7 @@ async def handle_job(job: dict):
                             memory_sampler_task = None
                         try:
                             success, info = await asyncio.wait_for(coro, timeout=max_runtime)
-                        except asyncio.TimeoutError:
+                        except TimeoutError:
                             success, info = False, "timeout"
 
                     elif job_type in ("create_archive", "archive"):
@@ -831,7 +788,7 @@ async def handle_job(job: dict):
                         redis_url = job.get("redis_url") or os.environ.get("REDIS_URL")
                         try:
                             success, info = await asyncio.wait_for(run_ffmpeg(input_path, output_path, job_id, ffmpeg_args=ffmpeg_args, redis_url=redis_url, progress_channel=progress_channel), timeout=max_runtime)
-                        except asyncio.TimeoutError:
+                        except TimeoutError:
                             success, info = False, "timeout"
 
                 # end with JOB_DURATION
@@ -893,10 +850,8 @@ async def handle_job(job: dict):
                                     if get_url:
                                         mapping["output_get_url"] = get_url
                                     mapping["output"] = get_url if get_url and send_link else dest
-                                    try:
+                                    with contextlib.suppress(Exception):
                                         mapping["out_bytes"] = str(os.path.getsize(out))
-                                    except Exception:
-                                        pass
                                     await r.hset(f"ffmpeg:job:{job_id}", mapping=mapping)
                                     upload_success = True
                                     await r.close()
@@ -1056,10 +1011,8 @@ async def handle_job(job: dict):
                                                             break
                                                     fmt = probe_info.get("format", {})
                                                     if fmt.get("duration"):
-                                                        try:
+                                                        with contextlib.suppress(ValueError, TypeError):
                                                             _vid_duration = int(float(fmt["duration"]))
-                                                        except (ValueError, TypeError):
-                                                            pass
                                                 except Exception:
                                                     # probe parse failed -> extension fallback
                                                     if str(out).lower().endswith(".zip"):
@@ -1364,10 +1317,8 @@ async def handle_job(job: dict):
                                     "status": _final_status,
                                 })
                             finally:
-                                try:
+                                with contextlib.suppress(Exception):
                                     await _r.close()
-                                except Exception:
-                                    pass
                         except Exception:
                             pass
 
@@ -1390,10 +1341,8 @@ async def handle_job(job: dict):
                         try:
                             if memory_sampler_task:
                                 memory_sampler_task.cancel()
-                                try:
+                                with contextlib.suppress(Exception):
                                     await memory_sampler_task
-                                except Exception:
-                                    pass
                         except Exception:
                             pass
 
@@ -1421,7 +1370,6 @@ async def handle_job(job: dict):
                         "could not find codec parameters",
                     )
 
-                    attempted_redownload = False
                     try:
                         # 1) Container/codec mismatch -> try remuxing to MKV and retry
                         if any(k in lower_err for k in container_indicators) and input_path:
@@ -1454,7 +1402,7 @@ async def handle_job(job: dict):
                                     cmd = [ffmpeg_bin, "-y", "-hide_banner", "-loglevel", "error", "-i", input_path, "-c", "copy", remux_path]
                                     try:
                                         proc = await asyncio.to_thread(subprocess.run, cmd, capture_output=True, text=True, timeout=600)
-                                    except Exception as e:
+                                    except Exception:
                                         proc = None
 
                                     ok = False
@@ -1469,10 +1417,8 @@ async def handle_job(job: dict):
                                         pass
 
                                     if ok:
-                                        try:
+                                        with contextlib.suppress(Exception):
                                             await publish_update(progress_channel, {"job_id": job_id, "progress": 0, "message": "remuxed", "note": "remux succeeded; retrying"})
-                                        except Exception:
-                                            pass
                                         logger.info("Remux succeeded for job %s, retrying ffmpeg against %s", job_id, remux_path)
                                         # Switch to remuxed input and retry
                                         input_path = remux_path
@@ -1485,10 +1431,8 @@ async def handle_job(job: dict):
                                             pass
                                         continue
                                     else:
-                                        try:
+                                        with contextlib.suppress(Exception):
                                             await publish_update(progress_channel, {"job_id": job_id, "progress": 0, "message": "remux_failed", "note": "remux attempted and failed"})
-                                        except Exception:
-                                            pass
                                 except Exception:
                                     logger.exception("Remux attempt failed for job %s", job_id)
 
@@ -1524,10 +1468,8 @@ async def handle_job(job: dict):
                                 # Remove possibly-corrupt file and attempt to re-fetch using available metadata
                                 try:
                                     if os.path.exists(input_path):
-                                        try:
+                                        with contextlib.suppress(Exception):
                                             os.remove(input_path)
-                                        except Exception:
-                                            pass
                                 except Exception:
                                     pass
 
@@ -1540,7 +1482,7 @@ async def handle_job(job: dict):
                                         try:
                                             from utils.forward_store import load_forward_metadata
 
-                                            meta = load_forward_metadata(fh)
+                                            meta = await load_forward_metadata(fh)
                                             if meta:
                                                 try:
                                                     from utils.userbot_downloader import download_forward_via_userbot
@@ -1594,20 +1536,15 @@ async def handle_job(job: dict):
                                 except Exception:
                                     pass
 
-                                attempted_redownload = True
                                 if ok:
-                                    try:
+                                    with contextlib.suppress(Exception):
                                         await publish_update(progress_channel, {"job_id": job_id, "progress": 0, "message": "redownloaded", "note": "re-download succeeded; retrying"})
-                                    except Exception:
-                                        pass
                                     logger.info("Redownload succeeded for job %s, retrying ffmpeg", job_id)
                                     # Retry immediately
                                     continue
                                 else:
-                                    try:
+                                    with contextlib.suppress(Exception):
                                         await publish_update(progress_channel, {"job_id": job_id, "progress": 0, "message": "redownload_failed", "note": "re-download attempted and failed"})
-                                    except Exception:
-                                        pass
 
                     except Exception:
                         logger.exception("Error during re-download attempt for job %s", job_id)
@@ -1639,18 +1576,14 @@ async def handle_job(job: dict):
 
             except asyncio.CancelledError:
                 logger.info("Job cancelled via worker shutdown")
-                try:
+                with contextlib.suppress(Exception):
                     await job_store.update_job(job_id, {"status": "cancelled", "message": "shutdown"})
-                except Exception:
-                    pass
                 raise
             except Exception as e:
                 JOBS_FAILED.inc()
-                logger.exception("Unhandled exception while processing job")
-                try:
-                    await job_store.update_job(job_id, {"status": "error", "error": str(e), "attempt": attempt})
-                except Exception:
-                    pass
+                logger.exception("Unhandled exception while processing job: %s", e)
+                with contextlib.suppress(Exception):
+                    await job_store.update_job(job_id, {"status": "error", "error": "processing_failed", "attempt": attempt})
                 if attempt <= retries:
                     await asyncio.sleep(2 ** attempt)
                     continue
@@ -1673,7 +1606,7 @@ async def handle_job(job: dict):
                 pass
 
 
-async def worker_loop(stop_event: Optional[asyncio.Event] = None):
+async def worker_loop(stop_event: asyncio.Event | None = None):
     """Main worker loop: pop jobs from Redis, process them, deliver results.
 
     Args:
@@ -1719,10 +1652,8 @@ async def worker_loop(stop_event: Optional[asyncio.Event] = None):
                     continue
                 logger.info(f"Picked job: {job.get('job_id')}")
                 # ensure persisted
-                try:
+                with contextlib.suppress(Exception):
                     await job_store.save_job(job)
-                except Exception:
-                    pass
                 await handle_job(job)
             except asyncio.CancelledError:
                 logger.info("Worker cancelled, exiting")
@@ -1735,14 +1666,12 @@ async def worker_loop(stop_event: Optional[asyncio.Event] = None):
         try:
             if forward_task:
                 forward_task.cancel()
-                try:
+                with contextlib.suppress(Exception):
                     await forward_task
-                except Exception:
-                    pass
         except Exception:
             pass
 
-def create_worker_task(stop_event: Optional[asyncio.Event] = None) -> asyncio.Task:
+def create_worker_task(stop_event: asyncio.Event | None = None) -> asyncio.Task:
     """Create and return a background asyncio Task that runs the worker loop.
 
     This is designed to be called from another async application (e.g. the
@@ -1834,11 +1763,9 @@ def main():
     try:
         loop.run_until_complete(worker_loop(stop_event))
     finally:
-        try:
+        with contextlib.suppress(Exception):
             # Close job store (Mongo) if used
             loop.run_until_complete(job_store.close())
-        except Exception:
-            pass
         try:
             # Close cache if initialized
             if _cache is not None:

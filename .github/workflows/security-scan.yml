@@ -1,0 +1,190 @@
+# Security Scan Pipeline
+# Runs on every push and pull request to main.
+# Performs: Bandit static analysis, pip-audit dependency scanning,
+# Ruff linting, OWASP leak pattern detection, and TruffleHog secret scanning.
+
+name: Security Scan
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  PYTHON_VERSION: "3.11"
+
+jobs:
+  security-scan:
+    name: "Bandit + Ruff + pip-audit"
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install bandit pip-audit ruff
+
+      - name: Run Bandit security scan
+        id: bandit
+        run: |
+          BANDIT_ARGS=""
+          if [ -f .bandit ]; then
+            BANDIT_ARGS="-c .bandit"
+          fi
+          python -m bandit $BANDIT_ARGS -r . -f json -o bandit-report.json 2>&1 || true
+
+          if [ ! -f bandit-report.json ]; then
+            echo "has_issues=false" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          python -c "
+          import json, os, sys
+          with open('bandit-report.json') as f:
+              data = json.load(f)
+          results = data.get('results', [])
+          total = len(results)
+          gh_out = os.environ.get('GITHUB_OUTPUT', '')
+          if total == 0:
+              print('Bandit: 0 findings')
+              if gh_out:
+                  with open(gh_out, 'a') as f:
+                      f.write('has_issues=false\n')
+          else:
+              highs = [r for r in results if r.get('issue_severity') == 'HIGH']
+              meds = [r for r in results if r.get('issue_severity') == 'MEDIUM']
+              print('::warning::Bandit found {} issue(s): {} HIGH, {} MEDIUM, {} LOW'.format(total, len(highs), len(meds), total - len(highs) - len(meds)))
+              for r in results:
+                  print('  [{}] {}: {}:{} - {}'.format(r['issue_severity'], r['test_id'], r['filename'], r['line_number'], r['issue_text']))
+              if highs:
+                  print('::error::Bandit found HIGH-severity issue(s)!')
+                  sys.exit(1)
+              if gh_out:
+                  with open(gh_out, 'a') as f:
+                      f.write('has_issues=true\n')
+          "
+
+      - name: Upload Bandit report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bandit-report
+          path: bandit-report.json
+          if-no-files-found: ignore
+
+      - name: Run pip-audit dependency scan
+        id: pipaudit
+        run: |
+          python -m pip_audit --requirement requirements.txt --desc 2>&1 | tee pip-audit-output.txt
+          if grep -q "No known vulnerabilities found" pip-audit-output.txt; then
+            echo "pip-audit: 0 known vulnerabilities"
+            echo "has_vulns=false" >> $GITHUB_OUTPUT
+          else
+            echo "::warning::pip-audit found vulnerabilities"
+            echo "has_vulns=true" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Run Ruff linter
+        id: ruff
+        continue-on-error: true
+        run: |
+          RUFF_ARGS=""
+          if [ -f ruff.toml ]; then
+            RUFF_ARGS="--config ruff.toml"
+          fi
+          python -m ruff check . $RUFF_ARGS --output-format github 2>&1 | tee ruff-output.txt
+          RUFF_EXIT=${PIPESTATUS[0]}
+          if [ $RUFF_EXIT -eq 0 ]; then
+            echo "Ruff: no issues found"
+            echo "has_issues=false" >> $GITHUB_OUTPUT
+          else
+            echo "::warning::Ruff found issues"
+            echo "has_issues=true" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Check for OWASP leak patterns
+        run: |
+          patterns_found=0
+          for p in "exc.__class__.__name__" "allow_redirects=True"; do
+            matches=$(grep -rn "$p" --include="*.py" . 2>/dev/null \
+              | grep -v ".venv" | grep -v "env/" | grep -v "__pycache__" \
+              | grep -v ".eggs" || true)
+            if [ -n "$matches" ]; then
+              echo "::warning::Found pattern '$p':"
+              echo "$matches"
+              patterns_found=$((patterns_found + 1))
+            fi
+          done
+          if [ $patterns_found -eq 0 ]; then
+            echo "No OWASP exception leak patterns found"
+          else
+            echo "::warning::$patterns_found OWASP pattern(s) detected"
+          fi
+
+      - name: Summary
+        if: always()
+        run: |
+          echo "========== SECURITY SCAN SUMMARY =========="
+          if [ -f bandit-report.json ]; then
+            fcount=$(python -c "
+          import json
+          with open('bandit-report.json') as f:
+              d = json.load(f)
+              print(len(d.get('results', [])))
+          " 2>/dev/null || echo '?')
+            echo "  Bandit:       $fcount findings"
+          else
+            echo "  Bandit:       skipped"
+          fi
+          if [ -f pip-audit-output.txt ]; then
+            if grep -q "No known vulnerabilities found" pip-audit-output.txt; then
+              echo "  pip-audit:    0 vulnerabilities"
+            else
+              echo "  pip-audit:    vulnerabilities found"
+            fi
+          else
+            echo "  pip-audit:    skipped"
+          fi
+          echo "  Ruff:         checked"
+          echo "  Leak patterns: checked"
+          echo "==========================================="
+
+  secret-scan:
+    name: "TruffleHog Secret Scan"
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code with full history
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Run TruffleHog secret scanner
+        id: trufflehog
+        continue-on-error: true
+        uses: docker://trufflesecurity/trufflehog:latest
+        with:
+          args: >-
+            git file://.
+            --only-verified
+            --fail
+            --no-update
+
+      - name: Check TruffleHog results
+        if: steps.trufflehog.outcome == 'failure'
+        run: |
+          echo "::warning::TruffleHog detected verified secrets"
+          echo "Review the logs and revoke any leaked credentials"

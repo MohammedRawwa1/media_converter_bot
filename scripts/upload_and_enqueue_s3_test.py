@@ -6,13 +6,14 @@ Usage:
 
 Requires: ffmpeg, boto3, redis env vars set (REDIS_URL, S3_BUCKET, S3_ENDPOINT, AWS_*).
 """
-import os
-import sys
-import uuid
+import contextlib
 import json
-import time
+import os
 import shutil
 import subprocess
+import sys
+import time
+import uuid
 
 try:
     import boto3
@@ -31,6 +32,9 @@ try:
     import config
 except Exception:
     config = None
+
+# Default TTL for job metadata in Redis (24 hours)
+JOB_METADATA_TTL = int(os.environ.get("JOB_METADATA_TTL", "86400"))
 
 
 def create_sample(path: str) -> bool:
@@ -124,10 +128,8 @@ def main():
         try:
             r.hset(f"ffmpeg:job:{job_id}", mapping=mapping)
             if JOB_METADATA_TTL and JOB_METADATA_TTL > 0:
-                try:
+                with contextlib.suppress(Exception):
                     r.expire(f"ffmpeg:job:{job_id}", JOB_METADATA_TTL)
-                except Exception:
-                    pass
         except Exception:
             pass
         r.lpush("ffmpeg:jobs", json.dumps(job))
@@ -135,7 +137,7 @@ def main():
         print(" JOB_ID:", job_id)
         print(" S3 key:", dest_key)
         print(" Output path:", output_path)
-        print("To monitor progress: redis-cli -u \"$REDIS_URL\" SUBSCRIBE \"ffmpeg:progress:%s\"" % job_id)
+        print(f"To monitor progress: redis-cli -u \"$REDIS_URL\" SUBSCRIBE \"ffmpeg:progress:{job_id}\"")
     except Exception as e:
         print("Failed to enqueue job:", e)
         sys.exit(5)

@@ -25,10 +25,10 @@ Usage in main.py::
 """
 
 import asyncio
+import contextlib
 import logging
 import os
 import time
-from typing import Optional
 
 logger = logging.getLogger(__name__)
 
@@ -57,10 +57,10 @@ class SessionHealth:
     def __init__(self, name: str):
         self.name = name
         self.alive = False
-        self.latency_ms: Optional[float] = None
-        self.error: Optional[str] = None
-        self.phone: Optional[str] = None
-        self.dc_id: Optional[int] = None
+        self.latency_ms: float | None = None
+        self.error: str | None = None
+        self.phone: str | None = None
+        self.dc_id: int | None = None
 
     @property
     def ok(self) -> bool:
@@ -101,7 +101,7 @@ class SessionHealthChecker:
     def __init__(
         self,
         check_interval: int = 3600,          # every hour
-        admin_user_id: Optional[int] = None,
+        admin_user_id: int | None = None,
         bot_app=None,                         # PTB Application
         db_model=None,                        # MongoDB model (MediaConversionModel)
         max_consecutive_failures: int = 3,
@@ -113,11 +113,11 @@ class SessionHealthChecker:
         self.max_consecutive_failures = max_consecutive_failures
 
         self.is_running = False
-        self._task: Optional[asyncio.Task] = None
+        self._task: asyncio.Task | None = None
 
         # Track transitions so we only alert once per failure streak
-        self._prev_pyrogram_ok: Optional[bool] = None
-        self._prev_telethon_ok: Optional[bool] = None
+        self._prev_pyrogram_ok: bool | None = None
+        self._prev_telethon_ok: bool | None = None
         self._pyrogram_failures = 0
         self._telethon_failures = 0
         self._last_advisory_time: float = 0
@@ -314,8 +314,8 @@ class SessionHealthChecker:
         try:
             from utils.telethon_session import (
                 build_pyrogram_client,
-                get_userbot_credentials,
                 get_pyrogram_session_string,
+                get_userbot_credentials,
             )
             if not get_pyrogram_session_string():
                 return False
@@ -324,11 +324,25 @@ class SessionHealthChecker:
             if client is None:
                 return False
 
-            logger.info("SessionHealthChecker: attempting session recycling (stop\u2192start)")
+            logger.info("SessionHealthChecker: attempting session recycling")
             try:
                 await client.start()
+                # Verify initial connection
+                me = await client.get_me()
+                if me is not None:
+                    logger.info("SessionHealthChecker: session already healthy, no recycling needed")
+                    return True
+
+                # Stop and wait for clean disconnection
                 await client.stop()
-                await asyncio.sleep(2)
+                for _ in range(10):
+                    if not client.is_connected:
+                        break
+                    await asyncio.sleep(0.5)
+                else:
+                    logger.warning("SessionHealthChecker: client did not disconnect in time")
+
+                await asyncio.sleep(1)
                 await client.start()
                 me = await client.get_me()
                 ok = me is not None
@@ -338,14 +352,10 @@ class SessionHealthChecker:
                 )
                 return ok
             finally:
-                try:
+                with contextlib.suppress(Exception):
                     await asyncio.sleep(0.5)
-                except Exception:
-                    pass
-                try:
+                with contextlib.suppress(Exception):
                     await client.stop()
-                except Exception:
-                    pass
         except Exception as exc:
             logger.warning("SessionHealthChecker: session recycling error: %s", exc)
             return False
@@ -360,10 +370,10 @@ class SessionHealthChecker:
 
         try:
             from utils.telethon_session import (
+                _get_env_value,
+                _load_session_string_from_file_async,
                 build_pyrogram_client,
                 get_userbot_credentials,
-                _load_session_string_from_file_async,
-                _get_env_value,
             )
         except ImportError as exc:
             h.error = f"import failed: {exc}"
@@ -411,10 +421,8 @@ class SessionHealthChecker:
                 h.alive = True
                 h.phone = getattr(me, "phone_number", None)
                 # Extract DC from raw session data
-                try:
+                with contextlib.suppress(Exception):
                     h.dc_id = client.storage.dc_id() if hasattr(client.storage, "dc_id") else None
-                except Exception:
-                    pass
                 # Persist session string to MongoDB for long-term survival
                 await self._save_pyrogram_session(client)
             else:
@@ -424,14 +432,10 @@ class SessionHealthChecker:
             h.latency_ms = round(elapsed, 1)
             h.error = str(exc)[:200]
         finally:
-            try:
+            with contextlib.suppress(Exception):
                 await asyncio.sleep(0.5)
-            except Exception:
-                pass
-            try:
+            with contextlib.suppress(Exception):
                 await client.stop()
-            except Exception:
-                pass
 
         return h
 
@@ -444,11 +448,11 @@ class SessionHealthChecker:
         h = SessionHealth("telethon")
 
         from utils.telethon_session import (
-            build_telethon_client,
-            get_userbot_credentials,
-            _load_session_string_from_file_async,
             _get_env_value,
+            _load_session_string_from_file_async,
+            build_telethon_client,
             get_telethon_session_path,
+            get_userbot_credentials,
         )
 
         # Check env vars first (fast, no I/O)
@@ -500,10 +504,8 @@ class SessionHealthChecker:
                         h.phone = getattr(me, "phone", None)
                 except Exception:
                     pass
-                try:
+                with contextlib.suppress(Exception):
                     h.dc_id = client.session.dc_id if hasattr(client.session, "dc_id") else None
-                except Exception:
-                    pass
                 # Persist session string to MongoDB for long-term survival
                 await self._save_telethon_session(client)
             else:
@@ -513,10 +515,8 @@ class SessionHealthChecker:
             h.latency_ms = round(elapsed, 1)
             h.error = str(exc)[:200]
         finally:
-            try:
+            with contextlib.suppress(Exception):
                 await client.disconnect()
-            except Exception:
-                pass
 
         return h
 
@@ -720,7 +720,7 @@ class SessionHealthChecker:
 # ──────────────────────────────────────────────────────────────────────
 # Global singleton (following the cleanup_manager pattern)
 # ──────────────────────────────────────────────────────────────────────
-_session_healthchecker: Optional[SessionHealthChecker] = None
+_session_healthchecker: SessionHealthChecker | None = None
 
 
 def get_session_healthchecker() -> SessionHealthChecker:
@@ -735,7 +735,7 @@ def get_session_healthchecker() -> SessionHealthChecker:
 
 
 def start_session_healthcheck(
-    admin_user_id: Optional[int] = None,
+    admin_user_id: int | None = None,
     bot_app=None,
     db_model=None,
     check_interval: int = 3600,

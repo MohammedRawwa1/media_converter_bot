@@ -4,7 +4,6 @@ import logging
 import os
 import tempfile
 import zipfile
-from typing import Dict, List, Tuple
 
 import config
 
@@ -42,7 +41,7 @@ class ExtendedMediaConverter:
             "subtitle": [".srt", ".ass", ".ssa", ".vtt"],
         }
 
-    async def execute_ffmpeg(self, cmd: List[str], input_path: str = None, output_path: str = None) -> Tuple[bool, str]:
+    async def execute_ffmpeg(self, cmd: list[str], input_path: str = None, output_path: str = None) -> tuple[bool, str]:
         """Execute FFmpeg command with proper error handling."""
         try:
             # Build command
@@ -178,12 +177,12 @@ class ExtendedMediaConverter:
         ]
         return (await self.execute_ffmpeg(cmd, None, output_path))[0]
 
-    async def merge_videos(self, video_paths: List[str], output_path: str) -> bool:
+    async def merge_videos(self, video_paths: list[str], output_path: str) -> bool:
         """Merge multiple videos into one."""
         # Create concat file
         concat_content = "\n".join([f"file '{path}'" for path in video_paths])
-        concat_file = tempfile.NamedTemporaryFile(mode="w", delete=False, suffix=".txt")
-        concat_file.write(concat_content)
+        with tempfile.NamedTemporaryFile(mode="w", delete=False, suffix=".txt") as concat_file:
+            concat_file.write(concat_content)
         concat_file.close()
 
         try:
@@ -195,7 +194,7 @@ class ExtendedMediaConverter:
             os.unlink(concat_file.name)
             return False
 
-    async def merge_audios(self, audio_paths: List[str], output_path: str) -> bool:
+    async def merge_audios(self, audio_paths: list[str], output_path: str) -> bool:
         """Merge multiple audio files."""
         # Create input string
         inputs = []
@@ -210,7 +209,7 @@ class ExtendedMediaConverter:
         cmd = inputs + ["-filter_complex", filter_complex, "-map", "[out]", "-c:a", "libmp3lame", "-q:a", "2"]
         return (await self.execute_ffmpeg(cmd, None, output_path))[0]
 
-    async def split_video(self, input_path: str, output_pattern: str, segment_time: str = "01:00:00") -> List[str]:
+    async def split_video(self, input_path: str, output_pattern: str, segment_time: str = "01:00:00") -> list[str]:
         """Split video into segments."""
         cmd = ["-c", "copy", "-map", "0", "-segment_time", segment_time, "-f", "segment", "-reset_timestamps", "1"]
         success = (await self.execute_ffmpeg(cmd, input_path, output_pattern))[0]
@@ -311,7 +310,7 @@ class ExtendedMediaConverter:
         ]
         return (await self.execute_ffmpeg(cmd, None, output_path))[0]
 
-    async def extract_streams(self, input_path: str, output_dir: str) -> Dict[str, str]:
+    async def extract_streams(self, input_path: str, output_dir: str) -> dict[str, str]:
         """Extract all streams (video, audio, subtitles)."""
         # Validate input and probe safely
         try:
@@ -357,7 +356,7 @@ class ExtendedMediaConverter:
         cmd = ["-ss", time, "-vframes", "1", "-q:v", "2"]
         return (await self.execute_ffmpeg(cmd, input_path, output_path))[0]
 
-    async def take_screenshot_grid(self, input_path: str, output_dir: str, count: int = 9) -> List[str]:
+    async def take_screenshot_grid(self, input_path: str, output_dir: str, count: int = 9) -> list[str]:
         """Take multiple screenshots at intervals."""
         # Get video duration
         probe = ffmpeg.probe(input_path)
@@ -409,7 +408,7 @@ class ExtendedMediaConverter:
             cmd = ["-t", str(duration), "-c", "copy"]
             return (await self.execute_ffmpeg(cmd, input_path, output_path))[0]
 
-    async def create_archive(self, file_paths: List[str], output_path: str) -> bool:
+    async def create_archive(self, file_paths: list[str], output_path: str) -> bool:
         """Create ZIP archive of files."""
         try:
             with zipfile.ZipFile(output_path, "w", zipfile.ZIP_DEFLATED) as zipf:
@@ -421,7 +420,7 @@ class ExtendedMediaConverter:
             logger.error(f"Archive creation failed: {e}")
             return False
 
-    async def edit_metadata(self, input_path: str, output_path: str, metadata: Dict[str, str]) -> bool:
+    async def edit_metadata(self, input_path: str, output_path: str, metadata: dict[str, str]) -> bool:
         """Edit video metadata."""
         cmd = ["-c", "copy", "-map_metadata", "-1"]  # Remove all metadata
 

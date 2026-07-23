@@ -1,12 +1,13 @@
-import io
-import os
-import logging
-import shutil
-from typing import Union, Optional, Callable
-from datetime import datetime
 import asyncio
-import subprocess
+import contextlib
+import io
 import json
+import logging
+import os
+import shutil
+import subprocess
+from collections.abc import Callable
+from datetime import datetime
 
 try:
     from telethon import TelegramClient
@@ -23,7 +24,7 @@ except Exception:  # pragma: no cover - optional dependency
 logger = logging.getLogger(__name__)
 
 
-async def _normalize_target(chat_id: Union[int, str], client=None):
+async def _normalize_target(chat_id: int | str, client=None):
     """Return a compatible target entity for `chat_id`."""
     if isinstance(chat_id, str) and chat_id.startswith("@"):
         return chat_id
@@ -86,9 +87,7 @@ def _is_503_timeout(exc: Exception) -> bool:
         return True
     if "-503" in err_str:
         return True
-    if "InternalServerError" in type(exc).__name__:
-        return True
-    return False
+    return "InternalServerError" in type(exc).__name__
 
 
 # ---------------------------------------------------------------------------
@@ -187,9 +186,9 @@ async def _get_raw_file_location(msg):
 async def _download_bytes_via_raw_api(
     client,
     msg,
-    chunk_size_kb: Optional[int] = None,
+    chunk_size_kb: int | None = None,
     progress_callback=None,
-) -> Optional[bytes]:
+) -> bytes | None:
     """Download media bytes using raw ``upload.GetFile`` with configurable
     chunk size and per-chunk retry with exponential backoff.
 
@@ -272,10 +271,8 @@ async def _download_bytes_via_raw_api(
         offset += len(chunk_data)
 
         if progress_callback and total_size > 0:
-            try:
+            with contextlib.suppress(Exception):
                 progress_callback(offset, total_size)
-            except Exception:
-                pass
 
         # If we received less than the requested limit, it's the last chunk
         if len(chunk_data) < chunk_size:
@@ -297,7 +294,7 @@ async def _download_bytes_via_raw_api(
 # Recovery helpers: forward to Saved Messages, 1-byte probe, session recycle
 # ---------------------------------------------------------------------------
 
-async def _forward_to_saved_messages(client, chat_id, message_id: int) -> Optional[int]:
+async def _forward_to_saved_messages(client, chat_id, message_id: int) -> int | None:
     """Forward a message to Saved Messages to get a fresh ``file_reference``.
 
     Telegram assigns a new ``file_reference`` to the forwarded copy, which
@@ -385,10 +382,10 @@ async def _recycle_client_session(client) -> bool:
 
 async def _try_relay_fallback(
     client,
-    chat_id: Union[int, str],
+    chat_id: int | str,
     message_id: int,
     dest_path: str,
-    relay_chat_id: Optional[Union[int, str]] = None,
+    relay_chat_id: int | str | None = None,
     client_type: str = "pyrogram",
 ) -> bool:
     """Try a relay-group fallback by forwarding the original message to a trusted chat
@@ -437,8 +434,7 @@ async def _try_relay_fallback(
         relay_msgs = await client.get_messages(relay_chat_id, message_ids=[relay_msg_id])
         if relay_msgs:
             relay_msg = relay_msgs[0] if isinstance(relay_msgs, list) else relay_msgs
-            if relay_msg and getattr(relay_msg, "media", None):
-                if await _download_and_ensure_path(client, relay_msg, dest_path):
+            if relay_msg and getattr(relay_msg, "media", None) and await _download_and_ensure_path(client, relay_msg, dest_path):
                     return True
         logger.warning(
             "userbot: relay fallback download from %s/%s failed",
@@ -597,18 +593,22 @@ async def _attempt_recovery_download(
 
 
 async def _download_with_telethon(
-    chat_id: Union[int, str],
+    chat_id: int | str,
     message_id: int,
     dest_path: str,
-    msg_date: Optional[str] = None,
-    file_unique_id: Optional[str] = None,
+    msg_date: str | None = None,
+    file_unique_id: str | None = None,
 ) -> bool:
     """Download using Telethon client."""
     if TelegramClient is None:
         logger.debug("Telethon not installed; skipping Telethon download")
         return False
 
-    from utils.telethon_session import build_telethon_client, get_userbot_credentials, get_telethon_session_string_for_user
+    from utils.telethon_session import (
+        build_telethon_client,
+        get_telethon_session_string_for_user,
+        get_userbot_credentials,
+    )
 
     chunk_size_kb = get_download_chunk_size_kb()
     api_id, api_hash = get_userbot_credentials()
@@ -668,10 +668,8 @@ async def _download_with_telethon(
                             if ok:
                                 return True
                         logger.warning("userbot: downloaded file failed validation (attempt %s) %s", attempt + 1, dest_path)
-                        try:
+                        with contextlib.suppress(Exception):
                             os.remove(dest_path)
-                        except Exception:
-                            pass
                     except Exception as e:
                         logger.exception("userbot: download attempt %s failed: %s", attempt + 1, e)
                 logger.debug("userbot: message found but downloads failed validation: %s/%s", target, message_id)
@@ -695,7 +693,7 @@ async def _download_with_telethon(
                     )
                     async for m in client.iter_messages(target, limit=100, offset_date=dt):
                         if getattr(m, "media", None):
-                            for attempt in range(3):
+                            for _ in range(3):
                                 try:
                                     await client.download_media(m, file=dest_path, part_size_kb=chunk_size_kb)
                                     if os.path.exists(dest_path) and os.path.getsize(dest_path) > 0:
@@ -718,7 +716,7 @@ async def _download_with_telethon(
                 )
                 async for m in client.iter_messages(target, limit=200):
                     if getattr(m, "media", None):
-                        for attempt in range(3):
+                        for _ in range(3):
                             try:
                                 await client.download_media(m, file=dest_path, part_size_kb=chunk_size_kb)
                                 if os.path.exists(dest_path) and os.path.getsize(dest_path) > 0:
@@ -749,10 +747,8 @@ async def _download_with_telethon(
 
         return False
     finally:
-        try:
+        with contextlib.suppress(Exception):
             await client.disconnect()
-        except Exception:
-            pass
 
 
 async def _resolve_bot_api_channel_raw(client, bot_api_chat_id: int):
@@ -905,10 +901,10 @@ async def _download_and_ensure_path(client, msg, dest_path):
 
 
 async def _download_bytes_with_pyrogram(
-    chat_id: Union[int, str],
+    chat_id: int | str,
     message_id: int,
-    progress_callback: Optional[Callable[[int, int], None]] = None,
-) -> Optional[bytes]:
+    progress_callback: Callable[[int, int], None] | None = None,
+) -> bytes | None:
     """Download a message's media into memory (bytes) using Pyrogram.
 
     Uses ``download_media(..., in_memory=True)`` (with retry on ``-503``)
@@ -938,10 +934,8 @@ async def _download_bytes_with_pyrogram(
     _explicit_chunk_size = None
     _raw_chunk_override = os.getenv("DOWNLOAD_CHUNK_SIZE_KB", "")
     if _raw_chunk_override:
-        try:
+        with contextlib.suppress(TypeError, ValueError):
             _explicit_chunk_size = int(_raw_chunk_override)
-        except (TypeError, ValueError):
-            pass
 
     try:
         await client.start()
@@ -1106,8 +1100,9 @@ async def _download_bytes_with_pyrogram(
             "trying recovery via temp file...",
             chat_id, message_id,
         )
+        import tempfile as _tempfile
         _tmp_path = os.path.join(
-            os.getenv("TEMP_PATH", "/tmp"),
+            os.getenv("TEMP_PATH", _tempfile.gettempdir()),
             f"recovery_{chat_id}_{message_id}.tmp",
         )
         try:
@@ -1135,18 +1130,14 @@ async def _download_bytes_with_pyrogram(
         # ``sqlite3.ProgrammingError: Cannot operate on a closed database``
         # when ``handle_updates -> fetch_peers -> storage.update_peers``
         # is still in flight.
-        try:
+        with contextlib.suppress(Exception):
             await asyncio.sleep(1)
-        except Exception:
-            pass
-        try:
+        with contextlib.suppress(Exception):
             await client.stop()
-        except Exception:
-            pass
 
 
 async def _download_with_pyrogram(
-    chat_id: Union[int, str],
+    chat_id: int | str,
     message_id: int,
     dest_path: str,
 ) -> bool:
@@ -1432,22 +1423,18 @@ async def _download_with_pyrogram(
         # ``sqlite3.ProgrammingError: Cannot operate on a closed database``
         # when ``handle_updates -> fetch_peers -> storage.update_peers``
         # is still in flight.
-        try:
+        with contextlib.suppress(Exception):
             await asyncio.sleep(1)
-        except Exception:
-            pass
-        try:
+        with contextlib.suppress(Exception):
             await client.stop()
-        except Exception:
-            pass
 
 
 async def download_forward_via_userbot(
-    chat_id: Union[int, str],
+    chat_id: int | str,
     message_id: int,
     dest_path: str,
-    msg_date: Optional[str] = None,
-    file_unique_id: Optional[str] = None,
+    msg_date: str | None = None,
+    file_unique_id: str | None = None,
 ) -> bool:
     """Download a message media using a user account.
 
@@ -1506,10 +1493,10 @@ async def download_forward_via_userbot(
 
 
 async def download_bytes_via_userbot(
-    chat_id: Union[int, str],
+    chat_id: int | str,
     message_id: int,
-    progress_callback: Optional[Callable[[int, int], None]] = None,
-) -> Optional[bytes]:
+    progress_callback: Callable[[int, int], None] | None = None,
+) -> bytes | None:
     """Download a message media into memory (bytes) using userbot.
 
     Tries Pyrogram with ``in_memory=True`` first to avoid any disk I/O.
@@ -1552,7 +1539,8 @@ async def download_bytes_via_userbot(
     # Try Telethon with BytesIO as fallback
     if TelegramClient is not None and has_usable_telethon_session():
         try:
-            from utils.telethon_session import build_telethon_client, get_userbot_credentials as _get_creds
+            from utils.telethon_session import build_telethon_client
+            from utils.telethon_session import get_userbot_credentials as _get_creds
 
             chunk_size_kb = get_download_chunk_size_kb()
             _api_id, _api_hash = _get_creds()

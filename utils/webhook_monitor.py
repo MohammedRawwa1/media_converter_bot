@@ -4,16 +4,14 @@ Webhook heartbeat monitoring for bot reliability.
 """
 
 import asyncio
+import contextlib
 import logging
+import os
 import time
 from datetime import datetime
-from typing import Dict
-from email.utils import parsedate_to_datetime
+from urllib.parse import urlparse
 
 import aiohttp
-import os
-from urllib.parse import urlparse
-import random
 
 logger = logging.getLogger(__name__)
 
@@ -135,7 +133,7 @@ class WebhookMonitor:
                         # Increase backoff interval with small jitter
                         old = getattr(self, "_current_interval", self.check_interval)
                         new = min(old * 2, self._max_backoff)
-                        jitter = random.uniform(0, min(5, new * 0.1))
+                        jitter = min(5, new * 0.1) * 0.5  # deterministic jitter
                         self._current_interval = new + jitter
                         logger.warning(
                             f"⚠️ Webhook health check rate-limited (status: 429). Backing off from {old}s to {self._current_interval:.1f}s"
@@ -153,7 +151,7 @@ class WebhookMonitor:
                     self.last_error = str(e)
                     raise
 
-        except asyncio.TimeoutError as e:
+        except TimeoutError as e:
             self.is_healthy = False
             self.failed_checks += 1
             self.consecutive_failures += 1
@@ -161,7 +159,7 @@ class WebhookMonitor:
             try:
                 old = getattr(self, "_current_interval", self.check_interval)
                 new = min(old * 2, self._max_backoff)
-                jitter = random.uniform(0, min(5, new * 0.2))
+                jitter = min(5, new * 0.2) * 0.5  # deterministic jitter
                 self._current_interval = new + jitter
             except Exception:
                 pass
@@ -176,7 +174,7 @@ class WebhookMonitor:
             try:
                 old = getattr(self, "_current_interval", self.check_interval)
                 new = min(old * 2, self._max_backoff)
-                jitter = random.uniform(0, min(5, new * 0.2))
+                jitter = min(5, new * 0.2) * 0.5  # deterministic jitter
                 self._current_interval = new + jitter
             except Exception:
                 pass
@@ -191,7 +189,7 @@ class WebhookMonitor:
             try:
                 old = getattr(self, "_current_interval", self.check_interval)
                 new = min(old * 2, self._max_backoff)
-                jitter = random.uniform(0, min(5, new * 0.2))
+                jitter = min(5, new * 0.2) * 0.5  # deterministic jitter
                 self._current_interval = new + jitter
             except Exception:
                 pass
@@ -234,7 +232,7 @@ class WebhookMonitor:
                 try:
                     old = getattr(self, "_current_interval", self.check_interval)
                     new = min(old * 2, self._max_backoff)
-                    jitter = random.uniform(0, min(5, new * 0.2))
+                    jitter = min(5, new * 0.2) * 0.5  # deterministic jitter
                     self._current_interval = new + jitter
                 except Exception:
                     pass
@@ -251,14 +249,12 @@ class WebhookMonitor:
         """Stop webhook monitoring."""
         if self.monitor_task and not self.monitor_task.done():
             self.monitor_task.cancel()
-            try:
+            with contextlib.suppress(asyncio.CancelledError):
                 await self.monitor_task
-            except asyncio.CancelledError:
-                pass
 
         logger.info("Webhook monitoring stopped")
 
-    def get_status(self) -> Dict:
+    def get_status(self) -> dict:
         """Get current webhook status."""
         return {
             "healthy": self.is_healthy,
@@ -356,7 +352,7 @@ class WebhookRecoveryManager:
         await self.monitor.stop_monitoring()
         logger.info("Webhook recovery manager stopped")
 
-    def get_stats(self) -> Dict:
+    def get_stats(self) -> dict:
         """Get recovery statistics."""
         status = self.monitor.get_status()
         status["recovery_attempts"] = self.recovery_attempts

@@ -1,11 +1,11 @@
-import json
-import os
 import asyncio
+import contextlib
+import json
 import logging
+import os
 import time
-from typing import Optional
-from urllib.parse import urlparse
 import uuid
+from urllib.parse import urlparse
 
 try:
     import redis.asyncio as aioredis
@@ -145,10 +145,8 @@ async def enqueue_job(job: dict) -> None:
             try:
                 await r.hset(f"ffmpeg:job:{job_id}", mapping=mapping)
                 if JOB_METADATA_TTL and JOB_METADATA_TTL > 0:
-                    try:
+                    with contextlib.suppress(Exception):
                         await r.expire(f"ffmpeg:job:{job_id}", JOB_METADATA_TTL)
-                    except Exception:
-                        pass
             except Exception:
                 # best-effort - proceed to push the job even if hset fails
                 pass
@@ -168,15 +166,13 @@ async def enqueue_job(job: dict) -> None:
         await r.lpush(JOB_LIST, json.dumps(job))
     except Exception:
         # If push fails, there's not much we can do here - leave the hash as-is
-        try:
+        with contextlib.suppress(Exception):
             logging.getLogger(__name__).exception("Failed to push job onto Redis list for job %s", job.get("job_id"))
-        except Exception:
-            pass
     except Exception:
         pass
     # persist to Mongo if available (best-effort)
     try:
-        from .job_store import init as _init_store, save_job
+        from .job_store import save_job
 
         # Fire-and-forget init if env provided
         mongo_uri = os.environ.get("MONGO_URI")
@@ -196,7 +192,7 @@ async def enqueue_job(job: dict) -> None:
     await r.close()
 
 
-async def pop_job(timeout: int = 5) -> Optional[dict]:
+async def pop_job(timeout: int = 5) -> dict | None:
     """Blocking pop a job from the Redis job list (BRPOP semantics)."""
     r = await get_redis()
     try:
@@ -207,15 +203,11 @@ async def pop_job(timeout: int = 5) -> Optional[dict]:
             if due:
                 for item in due:
                     raw = item.decode() if isinstance(item, bytes) else item
-                    try:
+                    with contextlib.suppress(Exception):
                         # remove then push to front of queue so it will be picked in order
                         await r.zrem(DELAYED_SET, raw)
-                    except Exception:
-                        pass
-                    try:
+                    with contextlib.suppress(Exception):
                         await r.lpush(JOB_LIST, raw)
-                    except Exception:
-                        pass
         except Exception:
             # best-effort; don't fail pop if this step errors
             pass
@@ -295,7 +287,5 @@ async def release_input_lock(lock_key: str, owner_job_id: str, redis_client=None
         return False
     finally:
         if close_client and client is not None:
-            try:
+            with contextlib.suppress(Exception):
                 await client.close()
-            except Exception:
-                pass

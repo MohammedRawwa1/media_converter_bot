@@ -1,8 +1,8 @@
 import asyncio
-import threading
+import contextlib
 import logging
 import re
-import json
+import threading
 from collections import defaultdict
 
 logger = logging.getLogger(__name__)
@@ -41,10 +41,8 @@ async def _ws_handler(websocket, path):
     # Expect path like /ws/<job_id>
     m = re.match(r"^/ws/(?P<job_id>[^/]+)$", path)
     if not m:
-        try:
+        with contextlib.suppress(Exception):
             await websocket.close()
-        except Exception:
-            pass
         return
 
     job_id = m.group("job_id")
@@ -83,7 +81,7 @@ async def _redis_listener():
             # msg may be of type pmessage when using pattern subscribe
             # normalize channel and data
             try:
-                mtype = msg.get("type")
+                msg.get("type")
                 channel = msg.get("channel") or msg.get("pattern") or msg.get("channel")
                 data = msg.get("data")
                 if isinstance(channel, (bytes, bytearray)):
@@ -108,11 +106,8 @@ async def _redis_listener():
                     continue
 
                 for ws in targets:
-                    try:
+                    with contextlib.suppress(Exception):
                         await ws.send(data)
-                    except Exception:
-                        # ignore send errors; client cleanup occurs on disconnect
-                        pass
             except Exception:
                 logger.exception("Error processing redis message for ws server")
                 continue
@@ -123,13 +118,11 @@ async def _redis_listener():
                 await pub.close()
         except Exception:
             pass
-        try:
+        with contextlib.suppress(Exception):
             await r.close()
-        except Exception:
-            pass
 
 
-async def _serve(host: str = "0.0.0.0", port: int = 6789):
+async def _serve(host: str = "127.0.0.1", port: int = 6789):
     if websockets is None:
         logger.error("websockets package not available; cannot start ws server")
         return
@@ -149,7 +142,7 @@ async def _serve(host: str = "0.0.0.0", port: int = 6789):
         await server.wait_closed()
 
 
-def start_in_thread(host: str = "0.0.0.0", port: int = 6789):
+def start_in_thread(host: str = "127.0.0.1", port: int = 6789):
     """Start the websocket server in a background thread and return the Thread object."""
 
     def _run_loop():
@@ -160,10 +153,8 @@ def start_in_thread(host: str = "0.0.0.0", port: int = 6789):
         except Exception:
             logger.exception("WS server loop error")
         finally:
-            try:
+            with contextlib.suppress(Exception):
                 loop.run_until_complete(loop.shutdown_asyncgens())
-            except Exception:
-                pass
             loop.close()
 
     t = threading.Thread(target=_run_loop, daemon=True)

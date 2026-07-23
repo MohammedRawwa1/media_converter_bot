@@ -1,10 +1,11 @@
-import os
-import json
 import asyncio
+import contextlib
+import json
 import logging
+import os
 import shutil
 import tempfile
-from typing import Union, Optional, Callable
+from collections.abc import Callable
 
 try:
     from telethon import TelegramClient
@@ -21,7 +22,7 @@ except Exception:  # pragma: no cover - optional dependency
 logger = logging.getLogger(__name__)
 
 
-async def _normalize_target(chat_id: Union[int, str], client=None):
+async def _normalize_target(chat_id: int | str, client=None):
     try:
         if isinstance(chat_id, str) and chat_id.startswith("@"):
             return chat_id
@@ -34,8 +35,8 @@ async def _normalize_target(chat_id: Union[int, str], client=None):
 
 
 async def _send_with_telethon(
-    chat_id: Union[int, str], file_path: str, caption: Optional[str] = None,
-    progress_callback: Optional[Callable[[int, int], None]] = None,
+    chat_id: int | str, file_path: str, caption: str | None = None,
+    progress_callback: Callable[[int, int], None] | None = None,
 ) -> bool:
     """Send a file using Telethon.
 
@@ -75,10 +76,8 @@ async def _send_with_telethon(
         logger.exception("userbot: Telethon failed to send file %s", file_path)
         return False
     finally:
-        try:
+        with contextlib.suppress(Exception):
             await client.disconnect()
-        except Exception:
-            pass
 
 
 async def _probe_video_metadata(path: str) -> dict:
@@ -116,14 +115,12 @@ async def _probe_video_metadata(path: str) -> dict:
     # Duration from format section
     fmt = data.get("format", {})
     if fmt.get("duration"):
-        try:
+        with contextlib.suppress(ValueError, TypeError):
             meta["duration"] = int(float(fmt["duration"]))
-        except (ValueError, TypeError):
-            pass
     return meta
 
 
-async def _generate_video_thumbnail(path: str) -> Optional[str]:
+async def _generate_video_thumbnail(path: str) -> str | None:
     """Extract a single frame thumbnail from the video at ~1 second mark.
 
     Returns the path to a JPEG thumbnail file, or None on failure.
@@ -152,8 +149,8 @@ async def _generate_video_thumbnail(path: str) -> Optional[str]:
 
 
 async def _send_with_pyrogram(
-    chat_id: Union[int, str], file_path: str, caption: Optional[str] = None,
-    progress_callback: Optional[Callable[[int, int], None]] = None,
+    chat_id: int | str, file_path: str, caption: str | None = None,
+    progress_callback: Callable[[int, int], None] | None = None,
 ) -> bool:
     """Send a file using Pyrogram (session string fallback).
 
@@ -219,19 +216,15 @@ async def _send_with_pyrogram(
     finally:
         # Clean up temp thumbnail directory
         if _temp_cleanup:
-            try:
+            with contextlib.suppress(Exception):
                 shutil.rmtree(_temp_cleanup, ignore_errors=True)
-            except Exception:
-                pass
-        try:
+        with contextlib.suppress(Exception):
             await client.stop()
-        except Exception:
-            pass
 
 
 async def send_file_via_userbot(
-    chat_id: Union[int, str], file_path: str, caption: Optional[str] = None,
-    progress_callback: Optional[Callable[[int, int], None]] = None,
+    chat_id: int | str, file_path: str, caption: str | None = None,
+    progress_callback: Callable[[int, int], None] | None = None,
 ) -> bool:
     """Send a file using a user account.
 

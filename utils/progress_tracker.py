@@ -2,8 +2,8 @@
 import asyncio
 import logging
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Callable, Dict, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -18,9 +18,9 @@ class TaskProgress:
     total_size: int
     processed_size: int = 0
     status: str = "pending"  # pending, downloading, processing, uploading, completed, failed
-    start_time: Optional[float] = None
-    end_time: Optional[float] = None
-    error_message: Optional[str] = None
+    start_time: float | None = None
+    end_time: float | None = None
+    error_message: str | None = None
 
     @property
     def progress_percentage(self) -> float:
@@ -67,7 +67,7 @@ class TaskProgress:
         self.status = "failed"
         self.error_message = error_message
 
-    def to_dict(self) -> Dict:
+    def to_dict(self) -> dict:
         """Convert to dictionary."""
         return {
             "task_id": self.task_id,
@@ -87,8 +87,8 @@ class ProgressTracker:
     """Manage multiple task progress trackers."""
 
     def __init__(self):
-        self.tasks: Dict[str, TaskProgress] = {}
-        self.callbacks: Dict[str, Callable] = {}
+        self.tasks: dict[str, TaskProgress] = {}
+        self.callbacks: dict[str, Callable] = {}
 
     def create_task(self, task_id: str, user_id: int, file_name: str, total_size: int) -> TaskProgress:
         """Create a new progress tracker for a task."""
@@ -97,7 +97,7 @@ class ProgressTracker:
         logger.info(f"Created task tracker: {task_id}")
         return task
 
-    def get_task(self, task_id: str) -> Optional[TaskProgress]:
+    def get_task(self, task_id: str) -> TaskProgress | None:
         """Get task progress by ID."""
         return self.tasks.get(task_id)
 
@@ -161,7 +161,7 @@ class ProgressTracker:
         except Exception as e:
             logger.error(f"Error executing callback for task {task_id}: {e}")
 
-    def get_all_tasks(self) -> Dict[str, TaskProgress]:
+    def get_all_tasks(self) -> dict[str, TaskProgress]:
         """Get all active tasks."""
         return self.tasks
 
@@ -184,7 +184,7 @@ class ProgressTracker:
 progress_tracker = ProgressTracker()
 
 
-async def send_progress_update(chat_id: int, bot, task: TaskProgress, message_id: Optional[int] = None):
+async def send_progress_update(chat_id: int, bot, task: TaskProgress, message_id: int | None = None):
     """Send or update progress message."""
     try:
         progress_bar = "🟩" * int(task.progress_percentage / 10) + "⬜" * (10 - int(task.progress_percentage / 10))

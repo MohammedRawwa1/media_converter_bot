@@ -1,6 +1,4 @@
 import subprocess
-import shlex
-import os
 
 
 def _parse_out_time(timestr: str) -> float:

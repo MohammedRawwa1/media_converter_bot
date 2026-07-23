@@ -1,5 +1,5 @@
-import sys
 import os
+import sys
 import traceback
 
 # ensure repo root on sys.path

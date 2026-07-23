@@ -6,6 +6,10 @@ services:
     name: media-conversion-web
     env: python
     runtime: python-3.11.7
+    # Render free tier: 512MB RAM. The in-process ffmpeg worker inside main.py
+    # handles jobs without needing a separate worker process, saving memory.
+    # Upgrade to 1 GB+ on paid plans for more concurrent conversions.
+    memory: 512 MB
     # Ensure AUTO_FETCH_FORWARDS is enabled so the web process publishes
     # lightweight fetch requests when forward metadata is saved. Sensitive
     # secrets (REDIS_URL, S3 credentials, TELETHON_SESSION) should be set
@@ -81,7 +85,8 @@ services:
       - key: TELETHON_DEBUG_PORT
         value: "8081"
       - key: TELETHON_DEBUG_TOKEN
-        value: "REPLACE_WITH_SECRET"
+        # ⚠️ Set this via Render dashboard secrets - never hardcode credentials
+        value: ""
       - key: TELETHON_LISTEN_INCOMING
         value: "1"
       - key: TEMP_UPLOAD_DIR
