@@ -9,7 +9,8 @@
 .gitattributes
 
 # ── CI / GitHub ──
-.github/
+# .github/ — kept in build context so CI files are present when watchPatterns triggers a deploy
+# See railway.json build.watchPatterns — deployment is triggered by .github/** changes there
 
 # ── Python bytecode cache ──
 __pycache__/
@@ -72,8 +73,9 @@ htmlcov/
 *.temp
 validation_results.txt
 
-# ── Deployment config that is read by the platform, not needed in the deployed image ──
-.dockerignore
+# ── Deployment config (Docker config NOT excluded — Docker needs it during build) ──
+# NOTE: .dockerignore is intentionally NOT listed here. Docker reads it from the
+# build context; if Railway excludes it, all .dockerignore rules would be lost.
 docker-compose*.yml
 docker-compose*.yaml
 

@@ -10,11 +10,15 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /app
 
-# Copy project
-COPY . /app
+# Copy requirements first for Docker layer caching
+# This way, pip install only re-runs when requirements.txt changes
+COPY requirements.txt ./
 
 # Install Python deps
 RUN pip install --upgrade pip setuptools wheel && pip install -r requirements.txt
+
+# Copy the rest of the project
+COPY . /app
 
 # Environment defaults
 ENV FFMPEG_PATH=/usr/bin/ffmpeg FFPROBE_PATH=/usr/bin/ffprobe PORT=10000 HEALTHCHECK_PORT=9000

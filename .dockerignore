@@ -1,31 +1,83 @@
-# .dockerignore - prevent secrets and build artifacts from leaking into Docker images
-.git
+# .dockerignore — Files excluded from Docker build context
+# Keeps the build context small and prevents secrets from leaking into images.
+# The Dockerfile does COPY . /app, so exclude anything not needed at runtime.
+
+# ── Version control ──
+.git/
 .gitignore
-.env
-.env.*
+.gitkeep
+.gitattributes
+
+# ── CI / GitHub workflows (not needed in runtime image) ──
+.github/
+
+# ── Python bytecode cache ──
+__pycache__/
 *.py[cod]
 *.pyo
 *.pyd
 *$py.class
-__pycache__/
+
+# ── Virtual environments (local dev) ──
 .venv/
+.venv.bak/
 venv/
+venv.bak/
 env/
-.pytest_cache/
-.mypy_cache/
-.ruff_cache/
-*.log
-logs/
-storage/
-tests/
-coverage/
-.coverage
-htmlcov/
-.DS_Store
-.vscode/
-.idea/
+env.bak/
+ENV/
+
+# ── Secrets & environment files ──
+.env
+.env.*
 *.session
 *.session-journal
 *.session.lock
 *.session.json
+
+# ── Runtime data directories (created on container startup) ──
+storage/
+logs/
+*.log
+
+# ── Python & tool caches ──
+.ruff_cache/
+.mypy_cache/
+.pytest_cache/
+.cache/
+*.egg-info/
+*.egg
+
+# ── IDE / Editor directories ──
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# ── Tests & coverage (not needed in production) ──
+tests/
+coverage/
+.coverage
+htmlcov/
+
+# ── Build & packaging artifacts ──
+dist/
+build/
 *.whl
+*.tar.gz
+
+# ── Temporary files ──
+*.tmp
+*.temp
+validation_results.txt
+
+# ── Docker & deployment config (needed for build but not in image) ──
+.dockerignore
+docker-compose*.yml
+docker-compose*.yaml
+
+# ── Utility scripts (local dev only) ──
+scripts/
+
