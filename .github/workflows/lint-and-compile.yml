@@ -28,12 +28,12 @@ jobs:
           python-version: ${{ env.PYTHON_VERSION }}
 
       - name: Run Ruff linter
-        uses: astral-sh/ruff-action@v3
+        uses: astral-sh/ruff-action@v4
         with:
           args: check . --config ruff.toml --output-format github
 
       - name: Check Ruff formatting
-        uses: astral-sh/ruff-action@v3
+        uses: astral-sh/ruff-action@v4
         with:
           args: format . --config ruff.toml --check --output-format github
 
