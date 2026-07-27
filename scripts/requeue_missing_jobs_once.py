@@ -16,6 +16,7 @@ Environment:
 This is best-effort and safe to run multiple times: it uses a per-job
 lock `ffmpeg:requeue_lock:<job_id>` to avoid duplicates.
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -80,9 +81,9 @@ async def _run_once():
                 return 0
 
             fh = _sval("forward_hash") or _sval("fh")
-            if not fh and isinstance(inp, str) and "forwards/" in inp and inp.endswith('.json'):
+            if not fh and isinstance(inp, str) and "forwards/" in inp and inp.endswith(".json"):
                 try:
-                    fh = os.path.basename(inp).replace('.json', '')
+                    fh = os.path.basename(inp).replace(".json", "")
                 except Exception:
                     fh = None
 
@@ -178,7 +179,7 @@ async def _run_once():
             else:
                 await client.close()
         except Exception:
-            pass
+            logger.debug("requeue missing: operation failed")
 
     logger.info("Done scanning; actions taken: %s", count)
     return 0

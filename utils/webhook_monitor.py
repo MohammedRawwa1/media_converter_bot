@@ -54,6 +54,7 @@ class WebhookMonitor:
         # Last observed HTTP status code or exception message (for diagnostics)
         self.last_status_code = None
         self.last_error = None
+
     async def health_check(self) -> bool:
         """
         Perform a health check on the webhook.
@@ -70,13 +71,17 @@ class WebhookMonitor:
                 local_url = f"http://127.0.0.1:{local_port}{local_path}"
                 async with aiohttp.ClientSession() as session:
                     try:
-                        async with session.head(local_url, timeout=aiohttp.ClientTimeout(total=self.local_timeout)) as resp:
+                        async with session.head(
+                            local_url, timeout=aiohttp.ClientTimeout(total=self.local_timeout)
+                        ) as resp:
                             status = resp.status
                     except Exception as e_head:
                         # HEAD can be rejected or may time out; try GET as a fallback
                         logger.debug("Local HEAD failed; attempting GET", exc_info=e_head)
                         try:
-                            async with session.get(local_url, timeout=aiohttp.ClientTimeout(total=self.local_timeout + 2)) as resp:
+                            async with session.get(
+                                local_url, timeout=aiohttp.ClientTimeout(total=self.local_timeout + 2)
+                            ) as resp:
                                 status = resp.status
                         except Exception:
                             logger.debug("Local GET also failed; falling back to external check")
@@ -101,12 +106,16 @@ class WebhookMonitor:
             async with aiohttp.ClientSession() as session:
                 try:
                     try:
-                        async with session.head(self.webhook_url, timeout=aiohttp.ClientTimeout(total=self.external_timeout)) as response:
+                        async with session.head(
+                            self.webhook_url, timeout=aiohttp.ClientTimeout(total=self.external_timeout)
+                        ) as response:
                             status = response.status
                     except Exception as e_head:
                         logger.debug("External HEAD failed; attempting GET", exc_info=e_head)
                         try:
-                            async with session.get(self.webhook_url, timeout=aiohttp.ClientTimeout(total=self.external_timeout + 5)) as response:
+                            async with session.get(
+                                self.webhook_url, timeout=aiohttp.ClientTimeout(total=self.external_timeout + 5)
+                            ) as response:
                                 status = response.status
                         except Exception:
                             logger.debug("External GET also failed")
@@ -162,9 +171,11 @@ class WebhookMonitor:
                 jitter = min(5, new * 0.2) * 0.5  # deterministic jitter
                 self._current_interval = new + jitter
             except Exception:
-                pass
+                logger.debug("WebhookMonitor: backoff calculation failed", exc_info=True)
             self.last_error = str(e)
-            logger.error(f"❌ Webhook health check timeout for {self.webhook_url}; increasing backoff to {self._current_interval}s: {e}")
+            logger.error(
+                f"❌ Webhook health check timeout for {self.webhook_url}; increasing backoff to {self._current_interval}s: {e}"
+            )
             return False
 
         except aiohttp.ClientConnectorError as e:
@@ -177,9 +188,11 @@ class WebhookMonitor:
                 jitter = min(5, new * 0.2) * 0.5  # deterministic jitter
                 self._current_interval = new + jitter
             except Exception:
-                pass
+                logger.debug("WebhookMonitor: backoff calculation failed (conn error)", exc_info=True)
             self.last_error = str(e)
-            logger.error(f"❌ Webhook connection error for {self.webhook_url}: {e}; increasing backoff to {self._current_interval}s")
+            logger.error(
+                f"❌ Webhook connection error for {self.webhook_url}: {e}; increasing backoff to {self._current_interval}s"
+            )
             return False
 
         except Exception as e:
@@ -192,9 +205,11 @@ class WebhookMonitor:
                 jitter = min(5, new * 0.2) * 0.5  # deterministic jitter
                 self._current_interval = new + jitter
             except Exception:
-                pass
+                logger.debug("WebhookMonitor: backoff calculation failed (health error)", exc_info=True)
             self.last_error = str(e)
-            logger.error(f"❌ Webhook health check error for {self.webhook_url}: {e}; increasing backoff to {self._current_interval}s")
+            logger.error(
+                f"❌ Webhook health check error for {self.webhook_url}: {e}; increasing backoff to {self._current_interval}s"
+            )
             return False
 
     async def start_monitoring(self):
@@ -235,9 +250,11 @@ class WebhookMonitor:
                     jitter = min(5, new * 0.2) * 0.5  # deterministic jitter
                     self._current_interval = new + jitter
                 except Exception:
-                    pass
+                    logger.debug("WebhookMonitor: backoff calculation failed (client error)", exc_info=True)
                 self.last_error = str(e)
-                logger.error(f"❌ Webhook client error for {self.webhook_url}: {e}; increasing backoff to {self._current_interval}s")
+                logger.error(
+                    f"❌ Webhook client error for {self.webhook_url}: {e}; increasing backoff to {self._current_interval}s"
+                )
                 # Sleep for the backoff interval before retrying
                 await asyncio.sleep(getattr(self, "_current_interval", self.check_interval))
 

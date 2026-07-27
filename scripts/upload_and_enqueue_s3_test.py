@@ -6,14 +6,18 @@ Usage:
 
 Requires: ffmpeg, boto3, redis env vars set (REDIS_URL, S3_BUCKET, S3_ENDPOINT, AWS_*).
 """
+
 import contextlib
 import json
+import logging
 import os
 import shutil
 import subprocess
 import sys
 import time
 import uuid
+
+logger = logging.getLogger(__name__)
 
 try:
     import boto3
@@ -42,7 +46,18 @@ def create_sample(path: str) -> bool:
     if not ffmpeg:
         print("ffmpeg not found; please install or set FFMPEG_PATH")
         return False
-    cmd = [ffmpeg, "-f", "lavfi", "-i", "testsrc=duration=8:size=640x360:rate=25", "-c:v", "libx264", "-pix_fmt", "yuv420p", path]
+    cmd = [
+        ffmpeg,
+        "-f",
+        "lavfi",
+        "-i",
+        "testsrc=duration=8:size=640x360:rate=25",
+        "-c:v",
+        "libx264",
+        "-pix_fmt",
+        "yuv420p",
+        path,
+    ]
     try:
         subprocess.run(cmd, check=True)
         return True
@@ -63,7 +78,9 @@ def main():
     redis_url = os.environ.get("REDIS_URL")
 
     if not bucket or not endpoint or not access or not secret:
-        print("Missing S3 configuration in environment (S3_BUCKET, S3_ENDPOINT, AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY)")
+        print(
+            "Missing S3 configuration in environment (S3_BUCKET, S3_ENDPOINT, AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY)"
+        )
         sys.exit(2)
     if not redis_url:
         print("Missing REDIS_URL environment variable")
@@ -84,7 +101,7 @@ def main():
     if endpoint:
         kwargs["endpoint_url"] = endpoint
     if os.environ.get("S3_FORCE_PATH_STYLE", "").lower() in ("1", "true", "yes"):
-        kwargs["config"] = botocore.client.Config(s3={'addressing_style': 'path'})
+        kwargs["config"] = botocore.client.Config(s3={"addressing_style": "path"})
 
     client = boto3.client("s3", aws_access_key_id=access, aws_secret_access_key=secret, **kwargs)
 
@@ -95,7 +112,11 @@ def main():
         sys.exit(4)
 
     job_id = str(uuid.uuid4())
-    output_dir = getattr(config, "OUTPUT_PATH", os.path.join(getattr(config, 'STORAGE_PATH', 'storage'), 'output')) if config else os.path.join("storage", "output")
+    output_dir = (
+        getattr(config, "OUTPUT_PATH", os.path.join(getattr(config, "STORAGE_PATH", "storage"), "output"))
+        if config
+        else os.path.join("storage", "output")
+    )
     os.makedirs(output_dir, exist_ok=True)
     output_path = os.path.join(output_dir, f"{job_id}.mp4")
 
@@ -131,17 +152,17 @@ def main():
                 with contextlib.suppress(Exception):
                     r.expire(f"ffmpeg:job:{job_id}", JOB_METADATA_TTL)
         except Exception:
-            pass
+            logger.debug("upload and: create metadata before pushing job to avoid race where worker pop...")
         r.lpush("ffmpeg:jobs", json.dumps(job))
         print("Enqueued remote-key job:")
         print(" JOB_ID:", job_id)
         print(" S3 key:", dest_key)
         print(" Output path:", output_path)
-        print(f"To monitor progress: redis-cli -u \"$REDIS_URL\" SUBSCRIBE \"ffmpeg:progress:{job_id}\"")
+        print(f'To monitor progress: redis-cli -u "$REDIS_URL" SUBSCRIBE "ffmpeg:progress:{job_id}"')
     except Exception as e:
         print("Failed to enqueue job:", e)
         sys.exit(5)
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()

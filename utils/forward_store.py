@@ -37,12 +37,18 @@ def _publish_forward_notification(fid: str, extra: dict = None) -> None:
             payload.update(extra)
 
         with contextlib.suppress(Exception):
-            logger.info("forward_store: publish -> forward_channel=%s fetch_channel=%s do_auto_fetch=%s payload=%s",
-                        forward_channel, fetch_channel, do_auto_fetch, payload)
+            logger.info(
+                "forward_store: publish -> forward_channel=%s fetch_channel=%s do_auto_fetch=%s payload=%s",
+                forward_channel,
+                fetch_channel,
+                do_auto_fetch,
+                payload,
+            )
 
         # Single sync publish path (avoids double-publishing from async fallback)
         try:
             import redis as _redis
+
             if redis_url:
                 client = _redis.from_url(redis_url, decode_responses=True)
             else:
@@ -53,10 +59,10 @@ def _publish_forward_notification(fid: str, extra: dict = None) -> None:
                 with contextlib.suppress(Exception):
                     client.publish(fetch_channel, json.dumps({"forward_hash": fid}))
         except Exception:
-            pass
+            logger.debug("forward_store: Redis publish failed (inner)")
     except Exception:
+        logger.debug("forward_store: Redis publish failed (outer)")
         # never raise
-        pass
 
 
 def _local_forwards_dir() -> str:
@@ -108,8 +114,8 @@ async def save_forward_metadata(metadata: dict) -> str:
                 _publish_forward_notification(fid, {"remote_key": key, "file_id": data.get("file_id")})
             return fid
         except Exception:
+            logger.debug("forward_store: S3 save failed, falling back to local for %s", fid)
             # fallback to local
-            pass
 
     # default: write locally and return id
     p = _local_path_for(fid)
@@ -139,9 +145,9 @@ async def _upload_file_async(local_path: str, key: str) -> None:
             if os.path.exists(local_path):
                 os.remove(local_path)
         except Exception:
-            pass
+            logger.debug("forward_store: failed to remove local file after upload: %s", local_path)
     except Exception:
-        pass
+        logger.debug("forward_store: upload_file_async failed for %s", key)
 
 
 async def load_forward_metadata(fid: str) -> dict | None:
@@ -202,12 +208,12 @@ async def _download_file_async(key: str, dest: str) -> None:
                 if os.path.exists(dest) and (os.path.getsize(dest) > 0):
                     return
             except Exception:
-                pass
+                logger.debug("forward_store: download attempt %d/%d failed for %s", attempt, retries, key)
 
             if attempt < retries:
                 await asyncio.sleep(backoff * (2 ** (attempt - 1)))
     except Exception:
-        pass
+        logger.debug("forward_store: download_file_async failed for %s", key)
 
 
 async def delete_forward_metadata(fid: str) -> bool:
@@ -233,7 +239,7 @@ async def delete_forward_metadata(fid: str) -> bool:
         stack = _trace.format_stack(limit=6)
         logger.info("delete_forward_metadata called for %s; caller stack:\n%s", fid, "".join(stack))
     except Exception:
-        pass
+        logger.debug("forward_store: failed to capture caller stack for %s", fid)
 
     backend_name = (os.getenv("STORAGE_BACKEND") or (config.STORAGE_BACKEND if config else "local")).lower()
     key = f"forwards/{fid}.json"
@@ -262,7 +268,11 @@ async def delete_forward_metadata(fid: str) -> bool:
                         await b.delete(key)
                     return True
                 except Exception:
-                    logger.exception("Archive copy via boto3 failed for %s -> %s; falling back to download/reupload", key, archive_key)
+                    logger.exception(
+                        "Archive copy via boto3 failed for %s -> %s; falling back to download/reupload",
+                        key,
+                        archive_key,
+                    )
                     # Fallback: download then reupload
                     try:
                         import tempfile
@@ -293,8 +303,8 @@ async def delete_forward_metadata(fid: str) -> bool:
             await b.delete(key)
             return True
         except Exception:
+            logger.debug("forward_store: S3 delete failed for %s; trying local fallback", key)
             # fallback: attempt to delete local file if present
-            pass
 
     p = _local_path_for(fid)
     try:
@@ -302,5 +312,5 @@ async def delete_forward_metadata(fid: str) -> bool:
             os.remove(p)
             return True
     except Exception:
-        pass
+        logger.debug("forward_store: failed to remove local forward metadata: %s", p)
     return False

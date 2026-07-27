@@ -35,7 +35,9 @@ async def _normalize_target(chat_id: int | str, client=None):
 
 
 async def _send_with_telethon(
-    chat_id: int | str, file_path: str, caption: str | None = None,
+    chat_id: int | str,
+    file_path: str,
+    caption: str | None = None,
     progress_callback: Callable[[int, int], None] | None = None,
 ) -> bool:
     """Send a file using Telethon.
@@ -64,6 +66,7 @@ async def _send_with_telethon(
         # Pass a phone callback that raises instead of prompting stdin.
         async def _no_phone():
             raise RuntimeError("Telethon phone prompt unexpectedly triggered")
+
         await client.start(phone=_no_phone)
         target = await _normalize_target(chat_id, client)
         kwargs = {"file": file_path, "caption": caption}
@@ -89,8 +92,13 @@ async def _probe_video_metadata(path: str) -> dict:
     ffprobe_bin = "ffprobe"
     try:
         proc = await asyncio.create_subprocess_exec(
-            ffprobe_bin, "-v", "quiet", "-print_format", "json",
-            "-show_entries", "stream=width,height,codec_type:format=duration",
+            ffprobe_bin,
+            "-v",
+            "quiet",
+            "-print_format",
+            "json",
+            "-show_entries",
+            "stream=width,height,codec_type:format=duration",
             path,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
@@ -132,8 +140,17 @@ async def _generate_video_thumbnail(path: str) -> str | None:
     thumb_path = os.path.join(tmp_dir, "thumb.jpg")
     try:
         proc = await asyncio.create_subprocess_exec(
-            ffmpeg_bin, "-y", "-ss", "00:00:01", "-i", path,
-            "-vframes", "1", "-q:v", "2", thumb_path,
+            ffmpeg_bin,
+            "-y",
+            "-ss",
+            "00:00:01",
+            "-i",
+            path,
+            "-vframes",
+            "1",
+            "-q:v",
+            "2",
+            thumb_path,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
@@ -149,7 +166,9 @@ async def _generate_video_thumbnail(path: str) -> str | None:
 
 
 async def _send_with_pyrogram(
-    chat_id: int | str, file_path: str, caption: str | None = None,
+    chat_id: int | str,
+    file_path: str,
+    caption: str | None = None,
     progress_callback: Callable[[int, int], None] | None = None,
 ) -> bool:
     """Send a file using Pyrogram (session string fallback).
@@ -169,6 +188,7 @@ async def _send_with_pyrogram(
         return False
 
     from utils.telethon_session import build_pyrogram_client, get_userbot_credentials
+
     api_id, api_hash = get_userbot_credentials()
 
     client = build_pyrogram_client(api_id, api_hash)
@@ -207,7 +227,10 @@ async def _send_with_pyrogram(
         await client.send_video(target, file_path, **kwargs)
         logger.info(
             "userbot: Pyrogram sent video %s to %s (meta=%s, thumb=%s)",
-            file_path, target, video_meta, bool(thumb_path),
+            file_path,
+            target,
+            video_meta,
+            bool(thumb_path),
         )
         return True
     except Exception:
@@ -223,7 +246,9 @@ async def _send_with_pyrogram(
 
 
 async def send_file_via_userbot(
-    chat_id: int | str, file_path: str, caption: str | None = None,
+    chat_id: int | str,
+    file_path: str,
+    caption: str | None = None,
     progress_callback: Callable[[int, int], None] | None = None,
 ) -> bool:
     """Send a file using a user account.

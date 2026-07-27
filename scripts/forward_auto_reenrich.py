@@ -23,6 +23,7 @@ Environment:
   FETCH_CHANNEL - default: ffmpeg:fetch
   REQUEUE_LOCK_TTL - seconds to avoid duplicate requeues (default 300)
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -94,6 +95,7 @@ async def _process_forward(fid, payload: dict, client) -> None:
                 stored = await client.hgetall(key)
                 if not stored:
                     continue
+
                 # normalize stored values to strings
                 def _sval(k, stored=stored):
                     v = stored.get(k)
@@ -121,10 +123,14 @@ async def _process_forward(fid, payload: dict, client) -> None:
                             if isinstance(fwd, (bytes, bytearray)):
                                 fwd = fwd.decode("utf-8")
                             fj = json.loads(fwd) if isinstance(fwd, str) else fwd
-                            if isinstance(fj, dict) and (str(fj.get("fid") or fj.get("forward_hash") or fj.get("file_id")) == str(fid)):
+                            if isinstance(fj, dict) and (
+                                str(fj.get("fid") or fj.get("forward_hash") or fj.get("file_id")) == str(fid)
+                            ):
                                 matched = True
                         except Exception:
-                            pass
+                            logger.debug(
+                                "forward auto: sometimes forward metadata is stored as JSON in a field called ..."
+                            )
 
                 if not matched:
                     continue
@@ -138,7 +144,7 @@ async def _process_forward(fid, payload: dict, client) -> None:
                         continue
                 except Exception:
                     # best-effort: if set fails, proceed (may duplicate)
-                    pass
+                    logger.debug("forward auto: failed to mark as processed, may duplicate")
 
                 # Build minimal job payload and call enqueue_job which HSETs then LPUSHes
                 try:
@@ -156,7 +162,7 @@ async def _process_forward(fid, payload: dict, client) -> None:
                     if orig:
                         job["original_filename"] = orig
                 except Exception:
-                    pass
+                    logger.debug("forward auto: in _sval()")
 
                 if enqueue_job:
                     try:
@@ -223,7 +229,7 @@ async def _async_run():
             else:
                 await client.close()
         except Exception:
-            pass
+            logger.debug("forward auto: operation failed")
     return 0
 
 

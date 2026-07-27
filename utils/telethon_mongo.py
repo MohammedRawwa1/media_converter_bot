@@ -7,6 +7,7 @@ into the existing Mongo model used by the application. Enabled via
 This module is best-effort and will not raise if Mongo or dependencies
 are missing.
 """
+
 import logging
 import os
 

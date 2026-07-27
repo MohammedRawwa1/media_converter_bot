@@ -1,9 +1,12 @@
 import contextlib
 import json
+import logging
 import os
 from typing import Any
 
 import config
+
+logger = logging.getLogger(__name__)
 
 DEFAULTS = {
     "upload_mode": "video",  # options: video, file, zip
@@ -41,7 +44,7 @@ def _save_all(data: dict[str, Any]) -> None:
         with open(p, "w", encoding="utf-8") as fh:
             json.dump(data, fh, ensure_ascii=False, indent=2)
     except Exception:
-        pass
+        logger.debug("Failed to save user settings")
 
 
 def get_user_settings(user_id: int) -> dict[str, Any]:

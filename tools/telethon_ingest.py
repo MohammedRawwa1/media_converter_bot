@@ -82,6 +82,7 @@ logger = logging.getLogger("telethon_ingest")
 try:
     import tempfile as _tempfile
     from logging.handlers import RotatingFileHandler
+
     LOG_PATH = Path(os.environ.get("TELETHON_LOG_PATH", os.path.join(_tempfile.gettempdir(), "telethon_ingest.log")))
     LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
     fh = RotatingFileHandler(str(LOG_PATH), maxBytes=5_000_000, backupCount=3)
@@ -92,11 +93,12 @@ try:
     logger.addHandler(fh)
     try:
         import logging as _logging
+
         _tel = _logging.getLogger("telethon")
         _tel.setLevel(logging.DEBUG)
         _tel.addHandler(fh)
     except Exception:
-        pass
+        logger.debug("telethon ingest: Attach both module logger and telethon's logger for verbose ...")
 except Exception:
     LOG_PATH = None
 
@@ -184,7 +186,7 @@ async def _start_healthcheck_server():
     runner = _web.AppRunner(app)
     try:
         await runner.setup()
-        bind_host = os.environ.get("TELETHON_DEBUG_HOST", "0.0.0.0")  # noqa: S104
+        bind_host = os.environ.get("TELETHON_DEBUG_HOST", "0.0.0.0")  # nosec  # noqa: S104
         site = _web.TCPSite(runner, bind_host, port)
         await site.start()
         logger.info("telethon_ingest: healthcheck HTTP server started on %s:%s", bind_host, port)
@@ -206,12 +208,12 @@ async def _get_backend_instance():
         try:
             return await get_storage_backend()
         except Exception:
-            pass
+            logger.debug("telethon ingest: operation failed")
     if get_storage_backend_sync:
         try:
             return get_storage_backend_sync()
         except Exception:
-            pass
+            logger.debug("telethon ingest: operation failed")
     # Last-ditch: attempt on-the-fly import
     try:
         from utils.storage import get_storage_backend as _g
@@ -223,11 +225,11 @@ async def _get_backend_instance():
             try:
                 return await get_storage_backend()
             except Exception:
-                pass
+                logger.debug("telethon ingest: operation failed")
         if get_storage_backend_sync:
             return get_storage_backend_sync()
     except Exception:
-        pass
+        logger.debug("telethon ingest: Last-ditch: attempt on-the-fly import")
     return None
 
 
@@ -295,13 +297,20 @@ async def _upload_and_enqueue(local_path: str, original_name: str, chat_id: int 
             abs_path = os.path.abspath(local_path)
             exists = os.path.exists(abs_path)
             size = os.path.getsize(abs_path) if exists else None
-            logger.info("telethon_ingest: upload debug - local_path=%s abs_path=%s exists=%s size=%s", local_path, abs_path, exists, size)
+            logger.info(
+                "telethon_ingest: upload debug - local_path=%s abs_path=%s exists=%s size=%s",
+                local_path,
+                abs_path,
+                exists,
+                size,
+            )
         except Exception:
             logger.exception("telethon_ingest: failed to stat local_path %s", local_path)
 
         # Ensure we pass an absolute, resolved path to the storage backend
         try:
             from pathlib import Path as _Path
+
             abs_path = str(_Path(local_path).resolve())
         except Exception:
             abs_path = os.path.abspath(local_path)
@@ -314,7 +323,15 @@ async def _upload_and_enqueue(local_path: str, original_name: str, chat_id: int 
         # temporary POSIX-like path before uploading to ensure compatibility.
         try:
             import shutil
-            tmp_dir = os.environ.get("TEMP_UPLOAD_DIR") or _Path(getattr(config, "TEMP_PATH", os.path.join(os.path.dirname(os.path.dirname(__file__)), "storage", "temp"))).as_posix()
+
+            tmp_dir = (
+                os.environ.get("TEMP_UPLOAD_DIR")
+                or _Path(
+                    getattr(
+                        config, "TEMP_PATH", os.path.join(os.path.dirname(os.path.dirname(__file__)), "storage", "temp")
+                    )
+                ).as_posix()
+            )
             os.makedirs(tmp_dir, exist_ok=True)
             tmp_dst = os.path.join(tmp_dir, os.path.basename(abs_path))
             # If source and tmp_dst are the same, skip copy
@@ -340,7 +357,7 @@ async def _upload_and_enqueue(local_path: str, original_name: str, chat_id: int 
                     with contextlib.suppress(Exception):
                         os.remove(upload_src)
             except Exception:
-                pass
+                logger.debug("telethon ingest: operation failed")
         # Only remove local temp copy if operator did NOT request to keep uploads.
         # Prefer leaving cleanup responsibility to the worker which also respects
         # KEEP_LOCAL_UPLOADS (we patched worker to honor this global flag).
@@ -393,11 +410,11 @@ async def _upload_and_enqueue(local_path: str, original_name: str, chat_id: int 
                         loop.create_task(save_telethon_forward(job))
                     except Exception:
                         # best-effort only
-                        pass
+                        logger.debug("telethon ingest: failed to schedule save task")
             except Exception:
                 logger.exception("Telethon->Mongo bridge unavailable")
     except Exception:
-        pass
+        logger.debug("telethon ingest: Optionally save metadata to MongoDB for Telethon ingestion (...")
 
     if enqueue_job is None:
         logger.error("enqueue_job not available; cannot enqueue %s", job_id)
@@ -421,12 +438,17 @@ async def _process_forward_hash(forward_hash: str):
         logger.error("telethon_ingest: no metadata for forward_hash %s", forward_hash)
         return False
 
-    logger.info("telethon_ingest: processing forward %s meta_chat=%s meta_msg=%s", forward_hash, meta.get("chat_id"), meta.get("message_id") or meta.get("msg_id"))
+    logger.info(
+        "telethon_ingest: processing forward %s meta_chat=%s meta_msg=%s",
+        forward_hash,
+        meta.get("chat_id"),
+        meta.get("message_id") or meta.get("msg_id"),
+    )
     try:
         global LAST_FETCH_TS
         LAST_FETCH_TS = time.time()
     except Exception:
-        pass
+        logger.debug("telethon ingest: in _process_forward_hash()")
 
     tmp = _make_temp_path(forward_hash, os.path.splitext(meta.get("name") or "")[1] or "")
 
@@ -436,9 +458,18 @@ async def _process_forward_hash(forward_hash: str):
 
     try:
         ok = await download_forward_via_userbot(
-            meta.get("chat_id"), meta.get("message_id") or meta.get("msg_id"), tmp, msg_date=meta.get("registered_at") or meta.get("created_at"), file_unique_id=meta.get("file_unique_id")
+            meta.get("chat_id"),
+            meta.get("message_id") or meta.get("msg_id"),
+            tmp,
+            msg_date=meta.get("registered_at") or meta.get("created_at"),
+            file_unique_id=meta.get("file_unique_id"),
         )
-        logger.info("telethon_ingest: userbot download for %s returned ok=%s exists=%s", forward_hash, bool(ok), os.path.exists(tmp))
+        logger.info(
+            "telethon_ingest: userbot download for %s returned ok=%s exists=%s",
+            forward_hash,
+            bool(ok),
+            os.path.exists(tmp),
+        )
         if not ok or not os.path.exists(tmp):
             logger.error("telethon_ingest: download failed for %s", forward_hash)
             return False
@@ -448,7 +479,9 @@ async def _process_forward_hash(forward_hash: str):
 
     # Upload & enqueue using same helper
     try:
-        await _upload_and_enqueue(tmp, meta.get("name"), meta.get("chat_id"), meta.get("message_id") or meta.get("msg_id"))
+        await _upload_and_enqueue(
+            tmp, meta.get("name"), meta.get("chat_id"), meta.get("message_id") or meta.get("msg_id")
+        )
     except Exception:
         logger.exception("telethon_ingest: upload/enqueue failed for %s", forward_hash)
         return False
@@ -562,13 +595,13 @@ async def redis_listener():
                 with contextlib.suppress(Exception):
                     await pub.close()
         except Exception:
-            pass
+            logger.debug("telethon ingest: operation failed")
         try:
             if r is not None:
                 with contextlib.suppress(Exception):
                     await r.close()
         except Exception:
-            pass
+            logger.debug("telethon ingest: operation failed")
 
 
 def _make_temp_path(msg_id: str, ext: str = "") -> str:
@@ -589,8 +622,12 @@ async def main():
             "ENABLE_TELETHON_INGEST": os.getenv("ENABLE_TELETHON_INGEST") or "",
             "API_ID_present": bool(os.getenv("API_ID") or os.getenv("USERBOT_API_ID")),
             "API_HASH_present": bool(os.getenv("API_HASH") or os.getenv("USERBOT_API_HASH")),
-            "TELETHON_SESSION_present": bool(os.getenv("TELETHON_SESSION") or os.getenv("API_SESSION") or os.getenv("USERBOT_SESSION")),
-            "TELETHON_SESSION_NAME": os.getenv("TELETHON_SESSION_NAME") or os.getenv("API_SESSION_NAME") or "telethon_ingest",
+            "TELETHON_SESSION_present": bool(
+                os.getenv("TELETHON_SESSION") or os.getenv("API_SESSION") or os.getenv("USERBOT_SESSION")
+            ),
+            "TELETHON_SESSION_NAME": os.getenv("TELETHON_SESSION_NAME")
+            or os.getenv("API_SESSION_NAME")
+            or "telethon_ingest",
             "REDIS_URL_present": bool(os.getenv("REDIS_URL")),
             "STORAGE_BACKEND": os.getenv("STORAGE_BACKEND") or config.STORAGE_BACKEND,
         }
@@ -630,12 +667,20 @@ async def main():
             string_session_loaded = True
             logger.info("Using Telethon string session from env %s", session_env_used)
         except Exception:
-            logger.exception("Failed to load StringSession from env %s; falling back to file-based session name %s", session_env_used, session_name)
+            logger.exception(
+                "Failed to load StringSession from env %s; falling back to file-based session name %s",
+                session_env_used,
+                session_name,
+            )
             session = session_name
     else:
         session = session_name
         if session_env_used:
-            logger.warning("Found session env %s but StringSession class not available; using session name %s", session_env_used, session_name)
+            logger.warning(
+                "Found session env %s but StringSession class not available; using session name %s",
+                session_env_used,
+                session_name,
+            )
         else:
             logger.info("No string session env present; using session name %s", session_name)
 
@@ -643,7 +688,12 @@ async def main():
     try:
         if not string_session_loaded:
             # Prefer TELETHON_SESSION_DIR, then TEMP_PATH from config, then /tmp
-            session_dir = os.environ.get("TELETHON_SESSION_DIR") or os.environ.get("TEMP_PATH") or getattr(config, "TEMP_PATH", None) or _tempfile.gettempdir()
+            session_dir = (
+                os.environ.get("TELETHON_SESSION_DIR")
+                or os.environ.get("TEMP_PATH")
+                or getattr(config, "TEMP_PATH", None)
+                or _tempfile.gettempdir()
+            )
             with contextlib.suppress(Exception):
                 os.makedirs(session_dir, exist_ok=True)
             # Use a path under the session_dir to avoid write-permissions issues on remote
@@ -677,7 +727,9 @@ async def main():
             try:
                 # If a valid StringSession was loaded, do not touch file-based sessions.
                 if string_session_loaded:
-                    logger.info("telethon_ingest: TELETHON_CLEAN_SESSION set, but a valid StringSession was loaded; skipping file deletion")
+                    logger.info(
+                        "telethon_ingest: TELETHON_CLEAN_SESSION set, but a valid StringSession was loaded; skipping file deletion"
+                    )
                 else:
                     deleted = []
                     # Candidate directories to search for session files: cwd and project root
@@ -686,10 +738,17 @@ async def main():
                         cand_dirs.append(str(Path.home()))
                     import glob
                     import shutil
+
                     for d in cand_dirs:
                         try:
                             # remove common explicit names and any files starting with session_name
-                            patterns = [session_name, f"{session_name}.session", f"{session_name}.session-journal", f"{session_name}.session.lock", f"{session_name}*"]
+                            patterns = [
+                                session_name,
+                                f"{session_name}.session",
+                                f"{session_name}.session-journal",
+                                f"{session_name}.session.lock",
+                                f"{session_name}*",
+                            ]
                             for pat in patterns:
                                 for p in glob.glob(os.path.join(d, pat)):
                                     pth = Path(p)
@@ -708,7 +767,7 @@ async def main():
             except Exception:
                 logger.exception("telethon_ingest: error during TELETHON_CLEAN_SESSION cleanup")
     except Exception:
-        pass
+        logger.debug("telethon ingest: One-shot cleanup of local Telethon session files when reques...")
     # Determine whether we should listen for incoming messages (legacy behavior)
     LISTEN_INCOMING = os.environ.get("TELETHON_LISTEN_INCOMING", "").lower() in ("1", "true", "yes")
 
@@ -728,7 +787,6 @@ async def main():
                 asyncio.create_task(process_incoming(msg, client))
             except Exception:
                 logger.exception("Error in Telethon handler")
-
 
         async def process_incoming(msg, client_instance):
             # determine filename/extension safely
@@ -755,7 +813,9 @@ async def main():
 
             # Upload & enqueue
             try:
-                await _upload_and_enqueue(tmp, fname, getattr(msg.chat, "id", None) or getattr(msg, "chat_id", None), getattr(msg, "id", None))
+                await _upload_and_enqueue(
+                    tmp, fname, getattr(msg.chat, "id", None) or getattr(msg, "chat_id", None), getattr(msg, "id", None)
+                )
             except Exception:
                 logger.exception("Failed to upload/enqueue for %s", tmp)
 
@@ -767,7 +827,9 @@ async def main():
     # Write a small marker file so external deploy logs or healthchecks can
     # confirm the Telethon ingest process started successfully.
     try:
-        marker_dir = getattr(config, "TEMP_PATH", None) or os.path.join(os.path.dirname(os.path.dirname(__file__)), "storage", "temp")
+        marker_dir = getattr(config, "TEMP_PATH", None) or os.path.join(
+            os.path.dirname(os.path.dirname(__file__)), "storage", "temp"
+        )
         os.makedirs(marker_dir, exist_ok=True)
         marker = os.path.join(marker_dir, "telethon_ingest.started")
         with open(marker, "w") as fh:
@@ -794,7 +856,7 @@ async def main():
             except Exception:
                 logger.exception("telethon_ingest: upload_telethon_log failed during startup")
         except Exception:
-            pass
+            logger.debug("telethon ingest: Attempt to upload the telethon debug log as well (best-effort)")
     except Exception:
         logger.exception("Error while attempting to publish telethon_ingest.started marker to storage")
 
@@ -837,16 +899,16 @@ async def main():
                 except asyncio.CancelledError:
                     pass
                 except Exception:
-                    pass
+                    logger.debug("telethon ingest: Cancel background redis listener if started")
         except Exception:
-            pass
+            logger.debug("telethon ingest: operation failed")
         # Stop aiohttp debug server if running
         try:
             if http_runner is not None:
                 with contextlib.suppress(Exception):
                     await http_runner.cleanup()
         except Exception:
-            pass
+            logger.debug("telethon ingest: Stop aiohttp debug server if running")
 
 
 if __name__ == "__main__":
@@ -860,4 +922,4 @@ if __name__ == "__main__":
             with contextlib.suppress(Exception):
                 asyncio.run(upload_telethon_log("telethon_ingest_crash.log"))
         except Exception:
-            pass
+            logger.debug("telethon ingest: operation failed")

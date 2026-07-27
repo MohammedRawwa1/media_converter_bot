@@ -25,8 +25,11 @@ Usage:
 
 from __future__ import annotations
 
+import logging
 from datetime import datetime
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 
 def ok(
@@ -151,33 +154,37 @@ def json_response(
     """
     if framework == "auto":
         import sys
+
         if "flask" in sys.modules:
             try:
                 from flask import current_app
+
                 if current_app:
                     framework = "flask"
             except Exception:
-                pass
+                logger.debug("Failed to detect Flask framework")
         if framework == "auto" and "fastapi" in sys.modules:
             framework = "fastapi"
 
     if framework == "flask":
         try:
             from flask import jsonify
+
             resp = jsonify(body)
             resp.status_code = status
             if headers:
                 resp.headers.update(headers)
             return resp
         except Exception:
-            pass
+            logger.debug("Flask jsonify failed, falling through")
 
     if framework == "fastapi":
         try:
             from fastapi.responses import JSONResponse
+
             return JSONResponse(content=body, status_code=status, headers=headers)
         except Exception:
-            pass
+            logger.debug("FastAPI JSONResponse failed, falling through")
 
     # Fallback: plain tuple
     return body, status, headers

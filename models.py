@@ -48,15 +48,32 @@ class MediaConversionModel(FillableModel):
     # Fields in `guarded` are never writable via mass assignment.
     # This prevents injection of `is_admin`, `role` etc. via API payloads.
     fillable: set[str] = {
-        "user_id", "action", "file_name", "file_type", "file_size",
-        "input_format", "output_format", "input_size", "output_size",
-        "success", "processing_time", "timestamp", "username",
-        "error_message", "parameters", "chat_id", "message_id",
-        "source_format", "target_format", "bot_id",
+        "user_id",
+        "action",
+        "file_name",
+        "file_type",
+        "file_size",
+        "input_format",
+        "output_format",
+        "input_size",
+        "output_size",
+        "success",
+        "processing_time",
+        "timestamp",
+        "username",
+        "error_message",
+        "parameters",
+        "chat_id",
+        "message_id",
+        "source_format",
+        "target_format",
+        "bot_id",
     }
     guarded: set[str] = {"_id", "is_admin", "role", "permissions"}
 
-    def __init__(self, mongo_client, db_name: str = "media_conversion_bot", bot_id: str = None, collection_prefix: str = None):
+    def __init__(
+        self, mongo_client, db_name: str = "media_conversion_bot", bot_id: str = None, collection_prefix: str = None
+    ):
         """
         mongo_client: Motor/PyMongo client
         db_name: database name to use
@@ -85,15 +102,20 @@ class MediaConversionModel(FillableModel):
         )
         self.users = QueryBuilder(
             collection=self._users_coll,
-            fillable_fields={"user_id", "bot_id", "stats", "username",
-                             "first_seen", "last_activity"},
+            fillable_fields={"user_id", "bot_id", "stats", "username", "first_seen", "last_activity"},
             guarded_fields=self.guarded,
         )
         self.stats = QueryBuilder(
             collection=self._stats_coll,
-            fillable_fields={"date", "bot_id", "total_conversions",
-                             "actions", "formats", "total_input_size",
-                             "total_output_size"},
+            fillable_fields={
+                "date",
+                "bot_id",
+                "total_conversions",
+                "actions",
+                "formats",
+                "total_input_size",
+                "total_output_size",
+            },
             guarded_fields=self.guarded,
         )
         self.sessions = QueryBuilder(
@@ -103,8 +125,7 @@ class MediaConversionModel(FillableModel):
         )
         self.schedules = QueryBuilder(
             collection=self._schedules_coll,
-            fillable_fields={"run_at", "status", "bot_id", "created_at",
-                             "finished_at", "_id"},
+            fillable_fields={"run_at", "status", "bot_id", "created_at", "finished_at", "_id"},
             guarded_fields=self.guarded,
         )
 
@@ -253,20 +274,25 @@ class MediaConversionModel(FillableModel):
             if self.bot_id is not None:
                 query["bot_id"] = self.bot_id
 
-            conversions = await self.conversions.select(
-                filters=query,
-                projection={
-                    "_id": 0,
-                    "action": 1,
-                    "input_format": 1,
-                    "output_format": 1,
-                    "input_size": 1,
-                    "output_size": 1,
-                    "success": 1,
-                    "timestamp": 1,
-                    "processing_time": 1,
-                },
-            ).sort(("timestamp", -1)).limit(limit).to_list(length=limit)
+            conversions = (
+                await self.conversions.select(
+                    filters=query,
+                    projection={
+                        "_id": 0,
+                        "action": 1,
+                        "input_format": 1,
+                        "output_format": 1,
+                        "input_size": 1,
+                        "output_size": 1,
+                        "success": 1,
+                        "timestamp": 1,
+                        "processing_time": 1,
+                    },
+                )
+                .sort(("timestamp", -1))
+                .limit(limit)
+                .to_list(length=limit)
+            )
             return conversions
         except Exception as e:
             logger.error(f"Error getting recent conversions: {e}")
@@ -305,12 +331,14 @@ class MediaConversionModel(FillableModel):
             pipeline = []
             if self.bot_id is not None:
                 pipeline.append({"$match": {"bot_id": self.bot_id}})
-            pipeline.extend([
-                {"$group": {"_id": "$action", "count": {"$sum": 1}, "total_size": {"$sum": "$input_size"}}},
-                {"$sort": {"count": -1}},
-                {"$limit": limit},
-                {"$project": {"action": "$_id", "count": 1, "total_size": 1, "_id": 0}},
-            ])
+            pipeline.extend(
+                [
+                    {"$group": {"_id": "$action", "count": {"$sum": 1}, "total_size": {"$sum": "$input_size"}}},
+                    {"$sort": {"count": -1}},
+                    {"$limit": limit},
+                    {"$project": {"action": "$_id", "count": 1, "total_size": 1, "_id": 0}},
+                ]
+            )
 
             results = await self.conversions.aggregate(pipeline)
             return results[:limit]
@@ -427,26 +455,28 @@ class MediaConversionModel(FillableModel):
             pipeline = []
             if self.bot_id is not None:
                 pipeline.append({"$match": {"bot_id": self.bot_id}})
-            pipeline.extend([
-                {"$group": {"_id": "$success", "count": {"$sum": 1}}},
-                {
-                    "$group": {
-                        "_id": None,
-                        "total": {"$sum": "$count"},
-                        "successful": {"$sum": {"$cond": [{"$eq": ["$_id", True]}, "$count", 0]}} ,
-                        "failed": {"$sum": {"$cond": [{"$eq": ["$_id", False]}, "$count", 0]}} ,
-                    }
-                },
-                {
-                    "$project": {
-                        "_id": 0,
-                        "total": 1,
-                        "successful": 1,
-                        "failed": 1,
-                        "success_rate": {"$multiply": [{"$divide": ["$successful", "$total"]}, 100]},
-                    }
-                },
-            ])
+            pipeline.extend(
+                [
+                    {"$group": {"_id": "$success", "count": {"$sum": 1}}},
+                    {
+                        "$group": {
+                            "_id": None,
+                            "total": {"$sum": "$count"},
+                            "successful": {"$sum": {"$cond": [{"$eq": ["$_id", True]}, "$count", 0]}},
+                            "failed": {"$sum": {"$cond": [{"$eq": ["$_id", False]}, "$count", 0]}},
+                        }
+                    },
+                    {
+                        "$project": {
+                            "_id": 0,
+                            "total": 1,
+                            "successful": 1,
+                            "failed": 1,
+                            "success_rate": {"$multiply": [{"$divide": ["$successful", "$total"]}, 100]},
+                        }
+                    },
+                ]
+            )
 
             results = await self.conversions.aggregate(pipeline)
             return results[0] if results else {"total": 0, "successful": 0, "failed": 0, "success_rate": 0}
@@ -460,41 +490,43 @@ class MediaConversionModel(FillableModel):
             pipeline = []
             if self.bot_id is not None:
                 pipeline.append({"$match": {"bot_id": self.bot_id}})
-            pipeline.extend([
-                {
-                    "$group": {
-                        "_id": None,
-                        "total_input_size": {"$sum": "$input_size"},
-                        "total_output_size": {"$sum": "$output_size"},
-                        "total_files": {"$sum": 1},
-                    }
-                },
-                {
-                    "$project": {
-                        "_id": 0,
-                        "total_input_size": 1,
-                        "total_output_size": 1,
-                        "total_files": 1,
-                        "compression_ratio": {
-                            "$cond": [
-                                {"$eq": ["$total_input_size", 0]},
-                                0,
-                                {
-                                    "$multiply": [
-                                        {
-                                            "$divide": [
-                                                {"$subtract": ["$total_input_size", "$total_output_size"]},
-                                                "$total_input_size",
-                                            ]
-                                        },
-                                        100,
-                                    ]
-                                },
-                            ]
-                        },
-                    }
-                },
-            ])
+            pipeline.extend(
+                [
+                    {
+                        "$group": {
+                            "_id": None,
+                            "total_input_size": {"$sum": "$input_size"},
+                            "total_output_size": {"$sum": "$output_size"},
+                            "total_files": {"$sum": 1},
+                        }
+                    },
+                    {
+                        "$project": {
+                            "_id": 0,
+                            "total_input_size": 1,
+                            "total_output_size": 1,
+                            "total_files": 1,
+                            "compression_ratio": {
+                                "$cond": [
+                                    {"$eq": ["$total_input_size", 0]},
+                                    0,
+                                    {
+                                        "$multiply": [
+                                            {
+                                                "$divide": [
+                                                    {"$subtract": ["$total_input_size", "$total_output_size"]},
+                                                    "$total_input_size",
+                                                ]
+                                            },
+                                            100,
+                                        ]
+                                    },
+                                ]
+                            },
+                        }
+                    },
+                ]
+            )
 
             results = await self.conversions.aggregate(pipeline)
             return (

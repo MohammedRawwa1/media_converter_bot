@@ -53,6 +53,7 @@ except Exception:
 @dataclass
 class IngestResult:
     """Result of a big file ingestion attempt."""
+
     ok: bool
     job_id: str | None = None
     s3_key: str | None = None
@@ -83,7 +84,7 @@ class BigFilePipeline:
                 if get_cache is not None:
                     self._cache = await get_cache()
             except Exception:
-                pass
+                logger.debug("BigFilePipeline: cache init failed", exc_info=True)
 
     async def ingest_large_file(
         self,
@@ -131,9 +132,7 @@ class BigFilePipeline:
 
         # Try in-memory streaming for files 50-200MB when S3 is available
         _use_in_memory = (
-            self._storage is not None
-            and file_size > DEFAULT_BOT_API_MAX_BYTES
-            and file_size <= IN_MEMORY_MAX_BYTES
+            self._storage is not None and file_size > DEFAULT_BOT_API_MAX_BYTES and file_size <= IN_MEMORY_MAX_BYTES
         )
 
         # ── Check Redis byte cache before downloading ──
@@ -144,7 +143,8 @@ class BigFilePipeline:
                 if cached_data is not None and len(cached_data) > 0:
                     logger.info(
                         "BigFilePipeline: cache HIT for file_unique_id=%s (%dMB), uploading to S3",
-                        file_unique_id, len(cached_data) // (1024 * 1024),
+                        file_unique_id,
+                        len(cached_data) // (1024 * 1024),
                     )
                     actual_size = len(cached_data)
                     await self._storage.upload_bytes(cached_data, s3_key)
@@ -166,7 +166,9 @@ class BigFilePipeline:
                             )
                     logger.info(
                         "BigFilePipeline: cache pipeline succeeded for %s/%s (%d bytes)",
-                        chat_id, message_id, actual_size,
+                        chat_id,
+                        message_id,
+                        actual_size,
                     )
             except Exception as e:
                 logger.debug("BigFilePipeline: cache check failed: %s", e)
@@ -177,7 +179,9 @@ class BigFilePipeline:
 
                 logger.info(
                     "BigFilePipeline: in-memory download chat=%s msg=%s size=%dMB",
-                    chat_id, message_id, file_size // (1024 * 1024),
+                    chat_id,
+                    message_id,
+                    file_size // (1024 * 1024),
                 )
                 data = await download_bytes_via_userbot(chat_id, message_id, progress_callback=progress_callback)
                 if data is not None and len(data) > 0:
@@ -196,7 +200,8 @@ class BigFilePipeline:
                             await self._cache.cache_file_bytes(file_unique_id, data)
                             logger.info(
                                 "BigFilePipeline: cached %d bytes for file_unique_id=%s",
-                                actual_size, file_unique_id,
+                                actual_size,
+                                file_unique_id,
                             )
                         except Exception as cache_err:
                             logger.debug("BigFilePipeline: failed to cache file bytes: %s", cache_err)
@@ -218,7 +223,9 @@ class BigFilePipeline:
 
                     logger.info(
                         "BigFilePipeline: in-memory pipeline succeeded for %s/%s (%d bytes)",
-                        chat_id, message_id, actual_size,
+                        chat_id,
+                        message_id,
+                        actual_size,
                     )
                 else:
                     logger.info(
@@ -226,26 +233,26 @@ class BigFilePipeline:
                     )
             except Exception as e:
                 logger.warning(
-                    "BigFilePipeline: in-memory path failed (%s); falling back to disk-based download", e,
+                    "BigFilePipeline: in-memory path failed (%s); falling back to disk-based download",
+                    e,
                 )
 
         if not _in_memory_success:
             # Fallback: download to temp file, upload to S3, clean up
             try:
-                temp_dir = os.path.join(
-                    os.getenv("STORAGE_PATH", "storage"), "temp"
-                )
+                temp_dir = os.path.join(os.getenv("STORAGE_PATH", "storage"), "temp")
                 os.makedirs(temp_dir, exist_ok=True)
 
                 temp_path = os.path.join(temp_dir, f"{job_id}_src{ext}")
                 logger.info(
                     "BigFilePipeline: downloading via Pyrogram chat=%s msg=%s size=%dMB -> %s",
-                    chat_id, message_id, file_size // (1024 * 1024), temp_path,
+                    chat_id,
+                    message_id,
+                    file_size // (1024 * 1024),
+                    temp_path,
                 )
 
-                download_ok = await self._download_via_pyrogram(
-                    chat_id, message_id, temp_path
-                )
+                download_ok = await self._download_via_pyrogram(chat_id, message_id, temp_path)
                 if not download_ok or not os.path.exists(temp_path) or os.path.getsize(temp_path) == 0:
                     return IngestResult(
                         ok=False,
@@ -253,9 +260,7 @@ class BigFilePipeline:
                     )
 
                 actual_size = os.path.getsize(temp_path)
-                logger.info(
-                    "BigFilePipeline: disk download complete, actual_size=%dMB", actual_size // (1024 * 1024)
-                )
+                logger.info("BigFilePipeline: disk download complete, actual_size=%dMB", actual_size // (1024 * 1024))
 
                 # Cache file info
                 if self._cache and file_unique_id:
@@ -329,9 +334,7 @@ class BigFilePipeline:
             logger.exception("BigFilePipeline: enqueue failed: %s", e)
             return IngestResult(ok=False, error=f"Enqueue error: {e}")
 
-    async def _download_via_pyrogram(
-        self, chat_id: int, message_id: int, dest_path: str
-    ) -> bool:
+    async def _download_via_pyrogram(self, chat_id: int, message_id: int, dest_path: str) -> bool:
         """Download a message using Pyrogram userbot."""
         try:
             from utils.userbot_downloader import download_forward_via_userbot

@@ -40,7 +40,9 @@ def test_get_telethon_session_string_for_user_uses_mongodb(monkeypatch):
     monkeypatch.delenv("USERBOT_SESSION", raising=False)
 
     session_str = asyncio.run(
-        telethon_session.get_telethon_session_string_for_user(user_id=42, db_model=FakeDbModel({"string_session": "abc"}))
+        telethon_session.get_telethon_session_string_for_user(
+            user_id=42, db_model=FakeDbModel({"string_session": "abc"})
+        )
     )
 
     assert session_str == "abc"

@@ -39,8 +39,8 @@ app = FastAPI(title="TG File Index API")
 # Rate limiting is handled per-endpoint (inline) to preserve different limits
 # per route. The chain handles cross-cutting concerns:
 chain = MiddlewareChain()
-chain.use(with_request_id)            # unique request ID per call
-chain.use(with_request_logging)        # log every request/response with timing
+chain.use(with_request_id)  # unique request ID per call
+chain.use(with_request_logging)  # log every request/response with timing
 # with_rate_limit and with_cache are handled per-endpoint for granularity
 
 # mount static for favicon
@@ -120,7 +120,9 @@ async def root_post(ctx: RequestContext, request: Request = None, payload: dict 
     client_ip = get_client_ip(request)
     if not web_rate_limiter.check_limit("webhook", client_ip):
         return make_rate_limit_response("webhook", client_ip)
-    logger.debug("root_post received payload keys: {}", list(payload.keys()) if isinstance(payload, dict) else type(payload))
+    logger.debug(
+        "root_post received payload keys: {}", list(payload.keys()) if isinstance(payload, dict) else type(payload)
+    )
     if payload and ("message" in payload or "edited_message" in payload):
         token = None
         for c in settings.API_CREDENTIALS:
@@ -141,12 +143,11 @@ async def root_post(ctx: RequestContext, request: Request = None, payload: dict 
     return ok(None, message="acknowledged")
 
 
-
 @app.post("/webhook/{token}")
 @chain("/webhook/{token}", methods=["POST"], framework="fastapi")
 async def telegram_webhook(ctx: RequestContext, token: str, update: dict, request: Request = None):
     """Process Telegram Bot API webhook updates for configured bot tokens.
-    
+
     Go-style: middleware + standardized envelope. Rate limiting per-endpoint.
     """
     client_ip = get_client_ip(request)
@@ -163,7 +164,7 @@ async def telegram_webhook(ctx: RequestContext, token: str, update: dict, reques
     chat_id = (message.get("chat") or {}).get("id")
     text_trunc = (text[:120] + "...") if len(text) > 120 else text
     logger.info("webhook token={} update_id={} chat={} text={}", "[REDACTED]", update_id, chat_id, text_trunc)
-    
+
     if not text:
         logger.debug("No text/caption in incoming update, ignoring")
         return ok(None, message="ignored")
@@ -238,6 +239,7 @@ async def telegram_webhook(ctx: RequestContext, token: str, update: dict, reques
 
             async def _spawn_and_log(cmd, env, cwd):
                 proc = await asyncio.create_subprocess_exec(*cmd, env=env, cwd=cwd, stdout=PIPE, stderr=PIPE)
+
                 async def _drain(stream, level="info"):
                     try:
                         while True:
@@ -250,6 +252,7 @@ async def telegram_webhook(ctx: RequestContext, token: str, update: dict, reques
                             (logger.info if level == "info" else logger.error)("[backfill] {}", text)
                     except Exception:
                         logger.exception("Error reading subprocess stream")
+
                 asyncio.create_task(_drain(proc.stdout, "info"))
                 asyncio.create_task(_drain(proc.stderr, "error"))
 
@@ -441,9 +444,15 @@ async def api_search(
 
     # Fillable projection: only whitelisted fields (like SELECT specific columns)
     FILLABLE_PROJECTION = {
-        "_id": 0, "chat_id": 1, "message_id": 1, "filename": 1,
-        "timestamp": 1, "title_tokens": 1, "quality_tokens": 1,
-        "codec_tokens": 1, "year": 1,
+        "_id": 0,
+        "chat_id": 1,
+        "message_id": 1,
+        "filename": 1,
+        "timestamp": 1,
+        "title_tokens": 1,
+        "quality_tokens": 1,
+        "codec_tokens": 1,
+        "year": 1,
     }
 
     # Parameterized query (prepared-statement pattern)
@@ -460,8 +469,8 @@ async def api_search(
         or_clauses = []
         for t in tokens:
             escaped = re.escape(t)
-            or_clauses.append({"title_tokens": {"$elemMatch": {"$regex": f'^{escaped}', "$options": "i"}}})
-            or_clauses.append({"filename": {"$regex": f'{escaped}', "$options": "i"}})
+            or_clauses.append({"title_tokens": {"$elemMatch": {"$regex": f"^{escaped}", "$options": "i"}}})
+            or_clauses.append({"filename": {"$regex": f"{escaped}", "$options": "i"}})
         try:
             docs2 = await coll.find({"$or": or_clauses}, FILLABLE_PROJECTION).to_list(length=500)
             results2 = _score_search_results(docs2, tokens, q, fallback=True)

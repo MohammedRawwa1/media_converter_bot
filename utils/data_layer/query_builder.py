@@ -47,8 +47,17 @@ class PreparedQuery:
     so no injection is possible.
     """
 
-    __slots__ = ("collection", "fillable", "guarded", "_filter", "_projection",
-                 "_sort", "_limit", "_skip", "_allow_disk_use")
+    __slots__ = (
+        "collection",
+        "fillable",
+        "guarded",
+        "_filter",
+        "_projection",
+        "_sort",
+        "_limit",
+        "_skip",
+        "_allow_disk_use",
+    )
 
     def __init__(
         self,
@@ -256,8 +265,7 @@ class QueryBuilder:
 
         try:
             result = await self.collection.insert_one(safe_data)
-            logger.info("QB INSERT: collection=%s fields=%s",
-                        self.collection.name, list(safe_data.keys()))
+            logger.info("QB INSERT: collection=%s fields=%s", self.collection.name, list(safe_data.keys()))
             return str(result.inserted_id)
         except Exception as e:
             logger.exception("QB INSERT failed: %s", e)
@@ -272,8 +280,7 @@ class QueryBuilder:
 
         try:
             result = await self.collection.insert_many(safe_list)
-            logger.info("QB INSERT_MANY: collection=%s count=%d",
-                        self.collection.name, len(safe_list))
+            logger.info("QB INSERT_MANY: collection=%s count=%d", self.collection.name, len(safe_list))
             return [str(id_) for id_ in result.inserted_ids]
         except Exception as e:
             logger.exception("QB INSERT_MANY failed: %s", e)
@@ -301,17 +308,15 @@ class QueryBuilder:
 
         try:
             if multi:
-                result = await self.collection.update_many(
-                    validated_filters, validated_updates, upsert=upsert
-                )
+                result = await self.collection.update_many(validated_filters, validated_updates, upsert=upsert)
             else:
-                result = await self.collection.update_one(
-                    validated_filters, validated_updates, upsert=upsert
-                )
-            logger.info("QB UPDATE: collection=%s matched=%d modified=%d",
-                        self.collection.name,
-                        result.matched_count,
-                        result.modified_count)
+                result = await self.collection.update_one(validated_filters, validated_updates, upsert=upsert)
+            logger.info(
+                "QB UPDATE: collection=%s matched=%d modified=%d",
+                self.collection.name,
+                result.matched_count,
+                result.modified_count,
+            )
             return result.modified_count
         except Exception as e:
             logger.exception("QB UPDATE failed: %s", e)
@@ -331,9 +336,7 @@ class QueryBuilder:
                 result = await self.collection.delete_many(validated_filters)
             else:
                 result = await self.collection.delete_one(validated_filters)
-            logger.info("QB DELETE: collection=%s deleted=%d",
-                        self.collection.name,
-                        result.deleted_count)
+            logger.info("QB DELETE: collection=%s deleted=%d", self.collection.name, result.deleted_count)
             return result.deleted_count
         except Exception as e:
             logger.exception("QB DELETE failed: %s", e)
@@ -354,9 +357,7 @@ class QueryBuilder:
         for stage in pipeline:
             for key in stage:
                 if key in dangerous_stages:
-                    raise ValidationError(
-                        f"Dangerous aggregation stage '{key}' is not allowed"
-                    )
+                    raise ValidationError(f"Dangerous aggregation stage '{key}' is not allowed")
 
         try:
             cursor = self.collection.aggregate(pipeline)
@@ -375,14 +376,27 @@ class QueryBuilder:
             if isinstance(val, dict):
                 for op_key in val:
                     if op_key.startswith("$") and op_key in dangerous_ops:
-                        raise ValidationError(
-                            f"Dangerous operator '{op_key}' in filter"
-                        )
+                        raise ValidationError(f"Dangerous operator '{op_key}' in filter")
                     if op_key.startswith("$") and op_key not in (
-                        "$eq", "$ne", "$gt", "$gte", "$lt", "$lte",
-                        "$in", "$nin", "$all", "$elemMatch", "$regex",
-                        "$options", "$exists", "$type", "$not", "$size",
-                        "$and", "$or", "$nor",
+                        "$eq",
+                        "$ne",
+                        "$gt",
+                        "$gte",
+                        "$lt",
+                        "$lte",
+                        "$in",
+                        "$nin",
+                        "$all",
+                        "$elemMatch",
+                        "$regex",
+                        "$options",
+                        "$exists",
+                        "$type",
+                        "$not",
+                        "$size",
+                        "$and",
+                        "$or",
+                        "$nor",
                     ):
                         raise ValidationError(f"Operator '{op_key}' is not allowed in filters")
                 return {k: _validate_value(v) for k, v in val.items()}
@@ -406,17 +420,28 @@ class QueryBuilder:
         if base_field.startswith("$"):
             raise ValidationError(f"Field name cannot start with '$': {field}")
         if self.fillable and base_field not in self.fillable and base_field != "_id":
-            raise ValidationError(
-                f"Field '{base_field}' is not in fillable fields: {self.fillable}"
-            )
+            raise ValidationError(f"Field '{base_field}' is not in fillable fields: {self.fillable}")
         if base_field in self.guarded:
             raise ValidationError(f"Field '{base_field}' is guarded")
 
     def _validate_updates(self, updates: dict[str, Any]) -> dict[str, Any]:
         """Validate update operators and field names."""
-        allowed_ops = {"$set", "$inc", "$push", "$pull", "$unset",
-                       "$addToSet", "$min", "$max", "$mul", "$rename",
-                       "$each", "$position", "$slice", "$sort"}
+        allowed_ops = {
+            "$set",
+            "$inc",
+            "$push",
+            "$pull",
+            "$unset",
+            "$addToSet",
+            "$min",
+            "$max",
+            "$mul",
+            "$rename",
+            "$each",
+            "$position",
+            "$slice",
+            "$sort",
+        }
 
         validated = {}
         for op, fields in updates.items():

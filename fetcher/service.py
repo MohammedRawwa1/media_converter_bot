@@ -101,7 +101,7 @@ async def process_forward_hash(forward_hash: str):
             except Exception:
                 logger.exception("fetcher: failed to upload fetched input to storage for %s", forward_hash)
     except Exception:
-        pass
+        logger.debug("Fetcher: service operation failed (non-fatal)", exc_info=True)
 
     # build job and enqueue
     try:
@@ -215,7 +215,7 @@ def main():
     app.on_startup.append(on_startup)
     app.on_cleanup.append(on_cleanup)
 
-    host = os.environ.get("FETCHER_HOST", "0.0.0.0")  # noqa: S104
+    host = os.environ.get("FETCHER_HOST", "0.0.0.0")  # nosec  # noqa: S104
     port = int(os.environ.get("PORT", os.environ.get("FETCHER_PORT", "8765")))
     web.run_app(app, host=host, port=port)
 

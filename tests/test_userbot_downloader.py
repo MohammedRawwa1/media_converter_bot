@@ -12,10 +12,11 @@ class UserbotDownloaderTests(unittest.IsolatedAsyncioTestCase):
         pyrogram_mock = AsyncMock(return_value=True)
         telethon_mock = AsyncMock(return_value=False)
 
-        with patch.object(mod, "_download_with_pyrogram", pyrogram_mock), patch.object(
-            mod, "_download_with_telethon", telethon_mock
-        ), patch("utils.userbot_downloader.PyrogramClient", object()), patch(
-            "utils.telethon_session.get_pyrogram_session_string", return_value="session-string"
+        with (
+            patch.object(mod, "_download_with_pyrogram", pyrogram_mock),
+            patch.object(mod, "_download_with_telethon", telethon_mock),
+            patch("utils.userbot_downloader.PyrogramClient", object()),
+            patch("utils.telethon_session.get_pyrogram_session_string", return_value="session-string"),
         ):
             result = await mod.download_forward_via_userbot(123, 456, os.path.join(tempfile.gettempdir(), "test_file"))
 

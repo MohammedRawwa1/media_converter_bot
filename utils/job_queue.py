@@ -7,6 +7,8 @@ import time
 import uuid
 from urllib.parse import urlparse
 
+logger = logging.getLogger(__name__)
+
 try:
     import redis.asyncio as aioredis
 except Exception:
@@ -52,10 +54,12 @@ async def get_redis():
             hostport = f"{hostport}:{parsed.port}"
         logging.getLogger(__name__).debug("Connecting to Redis at %s (scheme=%s)", hostport, parsed.scheme)
     except Exception:
-        pass
+        logging.getLogger(__name__).debug("job_queue: failed to parse REDIS_URL for diagnostic logging")
 
     # module-level storage for the real client and proxy
-    _redis_client = aioredis.from_url(redis_url, decode_responses=True, max_connections=int(os.getenv("REDIS_MAX_CONNECTIONS", "50")))
+    _redis_client = aioredis.from_url(
+        redis_url, decode_responses=True, max_connections=int(os.getenv("REDIS_MAX_CONNECTIONS", "50"))
+    )
 
     class _RedisProxy:
         def __init__(self, client):
@@ -85,7 +89,7 @@ async def close_redis():
                 else:
                     await _redis_client.close()
             except Exception:
-                pass
+                logger.debug("job_queue: failed to close Redis client during shutdown")
     finally:
         _redis_client = None
         _redis_proxy = None
@@ -97,6 +101,7 @@ async def enqueue_job(job: dict) -> None:
     # Normalize path separators for any local paths to a portable POSIX style
     try:
         import pathlib
+
         if job.get("input_path"):
             try:
                 job["input_path"] = pathlib.PurePath(job["input_path"]).as_posix()
@@ -115,13 +120,14 @@ async def enqueue_job(job: dict) -> None:
             if job.get("output_path"):
                 job["output_path"] = job["output_path"].replace("\\", "/")
         except Exception:
-            pass
+            logger.debug("job_queue: path normalization failed for job")
+
     # If no request_id provided, generate one for end-to-end tracing
     try:
         if not job.get("request_id"):
             job["request_id"] = str(uuid.uuid4())
     except Exception:
-        pass
+        logger.debug("job_queue: failed to set request_id for job")
 
     # Initialize a Redis job hash so status endpoints see the job immediately.
     # Write the job hash before pushing to the list to avoid a race where a
@@ -148,18 +154,20 @@ async def enqueue_job(job: dict) -> None:
                     with contextlib.suppress(Exception):
                         await r.expire(f"ffmpeg:job:{job_id}", JOB_METADATA_TTL)
             except Exception:
+                logger.debug("job_queue: hset failed for job %s (best-effort)", job_id)
                 # best-effort - proceed to push the job even if hset fails
-                pass
 
             try:
                 src = mapping.get("input")
                 out = mapping.get("output")
-                logging.getLogger(__name__).info("Prepared job %s request_id=%s input=%s output=%s", job_id, mapping.get("request_id"), src, out)
+                logging.getLogger(__name__).info(
+                    "Prepared job %s request_id=%s input=%s output=%s", job_id, mapping.get("request_id"), src, out
+                )
             except Exception:
-                pass
+                logger.debug("job_queue: failed to log job preparation for %s", job_id)
 
     except Exception:
-        pass
+        logger.debug("job_queue: failed to prepare job hash for %s", job_id)
 
     # Finally push the job into the queue
     try:
@@ -168,8 +176,7 @@ async def enqueue_job(job: dict) -> None:
         # If push fails, there's not much we can do here - leave the hash as-is
         with contextlib.suppress(Exception):
             logging.getLogger(__name__).exception("Failed to push job onto Redis list for job %s", job.get("job_id"))
-    except Exception:
-        pass
+        logger.debug("job_queue: lpush failed for job %s", job.get("job_id"))
     # persist to Mongo if available (best-effort)
     try:
         from .job_store import save_job
@@ -185,9 +192,9 @@ async def enqueue_job(job: dict) -> None:
                 else:
                     loop.run_until_complete(save_job(job))
             except Exception:
-                pass
+                logger.debug("job_queue: failed to persist job %s to Mongo", job.get("job_id", "?"))
     except Exception:
-        pass
+        logger.debug("job_queue: failed to import save_job")
 
     await r.close()
 
@@ -209,8 +216,8 @@ async def pop_job(timeout: int = 5) -> dict | None:
                     with contextlib.suppress(Exception):
                         await r.lpush(JOB_LIST, raw)
         except Exception:
+            logger.debug("job_queue: failed to promote delayed jobs")
             # best-effort; don't fail pop if this step errors
-            pass
         item = await r.brpop(JOB_LIST, timeout=timeout)
         if not item:
             return None
@@ -271,7 +278,7 @@ async def release_input_lock(lock_key: str, owner_job_id: str, redis_client=None
                 logging.getLogger(__name__).info("Released input lock %s for job %s", lock_key, owner_job_id)
                 return True
         except Exception:
-            pass
+            logger.debug("job_queue: Lua eval failed for lock %s", lock_key)
 
         try:
             current = await client.get(lock_key)
@@ -282,7 +289,7 @@ async def release_input_lock(lock_key: str, owner_job_id: str, redis_client=None
                 logging.getLogger(__name__).info("Released input lock %s for job %s", lock_key, owner_job_id)
                 return True
         except Exception:
-            pass
+            logger.debug("job_queue: get/delete fallback failed for lock %s", lock_key)
 
         return False
     finally:

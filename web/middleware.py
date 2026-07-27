@@ -106,8 +106,7 @@ class MiddlewareChain:
             self._middleware_stack: list[Callable] = []
         self._middleware_stack.append(middleware_fn)
 
-    def __call__(self, route: str, methods: list[str] | None = None,
-                 framework: str = "flask", **kwargs):
+    def __call__(self, route: str, methods: list[str] | None = None, framework: str = "flask", **kwargs):
         """Decorator that registers a route with the middleware chain.
 
         Args:
@@ -119,11 +118,17 @@ class MiddlewareChain:
         methods = methods or ["GET"]
 
         def decorator(handler: Callable):
-            self._middleware.append((route, handler, {
-                "methods": methods,
-                "framework": framework,
-                **kwargs,
-            }))
+            self._middleware.append(
+                (
+                    route,
+                    handler,
+                    {
+                        "methods": methods,
+                        "framework": framework,
+                        **kwargs,
+                    },
+                )
+            )
 
             @wraps(handler)
             def wrapper(*args, **kwargs):
@@ -195,6 +200,7 @@ class MiddlewareChain:
 
         elif isinstance(app, FastAPI):
             from fastapi import APIRouter
+
             router = APIRouter()
 
             for route, handler, opts in self._middleware:
@@ -267,6 +273,7 @@ def _log_request(ctx: RequestContext, response: Any):
 def _is_async(func: Callable) -> bool:
     """Check if a function is async."""
     import asyncio
+
     return asyncio.iscoroutinefunction(func)
 
 
@@ -305,6 +312,7 @@ def with_rate_limit(endpoint: str, calls_per_second: int = 10, burst: int = 20):
             logger.warning("Rate limited: %s %s", endpoint, client_ip)
             body, status, headers = make_rate_limit_response(endpoint, client_ip)
             from utils.response import error
+
             return error(code="rate_limited", message=body.get("detail", "Too many requests"), status=429)
         return await kwargs["next_handler"]()
 

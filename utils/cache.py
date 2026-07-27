@@ -31,10 +31,10 @@ except Exception:
 logger = logging.getLogger(__name__)
 
 # Default TTLs (seconds)
-DEFAULT_TTL = 3600          # 1 hour
-SHORT_TTL = 300             # 5 minutes
-MEDIUM_TTL = 1800           # 30 minutes
-LONG_TTL = 86400            # 24 hours
+DEFAULT_TTL = 3600  # 1 hour
+SHORT_TTL = 300  # 5 minutes
+MEDIUM_TTL = 1800  # 30 minutes
+LONG_TTL = 86400  # 24 hours
 
 # Key prefixes
 PREFIX_JOB = "cache:job:"

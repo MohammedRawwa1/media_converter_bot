@@ -1,0 +1,93 @@
+# Lint & Compile CI
+# Runs on every push (all branches) and pull request.
+# Performs: ruff linting, ruff format check, Python syntax/py_compile checks.
+# Lightweight — only needs stdlib for py_compile, no runtime deps.
+
+name: Lint & Compile
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+env:
+  PYTHON_VERSION: "3.12"
+
+jobs:
+  lint:
+    name: "Ruff lint + py_compile"
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Run Ruff linter
+        uses: astral-sh/ruff-action@v3
+        with:
+          args: check . --config ruff.toml --output-format github
+
+      - name: Check Ruff formatting
+        uses: astral-sh/ruff-action@v3
+        with:
+          args: format . --config ruff.toml --check --output-format github
+
+      - name: Run py_compile syntax check
+        id: pycompile
+        run: |
+          python << 'PYEOF'
+import os
+import py_compile
+import sys
+
+EXCLUDED_DIRS = {
+    ".git",
+    ".venv",
+    "env",
+    "__pycache__",
+    ".eggs",
+    "node_modules",
+    ".mypy_cache",
+    ".pytest_cache",
+}
+
+issues = []
+root = os.path.abspath(".")
+for dirpath, dirnames, filenames in os.walk(root):
+    # Prune excluded directories in-place so os.walk skips them
+    dirnames[:] = [d for d in dirnames if d not in EXCLUDED_DIRS]
+
+    for fname in filenames:
+        if not fname.endswith(".py"):
+            continue
+        fpath = os.path.join(dirpath, fname)
+        try:
+            py_compile.compile(fpath, doraise=True)
+        except py_compile.PyCompileError as e:
+            # Print in GitHub Actions annotation format
+            rel = os.path.relpath(fpath, root)
+            print(f"::error file={rel}::SyntaxError: {e}")
+            issues.append(rel)
+
+if issues:
+    print(f"::error::py_compile: {len(issues)} file(s) have syntax errors:")
+    for f in issues:
+        print(f"  - {f}")
+    sys.exit(1)
+else:
+    print("✅ py_compile: all files syntactically valid")
+PYEOF
+
+      - name: Summary
+        if: always()
+        run: |
+          echo "========== LINT & COMPILE SUMMARY =========="
+          echo "  Ruff lint:       checked"
+          echo "  Ruff format:    checked"
+          echo "  py_compile:     ${{ steps.pycompile.outcome == 'success' && '✅ passed' || '❌ syntax errors' }}"
+          echo "============================================"

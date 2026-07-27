@@ -17,7 +17,7 @@ COPY . /app
 RUN pip install --upgrade pip setuptools wheel && pip install -r requirements.txt
 
 # Environment defaults
-ENV FFMPEG_PATH=/usr/bin/ffmpeg FFPROBE_PATH=/usr/bin/ffprobe PORT=10000
+ENV FFMPEG_PATH=/usr/bin/ffmpeg FFPROBE_PATH=/usr/bin/ffprobe PORT=10000 HEALTHCHECK_PORT=9000
 
 RUN useradd -m botuser && chown -R botuser /app
 

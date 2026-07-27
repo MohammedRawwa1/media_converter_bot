@@ -121,7 +121,7 @@ class BotErrorHandler:
         # Keep in memory log (with size limit)
         self.error_log.append(error_entry)
         if len(self.error_log) > self.max_log_size:
-            self.error_log = self.error_log[-self.max_log_size:]
+            self.error_log = self.error_log[-self.max_log_size :]
 
         return error_entry
 
@@ -253,7 +253,10 @@ def async_error_handler(context: str, send_user_message_callback: Callable | Non
 
 # Logging configuration helper
 def setup_comprehensive_logging(
-    log_file: str = "logs/bot.log", level: int = logging.INFO, max_bytes: int = 10485760, backup_count: int = 5  # 10MB
+    log_file: str = "logs/bot.log",
+    level: int = logging.INFO,
+    max_bytes: int = 10485760,
+    backup_count: int = 5,  # 10MB
 ) -> None:
     """
     Setup comprehensive logging with rotation.
@@ -341,7 +344,10 @@ def setup_comprehensive_logging(
                     stream_handler.setLevel(level)
                     stream_handler.setFormatter(formatter)
                     # Avoid adding duplicate stdout handlers
-                    has_stdout = any(isinstance(h, logging.StreamHandler) and getattr(h, "stream", None) is _sys.stdout for h in root_logger.handlers)
+                    has_stdout = any(
+                        isinstance(h, logging.StreamHandler) and getattr(h, "stream", None) is _sys.stdout
+                        for h in root_logger.handlers
+                    )
                     if not has_stdout:
                         root_logger.addHandler(stream_handler)
                     logger.info("✅ Stdout logging enabled (LOG_TO_STDOUT=1)")
@@ -349,6 +355,6 @@ def setup_comprehensive_logging(
                     logger.exception("Failed to attach stdout logging handler")
         except Exception:
             # Fallback: do nothing if env inspection fails
-            pass
+            logger.debug("error_handler: suppressed exception")
 
         logger.info("✅ Comprehensive logging initialized")

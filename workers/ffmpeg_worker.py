@@ -91,7 +91,7 @@ async def _update_upload_progress(job_id: str, progress_channel: str, pct: int, 
             with contextlib.suppress(Exception):
                 await r.close()
     except Exception:
-        pass
+        logger.debug("ffmpeg worker: operation failed")
 
 
 def _make_upload_progress_callback(job_id: str, progress_channel: str):
@@ -125,9 +125,9 @@ def _make_upload_progress_callback(job_id: str, progress_channel: str):
                         loop,
                     )
                 except Exception:
-                    pass
+                    logger.debug("ffmpeg worker: operation failed")
         except Exception:
-            pass
+            logger.debug("ffmpeg worker: in _progress()")
 
     return _progress
 
@@ -191,7 +191,7 @@ async def _forward_pubsub_listener(stop_event: asyncio.Event | None, event: asyn
             else:
                 await client.close()
         except Exception:
-            pass
+            logger.debug("ffmpeg worker: operation failed")
         return
 
     try:
@@ -232,7 +232,7 @@ async def _forward_pubsub_listener(stop_event: asyncio.Event | None, event: asyn
             else:
                 await client.close()
         except Exception:
-            pass
+            logger.debug("ffmpeg worker: operation failed")
 
 
 async def handle_job(job: dict):
@@ -253,7 +253,7 @@ async def handle_job(job: dict):
             output_path = os.path.normpath(output_path)
             job["output_path"] = output_path
     except Exception:
-        pass
+        logger.debug("ffmpeg worker: Normalize path separators in incoming job payloads (handle Win...")
 
     # Enrich job payload from Redis-stored job hash when fields are missing.
     # Some producers write extra metadata into the job hash (hset) but push
@@ -289,7 +289,7 @@ async def handle_job(job: dict):
                     if not job.get("output_path") and _sval("output"):
                         job["output_path"] = _sval("output")
             except Exception:
-                pass
+                logger.debug("ffmpeg worker: operation failed")
             try:
                 aclose = getattr(r, "aclose", None)
                 if aclose is not None:
@@ -297,9 +297,9 @@ async def handle_job(job: dict):
                 else:
                     await r.close()
             except Exception:
-                pass
+                logger.debug("ffmpeg worker: in _sval()")
     except Exception:
-        pass
+        logger.debug('ffmpeg worker: before we decide there is "no input".')
 
     # If job references a remote storage key (S3/MinIO), prefer to download it
     # when the local `input_path` is missing or the file is not present on disk.
@@ -358,7 +358,7 @@ async def handle_job(job: dict):
                         except Exception:
                             await r2.lpush(JOB_LIST, json.dumps(job))
                 except Exception:
-                    pass
+                    logger.debug("ffmpeg worker: operation failed")
 
                 with contextlib.suppress(Exception):
                     await publish_update(
@@ -380,7 +380,7 @@ async def handle_job(job: dict):
                         else:
                             await r2.close()
                     except Exception:
-                        pass
+                        logger.debug("ffmpeg worker: operation failed")
                 return
             else:
                 with contextlib.suppress(Exception):
@@ -403,7 +403,7 @@ async def handle_job(job: dict):
                         else:
                             await r2.close()
                     except Exception:
-                        pass
+                        logger.debug("ffmpeg worker: operation failed")
                 return
 
         # retry/backoff for transient storage/download issues
@@ -442,7 +442,7 @@ async def handle_job(job: dict):
                             mapping={"input": str(job.get("input_path") or ""), "input_from_remote": "1"},
                         )
             except Exception:
-                pass
+                logger.debug("ffmpeg worker: persist indicator into Redis job hash for observability")
             finally:
                 if r2 is not None:
                     try:
@@ -452,7 +452,7 @@ async def handle_job(job: dict):
                         else:
                             await r2.close()
                     except Exception:
-                        pass
+                        logger.debug("ffmpeg worker: operation failed")
         else:
             logger.exception("Failed to download input from storage for job %s: %s", job_id, last_exc)
             with contextlib.suppress(Exception):
@@ -535,7 +535,7 @@ async def handle_job(job: dict):
                     with contextlib.suppress(Exception):
                         await redis_lock_client.expire(lock_key, lock_ttl)
         except Exception:
-            pass
+            logger.debug("ffmpeg worker: acquired rather than entering an infinite requeue loop.")
 
     if not lock_acquired:
         logger.info("Input already locked for job %s, requeueing", job_id)
@@ -562,9 +562,9 @@ async def handle_job(job: dict):
                 else:
                     await redis_lock_client.close()
             except Exception:
-                pass
+                logger.debug("ffmpeg worker: operation failed")
         except Exception:
-            pass
+            logger.debug("ffmpeg worker: operation failed")
         return
 
     # mark processing start
@@ -582,9 +582,9 @@ async def handle_job(job: dict):
                     ttl=3600,
                 )
         except Exception:
-            pass
+            logger.debug("ffmpeg worker: Cache job start for fast status queries")
     except Exception:
-        pass
+        logger.debug("ffmpeg worker: mark processing start")
     with contextlib.suppress(Exception):
         await publish_update(progress_channel, {"job_id": job_id, "progress": 0, "message": "started"})
 
@@ -636,7 +636,7 @@ async def handle_job(job: dict):
                 with contextlib.suppress(Exception):
                     await publish_update(channel, {"job_id": job_id, "memory_rss": rss})
             except Exception:
-                pass
+                logger.debug("ffmpeg worker: operation failed")
             await asyncio.sleep(interval)
 
     try:
@@ -674,7 +674,7 @@ async def handle_job(job: dict):
                                     return
                         except Exception:
                             # on limiter failures, allow processing to continue
-                            pass
+                            logger.debug("ffmpeg worker: on limiter failures, allow processing to continue")
                         # Ensure there is some form of input before starting ffmpeg: a local path (that exists),
                         # a remote storage key, or a source URL. Prefer remote key download when present.
                         has_local_file = bool(input_path and os.path.exists(input_path))
@@ -732,7 +732,9 @@ async def handle_job(job: dict):
                                                     break
                                         except Exception:
                                             # swallow per-iteration errors and continue waiting
-                                            pass
+                                            logger.debug(
+                                                "ffmpeg worker: swallow per-iteration errors and continue waiting"
+                                            )
                                         # Wait up to 1s, but wake early if a forward notification arrives
                                         try:
                                             if FORWARD_NOTIFY_EVENT is not None:
@@ -756,7 +758,7 @@ async def handle_job(job: dict):
                                         else:
                                             await rr.close()
                                     except Exception:
-                                        pass
+                                        logger.debug("ffmpeg worker: operation failed")
 
                             # final check after waiting
                             if not has_local_file and not job.get("input_key") and not job.get("source_url"):
@@ -982,9 +984,9 @@ async def handle_job(job: dict):
                                     ttl=3600,
                                 )
                         except Exception:
-                            pass
+                            logger.debug("ffmpeg worker: Cache job result for fast status queries")
                     except Exception:
-                        pass
+                        logger.debug("ffmpeg worker: operation failed")
 
                     # Attempt to upload processed output to configured storage backend
                     upload_success = False
@@ -1028,11 +1030,13 @@ async def handle_job(job: dict):
                                     upload_success = True
                                     await r.close()
                                 except Exception:
-                                    pass
+                                    logger.debug(
+                                        "ffmpeg worker: Update Redis job hash with output metadata for the web UI"
+                                    )
                             except Exception:
                                 logger.exception("Failed to upload output for job %s", job_id)
                     except Exception:
-                        pass
+                        logger.debug("ffmpeg worker: operation failed")
 
                     try:
                         # Only remove the input when:
@@ -1148,7 +1152,7 @@ async def handle_job(job: dict):
                                                     if probe_info:
                                                         logger.debug("Worker: ffprobe cache HIT for %s", out)
                                             except Exception:
-                                                pass
+                                                logger.debug("ffmpeg worker: Try cache first for ffprobe results")
 
                                             if probe_info is None:  # cache miss
 
@@ -1184,7 +1188,7 @@ async def handle_job(job: dict):
                                                             )
                                                             logger.debug("Worker: cached ffprobe result for %s", out)
                                                     except Exception:
-                                                        pass
+                                                        logger.debug("ffmpeg worker: Cache ffprobe result")
                                                     streams = probe_info.get("streams", [])
                                                     if any(s.get("codec_type") == "video" for s in streams):
                                                         kind = "video"
@@ -1315,7 +1319,9 @@ async def handle_job(job: dict):
                                                             else:
                                                                 await r.close()
                                                         except Exception:
-                                                            pass
+                                                            logger.debug(
+                                                                "ffmpeg worker: Fallback: check Redis-stored job hash for thumbnail"
+                                                            )
 
                                                 except Exception:
                                                     thumb_path = None
@@ -1350,7 +1356,7 @@ async def handle_job(job: dict):
                                                         if _temp_thumb and os.path.exists(_temp_thumb):
                                                             os.remove(_temp_thumb)
                                                     except Exception:
-                                                        pass
+                                                        logger.debug("ffmpeg worker: operation failed")
                                             elif kind == "video":
                                                 # Try to attach thumbnail (thumb) when available
                                                 thumb_path = None
@@ -1425,7 +1431,7 @@ async def handle_job(job: dict):
                                                             else:
                                                                 await r.close()
                                                         except Exception:
-                                                            pass
+                                                            logger.debug("ffmpeg worker: operation failed")
 
                                                     # Auto-generate thumbnail from video if none provided
                                                     if not thumb_path:
@@ -1462,7 +1468,9 @@ async def handle_job(job: dict):
                                                             else:
                                                                 shutil.rmtree(_auto_thumb_dir, ignore_errors=True)
                                                         except Exception:
-                                                            pass
+                                                            logger.debug(
+                                                                "ffmpeg worker: Auto-generate thumbnail from video if none provided"
+                                                            )
                                                 except Exception:
                                                     thumb_path = None
 
@@ -1505,7 +1513,7 @@ async def handle_job(job: dict):
                                                             except Exception:
                                                                 os.remove(_temp_thumb)
                                                     except Exception:
-                                                        pass
+                                                        logger.debug("ffmpeg worker: operation failed")
                                             else:
                                                 # non-video non-zip fallback
                                                 thumb_path = None
@@ -1571,7 +1579,7 @@ async def handle_job(job: dict):
                                                         if _temp_thumb and os.path.exists(_temp_thumb):
                                                             os.remove(_temp_thumb)
                                                     except Exception:
-                                                        pass
+                                                        logger.debug("ffmpeg worker: operation failed")
                                         sent = True
                                     except Exception as e:
                                         logger.warning("Bot API send failed for job %s: %s", job_id, e)
@@ -1629,7 +1637,7 @@ async def handle_job(job: dict):
                                 with contextlib.suppress(Exception):
                                     await _r.close()
                         except Exception:
-                            pass
+                            logger.debug("ffmpeg worker: operation failed")
 
                     except Exception:
                         logger.exception("Failed to send result via Telegram")
@@ -1638,13 +1646,13 @@ async def handle_job(job: dict):
                         if job.get("cleanup_output", False) and out and os.path.exists(out):
                             os.remove(out)
                     except Exception:
-                        pass
+                        logger.debug("ffmpeg worker: in _probe()")
 
                     try:
                         if temp_input and os.path.exists(temp_input):
                             os.remove(temp_input)
                     except Exception:
-                        pass
+                        logger.debug("ffmpeg worker: in _probe()")
 
                         # cancel memory sampler if running
                         try:
@@ -1653,7 +1661,7 @@ async def handle_job(job: dict):
                                 with contextlib.suppress(Exception):
                                     await memory_sampler_task
                         except Exception:
-                            pass
+                            logger.debug("ffmpeg worker: cancel memory sampler if running")
 
                     return
 
@@ -1744,7 +1752,7 @@ async def handle_job(job: dict):
                                                 mapping={"remux_attempts": str(remux_attempts + 1)},
                                             )
                                     except Exception:
-                                        pass
+                                        logger.debug("ffmpeg worker: Persist attempt count")
 
                                     if ok:
                                         with contextlib.suppress(Exception):
@@ -1768,7 +1776,7 @@ async def handle_job(job: dict):
                                             if r:
                                                 await r.close()
                                         except Exception:
-                                            pass
+                                            logger.debug("ffmpeg worker: close redis client if opened")
                                         continue
                                     else:
                                         with contextlib.suppress(Exception):
@@ -1788,7 +1796,7 @@ async def handle_job(job: dict):
                                 if r:
                                     await r.close()
                             except Exception:
-                                pass
+                                logger.debug("ffmpeg worker: operation failed")
 
                         # 2) Truncated/corrupt input -> try re-download (existing logic)
                         if any(k in lower_err for k in corruption_indicators) and input_path:
@@ -1819,7 +1827,9 @@ async def handle_job(job: dict):
                                         with contextlib.suppress(Exception):
                                             os.remove(input_path)
                                 except Exception:
-                                    pass
+                                    logger.debug(
+                                        "ffmpeg worker: Remove possibly-corrupt file and attempt to re-fetch using ava..."
+                                    )
 
                                 ok = False
                                 tried = False
@@ -1846,9 +1856,9 @@ async def handle_job(job: dict):
                                                 except Exception:
                                                     ok = False
                                         except Exception:
-                                            pass
+                                            logger.debug("ffmpeg worker: operation failed")
                                 except Exception:
-                                    pass
+                                    logger.debug("ffmpeg worker: Try forward_hash if present")
 
                                 # Try direct chat/message metadata if available
                                 if not tried and job.get("chat_id") and (job.get("message_id") or job.get("msg_id")):
@@ -1888,12 +1898,12 @@ async def handle_job(job: dict):
                                             mapping={"redownload_attempts": str(redownload_attempts + 1)},
                                         )
                                 except Exception:
-                                    pass
+                                    logger.debug("ffmpeg worker: Persist redownload attempts")
                                 try:
                                     if r:
                                         await r.close()
                                 except Exception:
-                                    pass
+                                    logger.debug("ffmpeg worker: operation failed")
 
                                 if ok:
                                     with contextlib.suppress(Exception):
@@ -1943,9 +1953,9 @@ async def handle_job(job: dict):
                                     ttl=1800,
                                 )
                         except Exception:
-                            pass
+                            logger.debug("ffmpeg worker: operation failed")
                     except Exception:
-                        pass
+                        logger.debug("ffmpeg worker: operation failed")
 
                     if attempt <= retries:
                         backoff = min(30, 2**attempt)
@@ -1986,7 +1996,7 @@ async def handle_job(job: dict):
                 if redis_lock_client:
                     await redis_lock_client.close()
             except Exception:
-                pass
+                logger.debug("ffmpeg worker: operation failed")
 
 
 async def _start_healthcheck_server():
@@ -1994,7 +2004,7 @@ async def _start_healthcheck_server():
     try:
         from aiohttp import web
 
-        port = int(os.environ.get("PORT", "8000"))
+        port = int(os.environ.get("HEALTHCHECK_PORT", os.environ.get("PORT", "8000")))
 
         async def _handle_health(request):
             return web.json_response({"service": "ffmpeg_worker", "healthy": True, "ok": True})
@@ -2003,9 +2013,10 @@ async def _start_healthcheck_server():
         app.router.add_get("/health", _handle_health)
         runner = web.AppRunner(app)
         await runner.setup()
-        site = web.TCPSite(runner, "0.0.0.0", port)  # noqa: S104
+        host = os.environ.get("HEALTHCHECK_HOST", "0.0.0.0")  # nosec  # noqa: S104
+        site = web.TCPSite(runner, host, port)
         await site.start()
-        logger.info("Healthcheck server started on 0.0.0.0:%s/health", port)
+        logger.info("Healthcheck server started on %s:%s/health", host, port)
         return runner
     except Exception:
         logger.exception("Failed to start healthcheck server")
@@ -2079,7 +2090,7 @@ async def worker_loop(stop_event: asyncio.Event | None = None):
                 with contextlib.suppress(Exception):
                     await forward_task
         except Exception:
-            pass
+            logger.debug("ffmpeg worker: ensure forward listener is cancelled")
 
 
 def create_worker_task(stop_event: asyncio.Event | None = None) -> asyncio.Task:
@@ -2109,9 +2120,9 @@ def create_worker_task(stop_event: asyncio.Event | None = None) -> asyncio.Task:
                 if loop.is_running():
                     asyncio.create_task(job_store.init(mongo_uri))
             except Exception:
-                pass
+                logger.debug("ffmpeg worker: operation failed")
     except Exception:
-        pass
+        logger.debug("ffmpeg worker: Initialize job store if MONGO_URI is configured")
 
     # Initialize cache if helper available
     global _cache
@@ -2121,7 +2132,7 @@ def create_worker_task(stop_event: asyncio.Event | None = None) -> asyncio.Task:
             if loop.is_running():
                 asyncio.create_task(_init_cache())
     except Exception:
-        pass
+        logger.debug("ffmpeg worker: Initialize cache if helper available")
 
     # Wrap worker_loop to log top-level exceptions
     async def _wrapped():
@@ -2182,14 +2193,14 @@ def main():
             if _cache is not None:
                 loop.run_until_complete(_cache.close())
         except Exception:
-            pass
+            logger.debug("ffmpeg worker: Close job store (Mongo) if used")
         try:
             # Close shared Redis client used across utils
             loop.run_until_complete(close_redis())
         except Exception:
-            pass
+            logger.debug("ffmpeg worker: operation failed")
         except Exception:
-            pass
+            logger.debug("ffmpeg worker: in _signal_handler()")
         loop.close()
 
 

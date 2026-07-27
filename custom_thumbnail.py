@@ -19,11 +19,12 @@ async def add_thumb(update: Update, context: CallbackContext):
         with contextlib.suppress(Exception):
             os.makedirs(thumb_dir, exist_ok=True)
         thumb_path = os.path.join(thumb_dir, f"{user_id}.jpg")
-        async with aiofiles.open(thumb_path, 'wb') as f:
+        async with aiofiles.open(thumb_path, "wb") as f:
             await f.write(file_bytes)
         await update.message.reply_text("Thumbnail added successfully!")
     else:
         await update.message.reply_text("Please reply to a photo with this command.")
+
 
 async def del_thumb(update: Update, context: CallbackContext):
     user_id = update.effective_user.id
@@ -35,6 +36,7 @@ async def del_thumb(update: Update, context: CallbackContext):
         await update.message.reply_text("Thumbnail deleted successfully!")
     else:
         await update.message.reply_text("You don't have a custom thumbnail set.")
+
 
 async def setup_thumbnail_handlers(application):
     application.add_handler(CommandHandler("addthumb", add_thumb))

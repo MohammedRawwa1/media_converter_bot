@@ -8,7 +8,7 @@ import tempfile
 import config
 
 # Use configured FFMPEG_PATH, fallback to FFMPEG_PATH
-FFMPEG_PATH = getattr(config, 'FFMPEG_PATH', 'ffmpeg') or 'ffmpeg' 
+FFMPEG_PATH = getattr(config, "FFMPEG_PATH", "ffmpeg") or "ffmpeg"
 
 logger = logging.getLogger(__name__)
 
@@ -22,9 +22,13 @@ except ImportError:
     # Fallback if module not available
     async def run_subprocess_with_timeout(cmd, timeout_seconds=18000, operation_name="Operation"):
         if create_checked_subprocess_exec is not None:
-            process = await create_checked_subprocess_exec(*cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+            process = await create_checked_subprocess_exec(
+                *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+            )
         else:
-            process = await asyncio.create_subprocess_exec(*cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+            process = await asyncio.create_subprocess_exec(
+                *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+            )
         try:
             stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=timeout_seconds)
             return stdout, stderr, process.returncode
@@ -546,7 +550,7 @@ async def create_thumbnail_grid(input_path: str, output_path: str, rows: int = 3
             "-i",
             input_path,
             "-vf",
-            f"select=not(mod(n\\,{(rows*cols)+1})),scale=160:-1,tile={cols}x{rows}",
+            f"select=not(mod(n\\,{(rows * cols) + 1})),scale=160:-1,tile={cols}x{rows}",
             "-frames:v",
             "1",
             output_path,
@@ -572,7 +576,7 @@ async def generate_sample(input_path: str, output_path: str, duration: int = 30)
     """Generate sample/preview asynchronously."""
     try:
         # For mp4 outputs, re-encode to H.264/AAC and add movflags for streaming
-        if output_path.lower().endswith('.mp4'):
+        if output_path.lower().endswith(".mp4"):
             cmd = [
                 "ffmpeg",
                 "-y",

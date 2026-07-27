@@ -30,12 +30,15 @@ def _get_env_value(*names: str) -> str | None:
 
 
 def get_telethon_session_name() -> str:
-    return _get_env_value(
-        "API_SESSION_NAME",
-        "SESSION_NAME",
-        "USERBOT_SESSION_NAME",
-        "TELETHON_SESSION_NAME",
-    ) or "userbot_session"
+    return (
+        _get_env_value(
+            "API_SESSION_NAME",
+            "SESSION_NAME",
+            "USERBOT_SESSION_NAME",
+            "TELETHON_SESSION_NAME",
+        )
+        or "userbot_session"
+    )
 
 
 def get_telethon_session_dir() -> str:
@@ -197,7 +200,8 @@ def save_session_string_to_file(session_str: str, client_type: str = "telethon")
             except Exception as exc:
                 logger.debug(
                     "session: failed to read existing data from %s before write: %s",
-                    path, exc,
+                    path,
+                    exc,
                 )
         key = _KEY_TELETHON if client_type == "telethon" else _KEY_PYROGRAM
         existing[key] = session_str
@@ -207,7 +211,9 @@ def save_session_string_to_file(session_str: str, client_type: str = "telethon")
             json.dump(existing, f)
         logger.info(
             "session: persisted %s session string to %s (%d chars)",
-            client_type, path, len(session_str),
+            client_type,
+            path,
+            len(session_str),
         )
         # Invalidate in-memory cache so subsequent reads see the new data
         _invalidate_session_cache()
@@ -215,7 +221,9 @@ def save_session_string_to_file(session_str: str, client_type: str = "telethon")
     except Exception as exc:
         logger.debug(
             "session: failed to persist %s session string to %s: %s",
-            client_type, path, exc,
+            client_type,
+            path,
+            exc,
         )
         return False
 
@@ -255,7 +263,9 @@ def _load_session_string_from_file(client_type: str = "telethon") -> str | None:
     if session_str:
         logger.info(
             "session: loaded %s session string from %s (%d chars)",
-            client_type, _get_persisted_session_path(), len(session_str),
+            client_type,
+            _get_persisted_session_path(),
+            len(session_str),
         )
         return session_str
     return None
@@ -276,7 +286,9 @@ async def _load_session_string_from_file_async(client_type: str = "telethon") ->
     if session_str:
         logger.info(
             "session: loaded %s session string from %s (%d chars)",
-            client_type, _get_persisted_session_path(), len(session_str),
+            client_type,
+            _get_persisted_session_path(),
+            len(session_str),
         )
         return session_str
     return None
@@ -310,7 +322,9 @@ def _get_configured_session_string() -> str | None:
     return None
 
 
-async def get_telethon_session_string_for_user(user_id: int | None = None, db_model: object | None = None) -> str | None:
+async def get_telethon_session_string_for_user(
+    user_id: int | None = None, db_model: object | None = None
+) -> str | None:
     """Return a usable Telethon session string for the given user, if available.
 
     Checks env vars first, then a MongoDB-persisted session when db_model is supplied.
@@ -459,8 +473,7 @@ def build_telethon_client(api_id: int, api_hash: str, session_str: str | None = 
             )
         except Exception:
             logger.exception(
-                "session: StringSession failed to load; falling back to file-based "
-                "session at %s.session",
+                "session: StringSession failed to load; falling back to file-based session at %s.session",
                 get_telethon_session_path(),
             )
             # Fall through to file-based session below
@@ -568,7 +581,8 @@ def build_pyrogram_client(api_id: int, api_hash: str, session_str: str | None = 
         client.MAX_RETRIES = max_retries
         logger.info(
             "userbot: Pyrogram client configured with sleep_threshold=%s max_retries=%s",
-            sleep_threshold, max_retries,
+            sleep_threshold,
+            max_retries,
         )
         return client
     except Exception:
@@ -594,8 +608,13 @@ def has_usable_telethon_session() -> bool:
 
     # 1. Check env vars
     session_str = _get_env_value(
-        "API_SESSION", "SESSION", "api_session", "USERBOT_SESSION",
-        "userbot_session", "TELETHON_SESSION", "telethon_session",
+        "API_SESSION",
+        "SESSION",
+        "api_session",
+        "USERBOT_SESSION",
+        "userbot_session",
+        "TELETHON_SESSION",
+        "telethon_session",
     )
     if session_str:
         return True
@@ -628,7 +647,9 @@ def get_userbot_credentials():
     Raises RuntimeError if either is missing or api_id is not an integer.
     """
     api_id = os.getenv("API_ID") or os.getenv("api_id") or os.getenv("USERBOT_API_ID") or os.getenv("userbot_api_id")
-    api_hash = os.getenv("API_HASH") or os.getenv("api_hash") or os.getenv("USERBOT_API_HASH") or os.getenv("userbot_api_hash")
+    api_hash = (
+        os.getenv("API_HASH") or os.getenv("api_hash") or os.getenv("USERBOT_API_HASH") or os.getenv("userbot_api_hash")
+    )
     if not api_id or not api_hash:
         raise RuntimeError("API_ID and API_HASH must be set to use userbot fallback")
     try:

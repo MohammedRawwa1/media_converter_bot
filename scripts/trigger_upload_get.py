@@ -32,7 +32,7 @@ default_upload_url = os.environ.get("WEB_UPLOAD_URL") or "https://your-deploymen
 url = default_upload_url
 qs = parse.urlencode({"forward_hash": forward_hash})
 full = f"{url}?{qs}"
-req = request.Request(full, headers={"X-Upload-Token": secret}, method="GET")  # noqa: S310 - URL is hardcoded and validated below
+req = request.Request(full, headers={"X-Upload-Token": secret}, method="GET")  # noqa: S310
 
 try:
     # Validate URL scheme to prevent SSRF via file:// or internal IPs
@@ -40,7 +40,7 @@ try:
     if parsed_url.scheme not in ("http", "https"):
         print(f"Blocked urlopen with scheme={parsed_url.scheme}")
         raise ValueError(f"Unsupported URL scheme: {parsed_url.scheme}")
-    with request.urlopen(req, timeout=60) as resp:  # nosec # noqa: S310 - URL validated above
+    with request.urlopen(req, timeout=60) as resp:  # nosec  # noqa: S310
         body = resp.read().decode("utf-8", errors="replace")
         print("HTTP", resp.status)
         print(body)

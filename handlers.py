@@ -46,8 +46,10 @@ except Exception:
 # Import ACL helper
 try:
     from config import MAX_FILE_SIZE, is_user_allowed
+
     try:
         from utils.bigfile_pipeline import BigFilePipeline
+
         _bigfile_pipeline = BigFilePipeline()
     except Exception:
         _bigfile_pipeline = None
@@ -61,6 +63,7 @@ except Exception:
 # Optional user settings helper
 try:
     from utils import user_settings
+
     try:
         from utils.cache import get_cache
     except Exception:
@@ -89,7 +92,7 @@ def _extract_large_file_source(current_file: dict | None) -> tuple[int | None, i
         if forward_chat and forward_msg:
             return forward_chat, forward_msg
     except Exception:
-        pass
+        logger.debug("handlers: in _extract_large_file_source()")
 
     chat_id = current_file.get("chat_id") or current_file.get("forward_chat_id")
     message_id = current_file.get("msg_id") or current_file.get("message_id") or current_file.get("forward_message_id")
@@ -125,6 +128,7 @@ def _format_seconds_to_hhmmss(sec: float) -> str:
     else:
         return f"{h:02d}:{m:02d}:{int(s):02d}"
 
+
 # Optional ffmpeg-python binding (best-effort)
 try:
     import ffmpeg
@@ -144,9 +148,7 @@ except Exception:
     MediaConversionModel = None
 
 # Conversation states
-SELECT_TIME, SELECT_RESOLUTION, SELECT_BITRATE, MERGE_FILES, CUSTOM_INPUT = (
-    range(5)
-)
+SELECT_TIME, SELECT_RESOLUTION, SELECT_BITRATE, MERGE_FILES, CUSTOM_INPUT = range(5)
 
 
 class EnhancedMediaHandler:
@@ -160,9 +162,7 @@ class EnhancedMediaHandler:
         self._session_timeout_seconds = 3600  # 1 hour inactivity timeout
 
         # Concurrency limiter for conversions
-        self.conversion_semaphore = asyncio.Semaphore(
-            max_concurrent_conversions
-        )
+        self.conversion_semaphore = asyncio.Semaphore(max_concurrent_conversions)
         self._max_conversions = max_concurrent_conversions
         self.active_conversions: dict[int, str] = {}  # user_id -> task_name
         # Telemetry for malformed callbacks
@@ -187,7 +187,7 @@ class EnhancedMediaHandler:
                 if loop and loop.is_running():
                     asyncio.ensure_future(self._init_cache())
         except Exception:
-            pass
+            logger.debug("handlers: Redis cache for media analysis, user preferences, and file metadata")
 
     async def _cleanup_session(self, user_id: int):
         """Cleanup user session asynchronously."""
@@ -297,7 +297,10 @@ class EnhancedMediaHandler:
                         await asyncio.sleep(poll_interval)
                         continue
                     # decode
-                    info = {k.decode() if isinstance(k, bytes) else k: v.decode() if isinstance(v, bytes) else v for k, v in data.items()}
+                    info = {
+                        k.decode() if isinstance(k, bytes) else k: v.decode() if isinstance(v, bytes) else v
+                        for k, v in data.items()
+                    }
                     status = info.get("status")
                     progress = info.get("progress")
                     message = info.get("message") or ""
@@ -319,14 +322,18 @@ class EnhancedMediaHandler:
                         status_url = None
 
                     if status_url:
-                        kb = InlineKeyboardMarkup([
+                        kb = InlineKeyboardMarkup(
                             [
-                                InlineKeyboardButton("📊 Progress", url=status_url),
-                                InlineKeyboardButton("❌ Cancel", callback_data=f"cancel_job:{job_id}"),
+                                [
+                                    InlineKeyboardButton("📊 Progress", url=status_url),
+                                    InlineKeyboardButton("❌ Cancel", callback_data=f"cancel_job:{job_id}"),
+                                ]
                             ]
-                        ])
+                        )
                     else:
-                        kb = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data=f"cancel_job:{job_id}")]])
+                        kb = InlineKeyboardMarkup(
+                            [[InlineKeyboardButton("❌ Cancel", callback_data=f"cancel_job:{job_id}")]]
+                        )
                     if text != last_text:
                         await self.safe_edit(query, text, reply_markup=kb)
                         last_text = text
@@ -341,7 +348,14 @@ class EnhancedMediaHandler:
             # final fetch for output or error
             try:
                 data = await r.hgetall(f"ffmpeg:job:{job_id}")
-                info = {k.decode() if isinstance(k, bytes) else k: v.decode() if isinstance(v, bytes) else v for k, v in data.items()} if data else {}
+                info = (
+                    {
+                        k.decode() if isinstance(k, bytes) else k: v.decode() if isinstance(v, bytes) else v
+                        for k, v in data.items()
+                    }
+                    if data
+                    else {}
+                )
                 status = info.get("status")
                 output = info.get("output")
                 if status == "done" and output:
@@ -362,16 +376,16 @@ class EnhancedMediaHandler:
                                     if presigned:
                                         display_output = presigned
                                 except Exception:
-                                    pass
+                                    logger.debug("handlers: operation failed")
                     except Exception:
-                        pass
+                        logger.debug("handlers: operation failed")
                     await self.safe_edit(query, f"✅ Job {job_id} finished. Output: {display_output}")
                 elif status == "cancelled":
                     await self.safe_edit(query, f"⏹️ Job {job_id} was cancelled.")
                 else:
                     await self.safe_edit(query, f"⚠️ Job {job_id} finished with status: {status}")
             except Exception:
-                pass
+                logger.debug("handlers: final fetch for output or error")
             try:
                 try:
                     aclose = getattr(r, "aclose", None)
@@ -380,9 +394,9 @@ class EnhancedMediaHandler:
                     else:
                         await r.close()
                 except Exception:
-                    pass
+                    logger.debug("handlers: operation failed")
             except Exception:
-                pass
+                logger.debug("handlers: operation failed")
         except Exception:
             logger.exception("_watch_job_progress failed for %s", job_id)
 
@@ -472,9 +486,7 @@ class EnhancedMediaHandler:
             logger.exception("Failed to load persisted session for user %s", user_id)
             return None
 
-    async def _run_with_concurrency_limit(
-        self, user_id: int, task_name: str, coroutine
-    ):
+    async def _run_with_concurrency_limit(self, user_id: int, task_name: str, coroutine):
         """Run a conversion task with concurrency limiting."""
         async with self.conversion_semaphore:
             self.active_conversions[user_id] = task_name
@@ -515,10 +527,7 @@ class EnhancedMediaHandler:
             except Exception:
                 logger.exception("Failed to log BadRequest in safe_edit")
 
-            if (
-                "Message is not modified" in msg
-                or "specified new message content" in msg
-            ):
+            if "Message is not modified" in msg or "specified new message content" in msg:
                 logger.debug("Ignored MessageNotModified error during edit")
                 return None
 
@@ -553,9 +562,7 @@ class EnhancedMediaHandler:
         """
         try:
             # Increment in-memory counter
-            self.bad_callback_counts[reason] = (
-                self.bad_callback_counts.get(reason, 0) + 1
-            )
+            self.bad_callback_counts[reason] = self.bad_callback_counts.get(reason, 0) + 1
 
             # Ensure logs dir exists
             log_dir = os.path.join(os.path.dirname(__file__), "logs")
@@ -576,9 +583,7 @@ class EnhancedMediaHandler:
         except Exception:
             logger.exception("Failed to log bad callback event")
 
-    async def _check_conversion_quota(
-        self, update: Update, context: ContextTypes.DEFAULT_TYPE
-    ) -> bool:
+    async def _check_conversion_quota(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
         """Enforce per-user conversion rate limits if configured.
 
         Returns True if the user may proceed, False if they are rate-limited
@@ -592,34 +597,24 @@ class EnhancedMediaHandler:
         try:
             conversion_limiter = None
             if context and getattr(context, "application", None):
-                conversion_limiter = context.application.bot_data.get(
-                    "conversion_rate_limiter"
-                )
+                conversion_limiter = context.application.bot_data.get("conversion_rate_limiter")
             if conversion_limiter and user_id is not None:
-                allowed, message = await conversion_limiter.can_convert(
-                    str(user_id)
-                )
+                allowed, message = await conversion_limiter.can_convert(str(user_id))
                 if not allowed:
                     try:
                         if getattr(update, "callback_query", None):
-                            await self.safe_edit(
-                                update.callback_query, message
-                            )
+                            await self.safe_edit(update.callback_query, message)
                         elif getattr(update, "message", None):
                             await update.message.reply_text(message)
                     except Exception:
-                        logger.debug(
-                            "Failed to notify user about conversion rate limit"
-                        )
+                        logger.debug("Failed to notify user about conversion rate limit")
                 return allowed
         except Exception:
             # On any error, allow the conversion to proceed (fail-open)
             logger.debug("Conversion quota check failed, allowing conversion")
         return True
 
-    async def _ensure_current_file_downloaded(
-        self, update: Update, context: ContextTypes.DEFAULT_TYPE, session: dict
-    ):
+    async def _ensure_current_file_downloaded(self, update: Update, context: ContextTypes.DEFAULT_TYPE, session: dict):
         """Ensure the session's current_file is downloaded locally. Raises Exception on failure."""
         user_id = update.effective_user.id if update and update.effective_user else None
         current_file = session.get("current_file") if session else None
@@ -643,7 +638,7 @@ class EnhancedMediaHandler:
             max_size = 4 * 1024**3
         size = current_file.get("size")
         if size and size > max_size:
-            raise Exception(f"File too large ({size//1024//1024}MB). Max allowed: {max_size//1024//1024}MB")
+            raise Exception(f"File too large ({size // 1024 // 1024}MB). Max allowed: {max_size // 1024 // 1024}MB")
 
         # Preserve the original source identifiers for userbot fallback and the
         # big-file pipeline so we can reuse the real chat/message pair when the
@@ -698,10 +693,15 @@ class EnhancedMediaHandler:
                             original_filename=current_file.get("name"),
                         )
                         if _ingest.ok:
-                            logger.info("Big files pipeline: job %s queued for %s/%s (%dMB)",
-                                        _ingest.job_id, _bot_chat, _bot_msg, file_size // (1024*1024))
+                            logger.info(
+                                "Big files pipeline: job %s queued for %s/%s (%dMB)",
+                                _ingest.job_id,
+                                _bot_chat,
+                                _bot_msg,
+                                file_size // (1024 * 1024),
+                            )
                             await update.message.reply_text(
-                                f"Large file ({file_size // (1024*1024)} MB) queued for processing.\n"
+                                f"Large file ({file_size // (1024 * 1024)} MB) queued for processing.\n"
                                 f"Job: {_ingest.job_id[:8]}... You will receive the result shortly."
                             )
                             return
@@ -761,15 +761,18 @@ class EnhancedMediaHandler:
             # For large-file bot API failures, try the userbot fallback first.
             if enable_userbot and ("file is too big" in err_text.lower() or "too big" in err_text.lower()):
                 forward = current_file.get("forward") if current_file else None
-                if forward and forward.get("chat_id") and forward.get("message_id") and await _try_userbot_download(
-                    forward.get("chat_id"), forward.get("message_id"), "origin_forward"
+                if (
+                    forward
+                    and forward.get("chat_id")
+                    and forward.get("message_id")
+                    and await _try_userbot_download(forward.get("chat_id"), forward.get("message_id"), "origin_forward")
                 ):
-                        return
+                    return
 
                 bot_chat = current_file.get("chat_id")
                 bot_msg = current_file.get("msg_id") or current_file.get("message_id")
                 if bot_chat and bot_msg and await _try_userbot_download(bot_chat, bot_msg, "bot_chat_large_file"):
-                        return
+                    return
 
                 # Relay group fallback: forward the file to a shared group/channel
                 # where the userbot account has access, then download from there.
@@ -779,7 +782,9 @@ class EnhancedMediaHandler:
                         _relay_chat_id = int(_relay_chat_id)
                         logger.info(
                             "Relay: forwarding message %s/%s to relay group %s",
-                            bot_chat, bot_msg, _relay_chat_id,
+                            bot_chat,
+                            bot_msg,
+                            _relay_chat_id,
                         )
                         _forwarded = await context.bot.forward_message(
                             chat_id=_relay_chat_id,
@@ -790,16 +795,16 @@ class EnhancedMediaHandler:
                             _relay_msg_id = _forwarded.message_id
                             logger.info(
                                 "Relay: forwarded to %s/%s, trying userbot download",
-                                _relay_chat_id, _relay_msg_id,
+                                _relay_chat_id,
+                                _relay_msg_id,
                             )
-                            if await _try_userbot_download(
-                                _relay_chat_id, _relay_msg_id, "relay_group"
-                            ):
+                            if await _try_userbot_download(_relay_chat_id, _relay_msg_id, "relay_group"):
                                 return
                             else:
                                 logger.warning(
                                     "Relay: userbot download from %s/%s failed",
-                                    _relay_chat_id, _relay_msg_id,
+                                    _relay_chat_id,
+                                    _relay_msg_id,
                                 )
                     except Exception as _relay_exc:
                         logger.exception("Relay: forwarding/download failed: %s", _relay_exc)
@@ -818,13 +823,21 @@ class EnhancedMediaHandler:
                         raise Exception(
                             "Telegram reports the file is too big to download via the bot. "
                             f"Please either upload the file via the web uploader (POST to {upload_url}) or provide a direct public URL to the file."
-                            + (" Configure PYROGRAM_SESSION (preferred) or API_ID/API_HASH + API_SESSION if you want automatic userbot fallback." if enable_userbot else "")
+                            + (
+                                " Configure PYROGRAM_SESSION (preferred) or API_ID/API_HASH + API_SESSION if you want automatic userbot fallback."
+                                if enable_userbot
+                                else ""
+                            )
                         )
                 except Exception:
                     raise Exception(
                         "Telegram reports the file is too big to download via the bot. "
                         f"Please either upload the file via the web uploader (POST to {upload_url}) or provide a direct public URL to the file."
-                        + (" Configure PYROGRAM_SESSION (preferred) or API_ID/API_HASH + API_SESSION if you want automatic userbot fallback." if enable_userbot else "")
+                        + (
+                            " Configure PYROGRAM_SESSION (preferred) or API_ID/API_HASH + API_SESSION if you want automatic userbot fallback."
+                            if enable_userbot
+                            else ""
+                        )
                     ) from None
 
             forward = current_file.get("forward") if current_file else None
@@ -885,11 +898,13 @@ class EnhancedMediaHandler:
                         if getattr(update, "message", None) and getattr(update.message, "chat", None):
                             bot_chat = getattr(update.message.chat, "id", None)
                             bot_msg = getattr(update.message, "message_id", None)
-                        elif getattr(update, "callback_query", None) and getattr(update.callback_query, "message", None):
+                        elif getattr(update, "callback_query", None) and getattr(
+                            update.callback_query, "message", None
+                        ):
                             bot_chat = getattr(update.callback_query.message.chat, "id", None)
                             bot_msg = getattr(update.callback_query.message, "message_id", None)
                     except Exception:
-                        pass
+                        logger.debug("handlers: operation failed")
 
                 if bot_chat and bot_msg:
                     try:
@@ -914,12 +929,13 @@ class EnhancedMediaHandler:
         _use_remote = False
         try:
             from utils.storage import get_storage_backend as _gsb
+
             _bn = (os.getenv("STORAGE_BACKEND") or getattr(config, "STORAGE_BACKEND", "local") or "local").lower()
             if _bn in ("s3", "r2") and _gsb is not None:
                 _backend = await _gsb()
                 _use_remote = True
         except Exception:
-            pass
+            logger.debug("handlers: Check if we should stream directly to remote storage (S3/R2), skipp...")
 
         if _use_remote and _backend is not None:
             # Stream: download bytes from Telegram -> upload directly to S3, no local disk write
@@ -974,14 +990,22 @@ class EnhancedMediaHandler:
 
             # Diagnostic logging to help trace fallback behavior in production
             with contextlib.suppress(Exception):
-                logger.info("_handle_large_forward: fh=%s auto_fetch=%s web_upload_url=%s", fh, auto_fetch, web_upload_url)
+                logger.info(
+                    "_handle_large_forward: fh=%s auto_fetch=%s web_upload_url=%s", fh, auto_fetch, web_upload_url
+                )
 
             # Extra debug: record which fetch paths we will try
             try:
                 enable_userbot_env = os.environ.get("ENABLE_USERBOT", "").lower() in ("1", "true", "yes")
-                logger.info("_handle_large_forward debug: fh=%s enable_userbot_env=%s AUTO_FETCH_FORWARDS=%s PREFER_USERBOT=%s", fh, enable_userbot_env, auto_fetch, os.environ.get("PREFER_USERBOT"))
+                logger.info(
+                    "_handle_large_forward debug: fh=%s enable_userbot_env=%s AUTO_FETCH_FORWARDS=%s PREFER_USERBOT=%s",
+                    fh,
+                    enable_userbot_env,
+                    auto_fetch,
+                    os.environ.get("PREFER_USERBOT"),
+                )
             except Exception:
-                pass
+                logger.debug("handlers: Extra debug: record which fetch paths we will try")
 
             if auto_fetch:
                 # Prepare local paths
@@ -1018,11 +1042,26 @@ class EnhancedMediaHandler:
 
                         if download_forward_via_userbot is not None:
                             try:
-                                logger.info("Attempting userbot download for fh=%s chat=%s msg=%s -> %s", fh, metadata.get("chat_id"), metadata.get("message_id") or metadata.get("msg_id"), input_path)
-                                ok = await download_forward_via_userbot(
-                                    metadata.get("chat_id"), metadata.get("message_id") or metadata.get("msg_id"), input_path, msg_date=metadata.get("registered_at") or metadata.get("created_at"), file_unique_id=metadata.get("file_unique_id")
+                                logger.info(
+                                    "Attempting userbot download for fh=%s chat=%s msg=%s -> %s",
+                                    fh,
+                                    metadata.get("chat_id"),
+                                    metadata.get("message_id") or metadata.get("msg_id"),
+                                    input_path,
                                 )
-                                logger.info("userbot download result for fh=%s: ok=%s exists=%s", fh, bool(ok), os.path.exists(input_path))
+                                ok = await download_forward_via_userbot(
+                                    metadata.get("chat_id"),
+                                    metadata.get("message_id") or metadata.get("msg_id"),
+                                    input_path,
+                                    msg_date=metadata.get("registered_at") or metadata.get("created_at"),
+                                    file_unique_id=metadata.get("file_unique_id"),
+                                )
+                                logger.info(
+                                    "userbot download result for fh=%s: ok=%s exists=%s",
+                                    fh,
+                                    bool(ok),
+                                    os.path.exists(input_path),
+                                )
                                 if ok and os.path.exists(input_path):
                                     fetched = True
                             except Exception:
@@ -1045,7 +1084,9 @@ class EnhancedMediaHandler:
                             if upload_secret:
                                 headers["X-Upload-Token"] = upload_secret
                             try:
-                                resp = requests.post(web_upload_url, data={"forward_hash": fh}, headers=headers, timeout=60)
+                                resp = requests.post(
+                                    web_upload_url, data={"forward_hash": fh}, headers=headers, timeout=60
+                                )
                                 return resp
                             except Exception as e:
                                 with contextlib.suppress(Exception):
@@ -1054,7 +1095,9 @@ class EnhancedMediaHandler:
 
                         resp = await asyncio.get_event_loop().run_in_executor(None, _post_fetch)
                         with contextlib.suppress(Exception):
-                            logger.info("Webapp fetch response for fh=%s: resp=%s", fh, getattr(resp, 'status_code', None))
+                            logger.info(
+                                "Webapp fetch response for fh=%s: resp=%s", fh, getattr(resp, "status_code", None)
+                            )
 
                         if resp is not None and getattr(resp, "status_code", None) == 200:
                             try:
@@ -1063,11 +1106,16 @@ class EnhancedMediaHandler:
                                 # notify user
                                 try:
                                     if getattr(update, "callback_query", None):
-                                        await self.safe_edit(update.callback_query, f"✅ Server fetched and queued conversion (job {queued_job}).")
+                                        await self.safe_edit(
+                                            update.callback_query,
+                                            f"✅ Server fetched and queued conversion (job {queued_job}).",
+                                        )
                                     elif getattr(update, "message", None):
-                                        await update.message.reply_text(f"✅ Server fetched and queued conversion (job {queued_job}).")
+                                        await update.message.reply_text(
+                                            f"✅ Server fetched and queued conversion (job {queued_job})."
+                                        )
                                 except Exception:
-                                    pass
+                                    logger.debug("handlers: notify user")
                                 # delete saved forward metadata to avoid duplicates
                                 with contextlib.suppress(Exception):
                                     await delete_forward_metadata(fh)
@@ -1094,9 +1142,22 @@ class EnhancedMediaHandler:
                             "output_path": output_path,
                             "original_filename": metadata.get("name") or os.path.basename(input_path),
                             "output_filename": os.path.basename(output_path),
-                            "ffmpeg_args": ["-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-c:a", "aac", "-b:a", "128k"],
+                            "ffmpeg_args": [
+                                "-c:v",
+                                "libx264",
+                                "-preset",
+                                "veryfast",
+                                "-crf",
+                                "23",
+                                "-c:a",
+                                "aac",
+                                "-b:a",
+                                "128k",
+                            ],
                             "progress_channel": f"ffmpeg:progress:{job_id}",
-                            "chat_id": update.effective_chat.id if update and getattr(update, 'effective_chat', None) else None,
+                            "chat_id": update.effective_chat.id
+                            if update and getattr(update, "effective_chat", None)
+                            else None,
                             "thumbnail": metadata.get("thumbnail"),
                             "cleanup_input": True,
                             "cleanup_output": False,
@@ -1109,14 +1170,18 @@ class EnhancedMediaHandler:
                             try:
                                 q = getattr(update, "callback_query", None)
                                 if q is not None:
-                                    await self.safe_edit(q, f"✅ Fetched forwarded media and queued conversion (job {job_id}).")
+                                    await self.safe_edit(
+                                        q, f"✅ Fetched forwarded media and queued conversion (job {job_id})."
+                                    )
                                     with contextlib.suppress(Exception):
                                         asyncio.create_task(self._watch_job_progress(q, job_id))
                                 else:
                                     # fallback to replying in chat when no callback_query
                                     if getattr(update, "message", None):
                                         with contextlib.suppress(Exception):
-                                            await update.message.reply_text(f"✅ Fetched forwarded media and queued conversion (job {job_id}).")
+                                            await update.message.reply_text(
+                                                f"✅ Fetched forwarded media and queued conversion (job {job_id})."
+                                            )
                             except Exception:
                                 logger.exception("Failed to notify user after enqueue for %s", fh)
                             # cleanup saved forward metadata
@@ -1146,7 +1211,7 @@ class EnhancedMediaHandler:
             if self._cache:
                 _cached_prefs = await self._cache.get_user_session(str(user_id))
         except Exception:
-            pass
+            logger.debug("handlers: Try loading preferences from Redis cache first")
         if _cached_prefs and context.user_data is not None:
             # Merge cached prefs into user_data for fast access
             for k, v in _cached_prefs.items():
@@ -1171,9 +1236,22 @@ class EnhancedMediaHandler:
         text += f"• Rename File : {'Yes' if s.get('prefix') or s.get('suffix') else 'No'}\n"
 
         kb_page1 = [
-            [InlineKeyboardButton(f"Bulk Mode : { 'On' if s.get('bulk_mode') else 'Off' }", callback_data="toggle_bulk_mode")],
-            [InlineKeyboardButton(f"Thumbnail : { 'Yes' if s.get('use_custom_thumbnail') else 'No' }", callback_data="settings_page:2")],
-            [InlineKeyboardButton(f"Rename File : { 'Yes' if s.get('prefix') or s.get('suffix') else 'No' }", callback_data="video_renamer")],
+            [
+                InlineKeyboardButton(
+                    f"Bulk Mode : {'On' if s.get('bulk_mode') else 'Off'}", callback_data="toggle_bulk_mode"
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    f"Thumbnail : {'Yes' if s.get('use_custom_thumbnail') else 'No'}", callback_data="settings_page:2"
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    f"Rename File : {'Yes' if s.get('prefix') or s.get('suffix') else 'No'}",
+                    callback_data="video_renamer",
+                )
+            ],
             [InlineKeyboardButton("Upload as Audio", callback_data="menu_audio")],
             [InlineKeyboardButton("Upload as Video", callback_data="menu_video")],
             [InlineKeyboardButton("Stream Mapper", callback_data="menu_advanced")],
@@ -1230,7 +1308,9 @@ class EnhancedMediaHandler:
                 if getattr(update, "callback_query", None):
                     with contextlib.suppress(Exception):
                         await update.callback_query.answer()
-                    if getattr(update.callback_query, "message", None) and getattr(update.callback_query.message, "chat", None):
+                    if getattr(update.callback_query, "message", None) and getattr(
+                        update.callback_query.message, "chat", None
+                    ):
                         chat_id = update.callback_query.message.chat.id
                 elif getattr(update, "message", None) and getattr(update.message, "chat", None):
                     chat_id = update.message.chat.id
@@ -1245,7 +1325,9 @@ class EnhancedMediaHandler:
                     # Try to message the user directly
                     try:
                         if getattr(update, "effective_user", None) and getattr(context, "bot", None):
-                            await context.bot.send_message(chat_id=update.effective_user.id, text="⚠️ Failed to open bulk menu.")
+                            await context.bot.send_message(
+                                chat_id=update.effective_user.id, text="⚠️ Failed to open bulk menu."
+                            )
                     except Exception:
                         logger.exception("Secondary fallback for bulk menu failed")
             except Exception:
@@ -1259,7 +1341,9 @@ class EnhancedMediaHandler:
 
         args = context.args if hasattr(context, "args") else []
         if not args:
-            await update.message.reply_text("Usage: /bulk_url <url1> [url2 ...]\nYou can also paste multiple URLs in a message.")
+            await update.message.reply_text(
+                "Usage: /bulk_url <url1> [url2 ...]\nYou can also paste multiple URLs in a message."
+            )
             return
 
         enqueued = 0
@@ -1354,16 +1438,16 @@ class EnhancedMediaHandler:
         # Inform user job queued and provide a cancel button
         try:
             kb = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data=f"cancel_job:{job_id}")]])
-            await self.safe_edit(query, f"✅ Job queued (ID: {job_id}). I'll send the file when ready.", reply_markup=kb)
+            await self.safe_edit(
+                query, f"✅ Job queued (ID: {job_id}). I'll send the file when ready.", reply_markup=kb
+            )
             with contextlib.suppress(Exception):
                 asyncio.create_task(self._watch_job_progress(query, job_id))
         except Exception:
             await self.safe_edit(query, f"✅ Job queued (ID: {job_id}). I'll send the file when ready.")
         return
 
-    async def handle_media_message(
-        self, update: Update, context: ContextTypes.DEFAULT_TYPE
-    ):
+    async def handle_media_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Main entry point for media messages."""
         # Log incoming update for debugging dispatch issues
         try:
@@ -1373,21 +1457,11 @@ class EnhancedMediaHandler:
 
         try:
             update_id = getattr(update, "update_id", None)
-            msg_id = getattr(
-                getattr(update, "message", None), "message_id", None
-            )
-            has_video = bool(
-                getattr(getattr(update, "message", None), "video", None)
-            )
-            has_document = bool(
-                getattr(getattr(update, "message", None), "document", None)
-            )
-            has_audio = bool(
-                getattr(getattr(update, "message", None), "audio", None)
-            )
-            text_preview = (
-                getattr(getattr(update, "message", None), "text", None) or ""
-            )[:200]
+            msg_id = getattr(getattr(update, "message", None), "message_id", None)
+            has_video = bool(getattr(getattr(update, "message", None), "video", None))
+            has_document = bool(getattr(getattr(update, "message", None), "document", None))
+            has_audio = bool(getattr(getattr(update, "message", None), "audio", None))
+            text_preview = (getattr(getattr(update, "message", None), "text", None) or "")[:200]
 
             fmt = (
                 "Incoming message update: user_id=%s update_id=%s msg_id=%s "
@@ -1413,9 +1487,7 @@ class EnhancedMediaHandler:
         except Exception:
             # If ACL check fails for any reason, default to deny-safe
             with contextlib.suppress(Exception):
-                await update.message.reply_text(
-                    "Access denied. (ACL check failed)"
-                )
+                await update.message.reply_text("Access denied. (ACL check failed)")
             return
 
         # Initialize user session
@@ -1444,16 +1516,18 @@ class EnhancedMediaHandler:
                     # If rate limiter fails, continue but log
                     logger.debug("API rate limiter wait failed or was skipped")
         except Exception:
-            pass
+            logger.debug("handlers: Respect Telegram API rate limits if a limiter is provided in bot_data")
 
         # Clear awaiting_custom_resolution if user sends non-text
-        if getattr(context, "user_data", {}).get("awaiting_custom_resolution") and not getattr(update.message, "text", None):
-                context.user_data.pop("awaiting_custom_resolution", None)
-                await update.message.reply_text(
-                    "❌ Cancelled custom resolution. Send text like 1280x720 or send a file.",
-                    reply_markup=MediaMenuBuilder.get_back_button()
-                )
-                return
+        if getattr(context, "user_data", {}).get("awaiting_custom_resolution") and not getattr(
+            update.message, "text", None
+        ):
+            context.user_data.pop("awaiting_custom_resolution", None)
+            await update.message.reply_text(
+                "❌ Cancelled custom resolution. Send text like 1280x720 or send a file.",
+                reply_markup=MediaMenuBuilder.get_back_button(),
+            )
+            return
 
         # If user is in settings flow and sends a photo, treat as thumbnail upload
         try:
@@ -1507,7 +1581,9 @@ class EnhancedMediaHandler:
                 try:
                     ok = await self.converter.edit_metadata(input_path, output_path, tags)
                     if ok:
-                        await update.message.reply_text("✅ Tags applied. I'll replace the current file with the tagged version.")
+                        await update.message.reply_text(
+                            "✅ Tags applied. I'll replace the current file with the tagged version."
+                        )
                         # replace current file path
                         current_file["path"] = output_path
                     else:
@@ -1526,7 +1602,9 @@ class EnhancedMediaHandler:
         # save it to storage and add to the user's merge_list so multiple pasted
         # photos are collected automatically.
         try:
-            if getattr(update.message, "photo", None) and not getattr(context, "user_data", {}).get("awaiting_settings"):
+            if getattr(update.message, "photo", None) and not getattr(context, "user_data", {}).get(
+                "awaiting_settings"
+            ):
                 photos = update.message.photo
                 if photos:
                     # choose largest size variant
@@ -1549,7 +1627,9 @@ class EnhancedMediaHandler:
                         if mgid not in timers:
                             try:
                                 loop = asyncio.get_event_loop()
-                                handle = loop.call_later(1.0, lambda: asyncio.create_task(self._finalize_media_group(user_id, mgid)))
+                                handle = loop.call_later(
+                                    1.0, lambda: asyncio.create_task(self._finalize_media_group(user_id, mgid))
+                                )
                                 timers[mgid] = handle
                             except Exception:
                                 # best-effort: finalize immediately
@@ -1566,7 +1646,9 @@ class EnhancedMediaHandler:
                         self._persist_session(user_id)
                     except Exception:
                         logger.debug("Could not persist session after photo download")
-                    await update.message.reply_text(f"✅ Photo saved to merge list. Total items: {len(session['merge_list'])}")
+                    await update.message.reply_text(
+                        f"✅ Photo saved to merge list. Total items: {len(session['merge_list'])}"
+                    )
                     return
         except Exception:
             logger.exception("Failed to auto-handle incoming photo")
@@ -1596,7 +1678,18 @@ class EnhancedMediaHandler:
                         "job_id": job_id,
                         "source_url": url,
                         "output_path": output_path,
-                        "ffmpeg_args": ["-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-c:a", "aac", "-b:a", "128k"],
+                        "ffmpeg_args": [
+                            "-c:v",
+                            "libx264",
+                            "-preset",
+                            "veryfast",
+                            "-crf",
+                            "23",
+                            "-c:a",
+                            "aac",
+                            "-b:a",
+                            "128k",
+                        ],
                         "progress_channel": f"ffmpeg:progress:{job_id}",
                         "chat_id": update.effective_chat.id if update and update.effective_chat else None,
                         "caption": f"✅ Converted from URL: {url}",
@@ -1619,9 +1712,7 @@ class EnhancedMediaHandler:
                 "Please send a video, audio, or document file. You can also paste one or more URLs (http/https) to enqueue conversions."
             )
 
-    async def handle_video(
-        self, update: Update, context: ContextTypes.DEFAULT_TYPE, session: dict
-    ):
+    async def handle_video(self, update: Update, context: ContextTypes.DEFAULT_TYPE, session: dict):
         """Handle incoming video files."""
         video = update.message.video
         user_id = update.effective_user.id
@@ -1632,10 +1723,7 @@ class EnhancedMediaHandler:
         except Exception:
             max_size = 4 * 1024**3
         if video.file_size > max_size:
-            await update.message.reply_text(
-                "❌ File too large (max 4GB).\n"
-                "For larger files, use the /upload command."
-            )
+            await update.message.reply_text("❌ File too large (max 4GB).\nFor larger files, use the /upload command.")
             return
 
         # Register file lazily (do not download yet). We'll download on-demand
@@ -1695,7 +1783,13 @@ class EnhancedMediaHandler:
         }
 
         with contextlib.suppress(Exception):
-            logger.info("registered current_file for user %s id=%s forward=%s size=%s", user_id, file_id, forward_info, video.file_size)
+            logger.info(
+                "registered current_file for user %s id=%s forward=%s size=%s",
+                user_id,
+                file_id,
+                forward_info,
+                video.file_size,
+            )
         try:
             self._persist_session(user_id)
         except Exception:
@@ -1706,15 +1800,11 @@ class EnhancedMediaHandler:
 
         # Show main menu immediately (lazy download)
         await update.message.reply_text(
-            f"✅ Video registered!\n"
-            f"📦 Size: {video.file_size // 1024 // 1024} MB\n"
-            f"Choose an action:",
+            f"✅ Video registered!\n📦 Size: {video.file_size // 1024 // 1024} MB\nChoose an action:",
             reply_markup=MediaMenuBuilder.get_main_menu("video"),
         )
 
-    async def handle_audio(
-        self, update: Update, context: ContextTypes.DEFAULT_TYPE, session: dict
-    ):
+    async def handle_audio(self, update: Update, context: ContextTypes.DEFAULT_TYPE, session: dict):
         """Handle incoming audio files."""
         audio = update.message.audio
         user_id = update.effective_user.id
@@ -1787,18 +1877,20 @@ class EnhancedMediaHandler:
         }
 
         with contextlib.suppress(Exception):
-            logger.info("registered current_file for user %s id=%s forward=%s size=%s", user_id, audio.file_id, forward_info, audio.file_size)
+            logger.info(
+                "registered current_file for user %s id=%s forward=%s size=%s",
+                user_id,
+                audio.file_id,
+                forward_info,
+                audio.file_size,
+            )
 
         await update.message.reply_text(
-            f"✅ Audio registered!\n"
-            f"🎵 {audio.title or 'Unknown title'}\n"
-            f"Choose an action:",
+            f"✅ Audio registered!\n🎵 {audio.title or 'Unknown title'}\nChoose an action:",
             reply_markup=MediaMenuBuilder.get_main_menu("audio"),
         )
 
-    async def handle_document(
-        self, update: Update, context: ContextTypes.DEFAULT_TYPE, session: dict
-    ):
+    async def handle_document(self, update: Update, context: ContextTypes.DEFAULT_TYPE, session: dict):
         """Handle document files (could be video/audio)."""
         document = update.message.document
         user_id = update.effective_user.id
@@ -1954,18 +2046,26 @@ class EnhancedMediaHandler:
             logger.debug("Could not persist session after registering document")
 
         with contextlib.suppress(Exception):
-            logger.info("registered current_file for user %s id=%s forward=%s size=%s", user_id, document.file_id, forward_info, document.file_size)
+            logger.info(
+                "registered current_file for user %s id=%s forward=%s size=%s",
+                user_id,
+                document.file_id,
+                forward_info,
+                document.file_size,
+            )
 
         await update.message.reply_text(
-            f"✅ {file_type.capitalize()} registered!\n"
-            f"📁 {file_name}\n"
-            f"Choose an action:",
+            f"✅ {file_type.capitalize()} registered!\n📁 {file_name}\nChoose an action:",
             reply_markup=MediaMenuBuilder.get_main_menu(file_type),
         )
 
     async def _apply_fade(
-        self, update: Update, context: ContextTypes.DEFAULT_TYPE, session: dict,
-        fade_in: float = 0.0, fade_out: float = 0.0,
+        self,
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+        session: dict,
+        fade_in: float = 0.0,
+        fade_out: float = 0.0,
     ):
         """Apply audio fade-in and/or fade-out to the current file."""
         query = getattr(update, "callback_query", None)
@@ -1974,15 +2074,17 @@ class EnhancedMediaHandler:
 
         current_file = session.get("current_file") if session else None
         if not current_file:
-            await self.safe_edit(query, "❌ No file registered. Send a media file first.",
-                reply_markup=MediaMenuBuilder.get_back_button())
+            await self.safe_edit(
+                query,
+                "❌ No file registered. Send a media file first.",
+                reply_markup=MediaMenuBuilder.get_back_button(),
+            )
             return
 
         if not await self._check_conversion_quota(update, context):
             return
 
-        await self.safe_edit(query, "📈 Applying fade effect...",
-            reply_markup=MediaMenuBuilder.get_back_button())
+        await self.safe_edit(query, "📈 Applying fade effect...", reply_markup=MediaMenuBuilder.get_back_button())
 
         if not current_file.get("path") or not os.path.exists(current_file.get("path") or ""):
             try:
@@ -1994,8 +2096,7 @@ class EnhancedMediaHandler:
 
         input_path = current_file.get("path")
         if not input_path or not os.path.exists(input_path):
-            await self.safe_edit(query, "❌ File not found on disk.",
-                reply_markup=MediaMenuBuilder.get_back_button())
+            await self.safe_edit(query, "❌ File not found on disk.", reply_markup=MediaMenuBuilder.get_back_button())
             return
         ext = os.path.splitext(input_path)[1] or ".mp3"
         output_dir = getattr(config, "OUTPUT_PATH", "storage/output") if config else "storage/output"
@@ -2006,22 +2107,24 @@ class EnhancedMediaHandler:
         success = await self.converter.apply_fade(input_path, output_path, fade_in, fade_out)
         if success and os.path.exists(output_path):
             current_file["path"] = output_path
-            await self.safe_edit(query, "✅ Fade applied! Sending file...",
-            reply_markup=MediaMenuBuilder.get_back_button())
+            await self.safe_edit(
+                query, "✅ Fade applied! Sending file...", reply_markup=MediaMenuBuilder.get_back_button()
+            )
             try:
                 with open(output_path, "rb") as f:
                     await context.bot.send_document(chat_id=update.effective_chat.id, document=f)
             except Exception:
-                await self.safe_edit(query, "✅ Fade applied but failed to send. Check the output folder.",
-                reply_markup=MediaMenuBuilder.get_back_button())
+                await self.safe_edit(
+                    query,
+                    "✅ Fade applied but failed to send. Check the output folder.",
+                    reply_markup=MediaMenuBuilder.get_back_button(),
+                )
         else:
-            await self.safe_edit(query, "❌ Failed to apply fade effect.",
-            reply_markup=MediaMenuBuilder.get_back_button())
+            await self.safe_edit(
+                query, "❌ Failed to apply fade effect.", reply_markup=MediaMenuBuilder.get_back_button()
+            )
 
-
-    async def callback_handler(
-        self, update: Update, context: ContextTypes.DEFAULT_TYPE
-    ):
+    async def callback_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle all callback queries with enhanced features."""
         query = update.callback_query
         logger.info(
@@ -2052,9 +2155,7 @@ class EnhancedMediaHandler:
             with contextlib.suppress(Exception):
                 await query.answer()
             await self.safe_edit(query, "⚠️ Invalid button payload.")
-            logger.warning(
-                f"Invalid callback data type: {type(data)} data={data}"
-            )
+            logger.warning(f"Invalid callback data type: {type(data)} data={data}")
             # Persist bad callback event
             await self._log_bad_callback(
                 "invalid_payload",
@@ -2133,7 +2234,6 @@ class EnhancedMediaHandler:
         # canonical callback names (if ever needed) are provided by `utils.callbacks`.
         # We don't import them here to avoid unused-name noise from linters.
         try:
-
             # Map video bitrate shortcuts to generic bitrate handler
             if isinstance(data, str) and data.startswith("vbitrate_"):
                 data = "bitrate_" + data.split("_", 1)[1]
@@ -2159,9 +2259,7 @@ class EnhancedMediaHandler:
                 await self.safe_edit(
                     query,
                     "🎬 **Media Conversion Bot**\nSelect a category:",
-                    reply_markup=MediaMenuBuilder.get_main_menu(
-                        current_file["type"] if current_file else None
-                    ),
+                    reply_markup=MediaMenuBuilder.get_main_menu(current_file["type"] if current_file else None),
                 )
 
             elif data == "menu_video":
@@ -2283,7 +2381,9 @@ class EnhancedMediaHandler:
                 if not current_file:
                     await self.safe_edit(query, "\u274c No file registered. Send a file first.")
                 else:
-                    await self.safe_edit(query, "\u2699\ufe0f Custom optimization: compressing with CRF 23, preset medium, faststart...")
+                    await self.safe_edit(
+                        query, "\u2699\ufe0f Custom optimization: compressing with CRF 23, preset medium, faststart..."
+                    )
                     if not current_file.get("path") or not os.path.exists(current_file.get("path") or ""):
                         try:
                             await self._ensure_current_file_downloaded(update, context, session)
@@ -2300,17 +2400,24 @@ class EnhancedMediaHandler:
                     success = await self.converter.optimize_video(input_path, output_path, preset="medium", crf=23)
                     if success and os.path.exists(output_path):
                         current_file["path"] = output_path
-                        await self.safe_edit(query, "\u2705 Custom optimization complete!",
-                            reply_markup=MediaMenuBuilder.get_back_button())
+                        await self.safe_edit(
+                            query,
+                            "\u2705 Custom optimization complete!",
+                            reply_markup=MediaMenuBuilder.get_back_button(),
+                        )
                         try:
                             with open(output_path, "rb") as f:
                                 await context.bot.send_document(chat_id=update.effective_chat.id, document=f)
                         except Exception:
-                            await self.safe_edit(query, "\u2705 Optimized but failed to send.",
-                                reply_markup=MediaMenuBuilder.get_back_button())
+                            await self.safe_edit(
+                                query,
+                                "\u2705 Optimized but failed to send.",
+                                reply_markup=MediaMenuBuilder.get_back_button(),
+                            )
                     else:
-                        await self.safe_edit(query, "\u274c Failed to optimize.",
-                            reply_markup=MediaMenuBuilder.get_back_button())
+                        await self.safe_edit(
+                            query, "\u274c Failed to optimize.", reply_markup=MediaMenuBuilder.get_back_button()
+                        )
             elif isinstance(data, str) and data.startswith("optimize_"):
                 preset = data.split("_")[1]
                 await self.optimize_video(update, context, session, preset)
@@ -2386,9 +2493,7 @@ class EnhancedMediaHandler:
                 # Add the current file to the merge list
                 current_file = session.get("current_file")
                 if not current_file:
-                    await self.safe_edit(
-                        query, "❌ No current file to add. Send a file first."
-                    )
+                    await self.safe_edit(query, "❌ No current file to add. Send a file first.")
                     return
                 path = current_file.get("path")
                 if not path or not os.path.exists(path):
@@ -2437,13 +2542,16 @@ class EnhancedMediaHandler:
                     # Build navigation buttons
                     nav_buttons = []
                     if page > 1:
-                        nav_buttons.append(InlineKeyboardButton("⬅️ Prev", callback_data=f"merge_view:{page-1}"))
+                        nav_buttons.append(InlineKeyboardButton("⬅️ Prev", callback_data=f"merge_view:{page - 1}"))
                     if page < last_page:
-                        nav_buttons.append(InlineKeyboardButton("Next ➡️", callback_data=f"merge_view:{page+1}"))
+                        nav_buttons.append(InlineKeyboardButton("Next ➡️", callback_data=f"merge_view:{page + 1}"))
 
-                    control_row = [InlineKeyboardButton("🗑️ Clear", callback_data="merge_clear"), InlineKeyboardButton("↩️ Back", callback_data="menu_main")]
+                    control_row = [
+                        InlineKeyboardButton("🗑️ Clear", callback_data="merge_clear"),
+                        InlineKeyboardButton("↩️ Back", callback_data="menu_main"),
+                    ]
 
-                    kb = [ [InlineKeyboardButton(os.path.basename(p), callback_data="noop") ] for p in slice_items ]
+                    kb = [[InlineKeyboardButton(os.path.basename(p), callback_data="noop")] for p in slice_items]
                     if nav_buttons:
                         kb.append(nav_buttons)
                     kb.append(control_row)
@@ -2493,18 +2601,14 @@ class EnhancedMediaHandler:
                 await self.safe_edit(
                     query,
                     "❌ Operation cancelled.",
-                    reply_markup=MediaMenuBuilder.get_main_menu(
-                        current_file["type"] if current_file else None
-                    ),
+                    reply_markup=MediaMenuBuilder.get_main_menu(current_file["type"] if current_file else None),
                 )
 
             elif data == "confirm":
                 await self.safe_edit(
                     query,
                     "✅ Confirmed.",
-                    reply_markup=MediaMenuBuilder.get_main_menu(
-                        current_file["type"] if current_file else None
-                    ),
+                    reply_markup=MediaMenuBuilder.get_main_menu(current_file["type"] if current_file else None),
                 )
 
             elif isinstance(data, str) and data.startswith("bitrate_"):
@@ -2512,9 +2616,7 @@ class EnhancedMediaHandler:
                 await self.adjust_bitrate(update, context, session, bitrate)
 
             elif data == "trim_audio":
-                await self.safe_edit(
-                    query, "✂️ **Trim Audio**\nSend start time (HH:MM:SS):"
-                )
+                await self.safe_edit(query, "✂️ **Trim Audio**\nSend start time (HH:MM:SS):")
                 context.user_data["awaiting_trim"] = "start"
                 for key in list(context.user_data.keys()):
                     if key.startswith("awaiting_"):
@@ -2664,7 +2766,9 @@ class EnhancedMediaHandler:
                                 continue
 
                             job_id = str(uuid.uuid4()) if uuid else None
-                            output_dir = getattr(config, "OUTPUT_PATH", "storage/output") if config else "storage/output"
+                            output_dir = (
+                                getattr(config, "OUTPUT_PATH", "storage/output") if config else "storage/output"
+                            )
                             with contextlib.suppress(Exception):
                                 os.makedirs(output_dir, exist_ok=True)
                             out_path = os.path.join(output_dir, f"{f.get('id')}_bulk.mp4")
@@ -2674,7 +2778,9 @@ class EnhancedMediaHandler:
                                 "output_path": out_path,
                                 "ffmpeg_args": None,
                                 "progress_channel": f"ffmpeg:progress:{job_id}",
-                                "chat_id": update.effective_chat.id if update and getattr(update, 'effective_chat', None) else None,
+                                "chat_id": update.effective_chat.id
+                                if update and getattr(update, "effective_chat", None)
+                                else None,
                                 "thumbnail": f.get("thumbnail"),
                                 "caption": f"Bulk conversion finished for {f.get('name') or f.get('id')}",
                                 "cleanup_input": True,
@@ -2690,12 +2796,12 @@ class EnhancedMediaHandler:
                                     await enqueue_job(job)
                                     enqueued += 1
                                 except Exception:
-                                    logger.exception("Failed to enqueue bulk job for %s", f.get('id'))
+                                    logger.exception("Failed to enqueue bulk job for %s", f.get("id"))
                             else:
-                                sess.setdefault('queued_bulk_jobs', []).append(job)
+                                sess.setdefault("queued_bulk_jobs", []).append(job)
                                 enqueued += 1
                         except Exception:
-                            logger.exception("Failed processing bulk file %s", f.get('id'))
+                            logger.exception("Failed processing bulk file %s", f.get("id"))
 
                     await self.safe_edit(query, f"✅ Bulk apply queued for {enqueued} file(s).")
                 except Exception:
@@ -2704,12 +2810,18 @@ class EnhancedMediaHandler:
 
             elif data == "video_reorder":
                 # Placeholder for video reorder feature
-                await self.safe_edit(query, "🔁 Video Reorder\n\nThis feature is coming soon — you can manage order via the merge list for now.")
+                await self.safe_edit(
+                    query,
+                    "🔁 Video Reorder\n\nThis feature is coming soon — you can manage order via the merge list for now.",
+                )
 
             elif data == "mp3_tag_editor":
                 # Simple entry point for mp3 tag edits (advanced editor may be added later)
                 try:
-                    await self.safe_edit(query, "✏️ Mp3 Tag Editor\n\nSend a JSON object with tag keys and values (example: {\"title\":\"Song\"}).")
+                    await self.safe_edit(
+                        query,
+                        '✏️ Mp3 Tag Editor\n\nSend a JSON object with tag keys and values (example: {"title":"Song"}).',
+                    )
                     # mark awaiting state so next message can be treated as metadata
                     context.user_data["awaiting_mp3_tags"] = True
                 except Exception:
@@ -2717,11 +2829,17 @@ class EnhancedMediaHandler:
 
             elif data == "convert_to_video":
                 # Show video format menu
-                await self.safe_edit(query, "🔄 Convert To Video\nSelect target container:", reply_markup=MediaMenuBuilder.get_format_menu("video"))
+                await self.safe_edit(
+                    query,
+                    "🔄 Convert To Video\nSelect target container:",
+                    reply_markup=MediaMenuBuilder.get_format_menu("video"),
+                )
 
             elif data == "convert_to_file":
                 # Generic convert menu
-                await self.safe_edit(query, "🔄 Convert To File\nSelect target format:", reply_markup=MediaMenuBuilder.get_format_menu())
+                await self.safe_edit(
+                    query, "🔄 Convert To File\nSelect target format:", reply_markup=MediaMenuBuilder.get_format_menu()
+                )
 
             elif data == "batch_process":
                 await self.safe_edit(
@@ -2744,8 +2862,18 @@ class EnhancedMediaHandler:
                     text += f"• Prefix: {s.get('prefix')!s}\n"
                     text += f"• Suffix: {s.get('suffix')!s}\n"
                     kb = [
-                        [InlineKeyboardButton(f"Toggle Save Thumb: {'On' if s.get('save_thumbnail') else 'Off'}", callback_data="toggle_save_thumbnail")],
-                        [InlineKeyboardButton(f"Toggle Bulk Mode: {'On' if s.get('bulk_mode') else 'Off'}", callback_data="toggle_bulk_mode")],
+                        [
+                            InlineKeyboardButton(
+                                f"Toggle Save Thumb: {'On' if s.get('save_thumbnail') else 'Off'}",
+                                callback_data="toggle_save_thumbnail",
+                            )
+                        ],
+                        [
+                            InlineKeyboardButton(
+                                f"Toggle Bulk Mode: {'On' if s.get('bulk_mode') else 'Off'}",
+                                callback_data="toggle_bulk_mode",
+                            )
+                        ],
                         [InlineKeyboardButton("Next ➡️", callback_data="settings_page:2")],
                         [InlineKeyboardButton("Close", callback_data="menu_main")],
                     ]
@@ -2836,9 +2964,7 @@ class EnhancedMediaHandler:
                 await self.generate_sample(update, context, session)
 
             elif data == "add_subtitles":
-                await self.safe_edit(
-                    query, "➕ **Add Subtitles**\nSend subtitle file (.srt, .ass):"
-                )
+                await self.safe_edit(query, "➕ **Add Subtitles**\nSend subtitle file (.srt, .ass):")
                 # Expect next document upload to be subtitle file to attach
                 context.user_data["awaiting_subtitle_file"] = True
 
@@ -2850,10 +2976,7 @@ class EnhancedMediaHandler:
                 else:
                     await self.safe_edit(
                         query,
-                        (
-                            "✏️ **Burn Subtitles**\n"
-                            "Send subtitle file (.srt, .ass) to burn into the current video:"
-                        ),
+                        ("✏️ **Burn Subtitles**\nSend subtitle file (.srt, .ass) to burn into the current video:"),
                     )
                     context.user_data["awaiting_burn_subtitle"] = True
 
@@ -2929,9 +3052,7 @@ class EnhancedMediaHandler:
 
     # ========== IMPLEMENTATION METHODS ==========
 
-    async def convert_to_mp3(
-        self, update: Update, context: ContextTypes.DEFAULT_TYPE, session: dict
-    ):
+    async def convert_to_mp3(self, update: Update, context: ContextTypes.DEFAULT_TYPE, session: dict):
         """Convert video to MP3."""
         # Defensive: ensure this was invoked via a callback query
         if not await self._require_callback(update):
@@ -2949,13 +3070,9 @@ class EnhancedMediaHandler:
             return
 
         # Check rate limiting
-        conversion_limiter = context.application.bot_data.get(
-            "conversion_rate_limiter"
-        )
+        conversion_limiter = context.application.bot_data.get("conversion_rate_limiter")
         if conversion_limiter:
-            allowed, message = await conversion_limiter.can_convert(
-                str(user_id)
-            )
+            allowed, message = await conversion_limiter.can_convert(str(user_id))
             if not allowed:
                 await self.safe_edit(query, message)
                 return
@@ -2991,9 +3108,7 @@ class EnhancedMediaHandler:
 
                 lock = await AsyncFileLock.acquire(path)
                 async with lock:
-                    success = await self.converter.extract_audio_from_video(
-                        path, output_path, "mp3", "192k"
-                    )
+                    success = await self.converter.extract_audio_from_video(path, output_path, "mp3", "192k")
 
                     if success and os.path.exists(output_path):
                         file_size = os.path.getsize(output_path)
@@ -3005,8 +3120,7 @@ class EnhancedMediaHandler:
                             if file_size > bot_api_max_mb * 1024 * 1024:
                                 await self.safe_edit(
                                     query,
-                                    f"❌ File too large ({file_size//1024//1024}MB).\n"
-                                    "Try compression first.",
+                                    f"❌ File too large ({file_size // 1024 // 1024}MB).\nTry compression first.",
                                 )
                                 os.remove(output_path)
                             else:
@@ -3015,12 +3129,10 @@ class EnhancedMediaHandler:
                                         chat_id=update.effective_chat.id,
                                         audio=audio_file,
                                         caption="✅ Converted to MP3",
-                                        title=current_file.get("name", "file").replace(
-                                            ".mp4", ".mp3"
-                                        ),
+                                        title=current_file.get("name", "file").replace(".mp4", ".mp3"),
                                         performer="Media Bot",
                                     )
-                        
+
                             os.remove(output_path)
                     else:
                         await self.safe_edit(query, "❌ Conversion failed.")
@@ -3035,37 +3147,32 @@ class EnhancedMediaHandler:
                 if success and os.path.exists(output_path):
                     file_size = os.path.getsize(output_path)
                     if file_size > 50 * 1024 * 1024:  # 50MB Telegram limit
-                                try:
-                                    bot_api_max_mb = int(os.environ.get("BOT_API_MAX_MB", "50"))
-                                except Exception:
-                                    bot_api_max_mb = 50
-                                if file_size > bot_api_max_mb * 1024 * 1024:
-                                    await self.safe_edit(
-                                        query,
-                                        f"❌ File too large ({file_size//1024//1024}MB).\n"
-                                        "Try compression first.",
-                                    )
-                                    os.remove(output_path)
-                                else:
-                                    with open(output_path, "rb") as audio_file:
-                                        await context.bot.send_audio(
-                                            chat_id=update.effective_chat.id,
-                                            audio=audio_file,
-                                            caption="✅ Converted to MP3",
-                                            title=current_file.get("name", "file").replace(
-                                                ".mp4", ".mp3"
-                                            ),
-                                            performer="Media Bot",
-                                        )
+                        try:
+                            bot_api_max_mb = int(os.environ.get("BOT_API_MAX_MB", "50"))
+                        except Exception:
+                            bot_api_max_mb = 50
+                        if file_size > bot_api_max_mb * 1024 * 1024:
+                            await self.safe_edit(
+                                query,
+                                f"❌ File too large ({file_size // 1024 // 1024}MB).\nTry compression first.",
+                            )
+                            os.remove(output_path)
+                        else:
+                            with open(output_path, "rb") as audio_file:
+                                await context.bot.send_audio(
+                                    chat_id=update.effective_chat.id,
+                                    audio=audio_file,
+                                    caption="✅ Converted to MP3",
+                                    title=current_file.get("name", "file").replace(".mp4", ".mp3"),
+                                    performer="Media Bot",
+                                )
                     else:
                         with open(output_path, "rb") as audio_file:
                             await context.bot.send_audio(
                                 chat_id=update.effective_chat.id,
                                 audio=audio_file,
                                 caption="✅ Converted to MP3",
-                                title=current_file["name"].replace(
-                                    ".mp4", ".mp3"
-                                ),
+                                title=current_file["name"].replace(".mp4", ".mp3"),
                                 performer="Media Bot",
                             )
                         os.remove(output_path)
@@ -3081,9 +3188,7 @@ class EnhancedMediaHandler:
                 await self.safe_edit(query, f"❌ Failed to download file: {e}")
                 return
 
-        await self._run_with_concurrency_limit(
-            user_id, "mp3_conversion", do_conversion()
-        )
+        await self._run_with_concurrency_limit(user_id, "mp3_conversion", do_conversion())
 
     async def compress_video(
         self,
@@ -3102,9 +3207,7 @@ class EnhancedMediaHandler:
             return
 
         if crf == "custom":
-            await self.safe_edit(
-                query, "Enter CRF value (18-51, lower=better quality):"
-            )
+            await self.safe_edit(query, "Enter CRF value (18-51, lower=better quality):")
             context.user_data["awaiting_crf"] = True
             for key in list(context.user_data.keys()):
                 if key.startswith("awaiting_"):
@@ -3148,20 +3251,15 @@ class EnhancedMediaHandler:
                 )
             else:
                 # default optimize path: treat crf as an integer when possible
-                crf_value = (
-                    int(crf) if isinstance(crf, str) and crf.isdigit() else 28
-                )
-                success = await self.converter.optimize_video(
-                    current_file["path"], output_path, "medium", crf_value
-                )
+                crf_value = int(crf) if isinstance(crf, str) and crf.isdigit() else 28
+                success = await self.converter.optimize_video(current_file["path"], output_path, "medium", crf_value)
 
             if success and os.path.exists(output_path):
                 file_size = os.path.getsize(output_path)
                 if file_size > 2 * 1024**3:  # 2GB
                     await self.safe_edit(
                         query,
-                        f"❌ Compressed file still too large ({file_size//1024//1024}MB).\n"
-                        "Try higher compression.",
+                        f"❌ Compressed file still too large ({file_size // 1024 // 1024}MB).\nTry higher compression.",
                     )
                     os.remove(output_path)
                 else:
@@ -3185,13 +3283,9 @@ class EnhancedMediaHandler:
                 await self.safe_edit(query, f"❌ Failed to download file: {e}")
                 return
 
-        await self._run_with_concurrency_limit(
-            user_id, "compression", do_compression()
-        )
+        await self._run_with_concurrency_limit(user_id, "compression", do_compression())
 
-    async def merge_videos(
-        self, update: Update, context: ContextTypes.DEFAULT_TYPE, session: dict
-    ):
+    async def merge_videos(self, update: Update, context: ContextTypes.DEFAULT_TYPE, session: dict):
         """Merge multiple videos."""
         if not await self._require_callback(update):
             return
@@ -3203,22 +3297,17 @@ class EnhancedMediaHandler:
         if "merge_list" not in session or len(session["merge_list"]) < 2:
             await self.safe_edit(
                 query,
-                "❌ Need at least 2 videos to merge.\n"
-                "Send video files first, then click 'Start Merge'.",
+                "❌ Need at least 2 videos to merge.\nSend video files first, then click 'Start Merge'.",
             )
             return
 
-        await self.safe_edit(
-            query, f"🔀 Merging {len(session['merge_list'])} videos..."
-        )
+        await self.safe_edit(query, f"🔀 Merging {len(session['merge_list'])} videos...")
 
         output_dir = getattr(config, "OUTPUT_PATH", "storage/output") if config else "storage/output"
         with contextlib.suppress(Exception):
             os.makedirs(output_dir, exist_ok=True)
         output_path = os.path.join(output_dir, f"merged_{int(datetime.now().timestamp())}.mp4")
-        success = await self.converter.merge_videos(
-            session["merge_list"], output_path
-        )
+        success = await self.converter.merge_videos(session["merge_list"], output_path)
 
         if success and os.path.exists(output_path):
             with open(output_path, "rb") as video_file:
@@ -3238,9 +3327,7 @@ class EnhancedMediaHandler:
         else:
             await self.safe_edit(query, "❌ Merge failed.")
 
-    async def merge_audios(
-        self, update: Update, context: ContextTypes.DEFAULT_TYPE, session: dict
-    ):
+    async def merge_audios(self, update: Update, context: ContextTypes.DEFAULT_TYPE, session: dict):
         """Merge multiple audio files."""
         if not await self._require_callback(update):
             return
@@ -3252,22 +3339,17 @@ class EnhancedMediaHandler:
         if "merge_list" not in session or len(session["merge_list"]) < 2:
             await self.safe_edit(
                 query,
-                "❌ Need at least 2 audio files to merge.\n"
-                "Send audio files first, then click 'Start Merge'.",
+                "❌ Need at least 2 audio files to merge.\nSend audio files first, then click 'Start Merge'.",
             )
             return
 
-        await self.safe_edit(
-            query, f"🔀 Merging {len(session['merge_list'])} audio files..."
-        )
+        await self.safe_edit(query, f"🔀 Merging {len(session['merge_list'])} audio files...")
 
         output_dir = getattr(config, "OUTPUT_PATH", "storage/output") if config else "storage/output"
         with contextlib.suppress(Exception):
             os.makedirs(output_dir, exist_ok=True)
         output_path = os.path.join(output_dir, f"merged_{int(datetime.now().timestamp())}.mp3")
-        success = await self.converter.merge_audios(
-            session["merge_list"], output_path
-        )
+        success = await self.converter.merge_audios(session["merge_list"], output_path)
 
         if success and os.path.exists(output_path):
             with open(output_path, "rb") as audio_file:
@@ -3287,9 +3369,7 @@ class EnhancedMediaHandler:
         else:
             await self.safe_edit(query, "❌ Merge failed.")
 
-    async def remove_audio(
-        self, update: Update, context: ContextTypes.DEFAULT_TYPE, session: dict
-    ):
+    async def remove_audio(self, update: Update, context: ContextTypes.DEFAULT_TYPE, session: dict):
         """Remove audio from video."""
         if not await self._require_callback(update):
             return
@@ -3318,9 +3398,7 @@ class EnhancedMediaHandler:
         with contextlib.suppress(Exception):
             os.makedirs(output_dir, exist_ok=True)
         output_path = os.path.join(output_dir, f"{current_file['id']}_no_audio.mp4")
-        success = await self.converter.remove_audio(
-            current_file["path"], output_path
-        )
+        success = await self.converter.remove_audio(current_file["path"], output_path)
 
         if success and os.path.exists(output_path):
             with open(output_path, "rb") as video_file:
@@ -3363,9 +3441,7 @@ class EnhancedMediaHandler:
         }
 
         if resolution == "custom":
-            await self.safe_edit(
-                query, "Enter resolution (WIDTHxHEIGHT):\nExample: 1280x720"
-            )
+            await self.safe_edit(query, "Enter resolution (WIDTHxHEIGHT):\nExample: 1280x720")
             context.user_data["awaiting_resolution"] = True
             for key in list(context.user_data.keys()):
                 if key.startswith("awaiting_"):
@@ -3379,9 +3455,7 @@ class EnhancedMediaHandler:
             return
 
         width, height = res_map[resolution]
-        await self.safe_edit(
-            query, f"📐 Changing resolution to {width}x{height}..."
-        )
+        await self.safe_edit(query, f"📐 Changing resolution to {width}x{height}...")
 
         # Ensure file downloaded (lazy-download)
         if not current_file.get("path") or not os.path.exists(current_file.get("path") or ""):
@@ -3396,9 +3470,7 @@ class EnhancedMediaHandler:
         with contextlib.suppress(Exception):
             os.makedirs(output_dir, exist_ok=True)
         output_path = os.path.join(output_dir, f"{current_file['id']}_{width}x{height}.mp4")
-        success = await self.converter.change_resolution(
-            current_file["path"], output_path, width, height
-        )
+        success = await self.converter.change_resolution(current_file["path"], output_path, width, height)
 
         if success and os.path.exists(output_path):
             with open(output_path, "rb") as video_file:
@@ -3441,9 +3513,7 @@ class EnhancedMediaHandler:
         if preset == "custom":
             await self.safe_edit(
                 query,
-                "Enter optimization settings:\n"
-                "Format: preset,crf,bitrate\n"
-                "Example: slow,23,128k",
+                "Enter optimization settings:\nFormat: preset,crf,bitrate\nExample: slow,23,128k",
             )
             context.user_data["awaiting_optimize"] = True
             for key in list(context.user_data.keys()):
@@ -3517,7 +3587,9 @@ class EnhancedMediaHandler:
             # Inform user and provide cancel button
             try:
                 kb = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data=f"cancel_job:{job_id}")]])
-                await self.safe_edit(query, f"✅ Optimization job queued (ID: {job_id}). I'll update you with progress.", reply_markup=kb)
+                await self.safe_edit(
+                    query, f"✅ Optimization job queued (ID: {job_id}). I'll update you with progress.", reply_markup=kb
+                )
                 with contextlib.suppress(Exception):
                     asyncio.create_task(self._watch_job_progress(query, job_id))
             except Exception:
@@ -3539,9 +3611,7 @@ class EnhancedMediaHandler:
         else:
             await self.safe_edit(query, "❌ Optimization failed.")
 
-    async def repair_video(
-        self, update: Update, context: ContextTypes.DEFAULT_TYPE, session: dict
-    ):
+    async def repair_video(self, update: Update, context: ContextTypes.DEFAULT_TYPE, session: dict):
         """Attempt to repair corrupted video."""
         if not await self._require_callback(update):
             return
@@ -3636,9 +3706,7 @@ class EnhancedMediaHandler:
                 query,
                 "FFmpeg-python binding is not available on the server. This operation requires ffmpeg-python.",
             )
-            logger.info(
-                "ffmpeg-python not available for take_screenshot; falling back to CLI where possible"
-            )
+            logger.info("ffmpeg-python not available for take_screenshot; falling back to CLI where possible")
             return
 
         # Ensure file downloaded (lazy-download)
@@ -3655,9 +3723,7 @@ class EnhancedMediaHandler:
             duration = float(probe["format"]["duration"])
         except Exception as e:
             logger.warning(f"ffmpeg.probe failed: {e}")
-            await self.safe_edit(
-                query, "Failed to read media info for screenshot operation."
-            )
+            await self.safe_edit(query, "Failed to read media info for screenshot operation.")
             return
 
         if option == "custom":
@@ -3701,9 +3767,7 @@ class EnhancedMediaHandler:
         with contextlib.suppress(Exception):
             os.makedirs(output_dir, exist_ok=True)
         output_path = os.path.join(output_dir, f"{current_file.get('id', 'unknown')}_screenshot.jpg")
-        success = await self.converter.take_screenshot_at_time(
-            current_file["path"], output_path, time_str
-        )
+        success = await self.converter.take_screenshot_at_time(current_file["path"], output_path, time_str)
 
         if success and os.path.exists(output_path):
             with open(output_path, "rb") as photo_file:
@@ -3716,9 +3780,7 @@ class EnhancedMediaHandler:
         else:
             await self.safe_edit(query, "❌ Failed to take screenshot.")
 
-    async def create_thumbnail_grid(
-        self, update: Update, context: ContextTypes.DEFAULT_TYPE, session: dict
-    ):
+    async def create_thumbnail_grid(self, update: Update, context: ContextTypes.DEFAULT_TYPE, session: dict):
         """Create thumbnail grid from video."""
         if not await self._require_callback(update):
             return
@@ -3744,9 +3806,7 @@ class EnhancedMediaHandler:
         with contextlib.suppress(Exception):
             os.makedirs(output_dir, exist_ok=True)
         output_path = os.path.join(output_dir, f"{current_file['id']}_grid.jpg")
-        success = await self.converter.extract_thumbnail_grid(
-            current_file["path"], output_path, 3, 3
-        )
+        success = await self.converter.extract_thumbnail_grid(current_file["path"], output_path, 3, 3)
 
         if success and os.path.exists(output_path):
             with open(output_path, "rb") as photo_file:
@@ -3760,9 +3820,7 @@ class EnhancedMediaHandler:
             # Fallback to single screenshot
             await self.take_screenshot(update, context, session, "middle")
 
-    async def extract_streams(
-        self, update: Update, context: ContextTypes.DEFAULT_TYPE, session: dict
-    ):
+    async def extract_streams(self, update: Update, context: ContextTypes.DEFAULT_TYPE, session: dict):
         """Extract all streams from video."""
         if not await self._require_callback(update):
             return
@@ -3842,9 +3900,7 @@ class EnhancedMediaHandler:
         if not await self._check_conversion_quota(update, context):
             return
 
-        await self.safe_edit(
-            query, f"🔄 Converting to {format_type.upper()}..."
-        )
+        await self.safe_edit(query, f"🔄 Converting to {format_type.upper()}...")
 
         # Ensure file downloaded (lazy-download)
         if not current_file.get("path") or not os.path.exists(current_file.get("path") or ""):
@@ -3859,9 +3915,7 @@ class EnhancedMediaHandler:
         with contextlib.suppress(Exception):
             os.makedirs(output_base, exist_ok=True)
         output_path = os.path.join(output_base, f"{current_file['id']}_converted.{format_type}")
-        success = await self.converter.convert_audio_format(
-            current_file["path"], output_path, format_type
-        )
+        success = await self.converter.convert_audio_format(current_file["path"], output_path, format_type)
 
         if success and os.path.exists(output_path):
             mime_type = {
@@ -3883,9 +3937,7 @@ class EnhancedMediaHandler:
                 )
             os.remove(output_path)
         else:
-            await self.safe_edit(
-                query, f"❌ Failed to convert to {format_type}."
-            )
+            await self.safe_edit(query, f"❌ Failed to convert to {format_type}.")
 
     async def adjust_bitrate(
         self,
@@ -3933,9 +3985,7 @@ class EnhancedMediaHandler:
                 await self.safe_edit(query, f"❌ Failed to download file: {e}")
                 return
 
-        success, _ = await self.converter.execute_ffmpeg(
-            cmd, current_file["path"], output_path
-        )
+        success, _ = await self.converter.execute_ffmpeg(cmd, current_file["path"], output_path)
 
         if success and os.path.exists(output_path):
             with open(output_path, "rb") as audio_file:
@@ -3949,9 +3999,7 @@ class EnhancedMediaHandler:
         else:
             await self.safe_edit(query, "❌ Failed to adjust bitrate.")
 
-    async def normalize_audio(
-        self, update: Update, context: ContextTypes.DEFAULT_TYPE, session: dict
-    ):
+    async def normalize_audio(self, update: Update, context: ContextTypes.DEFAULT_TYPE, session: dict):
         """Normalize audio volume."""
         if not await self._require_callback(update):
             return
@@ -3991,9 +4039,7 @@ class EnhancedMediaHandler:
                 await self.safe_edit(query, f"❌ Failed to download file: {e}")
                 return
 
-        success, _ = await self.converter.execute_ffmpeg(
-            cmd, current_file["path"], output_path
-        )
+        success, _ = await self.converter.execute_ffmpeg(cmd, current_file["path"], output_path)
 
         if success and os.path.exists(output_path):
             with open(output_path, "rb") as audio_file:
@@ -4007,17 +4053,13 @@ class EnhancedMediaHandler:
         else:
             await self.safe_edit(query, "❌ Failed to normalize audio.")
 
-    async def extract_all_streams(
-        self, update: Update, context: ContextTypes.DEFAULT_TYPE, session: dict
-    ):
+    async def extract_all_streams(self, update: Update, context: ContextTypes.DEFAULT_TYPE, session: dict):
         """Extract all streams (video, audio, subtitles)."""
         if not await self._require_callback(update):
             return
         await self.extract_streams(update, context, session)
 
-    async def extract_subtitles(
-        self, update: Update, context: ContextTypes.DEFAULT_TYPE, session: dict
-    ):
+    async def extract_subtitles(self, update: Update, context: ContextTypes.DEFAULT_TYPE, session: dict):
         """Extract subtitles from video."""
         if not await self._require_callback(update):
             return
@@ -4043,9 +4085,7 @@ class EnhancedMediaHandler:
         with contextlib.suppress(Exception):
             os.makedirs(output_base, exist_ok=True)
         output_path = os.path.join(output_base, f"{current_file['id']}_subtitles.srt")
-        success = await self.converter.extract_subtitles(
-            current_file["path"], output_path
-        )
+        success = await self.converter.extract_subtitles(current_file["path"], output_path)
 
         if success and os.path.exists(output_path):
             with open(output_path, "rb") as sub_file:
@@ -4057,13 +4097,9 @@ class EnhancedMediaHandler:
                 )
             os.remove(output_path)
         else:
-            await self.safe_edit(
-                query, "❌ No subtitles found or extraction failed."
-            )
+            await self.safe_edit(query, "❌ No subtitles found or extraction failed.")
 
-    async def show_full_info(
-        self, update: Update, context: ContextTypes.DEFAULT_TYPE, session: dict
-    ):
+    async def show_full_info(self, update: Update, context: ContextTypes.DEFAULT_TYPE, session: dict):
         """Show full media information."""
         if not await self._require_callback(update):
             return
@@ -4112,9 +4148,7 @@ class EnhancedMediaHandler:
             info_text = "📊 **Full Media Analysis**\n\n"
             info_text += f"📁 **File:** {current_file['name']}\n"
             info_text += f"📦 **Size:** {format_info.get('size', 0) // 1024 // 1024} MB\n"
-            info_text += (
-                f"🎞️ **Format:** {format_info.get('format_name', 'N/A')}\n"
-            )
+            info_text += f"🎞️ **Format:** {format_info.get('format_name', 'N/A')}\n"
             info_text += f"⏱️ **Duration:** {float(format_info.get('duration', 0)):.2f}s\n"
             bitrate_kbps = int(format_info.get("bit_rate", 0)) // 1000
             info_text += f"📈 **Bitrate:** {bitrate_kbps} kbps\n\n"
@@ -4124,12 +4158,10 @@ class EnhancedMediaHandler:
 
             for i, stream in enumerate(streams):
                 codec_type = stream.get("codec_type", "unknown")
-                info_text += f"\n**Stream {i+1} ({codec_type}):**\n"
+                info_text += f"\n**Stream {i + 1} ({codec_type}):**\n"
 
                 if codec_type == "video":
-                    info_text += (
-                        f"  Codec: {stream.get('codec_name', 'N/A')}\n"
-                    )
+                    info_text += f"  Codec: {stream.get('codec_name', 'N/A')}\n"
                     info_text += f"  Resolution: {stream.get('width', 'N/A')}x{stream.get('height', 'N/A')}\n"
                     num, den = stream.get("avg_frame_rate", "0/1").split("/")
                     fps = float(num) / float(den) if float(den) != 0 else 0
@@ -4139,34 +4171,24 @@ class EnhancedMediaHandler:
                     info_text += f"  Bitrate: {sb_kbps}\n"
 
                 elif codec_type == "audio":
-                    info_text += (
-                        f"  Codec: {stream.get('codec_name', 'N/A')}\n"
-                    )
-                    info_text += (
-                        f"  Channels: {stream.get('channels', 'N/A')}\n"
-                    )
+                    info_text += f"  Codec: {stream.get('codec_name', 'N/A')}\n"
+                    info_text += f"  Channels: {stream.get('channels', 'N/A')}\n"
                     info_text += f"  Sample Rate: {stream.get('sample_rate', 'N/A')} Hz\n"
                     sb = stream.get("bit_rate")
                     sb_kbps = f"{int(sb) // 1000} kbps" if sb else "N/A"
                     info_text += f"  Bitrate: {sb_kbps}\n"
 
                 elif codec_type == "subtitle":
-                    info_text += (
-                        f"  Codec: {stream.get('codec_name', 'N/A')}\n"
-                    )
+                    info_text += f"  Codec: {stream.get('codec_name', 'N/A')}\n"
                     info_text += f"  Language: {stream.get('tags', {}).get('language', 'N/A')}\n"
 
-            await self.safe_edit(
-                query, info_text[:4000]
-            )  # Telegram message limit
+            await self.safe_edit(query, info_text[:4000])  # Telegram message limit
 
         except Exception as e:
             logger.error(f"Error analyzing media: {e}")
             await self.safe_edit(query, "❌ Failed to analyze media.")
 
-    async def create_archive(
-        self, update: Update, context: ContextTypes.DEFAULT_TYPE, session: dict
-    ):
+    async def create_archive(self, update: Update, context: ContextTypes.DEFAULT_TYPE, session: dict):
         """Create archive of processed files."""
         if not await self._require_callback(update):
             return
@@ -4208,9 +4230,7 @@ class EnhancedMediaHandler:
         with contextlib.suppress(Exception):
             asyncio.create_task(self._watch_job_progress(query, job_id))
 
-    async def generate_sample(
-        self, update: Update, context: ContextTypes.DEFAULT_TYPE, session: dict
-    ):
+    async def generate_sample(self, update: Update, context: ContextTypes.DEFAULT_TYPE, session: dict):
         """Generate sample/preview of media."""
         if not await self._require_callback(update):
             return
@@ -4261,9 +4281,7 @@ class EnhancedMediaHandler:
         with contextlib.suppress(Exception):
             asyncio.create_task(self._watch_job_progress(query, job_id))
 
-    async def show_media_info(
-        self, update: Update, context: ContextTypes.DEFAULT_TYPE, session: dict
-    ):
+    async def show_media_info(self, update: Update, context: ContextTypes.DEFAULT_TYPE, session: dict):
         """Show basic media information."""
         if not await self._require_callback(update):
             return
@@ -4285,7 +4303,11 @@ class EnhancedMediaHandler:
                 mongo_uri = None
                 try:
                     if "config" in globals() and config is not None:
-                        mongo_uri = getattr(config, "MONGO_URI", None) or os.environ.get("MONGO_URI") or os.environ.get("MONGODB_URL")
+                        mongo_uri = (
+                            getattr(config, "MONGO_URI", None)
+                            or os.environ.get("MONGO_URI")
+                            or os.environ.get("MONGODB_URL")
+                        )
                     else:
                         mongo_uri = os.environ.get("MONGO_URI") or os.environ.get("MONGODB_URL")
                 except Exception:
@@ -4344,17 +4366,13 @@ class EnhancedMediaHandler:
         except Exception as e:
             logger.error(f"Failed to log to MongoDB: {e}")
 
-    async def handle_custom_input(
-        self, update: Update, context: ContextTypes.DEFAULT_TYPE
-    ):
+    async def handle_custom_input(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle custom user input for various operations."""
         user_input = update.message.text.strip()
         user_id = update.effective_user.id
 
         if user_id not in self.user_sessions:
-            await update.message.reply_text(
-                "❌ Session expired. Please send a file first."
-            )
+            await update.message.reply_text("❌ Session expired. Please send a file first.")
             return ConversationHandler.END
 
         session = self.user_sessions[user_id]
@@ -4395,8 +4413,12 @@ class EnhancedMediaHandler:
                     output_base = getattr(config, "OUTPUT_PATH", "storage/output") if config else "storage/output"
                     with contextlib.suppress(Exception):
                         os.makedirs(output_base, exist_ok=True)
-                    output_path = os.path.join(output_base, f"{current_file['id']}_trim_{int(start_s)}_{int(end_s)}.mp4")
-                    success = await self.converter.trim_video(current_file["path"], output_path, start, user_input.strip())
+                    output_path = os.path.join(
+                        output_base, f"{current_file['id']}_trim_{int(start_s)}_{int(end_s)}.mp4"
+                    )
+                    success = await self.converter.trim_video(
+                        current_file["path"], output_path, start, user_input.strip()
+                    )
 
                     if success and os.path.exists(output_path):
                         with open(output_path, "rb") as vf:
@@ -4444,11 +4466,15 @@ class EnhancedMediaHandler:
                         await update.message.reply_text("❌ Invalid duration format. Use HH:MM:SS or seconds.")
                         return
 
-                    await update.message.reply_text(f"✂️ Trimming from {start} for duration {user_input} (to {end_str})...")
+                    await update.message.reply_text(
+                        f"✂️ Trimming from {start} for duration {user_input} (to {end_str})..."
+                    )
                     output_base = getattr(config, "OUTPUT_PATH", "storage/output") if config else "storage/output"
                     with contextlib.suppress(Exception):
                         os.makedirs(output_base, exist_ok=True)
-                    output_path = os.path.join(output_base, f"{current_file['id']}_trim_{int(start_s)}_{int(end_s)}.mp4")
+                    output_path = os.path.join(
+                        output_base, f"{current_file['id']}_trim_{int(start_s)}_{int(end_s)}.mp4"
+                    )
                     success = await self.converter.trim_video(current_file["path"], output_path, start, end_str)
 
                     if success and os.path.exists(output_path):
@@ -4557,17 +4583,13 @@ class EnhancedMediaHandler:
             if "x" in user_input:
                 try:
                     width, height = map(int, user_input.split("x"))
-                    await update.message.reply_text(
-                        f"📐 Changing resolution to {width}x{height}..."
-                    )
+                    await update.message.reply_text(f"📐 Changing resolution to {width}x{height}...")
 
                     output_base = getattr(config, "OUTPUT_PATH", "storage/output") if config else "storage/output"
                     with contextlib.suppress(Exception):
                         os.makedirs(output_base, exist_ok=True)
                     output_path = os.path.join(output_base, f"{current_file['id']}_{width}x{height}.mp4")
-                    success = await self.converter.change_resolution(
-                        current_file["path"], output_path, width, height
-                    )
+                    success = await self.converter.change_resolution(current_file["path"], output_path, width, height)
 
                     if success and os.path.exists(output_path):
                         with open(output_path, "rb") as video_file:
@@ -4579,20 +4601,12 @@ class EnhancedMediaHandler:
                             )
                         os.remove(output_path)
                     else:
-                        await update.message.reply_text(
-                            "❌ Failed to change resolution."
-                        )
+                        await update.message.reply_text("❌ Failed to change resolution.")
                 except Exception:
-                    logger.exception(
-                        "Invalid resolution input while parsing WIDTHxHEIGHT"
-                    )
-                    await update.message.reply_text(
-                        "❌ Invalid format. Use WIDTHxHEIGHT."
-                    )
+                    logger.exception("Invalid resolution input while parsing WIDTHxHEIGHT")
+                    await update.message.reply_text("❌ Invalid format. Use WIDTHxHEIGHT.")
             else:
-                await update.message.reply_text(
-                    "❌ Invalid format. Use WIDTHxHEIGHT."
-                )
+                await update.message.reply_text("❌ Invalid format. Use WIDTHxHEIGHT.")
 
             for key in list(context.user_data.keys()):
                 if key.startswith("awaiting_"):
@@ -4635,7 +4649,9 @@ class EnhancedMediaHandler:
                         )
                         # Try to call converter.split if available
                         try:
-                            output_base = getattr(config, "OUTPUT_PATH", "storage/output") if config else "storage/output"
+                            output_base = (
+                                getattr(config, "OUTPUT_PATH", "storage/output") if config else "storage/output"
+                            )
                             with contextlib.suppress(Exception):
                                 os.makedirs(output_base, exist_ok=True)
                             out = os.path.join(output_base, f"{current_file['id']}_split_{int(start)}_{int(end)}.mp4")
@@ -4655,9 +4671,7 @@ class EnhancedMediaHandler:
                             logger.exception("split_video failed")
                     else:
                         parts = int(user_input.strip())
-                        await update.message.reply_text(
-                            f"✅ Split into {parts} parts queued (placeholder)."
-                        )
+                        await update.message.reply_text(f"✅ Split into {parts} parts queued (placeholder).")
                 except Exception:
                     await update.message.reply_text(
                         "❌ Invalid split format. Use 'start-end' or an integer number of parts."
@@ -4730,7 +4744,7 @@ class EnhancedMediaHandler:
 
                         await update.message.reply_text("✅ Forwarded file successfully.")
                     except Exception as e:
-                        logger.exception("Failed to forward file to %s: %s", getattr(dest_chat, 'id', lookup), e)
+                        logger.exception("Failed to forward file to %s: %s", getattr(dest_chat, "id", lookup), e)
                         await update.message.reply_text(f"❌ Failed to forward: {e}")
 
             # Clear awaiting flag regardless of outcome to avoid stuck state
@@ -4738,9 +4752,7 @@ class EnhancedMediaHandler:
                 if key.startswith("awaiting_"):
                     del context.user_data[key]
             else:
-                await update.message.reply_text(
-                    "❌ Invalid format. Use WIDTHxHEIGHT."
-                )
+                await update.message.reply_text("❌ Invalid format. Use WIDTHxHEIGHT.")
                 for key in list(context.user_data.keys()):
                     if key.startswith("awaiting_"):
                         del context.user_data[key]
@@ -4759,9 +4771,7 @@ class EnhancedMediaHandler:
                 start_time = context.user_data.get("start_time", "00:00:00")
                 end_time = user_input
 
-                await update.message.reply_text(
-                    f"✂️ Trimming from {start_time} to {end_time}..."
-                )
+                await update.message.reply_text(f"✂️ Trimming from {start_time} to {end_time}...")
 
                 if not await self._check_conversion_quota(update, context):
                     return
@@ -4770,9 +4780,7 @@ class EnhancedMediaHandler:
                 with contextlib.suppress(Exception):
                     os.makedirs(output_base, exist_ok=True)
                 output_path = os.path.join(output_base, f"{current_file['id']}_trimmed.mp4")
-                success = await self.converter.trim_video(
-                    current_file["path"], output_path, start_time, end_time
-                )
+                success = await self.converter.trim_video(current_file["path"], output_path, start_time, end_time)
 
                 if success and os.path.exists(output_path):
                     with open(output_path, "rb") as video_file:
@@ -4788,17 +4796,13 @@ class EnhancedMediaHandler:
 
         elif context.user_data.get("awaiting_screenshot_time"):
             # Handle screenshot time
-            await update.message.reply_text(
-                f"🖼️ Taking screenshot at {user_input}..."
-            )
+            await update.message.reply_text(f"🖼️ Taking screenshot at {user_input}...")
 
             output_base = getattr(config, "OUTPUT_PATH", "storage/output") if config else "storage/output"
             with contextlib.suppress(Exception):
                 os.makedirs(output_base, exist_ok=True)
             output_path = os.path.join(output_base, f"{current_file['id']}_screenshot.jpg")
-            success = await self.converter.take_screenshot_at_time(
-                current_file["path"], output_path, user_input
-            )
+            success = await self.converter.take_screenshot_at_time(current_file["path"], output_path, user_input)
 
             if success and os.path.exists(output_path):
                 with open(output_path, "rb") as photo_file:
@@ -4809,17 +4813,13 @@ class EnhancedMediaHandler:
                     )
                 os.remove(output_path)
             else:
-                await update.message.reply_text(
-                    "❌ Failed to take screenshot."
-                )
+                await update.message.reply_text("❌ Failed to take screenshot.")
 
         elif context.user_data.get("awaiting_screenshot_count"):
             # Handle multiple screenshots
             if user_input.isdigit() and 2 <= int(user_input) <= 20:
                 count = int(user_input)
-                await update.message.reply_text(
-                    f"🖼️ Taking {count} screenshots..."
-                )
+                await update.message.reply_text(f"🖼️ Taking {count} screenshots...")
 
                 screenshots = await self.converter.take_screenshot_grid(
                     current_file["path"],
@@ -4835,24 +4835,18 @@ class EnhancedMediaHandler:
                             media_group.append(
                                 InputMediaPhoto(
                                     photo_file,
-                                    caption=(
-                                        f"Screenshot {i+1}" if i == 0 else ""
-                                    ),
+                                    caption=(f"Screenshot {i + 1}" if i == 0 else ""),
                                 )
                             )
 
-                    await context.bot.send_media_group(
-                        chat_id=update.effective_chat.id, media=media_group
-                    )
+                    await context.bot.send_media_group(chat_id=update.effective_chat.id, media=media_group)
 
                     # Cleanup
                     for screenshot_path in screenshots:
                         if os.path.exists(screenshot_path):
                             os.remove(screenshot_path)
                 else:
-                    await update.message.reply_text(
-                        "❌ Failed to take screenshots."
-                    )
+                    await update.message.reply_text("❌ Failed to take screenshots.")
             else:
                 await update.message.reply_text("❌ Enter number 2-20.")
                 for key in list(context.user_data.keys()):
@@ -4863,16 +4857,12 @@ class EnhancedMediaHandler:
             # Handle custom framerate input
             try:
                 fps = float(user_input)
-                await update.message.reply_text(
-                    f"⏱️ Changing framerate to {fps} fps..."
-                )
+                await update.message.reply_text(f"⏱️ Changing framerate to {fps} fps...")
                 output_base = getattr(config, "OUTPUT_PATH", "storage/output") if config else "storage/output"
                 with contextlib.suppress(Exception):
                     os.makedirs(output_base, exist_ok=True)
                 output_path = os.path.join(output_base, f"{current_file['id']}_fr_{int(fps)}.mp4")
-                success = await self.converter.change_framerate(
-                    current_file["path"], output_path, fps
-                )
+                success = await self.converter.change_framerate(current_file["path"], output_path, fps)
 
                 if success and os.path.exists(output_path):
                     with open(output_path, "rb") as video_file:
@@ -4884,13 +4874,9 @@ class EnhancedMediaHandler:
                         )
                     os.remove(output_path)
                 else:
-                    await update.message.reply_text(
-                        "❌ Failed to change framerate."
-                    )
+                    await update.message.reply_text("❌ Failed to change framerate.")
             except Exception:
-                await update.message.reply_text(
-                    "❌ Invalid FPS value. Use a number like 24 or 29.97."
-                )
+                await update.message.reply_text("❌ Invalid FPS value. Use a number like 24 or 29.97.")
                 for key in list(context.user_data.keys()):
                     if key.startswith("awaiting_"):
                         del context.user_data[key]
@@ -4900,9 +4886,7 @@ class EnhancedMediaHandler:
             if user_input.endswith("k"):
                 await self.adjust_bitrate(update, context, session, user_input)
             else:
-                await update.message.reply_text(
-                    "❌ Invalid bitrate. Use format like 128k, 320k."
-                )
+                await update.message.reply_text("❌ Invalid bitrate. Use format like 128k, 320k.")
                 for key in list(context.user_data.keys()):
                     if key.startswith("awaiting_"):
                         del context.user_data[key]
@@ -4911,9 +4895,7 @@ class EnhancedMediaHandler:
             # Handle custom optimization
             try:
                 preset, crf, bitrate = user_input.split(",")
-                await update.message.reply_text(
-                    f"⚡ Optimizing with preset={preset}, crf={crf}, bitrate={bitrate}..."
-                )
+                await update.message.reply_text(f"⚡ Optimizing with preset={preset}, crf={crf}, bitrate={bitrate}...")
 
                 output_base = getattr(config, "OUTPUT_PATH", "storage/output") if config else "storage/output"
                 with contextlib.suppress(Exception):
@@ -4934,9 +4916,7 @@ class EnhancedMediaHandler:
                     "+faststart",
                 ]
 
-                success, _ = await self.converter.execute_ffmpeg(
-                    cmd, current_file["path"], output_path
-                )
+                success, _ = await self.converter.execute_ffmpeg(cmd, current_file["path"], output_path)
 
                 if success and os.path.exists(output_path):
                     with open(output_path, "rb") as video_file:
@@ -4950,12 +4930,8 @@ class EnhancedMediaHandler:
                 else:
                     await update.message.reply_text("❌ Optimization failed.")
             except Exception:
-                logger.exception(
-                    "Invalid custom optimize input; expected preset,crf,bitrate"
-                )
-                await update.message.reply_text(
-                    "❌ Invalid format. Use: preset,crf,bitrate"
-                )
+                logger.exception("Invalid custom optimize input; expected preset,crf,bitrate")
+                await update.message.reply_text("❌ Invalid format. Use: preset,crf,bitrate")
                 for key in list(context.user_data.keys()):
                     if key.startswith("awaiting_"):
                         del context.user_data[key]
@@ -4969,9 +4945,7 @@ class EnhancedMediaHandler:
                     os.makedirs(output_base, exist_ok=True)
                 output_path = os.path.join(output_base, f"{current_file['id']}_with_metadata.mp4")
 
-                success = await self.converter.edit_metadata(
-                    current_file["path"], output_path, metadata
-                )
+                success = await self.converter.edit_metadata(current_file["path"], output_path, metadata)
 
                 if success and os.path.exists(output_path):
                     with open(output_path, "rb") as video_file:
@@ -4983,9 +4957,7 @@ class EnhancedMediaHandler:
                         )
                     os.remove(output_path)
                 else:
-                    await update.message.reply_text(
-                        "❌ Failed to update metadata."
-                    )
+                    await update.message.reply_text("❌ Failed to update metadata.")
             except json.JSONDecodeError:
                 await update.message.reply_text("❌ Invalid JSON format.")
                 for key in list(context.user_data.keys()):

@@ -6,6 +6,7 @@ Go/Laravel-style patterns:
   - QueryBuilder: parameterized queries with NoSQL injection prevention
   - PreparedQuery: like prepared statements in SQL
 """
+
 import logging
 import os
 import time
@@ -25,15 +26,40 @@ _db = None
 # Only these fields are allowed in mass-assignment operations.
 # Fields like "is_admin", "role", "permissions" would be silently stripped.
 JOB_FILLABLE: set[str] = {
-    "job_id", "status", "progress", "message", "error",
-    "input_path", "output_path", "input_key", "output_key",
-    "source_url", "original_filename", "output_filename",
-    "ffmpeg_args", "progress_channel", "chat_id", "bot_id",
-    "request_id", "user_id", "type", "retries", "attempt",
-    "started_at", "finished_at", "created_at", "cleanup_input",
-    "cleanup_output", "output_get_url", "out_bytes", "in_bytes",
-    "progress_by_size", "remote_missing_attempts", "redownload_attempts",
-    "remux_attempts", "input_from_remote",
+    "job_id",
+    "status",
+    "progress",
+    "message",
+    "error",
+    "input_path",
+    "output_path",
+    "input_key",
+    "output_key",
+    "source_url",
+    "original_filename",
+    "output_filename",
+    "ffmpeg_args",
+    "progress_channel",
+    "chat_id",
+    "bot_id",
+    "request_id",
+    "user_id",
+    "type",
+    "retries",
+    "attempt",
+    "started_at",
+    "finished_at",
+    "created_at",
+    "cleanup_input",
+    "cleanup_output",
+    "output_get_url",
+    "out_bytes",
+    "in_bytes",
+    "progress_by_size",
+    "remote_missing_attempts",
+    "redownload_attempts",
+    "remux_attempts",
+    "input_from_remote",
 }
 JOB_GUARDED: set[str] = {"_id"}
 
@@ -61,7 +87,12 @@ def _validate_field_names(fields: dict[str, Any]) -> dict[str, Any]:
         if isinstance(value, dict):
             for nested_key in value:
                 if nested_key.startswith("$") and nested_key not in (
-                    "$set", "$inc", "$push", "$pull", "$each", "$position"
+                    "$set",
+                    "$inc",
+                    "$push",
+                    "$pull",
+                    "$each",
+                    "$position",
                 ):
                     logger.warning("Blocked nested operator in update: %s", repr(nested_key)[:80])
                     continue
@@ -98,7 +129,7 @@ async def save_job(job: dict[str, Any]) -> None:
         if bot_id and bot_id not in JOB_GUARDED:
             safe_job["bot_id"] = bot_id
     except Exception:
-        pass
+        logger.debug("Failed to close MongoDB client")
 
     # Parameterized insert (prepared-statement-like: data is validated and filtered)
     await _db.jobs.insert_one(safe_job)

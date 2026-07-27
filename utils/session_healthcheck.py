@@ -100,10 +100,10 @@ class SessionHealthChecker:
 
     def __init__(
         self,
-        check_interval: int = 3600,          # every hour
+        check_interval: int = 3600,  # every hour
         admin_user_id: int | None = None,
-        bot_app=None,                         # PTB Application
-        db_model=None,                        # MongoDB model (MediaConversionModel)
+        bot_app=None,  # PTB Application
+        db_model=None,  # MongoDB model (MediaConversionModel)
         max_consecutive_failures: int = 3,
     ):
         self.check_interval = check_interval
@@ -191,12 +191,15 @@ class SessionHealthChecker:
             if r["alive"]:
                 logger.debug(
                     "SessionHealthChecker: %s OK (dc=%s, latency=%.0fms)",
-                    r["name"], r["dc_id"], r["latency_ms"] or 0,
+                    r["name"],
+                    r["dc_id"],
+                    r["latency_ms"] or 0,
                 )
             else:
                 logger.warning(
                     "SessionHealthChecker: %s UNHEALTHY — %s",
-                    r["name"], r["error"] or "unknown error",
+                    r["name"],
+                    r["error"] or "unknown error",
                 )
 
         # Detect transitions for Pyrogram
@@ -257,10 +260,8 @@ class SessionHealthChecker:
                 self._prev_telethon_ok = now_ok
 
         # If consecutive failures exceed threshold, re-alert
-        pyro_bad = (self._pyrogram_failures >= self.max_consecutive_failures
-                     and self._pyrogram_failures > 0)
-        tl_bad = (self._telethon_failures >= self.max_consecutive_failures
-                   and self._telethon_failures > 0)
+        pyro_bad = self._pyrogram_failures >= self.max_consecutive_failures and self._pyrogram_failures > 0
+        tl_bad = self._telethon_failures >= self.max_consecutive_failures and self._telethon_failures > 0
         if pyro_bad or tl_bad:
             now = time.time()
             if now - self._last_advisory_time > self._min_advisory_interval:
@@ -270,8 +271,7 @@ class SessionHealthChecker:
                     f"Pyrogram failures: {self._pyrogram_failures}",
                     f"Telethon failures: {self._telethon_failures}",
                     "",
-                    "You may need to regenerate the session:\n"
-                    "`python scripts/create_pyrogram_session.py`",
+                    "You may need to regenerate the session:\n`python scripts/create_pyrogram_session.py`",
                 ]
                 await self._send_admin_message("\n".join(lines))
 
@@ -317,6 +317,7 @@ class SessionHealthChecker:
                 get_pyrogram_session_string,
                 get_userbot_credentials,
             )
+
             if not get_pyrogram_session_string():
                 return False
             api_id, api_hash = get_userbot_credentials()
@@ -381,8 +382,10 @@ class SessionHealthChecker:
 
         # Check env vars first (fast, no I/O) — skip the file read if set
         env_str = _get_env_value(
-            "PYROGRAM_SESSION", "pyrogram_session",
-            "USERBOT_PYROGRAM_SESSION", "userbot_pyrogram_session",
+            "PYROGRAM_SESSION",
+            "pyrogram_session",
+            "USERBOT_PYROGRAM_SESSION",
+            "userbot_pyrogram_session",
         )
         if env_str:
             session_str = env_str
@@ -457,8 +460,13 @@ class SessionHealthChecker:
 
         # Check env vars first (fast, no I/O)
         session_str = _get_env_value(
-            "API_SESSION", "SESSION", "api_session", "USERBOT_SESSION",
-            "userbot_session", "TELETHON_SESSION", "telethon_session",
+            "API_SESSION",
+            "SESSION",
+            "api_session",
+            "USERBOT_SESSION",
+            "userbot_session",
+            "TELETHON_SESSION",
+            "telethon_session",
         )
         if not session_str:
             # Read the persisted JSON file async to avoid blocking the event loop
@@ -503,7 +511,7 @@ class SessionHealthChecker:
                     if me is not None:
                         h.phone = getattr(me, "phone", None)
                 except Exception:
-                    pass
+                    logger.debug("SessionHealthChecker: failed to get Telethon user info")
                 with contextlib.suppress(Exception):
                     h.dc_id = client.session.dc_id if hasattr(client.session, "dc_id") else None
                 # Persist session string to MongoDB for long-term survival
@@ -538,9 +546,10 @@ class SessionHealthChecker:
             saved_file = False
             try:
                 from utils.telethon_session import save_session_string_to_file_async
+
                 saved_file = await save_session_string_to_file_async(session_str, client_type="telethon")
             except Exception:
-                pass
+                logger.debug("SessionHealthChecker: failed to save Telethon session to file")
 
             # Save to MongoDB (for login flow and diagnostics).
             # Use distinct keys so Telethon and Pyrogram session strings
@@ -559,13 +568,15 @@ class SessionHealthChecker:
                     saved_mongo = True
                 except Exception as exc:
                     logger.debug(
-                        "SessionHealthChecker: failed to persist Telethon session to MongoDB: %s", exc,
+                        "SessionHealthChecker: failed to persist Telethon session to MongoDB: %s",
+                        exc,
                     )
 
             if saved_file or saved_mongo:
                 logger.info(
                     "SessionHealthChecker: persisted Telethon session (file=%s, mongo=%s)",
-                    saved_file, saved_mongo,
+                    saved_file,
+                    saved_mongo,
                 )
             else:
                 logger.debug(
@@ -573,7 +584,8 @@ class SessionHealthChecker:
                 )
         except Exception as exc:
             logger.debug(
-                "SessionHealthChecker: failed to extract Telethon session string: %s", exc,
+                "SessionHealthChecker: failed to extract Telethon session string: %s",
+                exc,
             )
 
     async def _save_pyrogram_session(self, client):
@@ -592,9 +604,10 @@ class SessionHealthChecker:
             saved_file = False
             try:
                 from utils.telethon_session import save_session_string_to_file_async
+
                 saved_file = await save_session_string_to_file_async(session_str, client_type="pyrogram")
             except Exception:
-                pass
+                logger.debug("SessionHealthChecker: failed to save Pyrogram session to file")
 
             # Save to MongoDB (for login flow and diagnostics).
             # Use distinct keys so Pyrogram and Telethon session strings
@@ -613,13 +626,15 @@ class SessionHealthChecker:
                     saved_mongo = True
                 except Exception as exc:
                     logger.debug(
-                        "SessionHealthChecker: failed to persist Pyrogram session to MongoDB: %s", exc,
+                        "SessionHealthChecker: failed to persist Pyrogram session to MongoDB: %s",
+                        exc,
                     )
 
             if saved_file or saved_mongo:
                 logger.info(
                     "SessionHealthChecker: persisted Pyrogram session (file=%s, mongo=%s)",
-                    saved_file, saved_mongo,
+                    saved_file,
+                    saved_mongo,
                 )
             else:
                 logger.debug(
@@ -627,7 +642,8 @@ class SessionHealthChecker:
                 )
         except Exception as exc:
             logger.debug(
-                "SessionHealthChecker: failed to export Pyrogram session string: %s", exc,
+                "SessionHealthChecker: failed to export Pyrogram session string: %s",
+                exc,
             )
 
     # ── Admin alerts ────────────────────────────────────────────────
@@ -636,9 +652,7 @@ class SessionHealthChecker:
         """Send a one-time alert to the admin about a session issue."""
         now = time.time()
         if now - self._last_advisory_time < self._min_advisory_interval:
-            logger.debug(
-                "SessionHealthChecker: skipping admin alert (rate-limited)"
-            )
+            logger.debug("SessionHealthChecker: skipping admin alert (rate-limited)")
             return
         self._last_advisory_time = now
 
@@ -654,20 +668,18 @@ class SessionHealthChecker:
             lines.append(f"\ud83d\udcf1 Phone: `{result['phone']}`")
         if result.get("dc_id"):
             lines.append(f"\ud83d\udda5 DC: `{result['dc_id']}`")
-        lines.extend([
-            "",
-            "Regenerate with:\n"
-            "`python scripts/create_pyrogram_session.py`",
-        ])
+        lines.extend(
+            [
+                "",
+                "Regenerate with:\n`python scripts/create_pyrogram_session.py`",
+            ]
+        )
         await self._send_admin_message("\n".join(lines))
 
     async def _send_admin_message(self, text: str):
         """Send a Markdown-formatted message to the admin via the bot."""
         if not self.admin_user_id or not self.bot_app:
-            logger.debug(
-                "SessionHealthChecker: no admin_user_id or bot_app; "
-                "skipping admin notification"
-            )
+            logger.debug("SessionHealthChecker: no admin_user_id or bot_app; skipping admin notification")
             return
         try:
             await self.bot_app.bot.send_message(
@@ -708,8 +720,7 @@ class SessionHealthChecker:
             lines.append("")
 
         lines.append(
-            "🔄 Check interval: `{}s`\n"
-            "🔔 Admin alerts: `{}`".format(
+            "🔄 Check interval: `{}s`\n🔔 Admin alerts: `{}`".format(
                 self.check_interval,
                 "Enabled" if self.admin_user_id else "Disabled",
             )

@@ -154,13 +154,13 @@ async def _dispatch_update_task(update):
                 with METRICS_LOCK:
                     METRICS["dispatch_attempts"] = METRICS.get("dispatch_attempts", 0) + 1
             except Exception:
-                pass
+                logger.debug("main: operation failed")
             await disp.process_update(update)
             try:
                 with METRICS_LOCK:
                     METRICS["updates_dispatched"] = METRICS.get("updates_dispatched", 0) + 1
             except Exception:
-                pass
+                logger.debug("main: operation failed")
             return
 
         # Fall back to Application.process_update if available
@@ -169,13 +169,13 @@ async def _dispatch_update_task(update):
                 with METRICS_LOCK:
                     METRICS["dispatch_attempts"] = METRICS.get("dispatch_attempts", 0) + 1
             except Exception:
-                pass
+                logger.debug("main: Fall back to Application.process_update if available")
             await BOT_APPLICATION.process_update(update)
             try:
                 with METRICS_LOCK:
                     METRICS["updates_dispatched"] = METRICS.get("updates_dispatched", 0) + 1
             except Exception:
-                pass
+                logger.debug("main: operation failed")
             return
 
         # As a last resort, try to enqueue back onto the application's update queue
@@ -185,21 +185,21 @@ async def _dispatch_update_task(update):
                 with METRICS_LOCK:
                     METRICS["updates_queued"] = METRICS.get("updates_queued", 0) + 1
             except Exception:
-                pass
+                logger.debug("main: As a last resort, try to enqueue back onto the application's update queue")
             return
         except Exception:
             try:
                 with METRICS_LOCK:
                     METRICS["dispatch_failures"] = METRICS.get("dispatch_failures", 0) + 1
             except Exception:
-                pass
+                logger.debug("main: operation failed")
             logger.exception("Failed to dispatch or enqueue update")
     except Exception as exc:
         try:
             with METRICS_LOCK:
                 METRICS["dispatch_failures"] = METRICS.get("dispatch_failures", 0) + 1
         except Exception:
-            pass
+            logger.debug("main: operation failed")
         logger.exception("Error dispatching update: %s", exc)
 
 
@@ -241,7 +241,7 @@ try:
         except Exception as se:
             logger.warning(f"Failed to initialize Sentry: {se}")
 except Exception:
-    pass
+    logger.debug("main: Initialize Sentry if configured via SENTRY_DSN environment variable")
 
 
 # Command handlers
@@ -549,7 +549,7 @@ def setup_handlers(application: Application) -> None:
             json_file_exists = os.path.exists(_p)
             json_session = await _load_all_sessions_from_file_async()
         except Exception:
-            pass
+            logger.debug("main: ── Persisted JSON file check (async, non-blocking) ──")
 
         tele_from_json = bool(json_session and json_session.get("telethon_session")) if json_session else False
         pyro_from_json = bool(json_session and json_session.get("pyrogram_session")) if json_session else False
@@ -575,7 +575,7 @@ def setup_handlers(application: Application) -> None:
 
                 telethon_ready = has_usable_telethon_session()
             except Exception:
-                pass
+                logger.debug("main: operation failed")
 
         # ── Pyrogram session string ──
         pyrogram_ready = False
@@ -584,7 +584,7 @@ def setup_handlers(application: Application) -> None:
 
             pyrogram_ready = bool(get_pyrogram_session_string())
         except Exception:
-            pass
+            logger.debug("main: ── Pyrogram session string ──")
 
         # ── Credentials check ──
         has_api_id = bool(
@@ -793,7 +793,7 @@ def setup_handlers(application: Application) -> None:
                     os.remove(session_path)
                     removed.append(session_path)
                 except Exception:
-                    pass
+                    logger.debug("main: operation failed")
             for suffix in (".session", ".session-journal", ".session.lock", ".session.json"):
                 path_with_suffix = session_path + suffix
                 if os.path.exists(path_with_suffix):
@@ -801,7 +801,7 @@ def setup_handlers(application: Application) -> None:
                         os.remove(path_with_suffix)
                         removed.append(path_with_suffix)
                     except Exception:
-                        pass
+                        logger.debug("main: operation failed")
 
             # Also clear any saved Telethon session from MongoDB
             try:
@@ -810,7 +810,7 @@ def setup_handlers(application: Application) -> None:
                     await db_model_lo.delete_session(user_id)
                     removed.append("MongoDB session")
             except Exception:
-                pass
+                logger.debug("main: Also clear any saved Telethon session from MongoDB")
 
             if removed:
                 await update.message.reply_text(
@@ -909,9 +909,9 @@ def setup_handlers(application: Application) -> None:
                     except RuntimeError:
                         pass
                 except Exception:
-                    pass
+                    logger.debug("main: operation failed")
         except Exception:
-            pass
+            logger.debug("main: Also clear any login client disconnect/restart state")
 
         # Check for optional 'resend' arg
         args = context.args if hasattr(context, "args") else []
@@ -947,7 +947,7 @@ def setup_handlers(application: Application) -> None:
                     logger.warning("FloodWait during clearflood resend for %s: wait=%s", phone, wait)
                     return
             except Exception:
-                pass
+                logger.debug("main: operation failed")
             logger.exception("Resend via /clearflood failed: %s", e)
             await update.message.reply_text("Failed to resend login code. See server logs for details.")
             return
@@ -966,7 +966,7 @@ def setup_handlers(application: Application) -> None:
             if new_hash:
                 context.user_data["login_code_hash"] = new_hash
         except Exception:
-            pass
+            logger.debug("main: in clearflood_command()")
 
         await update.message.reply_text(
             "Cleared FloodWait and resent login code (best-effort). Check your Telegram app for the code."
@@ -1010,14 +1010,14 @@ def setup_handlers(application: Application) -> None:
                 if login_task is not None and not login_task.done():
                     login_task.cancel()
             except Exception:
-                pass
+                logger.debug("main: Cancel the background client.start() task if running")
             # Cancel any pending future (code/password callback waiting)
             try:
                 fut = context.user_data.get("login_pending_future")
                 if fut is not None and not fut.done():
                     fut.cancel()
             except Exception:
-                pass
+                logger.debug("main: Cancel any pending future (code/password callback waiting)")
             # Disconnect any active Telethon client before clearing
             try:
                 client = context.user_data.get("login_client")
@@ -1030,9 +1030,9 @@ def setup_handlers(application: Application) -> None:
                         except RuntimeError:
                             pass
                     except Exception:
-                        pass
+                        logger.debug("main: operation failed")
             except Exception:
-                pass
+                logger.debug("main: Disconnect any active Telethon client before clearing")
             for key in (
                 "awaiting_login_phone",
                 "awaiting_login_code",
@@ -1073,7 +1073,7 @@ def setup_handlers(application: Application) -> None:
                     # expired — clear stored flood info
                     context.user_data.pop("login_flood_wait_until", None)
         except Exception:
-            pass
+            logger.debug("main: Respect any outstanding FloodWait imposed earlier: block retries")
 
         # Entry condition: if no pending future and no login flags are active,
         # fall through to the single cleanup point at the bottom of the function.
@@ -1132,7 +1132,7 @@ def setup_handlers(application: Application) -> None:
 
                 saved_session_str = await _load_session_string_from_file_async(client_type="telethon")
             except Exception:
-                pass
+                logger.debug("main: 1. Check the persisted JSON file first")
 
             # 2. Fall back to MongoDB if JSON file had nothing
             if not saved_session_str:
@@ -1238,7 +1238,7 @@ def setup_handlers(application: Application) -> None:
                                 _code = (_code or "").translate(_trans)
                                 _code = "".join(c for c in _code if c.isdigit())
                             except Exception:
-                                pass
+                                logger.debug("main: Normalize code (Unicode digits -> ASCII)")
                             return _code
 
                         async def _password_callback():
@@ -1302,7 +1302,7 @@ def setup_handlers(application: Application) -> None:
                                     await db_model_login.save_session(user_id, _mongo_save)
                                     saved_to.append("MongoDB")
                             except Exception:
-                                pass
+                                logger.debug('main: keep "string_session" for backward compatibility.')
 
                             # Save to local JSON file (bridges to downloader/uploader fallback chain)
                             try:
@@ -1311,7 +1311,9 @@ def setup_handlers(application: Application) -> None:
                                 if await save_session_string_to_file_async(str(session_str), client_type="telethon"):
                                     saved_to.append("JSON file")
                             except Exception:
-                                pass
+                                logger.debug(
+                                    "main: Save to local JSON file (bridges to downloader/uploader fallback chain)"
+                                )
 
                             # Also eagerly persist Pyrogram session from env var to JSON
                             # so both sessions are in the file right after /login.
@@ -1323,7 +1325,7 @@ def setup_handlers(application: Application) -> None:
                                     saved_to.append("Pyrogram JSON")
                                     logger.info("Eagerly persisted PYROGRAM_SESSION to JSON (during /login)")
                             except Exception:
-                                pass
+                                logger.debug("main: so both sessions are in the file right after /login.")
 
                             session_saved = ", ".join(saved_to) if saved_to else "memory (all saves failed)"
                             await context.bot.send_message(
@@ -1366,7 +1368,7 @@ def setup_handlers(application: Application) -> None:
                             if fut and not fut.done():
                                 fut.cancel()
                         except Exception:
-                            pass
+                            logger.debug("main: Clear pending future")
                         _clear_login_flow(user_id, context)
 
                 # Start the background task that handles the entire login flow.
@@ -1452,7 +1454,7 @@ def setup_handlers(application: Application) -> None:
                     if not pending_future.done():
                         pending_future.set_exception(exc)
                 except Exception:
-                    pass
+                    logger.debug("main: operation failed")
                 await update.message.reply_text(
                     "Failed to send your input to the login process. Please run /login again."
                 )
@@ -1564,7 +1566,7 @@ async def main(background: bool = False) -> None:
         application.bot_data["redis_url"] = getattr(cfg, "REDIS_URL", None)
         application.bot_data["ffmpeg_path"] = getattr(cfg, "FFMPEG_PATH", "ffmpeg")
     except Exception:
-        pass
+        logger.debug("main: Expose external service config into application context")
 
     # Expose application for ASGI metrics and introspection
     global BOT_APPLICATION, BOT_STARTED_AT
@@ -1615,7 +1617,7 @@ async def main(background: bool = False) -> None:
             except Exception as e:
                 logger.warning("Storage backend initialization failed: %s", e)
     except Exception:
-        pass
+        logger.debug("main: Optionally pre-initialize storage backend (fail-fast / diagnostics)")
 
     logger.info("Rate limiters initialized")
     logger.info(f"  - API limit: {TelegramAPIRateLimiter.GENERAL_LIMIT} calls/sec globally")
@@ -1742,7 +1744,7 @@ async def main(background: bool = False) -> None:
             logging.getLogger("ffmpeg").setLevel(logging.ERROR)
             logging.getLogger("ffmpeg._core").setLevel(logging.ERROR)
         except Exception:
-            pass
+            logger.debug("main: Reduce noisy logs from ffmpeg/ffmpeg-python internals where possible")
     except Exception:
         logger.info("ffmpeg-python not available; falling back to CLI ffmpeg calls")
 
@@ -1888,7 +1890,7 @@ async def main(background: bool = False) -> None:
                                         if getattr(u, "update_id", None) is not None:
                                             offset = int(u.update_id) + 1
                                     except Exception:
-                                        pass
+                                        logger.debug("main: operation failed")
                                     try:
                                         # Enqueue for ASGI consumer/dispatcher
                                         await BOT_APPLICATION.update_queue.put(u)
@@ -2047,7 +2049,7 @@ async def main(background: bool = False) -> None:
                         polling_task.cancel()
                         await polling_task
                     except Exception:
-                        pass
+                        logger.debug("main: operation failed")
                     finally:
                         with contextlib.suppress(Exception):
                             globals()["LONG_POLLER_STARTED"] = False
@@ -2058,7 +2060,7 @@ async def main(background: bool = False) -> None:
                         worker_task.cancel()
                         await worker_task
                     except Exception:
-                        pass
+                        logger.debug("main: Cancel the background worker task")
 
                 # Cancel the keep-alive heartbeat task
                 if keep_alive_task is not None:
@@ -2066,7 +2068,7 @@ async def main(background: bool = False) -> None:
                         keep_alive_task.cancel()
                         await keep_alive_task
                     except Exception:
-                        pass
+                        logger.debug("main: Cancel the keep-alive heartbeat task")
 
                 try:
                     await application.stop()
@@ -2082,7 +2084,7 @@ async def main(background: bool = False) -> None:
                             with contextlib.suppress(Exception):
                                 await close_fn()
                 except Exception:
-                    pass
+                    logger.debug("main: Close dedicated get_updates client if present")
 
         else:
             # Non-ASGI mode: use the context manager as before which manages
@@ -2228,17 +2230,17 @@ try:
                             if job_hash.get("out_bytes") is not None:
                                 resp["out_bytes"] = int(job_hash.get("out_bytes"))
                         except Exception:
-                            pass
+                            logger.debug("main: operation failed")
                         try:
                             if job_hash.get("in_bytes") is not None:
                                 resp["in_bytes"] = int(job_hash.get("in_bytes"))
                         except Exception:
-                            pass
+                            logger.debug("main: operation failed")
                         try:
                             if job_hash.get("progress_by_size") is not None:
                                 resp["progress_by_size"] = float(job_hash.get("progress_by_size"))
                         except Exception:
-                            pass
+                            logger.debug("main: operation failed")
                         return resp
 
                     # 4) Fallback to the in-memory JOB_STORE from the Flask app
@@ -2372,7 +2374,7 @@ try:
                                 lines = fh.readlines()[-1000:]
                                 result["logs"]["worker.log"] = "".join(lines)
                     except Exception:
-                        pass
+                        logger.debug("main: Also include worker log if present for quick debugging")
                 except Exception:
                     result["logs"]["error"] = traceback.format_exc()
 
@@ -2587,7 +2589,7 @@ try:
                                             await r.delete(k)
                                             removed.append(kstr)
                                         except Exception:
-                                            pass
+                                            logger.debug("main: operation failed")
 
                             # If input path provided, compute expected lock key and remove it
                             if input_path_provided:
@@ -2598,9 +2600,11 @@ try:
                                         await r.delete(lock_key)
                                         removed.append(lock_key)
                                     except Exception:
-                                        pass
+                                        logger.debug("main: operation failed")
                                 except Exception:
-                                    pass
+                                    logger.debug(
+                                        "main: If input path provided, compute expected lock key and remove it"
+                                    )
                         finally:
                             with contextlib.suppress(Exception):
                                 await r.close()
@@ -2633,7 +2637,7 @@ try:
                                         await r.lrem(JOB_LIST, 0, raw)
                                         removed += 1
                                     except Exception:
-                                        pass
+                                        logger.debug("main: operation failed")
                         finally:
                             with contextlib.suppress(Exception):
                                 await r.close()
@@ -2826,7 +2830,7 @@ try:
             with METRICS_LOCK:
                 METRICS["webhooks_received"] += 1
         except Exception:
-            pass
+            logger.debug("main: Increment webhook counter")
 
         # Helper: background retry dispatcher
         async def _background_retry_dispatch(u, attempts=12, delay=0.5):
@@ -2872,7 +2876,7 @@ try:
                         with METRICS_LOCK:
                             METRICS["dispatch_failures"] += 1
                     except Exception:
-                        pass
+                        logger.debug("main: operation failed")
             await asyncio.sleep(0.25)
 
         # Immediate dispatch not successful — try to enqueue
@@ -2998,7 +3002,7 @@ try:
                 }
             )
         except Exception:
-            pass
+            logger.debug("main: Telethon / userbot readiness diagnostics")
 
         return info
 
@@ -3100,7 +3104,7 @@ try:
                                                 if getattr(u, "update_id", None) is not None:
                                                     offset = int(u.update_id) + 1
                                             except Exception:
-                                                pass
+                                                logger.debug("main: operation failed")
                                             try:
                                                 await BOT_APPLICATION.update_queue.put(u)
                                             except Exception:

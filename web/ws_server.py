@@ -117,7 +117,7 @@ async def _redis_listener():
             if pub:
                 await pub.close()
         except Exception:
-            pass
+            logger.debug("WebSocket cleanup: failed to close connection")
         with contextlib.suppress(Exception):
             await r.close()
 

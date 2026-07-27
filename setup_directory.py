@@ -17,7 +17,9 @@ def setup_bot_directories():
         getattr(config, "INPUT_PATH", os.path.join(base, "input")) if config else os.path.join(base, "input"),
         getattr(config, "OUTPUT_PATH", os.path.join(base, "output")) if config else os.path.join(base, "output"),
         getattr(config, "TEMP_PATH", os.path.join(base, "temp")) if config else os.path.join(base, "temp"),
-        getattr(config, "THUMBNAIL_PATH", os.path.join(base, "thumbnails")) if config else os.path.join(base, "thumbnails"),
+        getattr(config, "THUMBNAIL_PATH", os.path.join(base, "thumbnails"))
+        if config
+        else os.path.join(base, "thumbnails"),
         "logs",
         os.path.join(base, "temp_sessions"),
     ]

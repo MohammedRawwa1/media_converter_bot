@@ -48,21 +48,23 @@ if __name__ == "__main__":
     try:
         try:
             import requests
+
             use_requests = True
         except Exception:
             import urllib.request as _ur
+
             use_requests = False
 
-        if 'url' in locals() and url:
-            print('\nAttempting HTTP GET on presigned URL...')
+        if "url" in locals() and url:
+            print("\nAttempting HTTP GET on presigned URL...")
             if use_requests:
                 try:
                     r = requests.get(url, stream=True, timeout=30)
-                    print('HTTP GET status:', r.status_code)
-                    print('Headers:', dict(r.headers))
+                    print("HTTP GET status:", r.status_code)
+                    print("Headers:", dict(r.headers))
                     r.close()
                 except Exception as e:
-                    print('requests.get failed:', e)
+                    print("requests.get failed:", e)
             else:
                 try:
                     # Validate URL scheme to prevent SSRF via file:// or internal IPs
@@ -70,10 +72,10 @@ if __name__ == "__main__":
                     if parsed_url.scheme not in ("http", "https"):
                         print(f"Blocked urlopen with scheme={parsed_url.scheme}")
                         raise ValueError(f"Unsupported URL scheme: {parsed_url.scheme}")
-                    resp = _ur.urlopen(url, timeout=30)  # nosec # noqa: S310 - URL validated above
-                    print('HTTP GET status:', resp.getcode())
-                    print('Headers:', dict(resp.getheaders()))
+                    resp = _ur.urlopen(url, timeout=30)  # nosec  # noqa: S310
+                    print("HTTP GET status:", resp.getcode())
+                    print("Headers:", dict(resp.getheaders()))
                 except Exception as e:
-                    print('urllib.request failed:', e)
+                    print("urllib.request failed:", e)
     except Exception:
         traceback.print_exc()

@@ -3,7 +3,6 @@
 Keyboard menu builders for Telegram bot.
 """
 
-
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
 from .callbacks import (
@@ -54,6 +53,7 @@ class MediaMenuBuilder:
     @staticmethod
     def get_main_menu(file_type: str = None) -> InlineKeyboardMarkup:
         """Get main menu based on file type."""
+
         # Shared helpers for common rows
         def row(left_label, left_cb, right_label, right_cb):
             return [
@@ -63,7 +63,7 @@ class MediaMenuBuilder:
 
         # Build rows according to the UI image. Adapt some labels based on
         # the `file_type` so that video uploads show video-oriented tools.
-        is_video = (file_type == "video")
+        is_video = file_type == "video"
 
         conv_label = "🎬 Video Converter" if is_video else "🎧 Audio Converter"
         # Use explicit `video_converter` callback so the UI shows the video converter
@@ -271,7 +271,12 @@ class MediaMenuBuilder:
             buttons.append(row)
 
         # actions: apply and back
-        buttons.append([InlineKeyboardButton("▶️ Apply Bulk", callback_data="bulk_apply"), InlineKeyboardButton("↩️ Back", callback_data=MENU_MAIN)])
+        buttons.append(
+            [
+                InlineKeyboardButton("▶️ Apply Bulk", callback_data="bulk_apply"),
+                InlineKeyboardButton("↩️ Back", callback_data=MENU_MAIN),
+            ]
+        )
         return InlineKeyboardMarkup(buttons)
 
     @staticmethod

@@ -18,7 +18,7 @@ def main():
     kb = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data="cancel_job:TEST")]])
     try:
         msg = bot.send_message(chat_id=int(chat), text="Test progress — cancel button", reply_markup=kb)
-        print("Sent test message id:", getattr(msg, 'message_id', None))
+        print("Sent test message id:", getattr(msg, "message_id", None))
     except Exception as e:
         print("Failed to send test message:", e)
 

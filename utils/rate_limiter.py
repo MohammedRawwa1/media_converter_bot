@@ -101,8 +101,7 @@ class RateLimiter:
                     getattr(self, "calls_per_second", "unknown"),
                 )
         except Exception:
-            # Avoid raising from logging diagnostics
-            pass
+            logger.debug("RateLimiter: diagnostic log failed (non-fatal)")
 
         return waited
 
@@ -192,7 +191,7 @@ class TelegramAPIRateLimiter:
                     per_user_wait,
                 )
         except Exception:
-            pass
+            logger.debug("TelegramAPIRateLimiter: diagnostic log failed (non-fatal)")
 
         return (global_wait, per_user_wait)
 
@@ -364,4 +363,3 @@ class ConversionRateLimiterRedis:
             with contextlib.suppress(Exception):
                 await r.close()
             return True
-

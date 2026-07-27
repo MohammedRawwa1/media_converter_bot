@@ -9,6 +9,7 @@ separate process and should be triggered to fetch/enqueue the forwarded input.
 
 Run: `python scripts/forward_reenricher.py`
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -84,7 +85,9 @@ def _sync_run():
     if not redis_sync:
         logger.error("redis (sync) not available; cannot run reenricher")
         return 2
-    client = redis_sync.from_url(REDIS_URL, decode_responses=True) if REDIS_URL else redis_sync.Redis(decode_responses=True)
+    client = (
+        redis_sync.from_url(REDIS_URL, decode_responses=True) if REDIS_URL else redis_sync.Redis(decode_responses=True)
+    )
     pub = client.pubsub()
     pub.subscribe(FORWARD_CHANNEL)
     logger.info("Subscribed to %s (sync)", FORWARD_CHANNEL)

@@ -22,6 +22,7 @@ pyrogram>=2.0.0,<3.0.0
 tgcrypto>=1.2.0
 Flask>=2.2.5
 Flask-Cors>=3.0.10
+a2wsgi>=1.10.0,<2.0.0
 gunicorn>=22.0.0,<23.0.0
 minio>=7.1.0
 

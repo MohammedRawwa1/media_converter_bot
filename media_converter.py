@@ -9,12 +9,12 @@ import config
 
 # Optional imports
 try:
-    import aiofiles  # noqa: F401
+    import aiofiles
 except ImportError:
     aiofiles = None
 
 try:
-    import ffmpeg  # noqa: F401
+    import ffmpeg
 except ImportError:
     ffmpeg = None
 
@@ -24,7 +24,7 @@ except Exception:
     create_checked_subprocess_exec = None
 
 try:
-    from PIL import Image  # noqa: F401
+    from PIL import Image
 except ImportError:
     Image = None
 
@@ -523,13 +523,13 @@ class ExtendedMediaConverter:
             # Cleanup temp files
             try:
                 import shutil
+
                 shutil.rmtree(temp_dir, ignore_errors=True)
             except Exception:
-                pass
+                logger.debug("Failed to generate thumbnail from video", exc_info=True)
 
     async def apply_fade(
-        self, input_path: str, output_path: str,
-        fade_in_duration: float = 0.0, fade_out_duration: float = 0.0
+        self, input_path: str, output_path: str, fade_in_duration: float = 0.0, fade_out_duration: float = 0.0
     ) -> bool:
         """Apply fade-in and/or fade-out to audio track of a media file.
 
@@ -556,14 +556,9 @@ class ExtendedMediaConverter:
                         None,
                     )
                     if audio_stream is not None:
-                        audio_duration = float(
-                            audio_stream.get("duration",
-                                probe.get("format", {}).get("duration", 0))
-                        )
+                        audio_duration = float(audio_stream.get("duration", probe.get("format", {}).get("duration", 0)))
                     else:
-                        audio_duration = float(
-                            probe.get("format", {}).get("duration", 0)
-                        )
+                        audio_duration = float(probe.get("format", {}).get("duration", 0))
             except Exception as e:
                 logger.error("apply_fade: probe failed: %s", e)
 
@@ -571,10 +566,15 @@ class ExtendedMediaConverter:
             if audio_duration <= 0:
                 try:
                     import asyncio as _aio
+
                     proc = await _aio.create_subprocess_exec(
-                        "ffprobe", "-v", "error",
-                        "-show_entries", "format=duration",
-                        "-of", "default=noprint_wrappers=1:nokey=1",
+                        "ffprobe",
+                        "-v",
+                        "error",
+                        "-show_entries",
+                        "format=duration",
+                        "-of",
+                        "default=noprint_wrappers=1:nokey=1",
                         input_path,
                         stdout=_aio.subprocess.PIPE,
                         stderr=_aio.subprocess.PIPE,
@@ -582,7 +582,7 @@ class ExtendedMediaConverter:
                     stdout, _ = await proc.communicate()
                     audio_duration = float(stdout.decode().strip()) if stdout else 0.0
                 except Exception:
-                    pass
+                    logger.debug("ffprobe fallback failed for audio duration")
 
             if audio_duration <= 0:
                 logger.error("apply_fade: cannot determine audio duration")

@@ -6,6 +6,7 @@ Usage:
 
 Creates a job in Redis list `ffmpeg:jobs` and a job hash `ffmpeg:job:<job_id>`.
 """
+
 import contextlib
 import json
 import os
@@ -32,7 +33,18 @@ def _ensure_sample_input(path: str):
     # If ffmpeg available, create a short test video
     ffmpeg = shutil.which("ffmpeg") or os.environ.get("FFMPEG_PATH")
     if ffmpeg:
-        cmd = [ffmpeg, "-f", "lavfi", "-i", "testsrc=duration=10:size=640x360:rate=25", "-c:v", "libx264", "-pix_fmt", "yuv420p", path]
+        cmd = [
+            ffmpeg,
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc=duration=10:size=640x360:rate=25",
+            "-c:v",
+            "libx264",
+            "-pix_fmt",
+            "yuv420p",
+            path,
+        ]
         try:
             print("Creating sample test video at:", path)
             import subprocess
@@ -72,6 +84,7 @@ def main():
     # Normalize to POSIX-style paths for portability across platforms
     try:
         from pathlib import Path
+
         posix_input = Path(input_path).as_posix()
         posix_output = Path(output_path).as_posix()
     except Exception:
@@ -113,5 +126,5 @@ def main():
         sys.exit(1)
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()

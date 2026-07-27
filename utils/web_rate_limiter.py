@@ -33,21 +33,21 @@ class WebRateLimiter:
         # Default rate limits per endpoint (requests per second, burst capacity)
         self.endpoint_limits = {
             # Public endpoints: strict limits
-            "status":        (5,   10),    # 5 req/s, burst 10
-            "download":      (2,   5),     # 2 req/s, burst 5
-            "events":        (5,   15),    # 5 req/s, burst 15 (SSE reconnect)
-            "search":        (10,  20),    # 10 req/s, burst 20
-            "health":        (10,  30),    # 10 req/s, burst 30
+            "status": (5, 10),  # 5 req/s, burst 10
+            "download": (2, 5),  # 2 req/s, burst 5
+            "events": (5, 15),  # 5 req/s, burst 15 (SSE reconnect)
+            "search": (10, 20),  # 10 req/s, burst 20
+            "health": (10, 30),  # 10 req/s, burst 30
             # Auth-protected endpoints: moderate limits
-            "upload":        (3,   10),    # 3 req/s, burst 10
-            "presign":       (3,   10),    # 3 req/s, burst 10
-            "enqueue_url":   (2,   5),     # 2 req/s, burst 5
-            "webhook":       (30,  60),    # 30 req/s (Telegram bursts)
-            "get_input":     (2,   5),     # 2 req/s, burst 5
-            "diag":          (1,   3),     # 1 req/s (diagnostic)
-            "debug_log":     (2,   5),     # 2 req/s, burst 5
+            "upload": (3, 10),  # 3 req/s, burst 10
+            "presign": (3, 10),  # 3 req/s, burst 10
+            "enqueue_url": (2, 5),  # 2 req/s, burst 5
+            "webhook": (30, 60),  # 30 req/s (Telegram bursts)
+            "get_input": (2, 5),  # 2 req/s, burst 5
+            "diag": (1, 3),  # 1 req/s (diagnostic)
+            "debug_log": (2, 5),  # 2 req/s, burst 5
             # Default fallback
-            "default":       (10,  20),    # 10 req/s, burst 20
+            "default": (10, 20),  # 10 req/s, burst 20
         }
 
     def get_limit(self, endpoint: str) -> tuple[float, float]:
@@ -68,9 +68,7 @@ class WebRateLimiter:
 
         with self._lock:
             now = time.time()
-            tokens, last_refill = self.buckets.get(
-                key, (float(burst_capacity), now)
-            )
+            tokens, last_refill = self.buckets.get(key, (float(burst_capacity), now))
 
             # Refill tokens based on elapsed time
             elapsed = now - last_refill

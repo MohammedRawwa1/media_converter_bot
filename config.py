@@ -6,6 +6,8 @@ import os
 import re
 from urllib.parse import urlparse
 
+logger = logging.getLogger(__name__)
+
 ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 try:
@@ -114,8 +116,7 @@ def _load_allowed_users() -> set[int]:
                         except Exception:
                             continue
     except Exception:
-        # best-effort
-        pass
+        logger.debug("Failed to load allowed users from file")
 
     return s
 
@@ -133,8 +134,7 @@ def persist_allowed_users() -> None:
         with open(_allowed_file, "w", encoding="utf-8") as fh:
             json.dump(sorted(list(ALLOWED_USER_IDS)), fh)
     except Exception:
-        # don't raise - caller should log
-        pass
+        logger.debug("Failed to persist allowed users to file")
 
 
 def _parse_optional_int(val: str | None) -> int | None:
@@ -224,7 +224,6 @@ def validate_env() -> None:
     Logs missing or malformed settings (names only) and warns on suspicious
     values. This helper never logs raw secret values.
     """
-    logger = logging.getLogger(__name__)
     missing = []
 
     # Required for normal operation

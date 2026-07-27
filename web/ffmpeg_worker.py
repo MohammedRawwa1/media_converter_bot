@@ -1,10 +1,13 @@
+import logging
 import subprocess
+
+logger = logging.getLogger(__name__)
 
 
 def _parse_out_time(timestr: str) -> float:
     # timestr like 00:01:23.456789
     try:
-        parts = timestr.split(':')
+        parts = timestr.split(":")
         h = int(parts[0])
         m = int(parts[1])
         s = float(parts[2])
@@ -15,7 +18,16 @@ def _parse_out_time(timestr: str) -> float:
 
 def get_duration(path: str) -> float:
     try:
-        cmd = ['ffprobe', '-v', 'error', '-show_entries', 'format=duration', '-of', 'default=noprint_wrappers=1:nokey=1', path]
+        cmd = [
+            "ffprobe",
+            "-v",
+            "error",
+            "-show_entries",
+            "format=duration",
+            "-of",
+            "default=noprint_wrappers=1:nokey=1",
+            path,
+        ]
         out = subprocess.check_output(cmd, stderr=subprocess.STDOUT, text=True)
         return float(out.strip())
     except Exception:
@@ -25,10 +37,24 @@ def get_duration(path: str) -> float:
 def convert_video(input_path: str, output_path: str, job_id: str, duration: float, progress_cb, finished_cb):
     # Basic x264/aac conversion with progress parsing via -progress pipe:1
     cmd = [
-        'ffmpeg', '-y', '-i', input_path,
-        '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '23',
-        '-c:a', 'aac', '-b:a', '128k',
-        '-progress', 'pipe:1', '-nostats', output_path
+        "ffmpeg",
+        "-y",
+        "-i",
+        input_path,
+        "-c:v",
+        "libx264",
+        "-preset",
+        "veryfast",
+        "-crf",
+        "23",
+        "-c:a",
+        "aac",
+        "-b:a",
+        "128k",
+        "-progress",
+        "pipe:1",
+        "-nostats",
+        output_path,
     ]
 
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1)
@@ -41,17 +67,17 @@ def convert_video(input_path: str, output_path: str, job_id: str, duration: floa
             line = raw.strip()
             if not line:
                 continue
-            if '=' not in line:
+            if "=" not in line:
                 continue
-            key, val = line.split('=', 1)
-            if key == 'out_time':
+            key, val = line.split("=", 1)
+            if key == "out_time":
                 current_out_time = _parse_out_time(val)
                 if duration and duration > 0:
                     pct = min(100.0, (current_out_time / duration) * 100.0)
                 else:
                     pct = 0.0
-                progress_cb(pct, f'encoding {pct:.1f}%')
-            elif key == 'progress' and val == 'end':
+                progress_cb(pct, f"encoding {pct:.1f}%")
+            elif key == "progress" and val == "end":
                 # finished signal from ffmpeg progress
                 break
 
@@ -60,8 +86,8 @@ def convert_video(input_path: str, output_path: str, job_id: str, duration: floa
             finished_cb(output_path)
         else:
             # attempt to read stderr
-            err = proc.stderr.read() if proc.stderr else ''
-            raise RuntimeError(f'ffmpeg failed: {err}')
+            err = proc.stderr.read() if proc.stderr else ""
+            raise RuntimeError(f"ffmpeg failed: {err}")
     finally:
         try:
             if proc.stdout:
@@ -69,4 +95,4 @@ def convert_video(input_path: str, output_path: str, job_id: str, duration: floa
             if proc.stderr:
                 proc.stderr.close()
         except Exception:
-            pass
+            logger.debug("ffmpeg worker: operation failed")

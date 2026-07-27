@@ -172,7 +172,7 @@ async def run_ffmpeg(
                             fh.write(chunk)
                             fh.flush()
                         except Exception:
-                            pass
+                            logger.debug("ffmpeg_runner: failed to write stderr chunk for job %s", job_id)
             except Exception:
                 logger.exception("ffmpeg_runner: stderr drain failed for %s", job_id)
 
@@ -254,7 +254,7 @@ async def run_ffmpeg(
                             store_map["progress_by_size"] = str(progress_by_size)
                         await redis_client.hset(f"ffmpeg:job:{job_id}", mapping=store_map)
                     except Exception:
-                        pass
+                        logger.debug("ffmpeg_runner: failed to publish progress to Redis for job %s", job_id)
                 if on_progress:
                     with contextlib.suppress(Exception):
                         on_progress(payload["progress"], message)
@@ -285,7 +285,7 @@ async def run_ffmpeg(
                             )
                         return False, "cancelled"
                 except Exception:
-                    pass
+                    logger.debug("ffmpeg_runner: failed to check cancel flag for job %s", job_id)
             # Check for progress=end marker (separate if, not elif of redis check)
             if key == "progress" and val == "end":
                 # finish marker
@@ -332,7 +332,7 @@ async def run_ffmpeg(
                             ),
                         )
                 except Exception:
-                    pass
+                    logger.debug("ffmpeg_runner: failed to publish job completion for %s", job_id)
             return True, output_path
         else:
             stderr = await proc.stderr.read() if proc.stderr else b""
@@ -354,7 +354,7 @@ async def run_ffmpeg(
                             json.dumps({"job_id": job_id, "progress": 0, "message": "error", "error": err}),
                         )
                 except Exception:
-                    pass
+                    logger.debug("ffmpeg_runner: failed to publish error for job %s", job_id)
             return False, err
 
     except asyncio.CancelledError:
@@ -371,6 +371,6 @@ async def run_ffmpeg(
                     else:
                         await redis_client.close()
                 except Exception:
-                    pass
+                    logger.debug("ffmpeg_runner: failed to close Redis client")
         except Exception:
-            pass
+            logger.debug("ffmpeg_runner: error in finally block for job %s", job_id)

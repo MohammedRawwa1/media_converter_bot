@@ -46,9 +46,7 @@ async def run_with_timeout(
     try:
         return await asyncio.wait_for(coro, timeout=timeout_seconds)
     except builtins.TimeoutError as e:
-        logger.error(
-            f"{operation_name} timeout after {timeout_seconds}s - " f"this operation took too long to complete"
-        )
+        logger.error(f"{operation_name} timeout after {timeout_seconds}s - this operation took too long to complete")
         raise TimeoutError(f"{operation_name} exceeded {timeout_seconds}s timeout limit") from e
 
 
@@ -134,7 +132,7 @@ async def run_subprocess_with_timeout(
                 process.kill()
                 await asyncio.wait_for(process.wait(), timeout=5)
             except Exception:
-                pass
+                logger.debug("Failed to terminate subprocess gracefully", exc_info=True)
         raise
 
     except Exception as e:
@@ -144,7 +142,7 @@ async def run_subprocess_with_timeout(
                 process.kill()
                 await asyncio.wait_for(process.wait(), timeout=5)
             except Exception:
-                pass
+                logger.debug("Failed to terminate subprocess gracefully", exc_info=True)
         raise
 
 

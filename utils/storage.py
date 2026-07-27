@@ -300,7 +300,11 @@ class S3AsyncBackend(AsyncStorageBackend):
             try:
                 logger.info(
                     "Uploading bytes → bucket=%s key=%s (attempt %s/%s) size=%d",
-                    self.bucket, dest_key, attempt, retries, len(data),
+                    self.bucket,
+                    dest_key,
+                    attempt,
+                    retries,
+                    len(data),
                 )
                 if self._use_aioboto3:
                     async with self._session.client("s3", **self._client_kwargs()) as client:
@@ -364,30 +368,42 @@ class S3AsyncBackend(AsyncStorageBackend):
             async with self._session.client("s3", **self._client_kwargs()) as client:
                 # generate_presigned_post is a local signing operation (no network)
                 post = client.generate_presigned_post(Bucket=self.bucket, Key=key, ExpiresIn=expires)
-                get_url = client.generate_presigned_url("get_object", Params={"Bucket": self.bucket, "Key": key}, ExpiresIn=expires * 24)
+                get_url = client.generate_presigned_url(
+                    "get_object", Params={"Bucket": self.bucket, "Key": key}, ExpiresIn=expires * 24
+                )
             return {"url": post["url"], "fields": post["fields"], "key": key, "get_url": get_url}
 
         if boto3 is None:
             raise RuntimeError("boto3 is required for S3 operations when aioboto3 is not installed")
+
         def _sync_post():
             client = boto3.client("s3", **self._client_kwargs())
             post = client.generate_presigned_post(Bucket=self.bucket, Key=key, ExpiresIn=expires)
-            get_url = client.generate_presigned_url("get_object", Params={"Bucket": self.bucket, "Key": key}, ExpiresIn=expires * 24)
+            get_url = client.generate_presigned_url(
+                "get_object", Params={"Bucket": self.bucket, "Key": key}, ExpiresIn=expires * 24
+            )
             return {"url": post["url"], "fields": post["fields"], "key": key, "get_url": get_url}
+
         return await asyncio.to_thread(_sync_post)
 
     async def generate_presigned_get(self, key: str, expires: int | None = None) -> str:
         expires = expires or config.PRESIGN_EXPIRES
         if self._use_aioboto3:
             async with self._session.client("s3", **self._client_kwargs()) as client:
-                url = client.generate_presigned_url("get_object", Params={"Bucket": self.bucket, "Key": key}, ExpiresIn=expires)
+                url = client.generate_presigned_url(
+                    "get_object", Params={"Bucket": self.bucket, "Key": key}, ExpiresIn=expires
+                )
             return url
 
         if boto3 is None:
             raise RuntimeError("boto3 is required for S3 operations when aioboto3 is not installed")
+
         def _sync_get():
             client = boto3.client("s3", **self._client_kwargs())
-            return client.generate_presigned_url("get_object", Params={"Bucket": self.bucket, "Key": key}, ExpiresIn=expires)
+            return client.generate_presigned_url(
+                "get_object", Params={"Bucket": self.bucket, "Key": key}, ExpiresIn=expires
+            )
+
         return await asyncio.to_thread(_sync_get)
 
     async def delete(self, key: str) -> bool:
@@ -475,7 +491,14 @@ async def get_storage_backend() -> AsyncStorageBackend:
 
     backend = (os.getenv("STORAGE_BACKEND") or config.STORAGE_BACKEND or "local").lower()
     if backend in ("s3", "r2"):
-        _STORAGE_SINGLETON = S3AsyncBackend(bucket=config.S3_BUCKET, endpoint_url=(os.getenv("S3_ENDPOINT") or config.S3_ENDPOINT or None), region=(os.getenv("S3_REGION") or config.S3_REGION or None), aws_access_key_id=(os.getenv("AWS_ACCESS_KEY_ID") or config.AWS_ACCESS_KEY_ID or None), aws_secret_access_key=(os.getenv("AWS_SECRET_ACCESS_KEY") or config.AWS_SECRET_ACCESS_KEY or None), use_ssl=config.S3_USE_SSL)
+        _STORAGE_SINGLETON = S3AsyncBackend(
+            bucket=config.S3_BUCKET,
+            endpoint_url=(os.getenv("S3_ENDPOINT") or config.S3_ENDPOINT or None),
+            region=(os.getenv("S3_REGION") or config.S3_REGION or None),
+            aws_access_key_id=(os.getenv("AWS_ACCESS_KEY_ID") or config.AWS_ACCESS_KEY_ID or None),
+            aws_secret_access_key=(os.getenv("AWS_SECRET_ACCESS_KEY") or config.AWS_SECRET_ACCESS_KEY or None),
+            use_ssl=config.S3_USE_SSL,
+        )
     else:
         _STORAGE_SINGLETON = LocalStorageBackend(base_path=(os.getenv("STORAGE_PATH") or config.STORAGE_PATH))
 
@@ -496,7 +519,14 @@ def get_storage_backend_sync() -> AsyncStorageBackend:
     backend = (os.getenv("STORAGE_BACKEND") or config.STORAGE_BACKEND or "local").lower()
     if backend in ("s3", "r2"):
         # create synchronously (may raise if aioboto3 missing)
-        _STORAGE_SINGLETON = S3AsyncBackend(bucket=config.S3_BUCKET, endpoint_url=config.S3_ENDPOINT or None, region=config.S3_REGION or None, aws_access_key_id=config.AWS_ACCESS_KEY_ID or None, aws_secret_access_key=config.AWS_SECRET_ACCESS_KEY or None, use_ssl=config.S3_USE_SSL)
+        _STORAGE_SINGLETON = S3AsyncBackend(
+            bucket=config.S3_BUCKET,
+            endpoint_url=config.S3_ENDPOINT or None,
+            region=config.S3_REGION or None,
+            aws_access_key_id=config.AWS_ACCESS_KEY_ID or None,
+            aws_secret_access_key=config.AWS_SECRET_ACCESS_KEY or None,
+            use_ssl=config.S3_USE_SSL,
+        )
     else:
         _STORAGE_SINGLETON = LocalStorageBackend(base_path=(os.getenv("STORAGE_PATH") or config.STORAGE_PATH))
 

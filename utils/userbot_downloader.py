@@ -119,15 +119,18 @@ async def _download_media_with_retry(
             if attempt >= max_retries - 1:
                 logger.warning(
                     "userbot: download_media exhausted %d retries (-503): %s",
-                    max_retries, exc,
+                    max_retries,
+                    exc,
                 )
                 raise  # last retry exhausted
 
             wait = delays[min(attempt, len(delays) - 1)]
             logger.warning(
-                "userbot: download_media attempt %d/%d failed (-503), "
-                "retrying in %ds: %s",
-                attempt + 1, max_retries, wait, exc,
+                "userbot: download_media attempt %d/%d failed (-503), retrying in %ds: %s",
+                attempt + 1,
+                max_retries,
+                wait,
+                exc,
             )
             await asyncio.sleep(wait)
 
@@ -160,7 +163,7 @@ async def _get_raw_file_location(msg):
             )
             return loc, doc.size
         except Exception:
-            pass
+            logger.debug("userbot: failed to get raw file location for document")
 
     # Photo media
     photo = getattr(media, "photo", None)
@@ -178,7 +181,7 @@ async def _get_raw_file_location(msg):
             )
             return loc, 0  # photo size not known upfront
         except Exception:
-            pass
+            logger.debug("userbot: failed to get raw file location for photo")
 
     return None, 0
 
@@ -217,7 +220,8 @@ async def _download_bytes_via_raw_api(
 
     logger.info(
         "userbot: raw API chunked download starting (chunk_size=%dKB, total_size=%d)",
-        chunk_size_kb, total_size,
+        chunk_size_kb,
+        total_size,
     )
 
     chunks = []
@@ -242,25 +246,28 @@ async def _download_bytes_via_raw_api(
             except Exception as exc:
                 if not _is_503_timeout(exc):
                     logger.warning(
-                        "userbot: raw API chunk at offset %d failed with "
-                        "non-retryable error: %s",
-                        offset, exc,
+                        "userbot: raw API chunk at offset %d failed with non-retryable error: %s",
+                        offset,
+                        exc,
                     )
                     return None  # non-retryable, bail out
 
                 if chunk_attempt >= max_chunk_retries - 1:
                     logger.warning(
-                        "userbot: raw API chunk at offset %d exhausted %d "
-                        "retries (-503): %s",
-                        offset, max_chunk_retries, exc,
+                        "userbot: raw API chunk at offset %d exhausted %d retries (-503): %s",
+                        offset,
+                        max_chunk_retries,
+                        exc,
                     )
                     return None
 
                 wait = chunk_delays[min(chunk_attempt, len(chunk_delays) - 1)]
                 logger.warning(
-                    "userbot: raw API chunk at offset %d attempt %d/%d, "
-                    "retrying in %ds",
-                    offset, chunk_attempt + 1, max_chunk_retries, wait,
+                    "userbot: raw API chunk at offset %d attempt %d/%d, retrying in %ds",
+                    offset,
+                    chunk_attempt + 1,
+                    max_chunk_retries,
+                    wait,
                 )
                 await asyncio.sleep(wait)
 
@@ -285,7 +292,9 @@ async def _download_bytes_via_raw_api(
     data = b"".join(chunks)
     logger.info(
         "userbot: raw API download complete: %d bytes in %d chunks (chunk_size=%dKB)",
-        len(data), len(chunks), chunk_size_kb,
+        len(data),
+        len(chunks),
+        chunk_size_kb,
     )
     return data
 
@@ -293,6 +302,7 @@ async def _download_bytes_via_raw_api(
 # ---------------------------------------------------------------------------
 # Recovery helpers: forward to Saved Messages, 1-byte probe, session recycle
 # ---------------------------------------------------------------------------
+
 
 async def _forward_to_saved_messages(client, chat_id, message_id: int) -> int | None:
     """Forward a message to Saved Messages to get a fresh ``file_reference``.
@@ -314,13 +324,17 @@ async def _forward_to_saved_messages(client, chat_id, message_id: int) -> int | 
             fwd_msg = forwarded[0] if isinstance(forwarded, list) else forwarded
             logger.info(
                 "userbot: forwarded %s/%s to Saved Messages -> msg %s",
-                chat_id, message_id, getattr(fwd_msg, "id", None),
+                chat_id,
+                message_id,
+                getattr(fwd_msg, "id", None),
             )
             return fwd_msg.id
     except Exception as exc:
         logger.warning(
             "userbot: forward to Saved Messages failed for %s/%s: %s",
-            chat_id, message_id, exc,
+            chat_id,
+            message_id,
+            exc,
         )
     return None
 
@@ -357,7 +371,8 @@ async def _probe_file_wakeup(client, msg) -> bool:
         return True
     except Exception as exc:
         logger.warning(
-            "userbot: 1-byte probe failed (node unresponsive): %s", exc,
+            "userbot: 1-byte probe failed (node unresponsive): %s",
+            exc,
         )
         return False
 
@@ -434,8 +449,12 @@ async def _try_relay_fallback(
         relay_msgs = await client.get_messages(relay_chat_id, message_ids=[relay_msg_id])
         if relay_msgs:
             relay_msg = relay_msgs[0] if isinstance(relay_msgs, list) else relay_msgs
-            if relay_msg and getattr(relay_msg, "media", None) and await _download_and_ensure_path(client, relay_msg, dest_path):
-                    return True
+            if (
+                relay_msg
+                and getattr(relay_msg, "media", None)
+                and await _download_and_ensure_path(client, relay_msg, dest_path)
+            ):
+                return True
         logger.warning(
             "userbot: relay fallback download from %s/%s failed",
             relay_chat_id,
@@ -468,7 +487,9 @@ async def _attempt_recovery_download(
 
     logger.info(
         "userbot: starting recovery download for %s/%s -> %s",
-        chat_id, message_id, dest_path,
+        chat_id,
+        message_id,
+        dest_path,
     )
 
     # Resolve the peer (same approach as _download_with_pyrogram)
@@ -499,7 +520,9 @@ async def _attempt_recovery_download(
                 channel_peer = await _resolve_bot_api_channel_raw(client, _peer)
                 if channel_peer is not None:
                     _m = await _get_messages_via_raw_channel_api(
-                        client, channel_peer, message_id,
+                        client,
+                        channel_peer,
+                        message_id,
                     )
                     if _m is not None and getattr(_m, "media", None):
                         msg = _m
@@ -510,7 +533,9 @@ async def _attempt_recovery_download(
 
     if msg is None:
         logger.warning(
-            "userbot: recovery could not find message %s/%s", chat_id, message_id,
+            "userbot: recovery could not find message %s/%s",
+            chat_id,
+            message_id,
         )
         return False
 
@@ -570,13 +595,15 @@ async def _attempt_recovery_download(
                 if fwd_msg and getattr(fwd_msg, "media", None):
                     logger.info(
                         "userbot: recovery \u2014 retrying download from forwarded copy (%s/%s)",
-                        me.id, fwd_msg_id,
+                        me.id,
+                        fwd_msg_id,
                     )
                     if await _download_and_ensure_path(client, fwd_msg, dest_path):
                         return True
         except Exception as exc:
             logger.warning(
-                "userbot: recovery \u2014 forward+retry download failed: %s", exc,
+                "userbot: recovery \u2014 forward+retry download failed: %s",
+                exc,
             )
 
     # ---- Step 4: Session recycling + final retry ----
@@ -587,7 +614,9 @@ async def _attempt_recovery_download(
             return True
 
     logger.warning(
-        "userbot: all recovery methods exhausted for %s/%s", chat_id, message_id,
+        "userbot: all recovery methods exhausted for %s/%s",
+        chat_id,
+        message_id,
     )
     return False
 
@@ -661,13 +690,21 @@ async def _download_with_telethon(
                 logger.info("userbot: message found; downloading %s/%s to %s", target, message_id, dest_path)
                 for attempt in range(3):
                     try:
-                        logger.debug("userbot: download attempt %s for %s/%s -> %s", attempt + 1, target, getattr(msg, 'id', None), dest_path)
+                        logger.debug(
+                            "userbot: download attempt %s for %s/%s -> %s",
+                            attempt + 1,
+                            target,
+                            getattr(msg, "id", None),
+                            dest_path,
+                        )
                         await client.download_media(msg, file=dest_path, part_size_kb=chunk_size_kb)
                         if os.path.exists(dest_path) and os.path.getsize(dest_path) > 0:
                             ok = await _ffprobe_ok(dest_path)
                             if ok:
                                 return True
-                        logger.warning("userbot: downloaded file failed validation (attempt %s) %s", attempt + 1, dest_path)
+                        logger.warning(
+                            "userbot: downloaded file failed validation (attempt %s) %s", attempt + 1, dest_path
+                        )
                         with contextlib.suppress(Exception):
                             os.remove(dest_path)
                     except Exception as e:
@@ -702,10 +739,10 @@ async def _download_with_telethon(
                                             logger.info("userbot: downloaded via date search to %s", dest_path)
                                             return True
                                 except Exception:
-                                    pass
+                                    logger.debug("userbot: date scan download attempt failed")
                     search_done = True
                 except Exception:
-                    pass
+                    logger.debug("userbot: date scan iteration failed for %s", target)
 
         # Scan recent messages
         if not search_done:
@@ -724,9 +761,9 @@ async def _download_with_telethon(
                                     if ok:
                                         return True
                             except Exception:
-                                pass
+                                logger.debug("userbot: recent scan download attempt failed")
             except Exception:
-                pass
+                logger.debug("userbot: recent scan iteration failed for %s", target)
 
         relay_chat_id = os.getenv("RELAY_CHAT_ID")
         if relay_chat_id:
@@ -769,10 +806,12 @@ async def _resolve_bot_api_channel_raw(client, bot_api_chat_id: int):
     try:
         result = await client.invoke(
             raw.functions.channels.GetChannels(
-                id=[raw.types.InputChannel(
-                    channel_id=raw_channel_id,
-                    access_hash=0,
-                )]
+                id=[
+                    raw.types.InputChannel(
+                        channel_id=raw_channel_id,
+                        access_hash=0,
+                    )
+                ]
             )
         )
         if result and result.chats:
@@ -780,7 +819,9 @@ async def _resolve_bot_api_channel_raw(client, bot_api_chat_id: int):
             access_hash = getattr(chat, "access_hash", 0)
             logger.info(
                 "userbot: resolved large channel %s -> channel_id=%s access_hash=%s",
-                bot_api_chat_id, raw_channel_id, access_hash,
+                bot_api_chat_id,
+                raw_channel_id,
+                access_hash,
             )
             return raw.types.InputPeerChannel(
                 channel_id=raw_channel_id,
@@ -789,7 +830,8 @@ async def _resolve_bot_api_channel_raw(client, bot_api_chat_id: int):
     except Exception as e:
         logger.warning(
             "userbot: failed to resolve large channel %s via raw API: %s",
-            bot_api_chat_id, e,
+            bot_api_chat_id,
+            e,
         )
     return None
 
@@ -810,7 +852,9 @@ def _is_large_bot_api_channel(peer_id) -> bool:
 
 
 async def _get_messages_via_raw_channel_api(
-    client, channel_peer, message_id: int,
+    client,
+    channel_peer,
+    message_id: int,
 ):
     """Get a single message from a channel using raw MTProto API.
 
@@ -830,13 +874,18 @@ async def _get_messages_via_raw_channel_api(
             users = {i.id: i for i in r.users}
             chats = {i.id: i for i in r.chats}
             msg = await pyro_types.Message._parse(
-                client, r.messages[0], users, chats, replies=0,
+                client,
+                r.messages[0],
+                users,
+                chats,
+                replies=0,
             )
             return msg
     except Exception as e:
         logger.warning(
             "userbot: GetMessages via raw API failed for msg %s: %s",
-            message_id, e,
+            message_id,
+            e,
         )
     return None
 
@@ -858,13 +907,15 @@ async def _download_and_ensure_path(client, msg, dest_path):
     except Exception as exc:
         logger.warning(
             "userbot: download_media_with_retry failed for %s: %s",
-            dest_path, exc,
+            dest_path,
+            exc,
         )
         return False
 
     logger.info(
         "userbot: download_media dest_path=%s returned=%s",
-        dest_path, _dl,
+        dest_path,
+        _dl,
     )
     if not _dl:
         logger.warning("userbot: download_media returned None")
@@ -877,12 +928,14 @@ async def _download_and_ensure_path(client, msg, dest_path):
         if os.path.exists(_dl_path):
             logger.info(
                 "userbot: moving downloaded file %s -> %s",
-                _dl_path, _abs_dest,
+                _dl_path,
+                _abs_dest,
             )
             shutil.move(_dl_path, _abs_dest)
         else:
             logger.warning(
-                "userbot: download_media returned %s but file does not exist", _dl_path,
+                "userbot: download_media returned %s but file does not exist",
+                _dl_path,
             )
 
     # Check at the absolute destination path (where the file should be)
@@ -891,11 +944,13 @@ async def _download_and_ensure_path(client, msg, dest_path):
         if ok:
             return True
         logger.warning(
-            "userbot: download succeeded but ffprobe validation failed: %s", _abs_dest,
+            "userbot: download succeeded but ffprobe validation failed: %s",
+            _abs_dest,
         )
     else:
         logger.warning(
-            "userbot: download_media produced empty/missing file at %s", _abs_dest,
+            "userbot: download_media produced empty/missing file at %s",
+            _abs_dest,
         )
     return False
 
@@ -922,6 +977,7 @@ async def _download_bytes_with_pyrogram(
         return None
 
     from utils.telethon_session import build_pyrogram_client, get_userbot_credentials
+
     api_id, api_hash = get_userbot_credentials()
 
     client = build_pyrogram_client(api_id, api_hash)
@@ -964,7 +1020,8 @@ async def _download_bytes_with_pyrogram(
             try:
                 logger.info(
                     "userbot: Pyrogram in-memory get_messages(peer=%s, msg=%s)",
-                    _peer, message_id,
+                    _peer,
+                    message_id,
                 )
                 messages = await client.get_messages(_peer, message_ids=[message_id])
 
@@ -973,7 +1030,9 @@ async def _download_bytes_with_pyrogram(
                     if msg and getattr(msg, "media", None):
                         logger.info(
                             "userbot: Pyrogram in-memory downloading %s/%s (peer=%s)",
-                            _peer, message_id, _peer,
+                            _peer,
+                            message_id,
+                            _peer,
                         )
                         logger.info(
                             "userbot: resolved message payload for in-memory download: peer=%s msg_id=%s media=%s",
@@ -988,64 +1047,79 @@ async def _download_bytes_with_pyrogram(
                         # ── Try raw-MTProto chunked download when chunk size is configured ──
                         if _explicit_chunk_size is not None:
                             raw_data = await _download_bytes_via_raw_api(
-                                client, msg,
+                                client,
+                                msg,
                                 chunk_size_kb=_explicit_chunk_size,
                                 progress_callback=progress_callback,
                             )
                             if raw_data is not None:
                                 logger.info(
                                     "userbot: raw API chunked download succeeded: %d bytes from %s/%s",
-                                    len(raw_data), _peer, message_id,
+                                    len(raw_data),
+                                    _peer,
+                                    message_id,
                                 )
                                 return raw_data
                             logger.info(
-                                "userbot: raw API chunked download failed for %s/%s, "
-                                "falling back to download_media",
-                                _peer, message_id,
+                                "userbot: raw API chunked download failed for %s/%s, falling back to download_media",
+                                _peer,
+                                message_id,
                             )
 
                         # ── Fallback: download_media with -503 retry ──
                         try:
                             data = await _download_media_with_retry(
-                                client, msg, **dl_kwargs,
+                                client,
+                                msg,
+                                **dl_kwargs,
                             )
                         except Exception as exc:
                             logger.warning(
-                                "userbot: in-memory download_media with retry failed "
-                                "for %s/%s: %s",
-                                _peer, message_id, exc,
+                                "userbot: in-memory download_media with retry failed for %s/%s: %s",
+                                _peer,
+                                message_id,
+                                exc,
                             )
                             data = None
 
                         if data is not None and isinstance(data, bytes) and len(data) > 0:
                             logger.info(
                                 "userbot: Pyrogram in-memory download succeeded: %d bytes from %s/%s",
-                                len(data), _peer, message_id,
+                                len(data),
+                                _peer,
+                                message_id,
                             )
                             return data
                         logger.warning(
                             "userbot: Pyrogram in-memory returned empty/invalid data for %s/%s",
-                            _peer, message_id,
+                            _peer,
+                            message_id,
                         )
                     else:
                         logger.info(
                             "userbot: Pyrogram in-memory msg %s/%s no media (peer=%s)",
-                            _peer, message_id, _peer,
+                            _peer,
+                            message_id,
+                            _peer,
                         )
                 else:
                     logger.info(
                         "userbot: Pyrogram in-memory get_messages(peer=%s) returned None for msg %s",
-                        _peer, message_id,
+                        _peer,
+                        message_id,
                     )
             except ValueError as e:
                 if "Peer id invalid" in str(e) and isinstance(_peer, int) and _is_large_bot_api_channel(_peer):
                     logger.info(
-                        "userbot: large channel ID %s for in-memory, trying raw API", _peer,
+                        "userbot: large channel ID %s for in-memory, trying raw API",
+                        _peer,
                     )
                     channel_peer = await _resolve_bot_api_channel_raw(client, _peer)
                     if channel_peer is not None:
                         msg = await _get_messages_via_raw_channel_api(
-                            client, channel_peer, message_id,
+                            client,
+                            channel_peer,
+                            message_id,
                         )
                         if msg is not None and getattr(msg, "media", None):
                             dl_kwargs = {"in_memory": True}
@@ -1055,25 +1129,28 @@ async def _download_bytes_with_pyrogram(
                             # ── Raw-MTProto chunked download for raw-API resolved messages ──
                             if _explicit_chunk_size is not None:
                                 raw_data = await _download_bytes_via_raw_api(
-                                    client, msg,
+                                    client,
+                                    msg,
                                     chunk_size_kb=_explicit_chunk_size,
                                     progress_callback=progress_callback,
                                 )
                                 if raw_data is not None:
                                     logger.info(
-                                        "userbot: raw API (large channel) chunked download "
-                                        "succeeded: %d bytes",
+                                        "userbot: raw API (large channel) chunked download succeeded: %d bytes",
                                         len(raw_data),
                                     )
                                     return raw_data
 
                             try:
                                 data = await _download_media_with_retry(
-                                    client, msg, **dl_kwargs,
+                                    client,
+                                    msg,
+                                    **dl_kwargs,
                                 )
                             except Exception as exc:
                                 logger.warning(
-                                    "userbot: raw-API resolved download_media failed: %s", exc,
+                                    "userbot: raw-API resolved download_media failed: %s",
+                                    exc,
                                 )
                                 data = None
 
@@ -1086,21 +1163,26 @@ async def _download_bytes_with_pyrogram(
                 else:
                     logger.warning(
                         "userbot: Pyrogram in-memory error with peer=%s msg=%s: %s",
-                        _peer, message_id, e,
+                        _peer,
+                        message_id,
+                        e,
                     )
             except Exception as e:
                 logger.warning(
                     "userbot: Pyrogram in-memory error with peer=%s msg=%s: %s",
-                    _peer, message_id, e,
+                    _peer,
+                    message_id,
+                    e,
                 )
 
         # ---- Final recovery: try recovery for in-memory path via temp file ----
         logger.warning(
-            "userbot: Pyrogram in-memory download failed for %s/%s, "
-            "trying recovery via temp file...",
-            chat_id, message_id,
+            "userbot: Pyrogram in-memory download failed for %s/%s, trying recovery via temp file...",
+            chat_id,
+            message_id,
         )
         import tempfile as _tempfile
+
         _tmp_path = os.path.join(
             os.getenv("TEMP_PATH", _tempfile.gettempdir()),
             f"recovery_{chat_id}_{message_id}.tmp",
@@ -1121,7 +1203,7 @@ async def _download_bytes_with_pyrogram(
                 if os.path.exists(_tmp_path):
                     os.remove(_tmp_path)
             except Exception:
-                pass
+                logger.debug("userbot: failed to remove temp recovery file %s", _tmp_path)
 
         return None
     finally:
@@ -1147,6 +1229,7 @@ async def _download_with_pyrogram(
         return False
 
     from utils.telethon_session import build_pyrogram_client, get_userbot_credentials
+
     api_id, api_hash = get_userbot_credentials()
 
     client = build_pyrogram_client(api_id, api_hash)
@@ -1193,7 +1276,8 @@ async def _download_with_pyrogram(
             try:
                 logger.info(
                     "userbot: Pyrogram trying get_messages(peer=%s, msg=%s)",
-                    _peer, message_id,
+                    _peer,
+                    message_id,
                 )
                 messages = await client.get_messages(_peer, message_ids=[message_id])
 
@@ -1210,7 +1294,10 @@ async def _download_with_pyrogram(
                     if msg and getattr(msg, "media", None):
                         logger.info(
                             "userbot: Pyrogram downloading %s/%s -> %s (peer=%s)",
-                            _peer, message_id, dest_path, _peer,
+                            _peer,
+                            message_id,
+                            dest_path,
+                            _peer,
                         )
                         logger.info(
                             "userbot: resolved message payload for disk download: peer=%s msg_id=%s media=%s",
@@ -1222,7 +1309,9 @@ async def _download_with_pyrogram(
                             return True
                         logger.warning(
                             "userbot: Pyrogram download failed for %s/%s (peer=%s)",
-                            _peer, message_id, _peer,
+                            _peer,
+                            message_id,
+                            _peer,
                         )
                         # File was found but download failed — break out to avoid re-downloading
                         # from another peer (the message is correct, download itself failed)
@@ -1230,12 +1319,15 @@ async def _download_with_pyrogram(
                     else:
                         logger.info(
                             "userbot: Pyrogram message %s/%s found but has no media (peer=%s)",
-                            _peer, message_id, _peer,
+                            _peer,
+                            message_id,
+                            _peer,
                         )
                 else:
                     logger.info(
                         "userbot: Pyrogram get_messages(peer=%s) returned None/empty for msg %s",
-                        _peer, message_id,
+                        _peer,
+                        message_id,
                     )
             except ValueError as e:
                 err_str = str(e)
@@ -1243,12 +1335,15 @@ async def _download_with_pyrogram(
                     # Pyrogram's get_peer_type range check rejects this channel ID.
                     # Retry using raw MTProto API.
                     logger.info(
-                        "userbot: large channel ID %s, retrying via raw API", _peer,
+                        "userbot: large channel ID %s, retrying via raw API",
+                        _peer,
                     )
                     channel_peer = await _resolve_bot_api_channel_raw(client, _peer)
                     if channel_peer is not None:
                         msg = await _get_messages_via_raw_channel_api(
-                            client, channel_peer, message_id,
+                            client,
+                            channel_peer,
+                            message_id,
                         )
                         if msg is not None:
                             _found_msg = True
@@ -1261,27 +1356,34 @@ async def _download_with_pyrogram(
                                     return True
                                 logger.warning(
                                     "userbot: raw API download failed validation for %s/%s",
-                                    _peer, message_id,
+                                    _peer,
+                                    message_id,
                                 )
                             else:
                                 logger.info(
                                     "userbot: raw API msg %s/%s has no media",
-                                    _peer, message_id,
+                                    _peer,
+                                    message_id,
                                 )
                         else:
                             logger.warning(
                                 "userbot: raw API returned no message for %s/%s",
-                                _peer, message_id,
+                                _peer,
+                                message_id,
                             )
                 else:
                     logger.warning(
                         "userbot: Pyrogram error with peer=%s msg=%s: %s",
-                        _peer, message_id, e,
+                        _peer,
+                        message_id,
+                        e,
                     )
             except Exception as e:
                 logger.warning(
                     "userbot: Pyrogram error with peer=%s msg=%s: %s",
-                    _peer, message_id, e,
+                    _peer,
+                    message_id,
+                    e,
                 )
 
         async def _try_large_channel(peer):
@@ -1290,13 +1392,16 @@ async def _download_with_pyrogram(
             if not _is_large_bot_api_channel(peer):
                 return False
             logger.info(
-                "userbot: large channel ID %s, trying raw API", peer,
+                "userbot: large channel ID %s, trying raw API",
+                peer,
             )
             channel_peer = await _resolve_bot_api_channel_raw(client, peer)
             if channel_peer is None:
                 return None
             msg = await _get_messages_via_raw_channel_api(
-                client, channel_peer, message_id,
+                client,
+                channel_peer,
+                message_id,
             )
             if msg is None or not getattr(msg, "media", None):
                 return None
@@ -1309,13 +1414,16 @@ async def _download_with_pyrogram(
             try:
                 logger.info(
                     "userbot: Pyrogram scanning history of peer=%s for msg=%s (fallback)",
-                    _peer, message_id,
+                    _peer,
+                    message_id,
                 )
                 async for msg in client.get_chat_history(_peer, limit=50):
                     if getattr(msg, "id", None) == message_id and getattr(msg, "media", None):
                         logger.info(
                             "userbot: Pyrogram found msg %s/%s in history (peer=%s)",
-                            _peer, message_id, _peer,
+                            _peer,
+                            message_id,
+                            _peer,
                         )
                         if await _download_and_ensure_path(client, msg, dest_path):
                             return True
@@ -1329,7 +1437,9 @@ async def _download_with_pyrogram(
                         _found_msg = True
             except Exception as e:
                 logger.warning(
-                    "userbot: Pyrogram history scan(peer=%s) failed: %s", _peer, e,
+                    "userbot: Pyrogram history scan(peer=%s) failed: %s",
+                    _peer,
+                    e,
                 )
 
         # Final attempt: try get_chat to resolve peer properly, then retry get_messages
@@ -1338,14 +1448,16 @@ async def _download_with_pyrogram(
                 try:
                     logger.info(
                         "userbot: Pyrogram resolving peer=%s via get_chat() for msg %s",
-                        _peer, message_id,
+                        _peer,
+                        message_id,
                     )
                     _chat = await client.get_chat(_peer)
                     if _chat:
                         _resolved_id = getattr(_chat, "id", _peer)
                         logger.info(
                             "userbot: Pyrogram resolved chat peer=%s -> id=%s",
-                            _peer, _resolved_id,
+                            _peer,
+                            _resolved_id,
                         )
                         messages = await client.get_messages(_resolved_id, message_ids=[message_id])
                         if messages:
@@ -1364,13 +1476,15 @@ async def _download_with_pyrogram(
                 except Exception as e:
                     logger.warning(
                         "userbot: Pyrogram get_chat(peer=%s) or retry failed: %s",
-                        _peer, e,
+                        _peer,
+                        e,
                     )
 
         if not _found_msg:
             logger.warning(
                 "userbot: Pyrogram could not find message %s in any candidate peer (%s)",
-                message_id, _candidates,
+                message_id,
+                _candidates,
             )
             logger.info(
                 "userbot: disk download failed to resolve any message for chat=%s msg=%s",
@@ -1405,14 +1519,15 @@ async def _download_with_pyrogram(
 
             # ---- Final recovery: attempt advanced techniques for persistent -503 ----
             logger.info(
-                "userbot: all standard download methods failed for %s/%s, "
-                "trying recovery (forward+probe+recycle)...",
-                chat_id, message_id,
+                "userbot: all standard download methods failed for %s/%s, trying recovery (forward+probe+recycle)...",
+                chat_id,
+                message_id,
             )
             if await _attempt_recovery_download(client, chat_id, message_id, dest_path):
                 logger.info(
                     "userbot: recovery download succeeded for %s/%s",
-                    chat_id, message_id,
+                    chat_id,
+                    message_id,
                 )
                 return True
 
@@ -1477,9 +1592,7 @@ async def download_forward_via_userbot(
     # Try Telethon only when a usable session exists.
     if TelegramClient is not None and has_usable_telethon_session():
         try:
-            result = await _download_with_telethon(
-                chat_id, message_id, dest_path, msg_date, file_unique_id
-            )
+            result = await _download_with_telethon(chat_id, message_id, dest_path, msg_date, file_unique_id)
             if result:
                 return True
             logger.info("userbot: Telethon download failed; no further fallback")
@@ -1533,7 +1646,8 @@ async def download_bytes_via_userbot(
             logger.info("userbot: Pyrogram in-memory download failed; trying Telethon fallback")
         except Exception as e:
             logger.warning(
-                "userbot: Pyrogram in-memory download error (%s); trying Telethon fallback", e,
+                "userbot: Pyrogram in-memory download error (%s); trying Telethon fallback",
+                e,
             )
 
     # Try Telethon with BytesIO as fallback
@@ -1561,17 +1675,20 @@ async def download_bytes_via_userbot(
                         if data and len(data) > 0:
                             logger.info(
                                 "userbot: in-memory download via Telethon succeeded: %d bytes (chunk_size=%dKB)",
-                                len(data), chunk_size_kb,
+                                len(data),
+                                chunk_size_kb,
                             )
                             return data
                 await _client.disconnect()
         except Exception as e:
             logger.warning(
-                "userbot: Telethon in-memory download error (%s)", e,
+                "userbot: Telethon in-memory download error (%s)",
+                e,
             )
 
     logger.warning(
         "userbot: all in-memory download methods failed for %s/%s",
-        chat_id, message_id,
+        chat_id,
+        message_id,
     )
     return None

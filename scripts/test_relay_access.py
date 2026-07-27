@@ -2,8 +2,11 @@
 """Test if the Pyrogram userbot can access the relay group."""
 
 import asyncio
+import logging
 import os
 import sys
+
+logger = logging.getLogger(__name__)
 
 # Ensure project root is on sys.path
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -38,9 +41,9 @@ async def test_relay_access():
         print(f"{FAIL} PYROGRAM_SESSION is not set!")
         return False
 
-    print(f"\n{'='*60}")
+    print(f"\n{'=' * 60}")
     print(f"Testing Pyrogram userbot access to relay group: {relay_chat_id}")
-    print(f"{'='*60}")
+    print(f"{'=' * 60}")
 
     try:
         api_id, api_hash = get_userbot_credentials()
@@ -89,9 +92,9 @@ async def test_relay_access():
         except Exception as e:
             print(f"{WARN} Can access group but cannot read messages: {e}")
 
-        print(f"\n{'='*60}")
+        print(f"\n{'=' * 60}")
         print(f"{OK} RELAY GROUP ACCESS: WORKING")
-        print(f"{'='*60}")
+        print(f"{'=' * 60}")
         print("\nThe userbot can access the relay group.")
         print("Large file downloads should work now.")
         return True
@@ -99,6 +102,7 @@ async def test_relay_access():
     except Exception as e:
         print(f"\n{FAIL} Unexpected error: {e}")
         import traceback
+
         traceback.print_exc()
         return False
     finally:
@@ -106,7 +110,7 @@ async def test_relay_access():
             await client.stop()
             print(f"{OK} Pyrogram client stopped")
         except Exception:
-            pass
+            logger.debug("test relay: operation failed")
 
 
 if __name__ == "__main__":

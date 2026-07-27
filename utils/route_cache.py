@@ -82,6 +82,7 @@ class RouteCache:
         if self._redis:
             try:
                 from utils.job_queue import get_redis
+
                 r = await get_redis()
                 raw = await r.get(self._prefixed_key(key))
                 if raw is not None:
@@ -117,6 +118,7 @@ class RouteCache:
         if self._redis:
             try:
                 from utils.job_queue import get_redis
+
                 r = await get_redis()
                 await r.setex(prefixed, ttl, serialized)
                 return True
@@ -141,10 +143,11 @@ class RouteCache:
         if self._redis:
             try:
                 from utils.job_queue import get_redis
+
                 r = await get_redis()
                 await r.delete(prefixed)
             except Exception:
-                pass
+                logger.debug("RouteCache: failed to delete from Redis: %s", key)
         self._memory_delete(key)
         return True
 
@@ -164,9 +167,7 @@ class RouteCache:
             try:
                 cursor = 0
                 while True:
-                    cursor, keys = self._redis.scan(
-                        cursor=cursor, match=f"{prefixed_prefix}*", count=100
-                    )
+                    cursor, keys = self._redis.scan(cursor=cursor, match=f"{prefixed_prefix}*", count=100)
                     if keys:
                         self._redis.delete(*keys)
                         count += len(keys)
@@ -187,12 +188,11 @@ class RouteCache:
         if self._redis:
             try:
                 from utils.job_queue import get_redis
+
                 r = await get_redis()
                 cursor = 0
                 while True:
-                    cursor, keys = await r.scan(
-                        cursor=cursor, match=f"{prefixed_prefix}*", count=100
-                    )
+                    cursor, keys = await r.scan(cursor=cursor, match=f"{prefixed_prefix}*", count=100)
                     if keys:
                         await r.delete(*keys)
                         count += len(keys)
@@ -240,12 +240,8 @@ class RouteCache:
     def make_key(route: str, params: dict | None = None) -> str:
         """Generate a deterministic cache key from route + sorted params."""
         if params:
-            sorted_items = sorted(
-                (k, str(v)) for k, v in params.items() if v is not None
-            )
-            param_hash = hashlib.sha256(
-                json.dumps(sorted_items, default=str).encode()
-            ).hexdigest()[:16]
+            sorted_items = sorted((k, str(v)) for k, v in params.items() if v is not None)
+            param_hash = hashlib.sha256(json.dumps(sorted_items, default=str).encode()).hexdigest()[:16]
             return f"{route}:{param_hash}"
         return route
 

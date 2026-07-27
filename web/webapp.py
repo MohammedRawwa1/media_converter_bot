@@ -45,7 +45,7 @@ try:
     if max_bytes and max_bytes > 0:
         app.config["MAX_CONTENT_LENGTH"] = max_bytes
 except Exception:
-    pass
+    logger.debug("webapp: failed to parse MAX_CONTENT_LENGTH_BYTES")
 
 # In-memory fallback job store when Redis is not available (best-effort)
 JOB_STORE = {}
@@ -53,6 +53,7 @@ JOB_STORE = {}
 # Try to use async job queue helpers when available
 try:
     from utils.job_queue import enqueue_job, get_redis
+
     aioredis_available = True
 except Exception:
     enqueue_job = None
@@ -132,7 +133,9 @@ def upload():
         try:
             from utils.forward_store import load_forward_metadata
         except Exception:
-            return jsonify({"error": "failed to load forward metadata", "detail": "Check server logs for details."}), 500
+            return jsonify(
+                {"error": "failed to load forward metadata", "detail": "Check server logs for details."}
+            ), 500
 
         # Try to load persisted forward metadata. If it's not yet available
         # (e.g. upload to S3 is still in progress), schedule a background
@@ -143,7 +146,9 @@ def upload():
         try:
             meta = asyncio.run(load_forward_metadata(forward_hash))
         except Exception:
-            return jsonify({"error": "failed to load forward metadata", "detail": "Check server logs for details."}), 500
+            return jsonify(
+                {"error": "failed to load forward metadata", "detail": "Check server logs for details."}
+            ), 500
 
         if not meta:
             # default extension while we wait for metadata to appear
@@ -153,6 +158,7 @@ def upload():
             def _poll_and_fetch(fid, inp_path, j_id, req_id, attempts=6, initial_delay=2):
                 import asyncio as _asyncio
                 import time
+
                 try:
                     from utils.forward_store import delete_forward_metadata as _delete_forward
                     from utils.forward_store import load_forward_metadata as _load_forward
@@ -194,7 +200,9 @@ def upload():
                             return
 
                         # Upload to remote storage if configured, else enqueue using local path
-                        backend_name_loc = (os.getenv("STORAGE_BACKEND") or getattr(config, "STORAGE_BACKEND", "local")).lower()
+                        backend_name_loc = (
+                            os.getenv("STORAGE_BACKEND") or getattr(config, "STORAGE_BACKEND", "local")
+                        ).lower()
                         use_remote_loc = backend_name_loc in ("s3", "r2") and get_storage_backend_sync is not None
                         key_loc = f"uploads/{j_id}_{os.path.basename(inp_path)}" if use_remote_loc else None
                         job_loc = None
@@ -211,7 +219,18 @@ def upload():
                                     "output_path": os.path.join(OUTPUT_DIR, f"{j_id}.mp4"),
                                     "original_filename": m.get("name") or os.path.basename(inp_path),
                                     "output_filename": f"{j_id}.mp4",
-                                    "ffmpeg_args": ["-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-c:a", "aac", "-b:a", "128k"],
+                                    "ffmpeg_args": [
+                                        "-c:v",
+                                        "libx264",
+                                        "-preset",
+                                        "veryfast",
+                                        "-crf",
+                                        "23",
+                                        "-c:a",
+                                        "aac",
+                                        "-b:a",
+                                        "128k",
+                                    ],
                                     "progress_channel": f"ffmpeg:progress:{j_id}",
                                     "cleanup_input": True,
                                 }
@@ -225,7 +244,18 @@ def upload():
                                 "output_path": os.path.join(OUTPUT_DIR, f"{j_id}.mp4"),
                                 "original_filename": m.get("name") or os.path.basename(inp_path),
                                 "output_filename": f"{j_id}.mp4",
-                                "ffmpeg_args": ["-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-c:a", "aac", "-b:a", "128k"],
+                                "ffmpeg_args": [
+                                    "-c:v",
+                                    "libx264",
+                                    "-preset",
+                                    "veryfast",
+                                    "-crf",
+                                    "23",
+                                    "-c:a",
+                                    "aac",
+                                    "-b:a",
+                                    "128k",
+                                ],
                                 "progress_channel": f"ffmpeg:progress:{j_id}",
                                 "cleanup_input": True,
                             }
@@ -244,15 +274,21 @@ def upload():
 
                     # not found yet: backoff then retry
                     with contextlib.suppress(Exception):
-                        time.sleep(initial_delay * (2 ** attempt))
+                        time.sleep(initial_delay * (2**attempt))
 
                 logger.warning("Forward metadata still not found after %s attempts for %s", attempts, fid)
 
-            t = threading.Thread(target=_poll_and_fetch, args=(forward_hash, input_path, job_id, request_id), daemon=True)
+            t = threading.Thread(
+                target=_poll_and_fetch, args=(forward_hash, input_path, job_id, request_id), daemon=True
+            )
             with contextlib.suppress(Exception):
-                logger.info("webapp.upload: starting background poll thread for forward %s -> %s", forward_hash, input_path)
+                logger.info(
+                    "webapp.upload: starting background poll thread for forward %s -> %s", forward_hash, input_path
+                )
             t.start()
-            return jsonify({"status": "accepted", "detail": "forward metadata not yet available; background fetch scheduled"}), 202
+            return jsonify(
+                {"status": "accepted", "detail": "forward metadata not yet available; background fetch scheduled"}
+            ), 202
 
         # Determine extension from original metadata or fallback to .mp4
         filename = meta.get("name") or ""
@@ -271,6 +307,7 @@ def upload():
         # previously caused indentation/syntax issues.
         def _bg_fetch_and_enqueue(meta_obj, inp_path, j_id, req_id):
             import asyncio as _asyncio
+
             try:
                 ok_loc = False
                 try:
@@ -308,7 +345,18 @@ def upload():
                             "output_path": os.path.join(OUTPUT_DIR, f"{j_id}.mp4"),
                             "original_filename": meta_obj.get("name") or os.path.basename(inp_path),
                             "output_filename": f"{j_id}.mp4",
-                            "ffmpeg_args": ["-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-c:a", "aac", "-b:a", "128k"],
+                            "ffmpeg_args": [
+                                "-c:v",
+                                "libx264",
+                                "-preset",
+                                "veryfast",
+                                "-crf",
+                                "23",
+                                "-c:a",
+                                "aac",
+                                "-b:a",
+                                "128k",
+                            ],
                             "progress_channel": f"ffmpeg:progress:{j_id}",
                             "cleanup_input": True,
                         }
@@ -320,7 +368,18 @@ def upload():
                             "output_path": os.path.join(OUTPUT_DIR, f"{j_id}.mp4"),
                             "original_filename": meta_obj.get("name") or os.path.basename(inp_path),
                             "output_filename": f"{j_id}.mp4",
-                            "ffmpeg_args": ["-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-c:a", "aac", "-b:a", "128k"],
+                            "ffmpeg_args": [
+                                "-c:v",
+                                "libx264",
+                                "-preset",
+                                "veryfast",
+                                "-crf",
+                                "23",
+                                "-c:a",
+                                "aac",
+                                "-b:a",
+                                "128k",
+                            ],
                             "progress_channel": f"ffmpeg:progress:{j_id}",
                             "cleanup_input": True,
                         }
@@ -331,7 +390,18 @@ def upload():
                         "output_path": os.path.join(OUTPUT_DIR, f"{j_id}.mp4"),
                         "original_filename": meta_obj.get("name") or os.path.basename(inp_path),
                         "output_filename": f"{j_id}.mp4",
-                        "ffmpeg_args": ["-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-c:a", "aac", "-b:a", "128k"],
+                        "ffmpeg_args": [
+                            "-c:v",
+                            "libx264",
+                            "-preset",
+                            "veryfast",
+                            "-crf",
+                            "23",
+                            "-c:a",
+                            "aac",
+                            "-b:a",
+                            "128k",
+                        ],
                         "progress_channel": f"ffmpeg:progress:{j_id}",
                         "cleanup_input": True,
                     }
@@ -387,6 +457,7 @@ def upload():
     }
     # Enqueue job: do not block the request thread for uploads/enqueues.
     if enqueue_job:
+
         def _background_upload_and_enqueue(j, key, use_remote, req_id):
             try:
                 # If remote backend is enabled, upload first then set input_key
@@ -422,7 +493,9 @@ def upload():
             except Exception:
                 logger.exception("Unexpected error in background upload/enqueue for job %s", j.get("job_id"))
 
-        t = threading.Thread(target=_background_upload_and_enqueue, args=(job, key, use_remote_backend, request_id), daemon=True)
+        t = threading.Thread(
+            target=_background_upload_and_enqueue, args=(job, key, use_remote_backend, request_id), daemon=True
+        )
         t.start()
     else:
         # Fallback: start a background thread that runs a synchronous conversion
@@ -460,23 +533,25 @@ def upload():
             t = threading.Thread(target=_worker, args=(job,), daemon=True)
             t.start()
         except Exception:
-            return jsonify({"error": "job queue not available on server", "detail": "Internal error. Check server logs."}), 503
+            return jsonify(
+                {"error": "job queue not available on server", "detail": "Internal error. Check server logs."}
+            ), 503
     return jsonify({"job_id": job_id})
 
 
 @app.route("/debug/telethon-log", methods=["GET"])
 def telethon_log():
     """
-    # Rate limiting: prevent DoS/DDoS
-    client_ip = get_client_ip(request)
-    if not web_rate_limiter.check_limit("debug_log", client_ip):
-        body, status, headers = make_rate_limit_response("debug_log", client_ip)
-        return jsonify(body), status, headers
+        # Rate limiting: prevent DoS/DDoS
+        client_ip = get_client_ip(request)
+        if not web_rate_limiter.check_limit("debug_log", client_ip):
+            body, status, headers = make_rate_limit_response("debug_log", client_ip)
+            return jsonify(body), status, headers
 
-Fetch the most recent Telethon ingest log from configured storage.
+    Fetch the most recent Telethon ingest log from configured storage.
 
-    Protected by `DEBUG_SECRET` if present in env. Returns plain text log
-    or 404 if not found.
+        Protected by `DEBUG_SECRET` if present in env. Returns plain text log
+        or 404 if not found.
     """
     debug_secret = os.environ.get("DEBUG_SECRET")
     if debug_secret:
@@ -523,9 +598,9 @@ Fetch the most recent Telethon ingest log from configured storage.
                     if keys:
                         candidates.extend(keys)
                 except Exception:
-                    pass
+                    logger.debug("webapp: failed to list keys for prefix %s", p)
     except Exception:
-        pass
+        logger.debug("webapp: list_keys iteration failed for telethon log prefixes")
 
     # If no candidates discovered, try some well-known names
     if not candidates:
@@ -589,16 +664,16 @@ Fetch the most recent Telethon ingest log from configured storage.
 @app.route("/presign", methods=["POST"])
 def presign():
     """
-    # Rate limiting: prevent DoS/DDoS
-    client_ip = get_client_ip(request)
-    if not web_rate_limiter.check_limit("presign", client_ip):
-        body, status, headers = make_rate_limit_response("presign", client_ip)
-        return jsonify(body), status, headers
+        # Rate limiting: prevent DoS/DDoS
+        client_ip = get_client_ip(request)
+        if not web_rate_limiter.check_limit("presign", client_ip):
+            body, status, headers = make_rate_limit_response("presign", client_ip)
+            return jsonify(body), status, headers
 
-Return a presigned S3 POST (or PUT) for client direct upload.
+    Return a presigned S3 POST (or PUT) for client direct upload.
 
-    Request JSON or form data: `filename`.
-    Requires `UPLOAD_SECRET` when configured.
+        Request JSON or form data: `filename`.
+        Requires `UPLOAD_SECRET` when configured.
     """
     upload_secret = os.environ.get("UPLOAD_SECRET")
     if upload_secret:
@@ -643,14 +718,15 @@ Return a presigned S3 POST (or PUT) for client direct upload.
         }
         try:
             from botocore.config import Config as BotoConfig
+
             force_path = str(os.getenv("S3_FORCE_PATH_STYLE", "")).lower() in ("1", "true", "yes")
             if force_path:
                 client_kwargs["config"] = BotoConfig(signature_version="s3v4", s3={"addressing_style": "path"})
             else:
                 client_kwargs["config"] = BotoConfig(signature_version="s3v4")
         except Exception:
+            logger.debug("webapp: botocore config creation failed, proceeding without explicit config")
             # botocore not available or config creation failed — proceed without explicit config
-            pass
 
         s3 = boto3.client("s3", **client_kwargs)
         # prefer a POST form upload (fields + url)
@@ -666,23 +742,23 @@ Return a presigned S3 POST (or PUT) for client direct upload.
 @app.route("/enqueue_from_url", methods=["POST"])
 def enqueue_from_url():
     """
-    # Rate limiting: prevent DoS/DDoS
-    client_ip = get_client_ip(request)
-    if not web_rate_limiter.check_limit("enqueue_url", client_ip):
-        body, status, headers = make_rate_limit_response("enqueue_url", client_ip)
-        return jsonify(body), status, headers
+        # Rate limiting: prevent DoS/DDoS
+        client_ip = get_client_ip(request)
+        if not web_rate_limiter.check_limit("enqueue_url", client_ip):
+            body, status, headers = make_rate_limit_response("enqueue_url", client_ip)
+            return jsonify(body), status, headers
 
-Enqueue a job that downloads from a public or presigned URL.
+    Enqueue a job that downloads from a public or presigned URL.
 
-    Request JSON: `source_url` (required), `original_filename` (optional).
-    Requires `UPLOAD_SECRET` when configured.
+        Request JSON: `source_url` (required), `original_filename` (optional).
+        Requires `UPLOAD_SECRET` when configured.
     """
     upload_secret = os.environ.get("UPLOAD_SECRET")
     if upload_secret:
         incoming_token = (
-            request.headers.get("X-Upload-Token")
-            or request.json.get("upload_token") if request.is_json else request.form.get("upload_token")
-            or request.args.get("upload_token")
+            request.headers.get("X-Upload-Token") or request.json.get("upload_token")
+            if request.is_json
+            else request.form.get("upload_token") or request.args.get("upload_token")
         )
         if not incoming_token or incoming_token != upload_secret:
             return (
@@ -692,7 +768,9 @@ Enqueue a job that downloads from a public or presigned URL.
 
     data = request.get_json(silent=True) or {}
     source_url = data.get("source_url") or request.form.get("source_url") or request.args.get("source_url")
-    original_filename = data.get("original_filename") or request.form.get("original_filename") or request.args.get("original_filename")
+    original_filename = (
+        data.get("original_filename") or request.form.get("original_filename") or request.args.get("original_filename")
+    )
 
     if not source_url:
         return jsonify({"error": "source_url required"}), 400
@@ -702,9 +780,10 @@ Enqueue a job that downloads from a public or presigned URL.
         logger.warning("SSRF blocked: source_url=%s", source_url[:120] if source_url else "None")
         return jsonify({"error": "invalid source_url", "detail": "URL blocked for security reasons"}), 400
 
-
     job_id = str(uuid.uuid4())
-    output_filename = (os.path.splitext(original_filename or job_id)[0] + ".mp4") if original_filename else f"{job_id}.mp4"
+    output_filename = (
+        (os.path.splitext(original_filename or job_id)[0] + ".mp4") if original_filename else f"{job_id}.mp4"
+    )
     output_path = os.path.join(OUTPUT_DIR, output_filename)
 
     job = {
@@ -748,7 +827,10 @@ async def _get_job_hash(job_id: str):
         await r.close()
         if not data:
             return None
-        decoded = {k.decode() if isinstance(k, bytes) else k: v.decode() if isinstance(v, bytes) else v for k, v in data.items()}
+        decoded = {
+            k.decode() if isinstance(k, bytes) else k: v.decode() if isinstance(v, bytes) else v
+            for k, v in data.items()
+        }
         return decoded
     except Exception:
         return None
@@ -859,7 +941,6 @@ def status(job_id):
     return jsonify({"job_id": job_id, "progress": 0.0, "message": "queued", "status": "queued"})
 
 
-
 @app.route("/download/<job_id>", methods=["GET"])
 def download(job_id):
 
@@ -884,7 +965,7 @@ def download(job_id):
 
                 return redirect(url)
         except Exception:
-            pass
+            logger.debug("webapp: failed to redirect to presigned URL for %s", job_id)
 
         # If output is a local path we can send it directly
         try:
@@ -897,7 +978,7 @@ def download(job_id):
                 except TypeError:
                     return send_file(output_path, as_attachment=True, attachment_filename=filename)
         except Exception:
-            pass
+            logger.debug("webapp: failed to send local output file for %s", job_id)
 
         # If storage key present, attempt to generate presigned GET and redirect
         try:
@@ -910,9 +991,9 @@ def download(job_id):
 
                     return redirect(url)
                 except Exception:
-                    pass
+                    logger.debug("webapp: presigned GET redirect failed for %s", job_id)
         except Exception:
-            pass
+            logger.debug("webapp: failed to process output_key redirect for %s", job_id)
 
     # Check in-memory JOB_STORE for output path
     try:
@@ -921,9 +1002,13 @@ def download(job_id):
         local = None
     if local and local.get("output") and os.path.exists(local.get("output")):
         try:
-            return send_file(local.get("output"), as_attachment=True, download_name=os.path.basename(local.get("output")))
+            return send_file(
+                local.get("output"), as_attachment=True, download_name=os.path.basename(local.get("output"))
+            )
         except TypeError:
-            return send_file(local.get("output"), as_attachment=True, attachment_filename=os.path.basename(local.get("output")))
+            return send_file(
+                local.get("output"), as_attachment=True, attachment_filename=os.path.basename(local.get("output"))
+            )
 
     # Fallback: look for storage/output/{job_id}.mp4
     out_path = os.path.join(OUTPUT_DIR, f"{job_id}.mp4")
@@ -936,18 +1021,19 @@ def download(job_id):
     return jsonify({"error": "output not available"}), 404
 
 
-@app.route('/events/<job_id>')
+@app.route("/events/<job_id>")
 def events(job_id):
     """
-    # Rate limiting: prevent DoS/DDoS
-    client_ip = get_client_ip(request)
-    if not web_rate_limiter.check_limit("events", client_ip):
-        body, status, headers = make_rate_limit_response("events", client_ip)
-        return jsonify(body), status, headers
+        # Rate limiting: prevent DoS/DDoS
+        client_ip = get_client_ip(request)
+        if not web_rate_limiter.check_limit("events", client_ip):
+            body, status, headers = make_rate_limit_response("events", client_ip)
+            return jsonify(body), status, headers
 
-Server-Sent Events endpoint that streams Redis progress pubsub messages
-    published on channel `ffmpeg:progress:{job_id}` to the browser.
+    Server-Sent Events endpoint that streams Redis progress pubsub messages
+        published on channel `ffmpeg:progress:{job_id}` to the browser.
     """
+
     def gen():
         pub = None
         try:
@@ -960,7 +1046,7 @@ Server-Sent Events endpoint that streams Redis progress pubsub messages
             if job_hash:
                 yield f"data: {json.dumps(job_hash)}\n\n"
 
-            red_url = os.environ.get('REDIS_URL')
+            red_url = os.environ.get("REDIS_URL")
             if not red_url:
                 # No Redis configured for this deployment; finish after initial state
                 return
@@ -971,13 +1057,13 @@ Server-Sent Events endpoint that streams Redis progress pubsub messages
             for message in pub.listen():
                 if not message:
                     continue
-                if message.get('type') != 'message':
+                if message.get("type") != "message":
                     continue
-                data = message.get('data')
+                data = message.get("data")
                 # ensure string
                 if isinstance(data, bytes):
                     try:
-                        data = data.decode('utf-8')
+                        data = data.decode("utf-8")
                     except Exception:
                         data = str(data)
                 yield f"data: {data}\n\n"
@@ -985,37 +1071,39 @@ Server-Sent Events endpoint that streams Redis progress pubsub messages
             # client disconnected
             pass
         except Exception:
-            pass
+            logger.debug("webapp: events listener error for %s", job_id)
         finally:
             try:
                 if pub:
                     pub.close()
             except Exception:
-                pass
+                logger.debug("webapp: failed to close pubsub for %s", job_id)
 
-    return Response(stream_with_context(gen()), content_type='text/event-stream')
+    return Response(stream_with_context(gen()), content_type="text/event-stream")
 
 
-@app.route("/get_input", methods=["GET"]) 
+@app.route("/get_input", methods=["GET"])
 def get_input():
     """
-    # Rate limiting: prevent DoS/DDoS
-    client_ip = get_client_ip(request)
-    if not web_rate_limiter.check_limit("get_input", client_ip):
-        body, status, headers = make_rate_limit_response("get_input", client_ip)
-        return jsonify(body), status, headers
+        # Rate limiting: prevent DoS/DDoS
+        client_ip = get_client_ip(request)
+        if not web_rate_limiter.check_limit("get_input", client_ip):
+            body, status, headers = make_rate_limit_response("get_input", client_ip)
+            return jsonify(body), status, headers
 
-Temporary token-protected endpoint to download files from the input folder.
-    Protection: prefer `DIAG_TOKEN` (header `X-DIAG-TOKEN` or `?token=`),
-    fallback to `UPLOAD_SECRET` (header `X-Upload-Token` or `?upload_token=`).
-    Use only for short-term debugging; remove after use.
-    Query params: `name` (filename in input dir).
+    Temporary token-protected endpoint to download files from the input folder.
+        Protection: prefer `DIAG_TOKEN` (header `X-DIAG-TOKEN` or `?token=`),
+        fallback to `UPLOAD_SECRET` (header `X-Upload-Token` or `?upload_token=`).
+        Use only for short-term debugging; remove after use.
+        Query params: `name` (filename in input dir).
     """
     diag_token = os.environ.get("DIAG_TOKEN")
     upload_secret = os.environ.get("UPLOAD_SECRET")
 
     incoming_diag = request.headers.get("X-DIAG-TOKEN") or request.args.get("token") or request.form.get("token")
-    incoming_upload = request.headers.get("X-Upload-Token") or request.args.get("upload_token") or request.form.get("upload_token")
+    incoming_upload = (
+        request.headers.get("X-Upload-Token") or request.args.get("upload_token") or request.form.get("upload_token")
+    )
 
     # Validate token
     if diag_token:
@@ -1050,20 +1138,20 @@ Temporary token-protected endpoint to download files from the input folder.
     return jsonify({"error": "Failed to send file. Check server logs."}), 500
 
 
-@app.route("/internal/diag", methods=["GET", "POST"]) 
+@app.route("/internal/diag", methods=["GET", "POST"])
 def internal_diag():
     """
-    # Rate limiting: prevent DoS/DDoS
-    client_ip = get_client_ip(request)
-    if not web_rate_limiter.check_limit("diag", client_ip):
-        body, status, headers = make_rate_limit_response("diag", client_ip)
-        return jsonify(body), status, headers
+        # Rate limiting: prevent DoS/DDoS
+        client_ip = get_client_ip(request)
+        if not web_rate_limiter.check_limit("diag", client_ip):
+            body, status, headers = make_rate_limit_response("diag", client_ip)
+            return jsonify(body), status, headers
 
-Token-protected diagnostic endpoint.
-    Set `DIAG_TOKEN` in the environment (random string). Call with header
-    `X-DIAG-TOKEN: <token>` or `?token=<token>`.
-    Returns masked env, Redis health, sample job list, optional job hash,
-    and last lines from app `logs/` directory.
+    Token-protected diagnostic endpoint.
+        Set `DIAG_TOKEN` in the environment (random string). Call with header
+        `X-DIAG-TOKEN: <token>` or `?token=<token>`.
+        Returns masked env, Redis health, sample job list, optional job hash,
+        and last lines from app `logs/` directory.
     """
     token = os.environ.get("DIAG_TOKEN")
     incoming = request.headers.get("X-DIAG-TOKEN") or request.args.get("token") or request.form.get("token")

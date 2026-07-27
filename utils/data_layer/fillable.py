@@ -105,9 +105,7 @@ class FillableModel:
         if strict:
             for key in data:
                 if key in guarded:
-                    raise GuardedFieldError(
-                        f"Field '{key}' is guarded and cannot be set via mass assignment"
-                    )
+                    raise GuardedFieldError(f"Field '{key}' is guarded and cannot be set via mass assignment")
         return {k: v for k, v in data.items() if k not in guarded}
 
     # ── Projection helpers ────────────────────────────────────────────
@@ -144,6 +142,7 @@ class FillableModel:
         unintended documents.
         """
         import re
+
         return re.escape(user_input)
 
     @classmethod
@@ -155,9 +154,7 @@ class FillableModel:
         """
         fillable = cls._get_fillable_fields()
         if fillable and field not in fillable:
-            raise ValidationError(
-                f"Sort field '{field}' is not in fillable fields: {fillable}"
-            )
+            raise ValidationError(f"Sort field '{field}' is not in fillable fields: {fillable}")
         if field.startswith("$"):
             raise ValidationError(f"Sort field cannot start with '$': {field}")
         return field
@@ -192,10 +189,7 @@ class FillableModel:
                 # Recursively sanitize nested operators
                 sanitized[key] = cls.sanitize_filter(value)
             elif isinstance(value, list):
-                sanitized[key] = [
-                    cls.sanitize_filter(item) if isinstance(item, dict) else item
-                    for item in value
-                ]
+                sanitized[key] = [cls.sanitize_filter(item) if isinstance(item, dict) else item for item in value]
             else:
                 sanitized[key] = value
         return sanitized

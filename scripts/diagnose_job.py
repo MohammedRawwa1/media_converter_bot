@@ -16,11 +16,14 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import os
 import subprocess
 import sys
 import tempfile
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 try:
     import redis
@@ -95,7 +98,7 @@ def tail_logs(lines: int = 200) -> dict[str, Any]:
             with open(worker_log, encoding="utf-8", errors="replace") as fh:
                 logs[os.path.basename(worker_log)] = "".join(fh.readlines()[-(lines * 5) :])
     except Exception:
-        pass
+        logger.debug("diagnose job: include worker log")
     return {"logs": logs}
 
 

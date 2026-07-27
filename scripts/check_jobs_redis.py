@@ -9,30 +9,30 @@ if repo_root not in sys.path:
 
 import redis
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     if len(sys.argv) < 2:
-        print('Usage: python scripts/check_jobs_redis.py <job_id> [job_id2 ...]')
+        print("Usage: python scripts/check_jobs_redis.py <job_id> [job_id2 ...]")
         sys.exit(2)
-    red_url = os.environ.get('REDIS_URL')
-    print('REDIS_URL:', red_url)
+    red_url = os.environ.get("REDIS_URL")
+    print("REDIS_URL:", red_url)
     if not red_url:
-        print('REDIS_URL not set in environment')
+        print("REDIS_URL not set in environment")
         sys.exit(1)
     try:
         r = redis.from_url(red_url, decode_responses=True)
     except Exception as e:
-        print('Failed to connect to Redis:', e)
+        print("Failed to connect to Redis:", e)
         traceback.print_exc()
         sys.exit(1)
     for job in sys.argv[1:]:
         try:
-            h = r.hgetall(f'ffmpeg:job:{job}')
-            print('\nJob', job, 'hash:')
+            h = r.hgetall(f"ffmpeg:job:{job}")
+            print("\nJob", job, "hash:")
             if not h:
-                print('(no hash found)')
+                print("(no hash found)")
             else:
                 for k, v in h.items():
-                    print(' ', k, ':', v)
+                    print(" ", k, ":", v)
         except Exception as e:
-            print('Failed to fetch job', job, e)
+            print("Failed to fetch job", job, e)
             traceback.print_exc()

@@ -9,6 +9,7 @@ storage backend contains the provided remote key (via `exists()`). When checks
 pass (or when `--force` is used), it calls `enqueue_job()` which atomically
 HSETs the job metadata then LPUSHes the job JSON onto the queue.
 """
+
 from __future__ import annotations
 
 import argparse
@@ -29,7 +30,9 @@ try:
     from utils.job_queue import enqueue_job, get_redis
     from utils.storage import get_storage_backend_sync
 except Exception:
-    print("Failed to import project helpers (utils.*). Ensure you're running this script from the repository root and have installed dependencies.")
+    print(
+        "Failed to import project helpers (utils.*). Ensure you're running this script from the repository root and have installed dependencies."
+    )
     import traceback
 
     traceback.print_exc()

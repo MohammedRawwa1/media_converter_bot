@@ -101,11 +101,11 @@ def enqueue_from_url():
                 if ttl and ttl > 0:
                     r.expire(f"ffmpeg:job:{job_id}", ttl)
             except Exception:
-                pass
+                logger.debug("Failed to set TTL for job %s", job_id)
         except Exception:
             logger.exception("Failed to HSET job metadata for %s", job_id)
     except Exception:
-        pass
+        logger.debug("Failed to prepare job metadata for %s", job_id)
 
     try:
         r.lpush(JOB_LIST, json.dumps(job))
