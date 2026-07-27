@@ -17,6 +17,10 @@ env/
 *.log
 logs/
 storage/
+tests/
+coverage/
+.coverage
+htmlcov/
 .DS_Store
 .vscode/
 .idea/

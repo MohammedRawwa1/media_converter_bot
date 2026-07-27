@@ -42,9 +42,16 @@ async def process_forward_hash(forward_hash: str):
         return False
 
     with contextlib.suppress(Exception):
-        logger.info("fetcher: processing forward %s meta_chat=%s meta_msg=%s", forward_hash, meta.get("chat_id"), meta.get("message_id") or meta.get("msg_id"))
+        logger.info(
+            "fetcher: processing forward %s meta_chat=%s meta_msg=%s",
+            forward_hash,
+            meta.get("chat_id"),
+            meta.get("message_id") or meta.get("msg_id"),
+        )
 
-    input_dir = os.environ.get("INPUT_PATH") or os.path.join(os.path.dirname(os.path.dirname(__file__)), "storage", "input")
+    input_dir = os.environ.get("INPUT_PATH") or os.path.join(
+        os.path.dirname(os.path.dirname(__file__)), "storage", "input"
+    )
     os.makedirs(input_dir, exist_ok=True)
 
     job_uuid = str(uuid.uuid4())
@@ -58,9 +65,18 @@ async def process_forward_hash(forward_hash: str):
     try:
         logger.info("fetcher: attempting userbot download for forward %s to %s", forward_hash, input_path)
         ok = await download_forward_via_userbot(
-            meta.get("chat_id"), meta.get("message_id") or meta.get("msg_id"), input_path, msg_date=meta.get("registered_at") or meta.get("created_at"), file_unique_id=meta.get("file_unique_id")
+            meta.get("chat_id"),
+            meta.get("message_id") or meta.get("msg_id"),
+            input_path,
+            msg_date=meta.get("registered_at") or meta.get("created_at"),
+            file_unique_id=meta.get("file_unique_id"),
         )
-        logger.info("fetcher: userbot download for %s returned ok=%s exists=%s", forward_hash, bool(ok), os.path.exists(input_path))
+        logger.info(
+            "fetcher: userbot download for %s returned ok=%s exists=%s",
+            forward_hash,
+            bool(ok),
+            os.path.exists(input_path),
+        )
         if not ok or not os.path.exists(input_path):
             logger.error("fetcher: download failed for %s", forward_hash)
             return False
@@ -90,7 +106,9 @@ async def process_forward_hash(forward_hash: str):
     # build job and enqueue
     try:
         job_id = job_uuid
-        output_dir = os.environ.get("OUTPUT_PATH") or os.path.join(os.path.dirname(os.path.dirname(__file__)), "storage", "output")
+        output_dir = os.environ.get("OUTPUT_PATH") or os.path.join(
+            os.path.dirname(os.path.dirname(__file__)), "storage", "output"
+        )
         os.makedirs(output_dir, exist_ok=True)
         base_name = os.path.splitext(meta.get("name") or os.path.basename(input_path))[0]
         output_path = os.path.join(output_dir, f"{base_name}_{job_id}.mp4")
@@ -159,6 +177,11 @@ async def redis_listener():
             asyncio.create_task(process_forward_hash(fh))
 
 
+async def handle_health(request):
+    """Healthcheck endpoint for Railway."""
+    return web.json_response({"service": "fetcher", "ok": True, "healthy": True})
+
+
 async def handle_http_fetch(request):
     try:
         data = await request.json()
@@ -174,7 +197,12 @@ async def handle_http_fetch(request):
 def main():
     logging.basicConfig(level=logging.INFO)
     app = web.Application()
-    app.add_routes([web.post("/fetch", handle_http_fetch)])
+    app.add_routes(
+        [
+            web.get("/health", handle_health),
+            web.post("/fetch", handle_http_fetch),
+        ]
+    )
 
     async def on_startup(app):
         app["redis_task"] = asyncio.create_task(redis_listener())
@@ -187,8 +215,8 @@ def main():
     app.on_startup.append(on_startup)
     app.on_cleanup.append(on_cleanup)
 
-    host = os.environ.get("FETCHER_HOST", "127.0.0.1")
-    port = int(os.environ.get("FETCHER_PORT", "8765"))
+    host = os.environ.get("FETCHER_HOST", "0.0.0.0")  # noqa: S104
+    port = int(os.environ.get("PORT", os.environ.get("FETCHER_PORT", "8765")))
     web.run_app(app, host=host, port=port)
 
 
