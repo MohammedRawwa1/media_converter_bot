@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Diagnostics helper for running ffprobe/remux/reencode/tail/redis checks
 
-Designed to be run on the Render instance (or any deployment) to inspect
+Designed to be run on the deployment instance to inspect
 input files, attempt a fast remux to MKV, or re-encode when ffmpeg fails.
 
 Usage examples:
@@ -11,6 +11,7 @@ Usage examples:
   python scripts/diagnose_job.py --action tail_logs --lines 200
   python scripts/diagnose_job.py --action job_info --job_id <JOB_ID>
 """
+
 from __future__ import annotations
 
 import argparse
@@ -92,7 +93,7 @@ def tail_logs(lines: int = 200) -> dict[str, Any]:
         worker_log = os.path.join(tempfile.gettempdir(), "worker.log")
         if os.path.isfile(worker_log):
             with open(worker_log, encoding="utf-8", errors="replace") as fh:
-                logs[os.path.basename(worker_log)] = "".join(fh.readlines()[-(lines * 5):])
+                logs[os.path.basename(worker_log)] = "".join(fh.readlines()[-(lines * 5) :])
     except Exception:
         pass
     return {"logs": logs}
@@ -134,7 +135,9 @@ def dump_env() -> dict[str, Any]:
 
 def main(argv=None):
     p = argparse.ArgumentParser()
-    p.add_argument("--action", required=True, choices=["ffprobe", "remux", "reencode", "tail_logs", "job_info", "ps", "env"]) 
+    p.add_argument(
+        "--action", required=True, choices=["ffprobe", "remux", "reencode", "tail_logs", "job_info", "ps", "env"]
+    )
     p.add_argument("--file", help="Path or basename of file in storage/input")
     p.add_argument("--out", help="Output path for remux/reencode (optional)")
     p.add_argument("--lines", type=int, default=200, help="Number of tail lines for logs")
@@ -150,7 +153,11 @@ def main(argv=None):
         if os.path.isabs(args.file):
             path = args.file
         else:
-            path = os.path.join(os.getcwd(), args.file) if os.path.exists(os.path.join(os.getcwd(), args.file)) else os.path.join(os.getcwd(), "storage", "input", os.path.basename(args.file))
+            path = (
+                os.path.join(os.getcwd(), args.file)
+                if os.path.exists(os.path.join(os.getcwd(), args.file))
+                else os.path.join(os.getcwd(), "storage", "input", os.path.basename(args.file))
+            )
     else:
         path = None
 
@@ -160,7 +167,9 @@ def main(argv=None):
         return
 
     if args.action == "remux":
-        out = args.out or os.path.join(os.getcwd(), "storage", "temp", os.path.splitext(os.path.basename(path))[0] + ".mkv")
+        out = args.out or os.path.join(
+            os.getcwd(), "storage", "temp", os.path.splitext(os.path.basename(path))[0] + ".mkv"
+        )
         os.makedirs(os.path.dirname(out), exist_ok=True)
         res = remux_to_mkv(path, out)
         res["output"] = out
@@ -168,7 +177,9 @@ def main(argv=None):
         return
 
     if args.action == "reencode":
-        out = args.out or os.path.join(os.getcwd(), "storage", "output", os.path.splitext(os.path.basename(path))[0] + "_reencoded.mp4")
+        out = args.out or os.path.join(
+            os.getcwd(), "storage", "output", os.path.splitext(os.path.basename(path))[0] + "_reencoded.mp4"
+        )
         os.makedirs(os.path.dirname(out), exist_ok=True)
         res = reencode(path, out)
         res["output"] = out

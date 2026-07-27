@@ -1,6 +1,7 @@
 """FFmpeg worker: consumes Redis job queue, runs ffmpeg via ffmpeg_runner,
 persists job state to MongoDB (if available), and exposes Prometheus metrics.
 """
+
 import asyncio
 import logging
 import os
@@ -45,6 +46,7 @@ except Exception:
     get_storage_backend = None
 try:
     from utils.rate_limiter import ConversionRateLimiterRedis
+
     _conv_limiter = ConversionRateLimiterRedis(conversions_per_hour=int(os.environ.get("CONVERSIONS_PER_HOUR", "360")))
 except Exception:
     _conv_limiter = None
@@ -69,16 +71,22 @@ async def _update_upload_progress(job_id: str, progress_channel: str, pct: int, 
     try:
         r = await get_redis()
         try:
-            await r.hset(f"ffmpeg:job:{job_id}", mapping={
-                "progress": str(pct),
-                "message": message,
-                "status": "uploading" if pct < 100 else "sending",
-            })
-            await publish_update(progress_channel, {
-                "job_id": job_id,
-                "progress": pct,
-                "message": message,
-            })
+            await r.hset(
+                f"ffmpeg:job:{job_id}",
+                mapping={
+                    "progress": str(pct),
+                    "message": message,
+                    "status": "uploading" if pct < 100 else "sending",
+                },
+            )
+            await publish_update(
+                progress_channel,
+                {
+                    "job_id": job_id,
+                    "progress": pct,
+                    "message": message,
+                },
+            )
         finally:
             with contextlib.suppress(Exception):
                 await r.close()
@@ -353,7 +361,16 @@ async def handle_job(job: dict):
                     pass
 
                 with contextlib.suppress(Exception):
-                    await publish_update(progress_channel, {"job_id": job_id, "progress": 0, "message": "requeued_missing_input", "attempts": attempts, "backoff": backoff})
+                    await publish_update(
+                        progress_channel,
+                        {
+                            "job_id": job_id,
+                            "progress": 0,
+                            "message": "requeued_missing_input",
+                            "attempts": attempts,
+                            "backoff": backoff,
+                        },
+                    )
 
                 if r2 is not None:
                     try:
@@ -367,7 +384,15 @@ async def handle_job(job: dict):
                 return
             else:
                 with contextlib.suppress(Exception):
-                    await publish_update(progress_channel, {"job_id": job_id, "progress": 0, "message": "download_failed", "error": "remote_key_missing_permanent"})
+                    await publish_update(
+                        progress_channel,
+                        {
+                            "job_id": job_id,
+                            "progress": 0,
+                            "message": "download_failed",
+                            "error": "remote_key_missing_permanent",
+                        },
+                    )
                 with contextlib.suppress(Exception):
                     await job_store.update_job(job_id, {"status": "error", "error": "remote_key_missing_permanent"})
                 if r2 is not None:
@@ -412,7 +437,10 @@ async def handle_job(job: dict):
                     r2 = None
                 if r2 is not None:
                     with contextlib.suppress(Exception):
-                        await r2.hset(f"ffmpeg:job:{job_id}", mapping={"input": str(job.get("input_path") or ""), "input_from_remote": "1"})
+                        await r2.hset(
+                            f"ffmpeg:job:{job_id}",
+                            mapping={"input": str(job.get("input_path") or ""), "input_from_remote": "1"},
+                        )
             except Exception:
                 pass
             finally:
@@ -428,7 +456,10 @@ async def handle_job(job: dict):
         else:
             logger.exception("Failed to download input from storage for job %s: %s", job_id, last_exc)
             with contextlib.suppress(Exception):
-                await publish_update(progress_channel, {"job_id": job_id, "progress": 0, "message": "download_failed", "error": "remote_download_failed"})
+                await publish_update(
+                    progress_channel,
+                    {"job_id": job_id, "progress": 0, "message": "download_failed", "error": "remote_download_failed"},
+                )
             with contextlib.suppress(Exception):
                 await job_store.update_job(job_id, {"status": "error", "error": "remote_download_failed"})
             return
@@ -457,7 +488,15 @@ async def handle_job(job: dict):
         except Exception as e:
             logger.exception("Failed to download source URL for job %s: %s", job_id, e)
             with contextlib.suppress(Exception):
-                await publish_update(progress_channel, {"job_id": job_id, "progress": 0, "message": "download_failed", "error": "source_url_download_failed"})
+                await publish_update(
+                    progress_channel,
+                    {
+                        "job_id": job_id,
+                        "progress": 0,
+                        "message": "download_failed",
+                        "error": "source_url_download_failed",
+                    },
+                )
             return
 
     # Acquire per-input lock to avoid duplicate processing
@@ -501,7 +540,9 @@ async def handle_job(job: dict):
     if not lock_acquired:
         logger.info("Input already locked for job %s, requeueing", job_id)
         with contextlib.suppress(Exception):
-            await publish_update(progress_channel, {"job_id": job_id, "progress": 0, "message": "locked", "note": "input_locked"})
+            await publish_update(
+                progress_channel, {"job_id": job_id, "progress": 0, "message": "locked", "note": "input_locked"}
+            )
         try:
             # Push into delayed set with a small backoff to avoid tight requeue loop
             backoff = int(os.environ.get("JOB_LOCK_BACKOFF", "5"))
@@ -532,10 +573,14 @@ async def handle_job(job: dict):
         # Cache job start for fast status queries
         try:
             if _cache:
-                await _cache.cache_job_metadata(job_id, {
-                    "status": "processing",
-                    "started_at": time.time(),
-                }, ttl=3600)
+                await _cache.cache_job_metadata(
+                    job_id,
+                    {
+                        "status": "processing",
+                        "started_at": time.time(),
+                    },
+                    ttl=3600,
+                )
         except Exception:
             pass
     except Exception:
@@ -549,7 +594,11 @@ async def handle_job(job: dict):
         if orig:
             sanitized = await file_utils.sanitize_filename(orig)
             base, ext = os.path.splitext(sanitized)
-            out_ext = ".mp4" if (job.get("ffmpeg_args") or job.get("type") in ("ffmpeg", None, "generate_sample")) else (ext or ".mp4")
+            out_ext = (
+                ".mp4"
+                if (job.get("ffmpeg_args") or job.get("type") in ("ffmpeg", None, "generate_sample"))
+                else (ext or ".mp4")
+            )
             out_dir = os.path.dirname(output_path) if output_path else getattr(config, "OUTPUT_PATH", "storage/output")
             os.makedirs(out_dir, exist_ok=True)
             candidate = os.path.join(out_dir, f"{base}{out_ext}")
@@ -611,7 +660,15 @@ async def handle_job(job: dict):
                                 if not ok:
                                     # inform progress channel and mark job as errored due to rate limit
                                     with contextlib.suppress(Exception):
-                                        await publish_update(progress_channel, {"job_id": job_id, "progress": 0, "message": "rate_limited", "error": "user rate limit reached"})
+                                        await publish_update(
+                                            progress_channel,
+                                            {
+                                                "job_id": job_id,
+                                                "progress": 0,
+                                                "message": "rate_limited",
+                                                "error": "user rate limit reached",
+                                            },
+                                        )
                                     with contextlib.suppress(Exception):
                                         await job_store.update_job(job_id, {"status": "error", "error": "rate_limited"})
                                     return
@@ -630,7 +687,15 @@ async def handle_job(job: dict):
                             wait_seconds = int(os.environ.get("JOB_WAIT_SECONDS", "10"))
                             # notify once that we're waiting
                             with contextlib.suppress(Exception):
-                                await publish_update(progress_channel, {"job_id": job_id, "progress": 0, "message": "waiting_for_input", "wait_seconds": wait_seconds})
+                                await publish_update(
+                                    progress_channel,
+                                    {
+                                        "job_id": job_id,
+                                        "progress": 0,
+                                        "message": "waiting_for_input",
+                                        "wait_seconds": wait_seconds,
+                                    },
+                                )
 
                             try:
                                 rr = await get_redis()
@@ -643,6 +708,7 @@ async def handle_job(job: dict):
                                         try:
                                             stored = await rr.hgetall(f"ffmpeg:job:{job_id}")
                                             if stored:
+
                                                 def _sval(key):
                                                     v = stored.get(key)
                                                     if isinstance(v, bytes):
@@ -696,16 +762,37 @@ async def handle_job(job: dict):
                             if not has_local_file and not job.get("input_key") and not job.get("source_url"):
                                 logger.error("No input available for job %s after waiting; marking as error", job_id)
                                 with contextlib.suppress(Exception):
-                                    await publish_update(progress_channel, {"job_id": job_id, "progress": 0, "message": "error", "error": "no_input_provided"})
+                                    await publish_update(
+                                        progress_channel,
+                                        {
+                                            "job_id": job_id,
+                                            "progress": 0,
+                                            "message": "error",
+                                            "error": "no_input_provided",
+                                        },
+                                    )
                                 with contextlib.suppress(Exception):
-                                    await job_store.update_job(job_id, {"status": "error", "error": "no_input_provided"})
+                                    await job_store.update_job(
+                                        job_id, {"status": "error", "error": "no_input_provided"}
+                                    )
                                 return
 
-                        coro = run_ffmpeg(input_path, output_path, job_id, ffmpeg_args=ffmpeg_args, redis_url=redis_url, progress_channel=progress_channel)
+                        coro = run_ffmpeg(
+                            input_path,
+                            output_path,
+                            job_id,
+                            ffmpeg_args=ffmpeg_args,
+                            redis_url=redis_url,
+                            progress_channel=progress_channel,
+                        )
                         # Start optional memory sampler
                         try:
                             if os.environ.get("ENABLE_MEMORY_SAMPLER", "").lower() in ("1", "true", "yes"):
-                                memory_sampler_task = asyncio.create_task(_memory_sampler(progress_channel, float(os.environ.get("MEMORY_SAMPLER_INTERVAL", "5.0"))))
+                                memory_sampler_task = asyncio.create_task(
+                                    _memory_sampler(
+                                        progress_channel, float(os.environ.get("MEMORY_SAMPLER_INTERVAL", "5.0"))
+                                    )
+                                )
                         except Exception:
                             memory_sampler_task = None
                         try:
@@ -714,32 +801,66 @@ async def handle_job(job: dict):
                             success, info = False, "timeout"
 
                     elif job_type in ("create_archive", "archive"):
-                        await publish_update(progress_channel, {"job_id": job_id, "progress": 5, "message": "creating archive"})
+                        await publish_update(
+                            progress_channel, {"job_id": job_id, "progress": 5, "message": "creating archive"}
+                        )
                         files = job.get("files") or []
                         ok, msg = await create_archive(files, output_path)
                         success = ok
                         info = output_path if ok else msg
-                        await publish_update(progress_channel, {"job_id": job_id, "progress": 100 if ok else 0, "message": "done" if ok else "error", "output": output_path if ok else None})
+                        await publish_update(
+                            progress_channel,
+                            {
+                                "job_id": job_id,
+                                "progress": 100 if ok else 0,
+                                "message": "done" if ok else "error",
+                                "output": output_path if ok else None,
+                            },
+                        )
 
                     elif job_type == "merge_videos":
-                        await publish_update(progress_channel, {"job_id": job_id, "progress": 5, "message": "merging videos"})
+                        await publish_update(
+                            progress_channel, {"job_id": job_id, "progress": 5, "message": "merging videos"}
+                        )
                         files = job.get("files") or []
                         ok, msg = await merge_videos(files, output_path)
                         success = ok
                         info = output_path if ok else msg
-                        await publish_update(progress_channel, {"job_id": job_id, "progress": 100 if ok else 0, "message": "done" if ok else "error", "output": output_path if ok else None})
+                        await publish_update(
+                            progress_channel,
+                            {
+                                "job_id": job_id,
+                                "progress": 100 if ok else 0,
+                                "message": "done" if ok else "error",
+                                "output": output_path if ok else None,
+                            },
+                        )
 
                     elif job_type == "merge_audios":
-                        await publish_update(progress_channel, {"job_id": job_id, "progress": 5, "message": "merging audios"})
+                        await publish_update(
+                            progress_channel, {"job_id": job_id, "progress": 5, "message": "merging audios"}
+                        )
                         files = job.get("files") or []
                         ok, msg = await merge_audios(files, output_path)
                         success = ok
                         info = output_path if ok else msg
-                        await publish_update(progress_channel, {"job_id": job_id, "progress": 100 if ok else 0, "message": "done" if ok else "error", "output": output_path if ok else None})
+                        await publish_update(
+                            progress_channel,
+                            {
+                                "job_id": job_id,
+                                "progress": 100 if ok else 0,
+                                "message": "done" if ok else "error",
+                                "output": output_path if ok else None,
+                            },
+                        )
 
                     elif job_type == "extract_streams":
-                        await publish_update(progress_channel, {"job_id": job_id, "progress": 5, "message": "extracting streams"})
-                        out_dir = job.get("output_dir") or os.path.join(getattr(config, "OUTPUT_PATH", "storage/output"), f"{job_id}_streams")
+                        await publish_update(
+                            progress_channel, {"job_id": job_id, "progress": 5, "message": "extracting streams"}
+                        )
+                        out_dir = job.get("output_dir") or os.path.join(
+                            getattr(config, "OUTPUT_PATH", "storage/output"), f"{job_id}_streams"
+                        )
                         os.makedirs(out_dir, exist_ok=True)
                         ok, extracted = await extract_streams(input_path, out_dir)
                         if ok and extracted:
@@ -747,19 +868,39 @@ async def handle_job(job: dict):
                             ok2, msg2 = await create_archive(list(extracted.values()), archive_path)
                             success = ok2
                             info = archive_path if ok2 else msg2
-                            await publish_update(progress_channel, {"job_id": job_id, "progress": 100 if ok2 else 0, "message": "done" if ok2 else "error", "output": archive_path if ok2 else None})
+                            await publish_update(
+                                progress_channel,
+                                {
+                                    "job_id": job_id,
+                                    "progress": 100 if ok2 else 0,
+                                    "message": "done" if ok2 else "error",
+                                    "output": archive_path if ok2 else None,
+                                },
+                            )
                         else:
                             success = False
                             info = "no_streams" if ok else "extract_failed"
-                            await publish_update(progress_channel, {"job_id": job_id, "progress": 0, "message": "error", "error": info})
+                            await publish_update(
+                                progress_channel, {"job_id": job_id, "progress": 0, "message": "error", "error": info}
+                            )
 
                     elif job_type == "generate_sample":
-                        await publish_update(progress_channel, {"job_id": job_id, "progress": 5, "message": "generating sample"})
+                        await publish_update(
+                            progress_channel, {"job_id": job_id, "progress": 5, "message": "generating sample"}
+                        )
                         dur = int(job.get("duration", 30))
                         ok, msg = await generate_sample(input_path, output_path, dur)
                         success = ok
                         info = output_path if ok else msg
-                        await publish_update(progress_channel, {"job_id": job_id, "progress": 100 if ok else 0, "message": "done" if ok else "error", "output": output_path if ok else None})
+                        await publish_update(
+                            progress_channel,
+                            {
+                                "job_id": job_id,
+                                "progress": 100 if ok else 0,
+                                "message": "done" if ok else "error",
+                                "output": output_path if ok else None,
+                            },
+                        )
 
                     elif job_type == "trim":
                         await publish_update(progress_channel, {"job_id": job_id, "progress": 5, "message": "trimming"})
@@ -768,7 +909,15 @@ async def handle_job(job: dict):
                         ok, msg = await trim_media(input_path, output_path, start_time, end_time)
                         success = ok
                         info = output_path if ok else msg
-                        await publish_update(progress_channel, {"job_id": job_id, "progress": 100 if ok else 0, "message": "done" if ok else "error", "output": output_path if ok else None})
+                        await publish_update(
+                            progress_channel,
+                            {
+                                "job_id": job_id,
+                                "progress": 100 if ok else 0,
+                                "message": "done" if ok else "error",
+                                "output": output_path if ok else None,
+                            },
+                        )
 
                     elif job_type == "rename":
                         new_name = job.get("new_name")
@@ -777,17 +926,32 @@ async def handle_job(job: dict):
                             os.rename(input_path, new_path)
                             success = True
                             info = new_path
-                            await publish_update(progress_channel, {"job_id": job_id, "progress": 100, "message": "renamed", "output": new_path})
+                            await publish_update(
+                                progress_channel,
+                                {"job_id": job_id, "progress": 100, "message": "renamed", "output": new_path},
+                            )
                         except Exception as e:
                             success = False
                             info = str(e)
-                            await publish_update(progress_channel, {"job_id": job_id, "progress": 0, "message": "error", "error": info})
+                            await publish_update(
+                                progress_channel, {"job_id": job_id, "progress": 0, "message": "error", "error": info}
+                            )
 
                     else:
                         ffmpeg_args = job.get("ffmpeg_args") if isinstance(job.get("ffmpeg_args"), list) else None
                         redis_url = job.get("redis_url") or os.environ.get("REDIS_URL")
                         try:
-                            success, info = await asyncio.wait_for(run_ffmpeg(input_path, output_path, job_id, ffmpeg_args=ffmpeg_args, redis_url=redis_url, progress_channel=progress_channel), timeout=max_runtime)
+                            success, info = await asyncio.wait_for(
+                                run_ffmpeg(
+                                    input_path,
+                                    output_path,
+                                    job_id,
+                                    ffmpeg_args=ffmpeg_args,
+                                    redis_url=redis_url,
+                                    progress_channel=progress_channel,
+                                ),
+                                timeout=max_runtime,
+                            )
                         except TimeoutError:
                             success, info = False, "timeout"
 
@@ -798,17 +962,25 @@ async def handle_job(job: dict):
                 if success:
                     JOBS_SUCCEEDED.inc()
                     out = info if isinstance(info, str) else output_path
-                    await publish_update(progress_channel, {"job_id": job_id, "progress": 100, "message": "done", "output": out})
+                    await publish_update(
+                        progress_channel, {"job_id": job_id, "progress": 100, "message": "done", "output": out}
+                    )
                     try:
-                        await job_store.update_job(job_id, {"status": "done", "finished_at": time.time(), "output": out})
+                        await job_store.update_job(
+                            job_id, {"status": "done", "finished_at": time.time(), "output": out}
+                        )
                         # Cache job result for fast status queries
                         try:
                             if _cache:
-                                await _cache.cache_job_metadata(job_id, {
-                                    "status": "done",
-                                    "output": out,
-                                    "finished_at": time.time(),
-                                }, ttl=3600)
+                                await _cache.cache_job_metadata(
+                                    job_id,
+                                    {
+                                        "status": "done",
+                                        "output": out,
+                                        "finished_at": time.time(),
+                                    },
+                                    ttl=3600,
+                                )
                         except Exception:
                             pass
                     except Exception:
@@ -933,7 +1105,9 @@ async def handle_job(job: dict):
                                 from utils.userbot_uploader import send_file_via_userbot
 
                                 _up_cb = _make_upload_progress_callback(job_id, progress_channel)
-                                ok = await send_file_via_userbot(chat_id, out, caption=caption, progress_callback=_up_cb)
+                                ok = await send_file_via_userbot(
+                                    chat_id, out, caption=caption, progress_callback=_up_cb
+                                )
                                 if ok:
                                     logger.info("Sent output via Telethon userbot (preferred) for job %s", job_id)
                                     sent = True
@@ -956,7 +1130,9 @@ async def handle_job(job: dict):
                                     try:
                                         if out and os.path.exists(out):
                                             # prefer ffprobe if available to detect real video streams
-                                            ffprobe_bin = getattr(config, "FFPROBE_PATH", None) or getattr(config, "FFMPEG_PATH", "ffmpeg").replace("ffmpeg", "ffprobe")
+                                            ffprobe_bin = getattr(config, "FFPROBE_PATH", None) or getattr(
+                                                config, "FFMPEG_PATH", "ffmpeg"
+                                            ).replace("ffmpeg", "ffprobe")
                                             ffmpeg_bin = getattr(config, "FFMPEG_PATH", "ffmpeg")
 
                                             # Try cache first for ffprobe results
@@ -964,7 +1140,10 @@ async def handle_job(job: dict):
                                             try:
                                                 if _cache and out and os.path.exists(out):
                                                     import hashlib as _hl
-                                                    _fhash = _hl.sha256(f"{out}:{os.path.getsize(out)}".encode()).hexdigest()[:16]
+
+                                                    _fhash = _hl.sha256(
+                                                        f"{out}:{os.path.getsize(out)}".encode()
+                                                    ).hexdigest()[:16]
                                                     probe_info = await _cache.get(f"cache:probe:{_fhash}")
                                                     if probe_info:
                                                         logger.debug("Worker: ffprobe cache HIT for %s", out)
@@ -972,9 +1151,21 @@ async def handle_job(job: dict):
                                                 pass
 
                                             if probe_info is None:  # cache miss
+
                                                 def _probe():
                                                     try:
-                                                        return subprocess.run([ffprobe_bin, "-v", "quiet", "-print_format", "json", "-show_streams", out], capture_output=True)
+                                                        return subprocess.run(
+                                                            [
+                                                                ffprobe_bin,
+                                                                "-v",
+                                                                "quiet",
+                                                                "-print_format",
+                                                                "json",
+                                                                "-show_streams",
+                                                                out,
+                                                            ],
+                                                            capture_output=True,
+                                                        )
                                                     except Exception:
                                                         return None
 
@@ -985,8 +1176,12 @@ async def handle_job(job: dict):
                                                     # Cache ffprobe result
                                                     try:
                                                         if _cache and out and os.path.exists(out) and probe_info:
-                                                            _fhash = _hl.sha256(f"{out}:{os.path.getsize(out)}".encode()).hexdigest()[:16]
-                                                            await _cache.set(f"cache:probe:{_fhash}", probe_info, ttl=86400)
+                                                            _fhash = _hl.sha256(
+                                                                f"{out}:{os.path.getsize(out)}".encode()
+                                                            ).hexdigest()[:16]
+                                                            await _cache.set(
+                                                                f"cache:probe:{_fhash}", probe_info, ttl=86400
+                                                            )
                                                             logger.debug("Worker: cached ffprobe result for %s", out)
                                                     except Exception:
                                                         pass
@@ -1032,7 +1227,15 @@ async def handle_job(job: dict):
                                         else:
                                             kind = "doc"
                                     except Exception:
-                                        kind = "zip" if out and str(out).lower().endswith(".zip") else ("video" if out and str(out).lower().endswith((".mp4", ".mov", ".mkv")) else "doc")
+                                        kind = (
+                                            "zip"
+                                            if out and str(out).lower().endswith(".zip")
+                                            else (
+                                                "video"
+                                                if out and str(out).lower().endswith((".mp4", ".mov", ".mkv"))
+                                                else "doc"
+                                            )
+                                        )
                                     try:
                                         # Use async Bot API methods directly and close the client when done
                                         async with Bot(token=bot_token) as bot:
@@ -1048,13 +1251,22 @@ async def handle_job(job: dict):
                                                             thumb_path = cand
                                                         else:
                                                             try:
-                                                                backend = await get_storage_backend() if get_storage_backend is not None else None
+                                                                backend = (
+                                                                    await get_storage_backend()
+                                                                    if get_storage_backend is not None
+                                                                    else None
+                                                                )
                                                             except Exception:
                                                                 backend = None
                                                             if backend:
-                                                                temp_dir = os.path.join(getattr(config, "TEMP_PATH", "storage/temp"))
+                                                                temp_dir = os.path.join(
+                                                                    getattr(config, "TEMP_PATH", "storage/temp")
+                                                                )
                                                                 os.makedirs(temp_dir, exist_ok=True)
-                                                                _temp_thumb = os.path.join(temp_dir, f"{job_id}_thumb{os.path.splitext(cand)[1] or '.jpg'}")
+                                                                _temp_thumb = os.path.join(
+                                                                    temp_dir,
+                                                                    f"{job_id}_thumb{os.path.splitext(cand)[1] or '.jpg'}",
+                                                                )
                                                                 try:
                                                                     ok = await backend.download_file(cand, _temp_thumb)
                                                                     if ok:
@@ -1073,15 +1285,26 @@ async def handle_job(job: dict):
                                                                     thumb_path = cand
                                                                 else:
                                                                     try:
-                                                                        backend = await get_storage_backend() if get_storage_backend is not None else None
+                                                                        backend = (
+                                                                            await get_storage_backend()
+                                                                            if get_storage_backend is not None
+                                                                            else None
+                                                                        )
                                                                     except Exception:
                                                                         backend = None
                                                                     if backend:
-                                                                        temp_dir = os.path.join(getattr(config, "TEMP_PATH", "storage/temp"))
+                                                                        temp_dir = os.path.join(
+                                                                            getattr(config, "TEMP_PATH", "storage/temp")
+                                                                        )
                                                                         os.makedirs(temp_dir, exist_ok=True)
-                                                                        _temp_thumb = os.path.join(temp_dir, f"{job_id}_thumb{os.path.splitext(cand)[1] or '.jpg'}")
+                                                                        _temp_thumb = os.path.join(
+                                                                            temp_dir,
+                                                                            f"{job_id}_thumb{os.path.splitext(cand)[1] or '.jpg'}",
+                                                                        )
                                                                         try:
-                                                                            ok = await backend.download_file(cand, _temp_thumb)
+                                                                            ok = await backend.download_file(
+                                                                                cand, _temp_thumb
+                                                                            )
                                                                             if ok:
                                                                                 thumb_path = _temp_thumb
                                                                         except Exception:
@@ -1100,15 +1323,28 @@ async def handle_job(job: dict):
                                                 _bot_up_cb = _make_upload_progress_callback(job_id, progress_channel)
                                                 try:
                                                     with open(out, "rb") as fh:
-                                                        fh = _ProgressFileWrapper(fh, file_size, _bot_up_cb) if file_size else fh
+                                                        fh = (
+                                                            _ProgressFileWrapper(fh, file_size, _bot_up_cb)
+                                                            if file_size
+                                                            else fh
+                                                        )
                                                         if thumb_path:
                                                             try:
                                                                 with open(thumb_path, "rb") as tf:
-                                                                    await bot.send_document(chat_id=chat_id, document=fh, caption=caption, thumb=tf)
+                                                                    await bot.send_document(
+                                                                        chat_id=chat_id,
+                                                                        document=fh,
+                                                                        caption=caption,
+                                                                        thumb=tf,
+                                                                    )
                                                             except Exception:
-                                                                await bot.send_document(chat_id=chat_id, document=fh, caption=caption)
+                                                                await bot.send_document(
+                                                                    chat_id=chat_id, document=fh, caption=caption
+                                                                )
                                                         else:
-                                                            await bot.send_document(chat_id=chat_id, document=fh, caption=caption)
+                                                            await bot.send_document(
+                                                                chat_id=chat_id, document=fh, caption=caption
+                                                            )
                                                 finally:
                                                     try:
                                                         if _temp_thumb and os.path.exists(_temp_thumb):
@@ -1126,13 +1362,22 @@ async def handle_job(job: dict):
                                                             thumb_path = cand
                                                         else:
                                                             try:
-                                                                backend = await get_storage_backend() if get_storage_backend is not None else None
+                                                                backend = (
+                                                                    await get_storage_backend()
+                                                                    if get_storage_backend is not None
+                                                                    else None
+                                                                )
                                                             except Exception:
                                                                 backend = None
                                                             if backend:
-                                                                temp_dir = os.path.join(getattr(config, "TEMP_PATH", "storage/temp"))
+                                                                temp_dir = os.path.join(
+                                                                    getattr(config, "TEMP_PATH", "storage/temp")
+                                                                )
                                                                 os.makedirs(temp_dir, exist_ok=True)
-                                                                _temp_thumb = os.path.join(temp_dir, f"{job_id}_thumb{os.path.splitext(cand)[1] or '.jpg'}")
+                                                                _temp_thumb = os.path.join(
+                                                                    temp_dir,
+                                                                    f"{job_id}_thumb{os.path.splitext(cand)[1] or '.jpg'}",
+                                                                )
                                                                 try:
                                                                     ok = await backend.download_file(cand, _temp_thumb)
                                                                     if ok:
@@ -1150,15 +1395,26 @@ async def handle_job(job: dict):
                                                                     thumb_path = cand
                                                                 else:
                                                                     try:
-                                                                        backend = await get_storage_backend() if get_storage_backend is not None else None
+                                                                        backend = (
+                                                                            await get_storage_backend()
+                                                                            if get_storage_backend is not None
+                                                                            else None
+                                                                        )
                                                                     except Exception:
                                                                         backend = None
                                                                     if backend:
-                                                                        temp_dir = os.path.join(getattr(config, "TEMP_PATH", "storage/temp"))
+                                                                        temp_dir = os.path.join(
+                                                                            getattr(config, "TEMP_PATH", "storage/temp")
+                                                                        )
                                                                         os.makedirs(temp_dir, exist_ok=True)
-                                                                        _temp_thumb = os.path.join(temp_dir, f"{job_id}_thumb{os.path.splitext(cand)[1] or '.jpg'}")
+                                                                        _temp_thumb = os.path.join(
+                                                                            temp_dir,
+                                                                            f"{job_id}_thumb{os.path.splitext(cand)[1] or '.jpg'}",
+                                                                        )
                                                                         try:
-                                                                            ok = await backend.download_file(cand, _temp_thumb)
+                                                                            ok = await backend.download_file(
+                                                                                cand, _temp_thumb
+                                                                            )
                                                                             if ok:
                                                                                 thumb_path = _temp_thumb
                                                                         except Exception:
@@ -1175,15 +1431,32 @@ async def handle_job(job: dict):
                                                     if not thumb_path:
                                                         try:
                                                             _auto_thumb_dir = tempfile.mkdtemp(prefix="auto_thumb_")
-                                                            _auto_thumb_path = os.path.join(_auto_thumb_dir, "thumb.jpg")
+                                                            _auto_thumb_path = os.path.join(
+                                                                _auto_thumb_dir, "thumb.jpg"
+                                                            )
                                                             _thumb_proc = await asyncio.create_subprocess_exec(
-                                                                ffmpeg_bin, "-y", "-ss", "00:00:01", "-i", out,
-                                                                "-vframes", "1", "-q:v", "2", _auto_thumb_path,
+                                                                ffmpeg_bin,
+                                                                "-y",
+                                                                "-ss",
+                                                                "00:00:01",
+                                                                "-i",
+                                                                out,
+                                                                "-vframes",
+                                                                "1",
+                                                                "-q:v",
+                                                                "2",
+                                                                _auto_thumb_path,
                                                                 stdout=asyncio.subprocess.PIPE,
                                                                 stderr=asyncio.subprocess.PIPE,
                                                             )
-                                                            await asyncio.wait_for(_thumb_proc.communicate(), timeout=30)
-                                                            if _thumb_proc.returncode == 0 and os.path.exists(_auto_thumb_path) and os.path.getsize(_auto_thumb_path) > 0:
+                                                            await asyncio.wait_for(
+                                                                _thumb_proc.communicate(), timeout=30
+                                                            )
+                                                            if (
+                                                                _thumb_proc.returncode == 0
+                                                                and os.path.exists(_auto_thumb_path)
+                                                                and os.path.getsize(_auto_thumb_path) > 0
+                                                            ):
                                                                 thumb_path = _auto_thumb_path
                                                                 _temp_thumb = _auto_thumb_path
                                                             else:
@@ -1196,7 +1469,11 @@ async def handle_job(job: dict):
                                                 _bot_up_cb = _make_upload_progress_callback(job_id, progress_channel)
                                                 try:
                                                     with open(out, "rb") as fh:
-                                                        fh = _ProgressFileWrapper(fh, file_size, _bot_up_cb) if file_size else fh
+                                                        fh = (
+                                                            _ProgressFileWrapper(fh, file_size, _bot_up_cb)
+                                                            if file_size
+                                                            else fh
+                                                        )
                                                         # Build send_video kwargs with available metadata
                                                         _send_kwargs = {
                                                             "chat_id": chat_id,
@@ -1239,13 +1516,22 @@ async def handle_job(job: dict):
                                                         thumb_path = cand
                                                     elif cand:
                                                         try:
-                                                            backend = await get_storage_backend() if get_storage_backend is not None else None
+                                                            backend = (
+                                                                await get_storage_backend()
+                                                                if get_storage_backend is not None
+                                                                else None
+                                                            )
                                                         except Exception:
                                                             backend = None
                                                         if backend:
-                                                            temp_dir = os.path.join(getattr(config, "TEMP_PATH", "storage/temp"))
+                                                            temp_dir = os.path.join(
+                                                                getattr(config, "TEMP_PATH", "storage/temp")
+                                                            )
                                                             os.makedirs(temp_dir, exist_ok=True)
-                                                            _temp_thumb = os.path.join(temp_dir, f"{job_id}_thumb{os.path.splitext(cand)[1] or '.jpg'}")
+                                                            _temp_thumb = os.path.join(
+                                                                temp_dir,
+                                                                f"{job_id}_thumb{os.path.splitext(cand)[1] or '.jpg'}",
+                                                            )
                                                             try:
                                                                 ok = await backend.download_file(cand, _temp_thumb)
                                                                 if ok:
@@ -1258,15 +1544,28 @@ async def handle_job(job: dict):
                                                 _bot_up_cb = _make_upload_progress_callback(job_id, progress_channel)
                                                 try:
                                                     with open(out, "rb") as fh:
-                                                        fh = _ProgressFileWrapper(fh, file_size, _bot_up_cb) if file_size else fh
+                                                        fh = (
+                                                            _ProgressFileWrapper(fh, file_size, _bot_up_cb)
+                                                            if file_size
+                                                            else fh
+                                                        )
                                                         if thumb_path:
                                                             try:
                                                                 with open(thumb_path, "rb") as tf:
-                                                                    await bot.send_document(chat_id=chat_id, document=fh, caption=caption, thumb=tf)
+                                                                    await bot.send_document(
+                                                                        chat_id=chat_id,
+                                                                        document=fh,
+                                                                        caption=caption,
+                                                                        thumb=tf,
+                                                                    )
                                                             except Exception:
-                                                                await bot.send_document(chat_id=chat_id, document=fh, caption=caption)
+                                                                await bot.send_document(
+                                                                    chat_id=chat_id, document=fh, caption=caption
+                                                                )
                                                         else:
-                                                            await bot.send_document(chat_id=chat_id, document=fh, caption=caption)
+                                                            await bot.send_document(
+                                                                chat_id=chat_id, document=fh, caption=caption
+                                                            )
                                                 finally:
                                                     try:
                                                         if _temp_thumb and os.path.exists(_temp_thumb):
@@ -1287,7 +1586,9 @@ async def handle_job(job: dict):
                                 from utils.userbot_uploader import send_file_via_userbot
 
                                 _up_cb = _make_upload_progress_callback(job_id, progress_channel)
-                                ok = await send_file_via_userbot(chat_id, out, caption=caption, progress_callback=_up_cb)
+                                ok = await send_file_via_userbot(
+                                    chat_id, out, caption=caption, progress_callback=_up_cb
+                                )
                                 if ok:
                                     logger.info("Sent output via Telethon userbot fallback for job %s", job_id)
                                     sent = True
@@ -1297,7 +1598,9 @@ async def handle_job(job: dict):
                                 logger.exception("Userbot fallback raised exception for job %s", job_id)
 
                         if not sent and chat_id:
-                            logger.warning("Could not deliver output for job %s — neither Bot API nor userbot succeeded", job_id)
+                            logger.warning(
+                                "Could not deliver output for job %s — neither Bot API nor userbot succeeded", job_id
+                            )
 
                         # Set final job status on Redis hash so _watch_job_progress (and web UI) can see it.
                         try:
@@ -1305,17 +1608,23 @@ async def handle_job(job: dict):
                             _final_msg = "delivered to Telegram" if sent else "delivery failed"
                             _r = await get_redis()
                             try:
-                                await _r.hset(f"ffmpeg:job:{job_id}", mapping={
-                                    "status": _final_status,
-                                    "progress": "100",
-                                    "message": _final_msg,
-                                })
-                                await publish_update(progress_channel, {
-                                    "job_id": job_id,
-                                    "progress": 100,
-                                    "message": _final_msg,
-                                    "status": _final_status,
-                                })
+                                await _r.hset(
+                                    f"ffmpeg:job:{job_id}",
+                                    mapping={
+                                        "status": _final_status,
+                                        "progress": "100",
+                                        "message": _final_msg,
+                                    },
+                                )
+                                await publish_update(
+                                    progress_channel,
+                                    {
+                                        "job_id": job_id,
+                                        "progress": 100,
+                                        "message": _final_msg,
+                                        "status": _final_status,
+                                    },
+                                )
                             finally:
                                 with contextlib.suppress(Exception):
                                     await _r.close()
@@ -1399,27 +1708,58 @@ async def handle_job(job: dict):
                                     os.makedirs(temp_dir, exist_ok=True)
                                     remux_path = os.path.join(temp_dir, f"{job_id}_remux.mkv")
                                     ffmpeg_bin = getattr(config, "FFMPEG_PATH", "ffmpeg")
-                                    cmd = [ffmpeg_bin, "-y", "-hide_banner", "-loglevel", "error", "-i", input_path, "-c", "copy", remux_path]
+                                    cmd = [
+                                        ffmpeg_bin,
+                                        "-y",
+                                        "-hide_banner",
+                                        "-loglevel",
+                                        "error",
+                                        "-i",
+                                        input_path,
+                                        "-c",
+                                        "copy",
+                                        remux_path,
+                                    ]
                                     try:
-                                        proc = await asyncio.to_thread(subprocess.run, cmd, capture_output=True, text=True, timeout=600)
+                                        proc = await asyncio.to_thread(
+                                            subprocess.run, cmd, capture_output=True, text=True, timeout=600
+                                        )
                                     except Exception:
                                         proc = None
 
                                     ok = False
-                                    if proc and getattr(proc, "returncode", 1) == 0 and os.path.exists(remux_path) and os.path.getsize(remux_path) > 0:
+                                    if (
+                                        proc
+                                        and getattr(proc, "returncode", 1) == 0
+                                        and os.path.exists(remux_path)
+                                        and os.path.getsize(remux_path) > 0
+                                    ):
                                         ok = True
 
                                     # Persist attempt count
                                     try:
                                         if r:
-                                            await r.hset(f"ffmpeg:job:{job_id}", mapping={"remux_attempts": str(remux_attempts + 1)})
+                                            await r.hset(
+                                                f"ffmpeg:job:{job_id}",
+                                                mapping={"remux_attempts": str(remux_attempts + 1)},
+                                            )
                                     except Exception:
                                         pass
 
                                     if ok:
                                         with contextlib.suppress(Exception):
-                                            await publish_update(progress_channel, {"job_id": job_id, "progress": 0, "message": "remuxed", "note": "remux succeeded; retrying"})
-                                        logger.info("Remux succeeded for job %s, retrying ffmpeg against %s", job_id, remux_path)
+                                            await publish_update(
+                                                progress_channel,
+                                                {
+                                                    "job_id": job_id,
+                                                    "progress": 0,
+                                                    "message": "remuxed",
+                                                    "note": "remux succeeded; retrying",
+                                                },
+                                            )
+                                        logger.info(
+                                            "Remux succeeded for job %s, retrying ffmpeg against %s", job_id, remux_path
+                                        )
                                         # Switch to remuxed input and retry
                                         input_path = remux_path
                                         job["input_path"] = remux_path
@@ -1432,7 +1772,15 @@ async def handle_job(job: dict):
                                         continue
                                     else:
                                         with contextlib.suppress(Exception):
-                                            await publish_update(progress_channel, {"job_id": job_id, "progress": 0, "message": "remux_failed", "note": "remux attempted and failed"})
+                                            await publish_update(
+                                                progress_channel,
+                                                {
+                                                    "job_id": job_id,
+                                                    "progress": 0,
+                                                    "message": "remux_failed",
+                                                    "note": "remux attempted and failed",
+                                                },
+                                            )
                                 except Exception:
                                     logger.exception("Remux attempt failed for job %s", job_id)
 
@@ -1489,7 +1837,11 @@ async def handle_job(job: dict):
 
                                                     tried = True
                                                     ok = await download_forward_via_userbot(
-                                                        meta.get("chat_id"), meta.get("message_id") or meta.get("msg_id"), input_path, msg_date=meta.get("registered_at") or meta.get("created_at"), file_unique_id=meta.get("file_unique_id")
+                                                        meta.get("chat_id"),
+                                                        meta.get("message_id") or meta.get("msg_id"),
+                                                        input_path,
+                                                        msg_date=meta.get("registered_at") or meta.get("created_at"),
+                                                        file_unique_id=meta.get("file_unique_id"),
                                                     )
                                                 except Exception:
                                                     ok = False
@@ -1504,7 +1856,9 @@ async def handle_job(job: dict):
                                         from utils.userbot_downloader import download_forward_via_userbot
 
                                         tried = True
-                                        ok = await download_forward_via_userbot(job.get("chat_id"), job.get("message_id") or job.get("msg_id"), input_path)
+                                        ok = await download_forward_via_userbot(
+                                            job.get("chat_id"), job.get("message_id") or job.get("msg_id"), input_path
+                                        )
                                     except Exception:
                                         ok = False
 
@@ -1513,7 +1867,9 @@ async def handle_job(job: dict):
                                     try:
                                         tried = True
                                         async with aiohttp.ClientSession() as session:
-                                            async with session.get(job.get("source_url"), timeout=aiohttp.ClientTimeout(total=60)) as resp:
+                                            async with session.get(
+                                                job.get("source_url"), timeout=aiohttp.ClientTimeout(total=60)
+                                            ) as resp:
                                                 if resp.status == 200:
                                                     with open(input_path, "wb") as fh:
                                                         async for chunk in resp.content.iter_chunked(1024 * 64):
@@ -1527,7 +1883,10 @@ async def handle_job(job: dict):
                                 # Persist redownload attempts
                                 try:
                                     if r:
-                                        await r.hset(f"ffmpeg:job:{job_id}", mapping={"redownload_attempts": str(redownload_attempts + 1)})
+                                        await r.hset(
+                                            f"ffmpeg:job:{job_id}",
+                                            mapping={"redownload_attempts": str(redownload_attempts + 1)},
+                                        )
                                 except Exception:
                                     pass
                                 try:
@@ -1538,36 +1897,58 @@ async def handle_job(job: dict):
 
                                 if ok:
                                     with contextlib.suppress(Exception):
-                                        await publish_update(progress_channel, {"job_id": job_id, "progress": 0, "message": "redownloaded", "note": "re-download succeeded; retrying"})
+                                        await publish_update(
+                                            progress_channel,
+                                            {
+                                                "job_id": job_id,
+                                                "progress": 0,
+                                                "message": "redownloaded",
+                                                "note": "re-download succeeded; retrying",
+                                            },
+                                        )
                                     logger.info("Redownload succeeded for job %s, retrying ffmpeg", job_id)
                                     # Retry immediately
                                     continue
                                 else:
                                     with contextlib.suppress(Exception):
-                                        await publish_update(progress_channel, {"job_id": job_id, "progress": 0, "message": "redownload_failed", "note": "re-download attempted and failed"})
+                                        await publish_update(
+                                            progress_channel,
+                                            {
+                                                "job_id": job_id,
+                                                "progress": 0,
+                                                "message": "redownload_failed",
+                                                "note": "re-download attempted and failed",
+                                            },
+                                        )
 
                     except Exception:
                         logger.exception("Error during re-download attempt for job %s", job_id)
 
                     # If we attempted re-download and it failed, fall through to normal failure handling
                     JOBS_FAILED.inc()
-                    await publish_update(progress_channel, {"job_id": job_id, "progress": 0, "message": "error", "error": info})
+                    await publish_update(
+                        progress_channel, {"job_id": job_id, "progress": 0, "message": "error", "error": info}
+                    )
                     try:
                         await job_store.update_job(job_id, {"status": "error", "error": info, "attempt": attempt})
                         try:
                             if _cache:
-                                await _cache.cache_job_metadata(job_id, {
-                                    "status": "error",
-                                    "error": info,
-                                    "attempt": attempt,
-                                }, ttl=1800)
+                                await _cache.cache_job_metadata(
+                                    job_id,
+                                    {
+                                        "status": "error",
+                                        "error": info,
+                                        "attempt": attempt,
+                                    },
+                                    ttl=1800,
+                                )
                         except Exception:
                             pass
                     except Exception:
                         pass
 
                     if attempt <= retries:
-                        backoff = min(30, 2 ** attempt)
+                        backoff = min(30, 2**attempt)
                         logger.info(f"Retrying job {job_id} in {backoff}s (attempt {attempt})")
                         await asyncio.sleep(backoff)
                         continue
@@ -1583,9 +1964,11 @@ async def handle_job(job: dict):
                 JOBS_FAILED.inc()
                 logger.exception("Unhandled exception while processing job: %s", e)
                 with contextlib.suppress(Exception):
-                    await job_store.update_job(job_id, {"status": "error", "error": "processing_failed", "attempt": attempt})
+                    await job_store.update_job(
+                        job_id, {"status": "error", "error": "processing_failed", "attempt": attempt}
+                    )
                 if attempt <= retries:
-                    await asyncio.sleep(2 ** attempt)
+                    await asyncio.sleep(2**attempt)
                     continue
                 else:
                     return
@@ -1606,6 +1989,29 @@ async def handle_job(job: dict):
                 pass
 
 
+async def _start_healthcheck_server():
+    """Start a minimal aiohttp server for Railway healthchecks on $PORT."""
+    try:
+        from aiohttp import web
+
+        port = int(os.environ.get("PORT", "8000"))
+
+        async def _handle_health(request):
+            return web.json_response({"service": "ffmpeg_worker", "healthy": True, "ok": True})
+
+        app = web.Application()
+        app.router.add_get("/health", _handle_health)
+        runner = web.AppRunner(app)
+        await runner.setup()
+        site = web.TCPSite(runner, "0.0.0.0", port)  # noqa: S104
+        await site.start()
+        logger.info("Healthcheck server started on 0.0.0.0:%s/health", port)
+        return runner
+    except Exception:
+        logger.exception("Failed to start healthcheck server")
+        return None
+
+
 async def worker_loop(stop_event: asyncio.Event | None = None):
     """Main worker loop: pop jobs from Redis, process them, deliver results.
 
@@ -1613,6 +2019,10 @@ async def worker_loop(stop_event: asyncio.Event | None = None):
         stop_event: When set, the worker loop exits gracefully.
     """
     logger.info("FFmpeg worker starting, waiting for jobs...")
+
+    # Start healthcheck server for Railway
+    await _start_healthcheck_server()
+
     # init job store if MONGO_URI available
     try:
         mongo_uri = os.environ.get("MONGO_URI")
@@ -1670,6 +2080,7 @@ async def worker_loop(stop_event: asyncio.Event | None = None):
                     await forward_task
         except Exception:
             pass
+
 
 def create_worker_task(stop_event: asyncio.Event | None = None) -> asyncio.Task:
     """Create and return a background asyncio Task that runs the worker loop.
@@ -1753,9 +2164,9 @@ def main():
 
     # start prometheus metrics server in background thread
     try:
-        # bind metrics server to loopback so platform agents (e.g. Render)
+        # bind metrics server to loopback so platform agents
         # do not detect an additional open public port
-        start_http_server(METRICS_PORT, addr='127.0.0.1')
+        start_http_server(METRICS_PORT, addr="127.0.0.1")
         logger.info(f"Prometheus metrics available on 127.0.0.1:{METRICS_PORT}")
     except Exception:
         logger.exception("Failed to start Prometheus metrics server")

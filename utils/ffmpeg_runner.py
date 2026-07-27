@@ -26,7 +26,7 @@ async def probe_duration(path: str) -> float | None:
     if not path:
         raise ValueError("Input path missing before ffprobe")
     if not os.path.exists(path):
-        raise FileNotFoundError(f"Input file missing before ffprobe: {path}")   
+        raise FileNotFoundError(f"Input file missing before ffprobe: {path}")
     ffprobe = getattr(config, "FFMPEG_PATH", "ffmpeg")
     ffprobe = ffprobe.replace("ffmpeg", "ffprobe") if "ffmpeg" in ffprobe else "ffprobe"
     try:
@@ -97,14 +97,14 @@ async def run_ffmpeg(
     - Publishes JSON updates to `progress_channel` (if provided) and writes job hash `ffmpeg:job:{job_id}`.
     """
     ffmpeg_bin = getattr(config, "FFMPEG_PATH", "ffmpeg") or "ffmpeg"
-    # Use veryfast preset to reduce memory usage on memory-constrained hosts (Render free tier).
+    # Use veryfast preset to reduce memory usage on memory-constrained hosts.
     # The -preset fast default was consuming too much RAM alongside multiple uvicorn workers.
     # veryfast uses ~30% less memory at the cost of slightly larger output files.
     ffmpeg_args = ffmpeg_args or ["-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-c:a", "aac", "-b:a", "128k"]
 
     # Validate input path before probing/starting ffmpeg
     if not input_path:
-        logger.error("Input file missing before ffmpeg for job %s", job_id)     
+        logger.error("Input file missing before ffmpeg for job %s", job_id)
         return False, "input file missing"
     if not os.path.exists(input_path):
         logger.error("Input file not found before ffmpeg for job %s: %s", job_id, input_path)
@@ -121,9 +121,13 @@ async def run_ffmpeg(
     except Exception:
         in_bytes = 0
 
-    cmd = [ffmpeg_bin, "-y", "-hide_banner", "-loglevel", "error", "-i", input_path] + ffmpeg_args + ["-progress", "pipe:1", "-nostats", output_path]
+    cmd = (
+        [ffmpeg_bin, "-y", "-hide_banner", "-loglevel", "error", "-i", input_path]
+        + ffmpeg_args
+        + ["-progress", "pipe:1", "-nostats", output_path]
+    )
 
-    logger.info("Running ffmpeg: %s", " ".join(shlex.quote(p) for p in cmd))    
+    logger.info("Running ffmpeg: %s", " ".join(shlex.quote(p) for p in cmd))
 
     # choose platform-specific creation flags / preexec
     kwargs = {}
@@ -139,9 +143,13 @@ async def run_ffmpeg(
         create_checked_subprocess_exec = None
 
     if create_checked_subprocess_exec is not None:
-        proc = await create_checked_subprocess_exec(*cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE, **kwargs)
+        proc = await create_checked_subprocess_exec(
+            *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE, **kwargs
+        )
     else:
-        proc = await asyncio.create_subprocess_exec(*cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE, **kwargs)
+        proc = await asyncio.create_subprocess_exec(
+            *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE, **kwargs
+        )
 
     # Start a background task to capture stderr to a per-job file for debugging.
     stderr_task = None
@@ -169,7 +177,7 @@ async def run_ffmpeg(
                 logger.exception("ffmpeg_runner: stderr drain failed for %s", job_id)
 
         try:
-            stderr_task = asyncio.create_task(_drain_stderr(proc, stderr_path)) 
+            stderr_task = asyncio.create_task(_drain_stderr(proc, stderr_path))
         except Exception:
             stderr_task = None
     except Exception:
@@ -181,7 +189,10 @@ async def run_ffmpeg(
             redis_client = aioredis.from_url(redis_url or os.environ.get("REDIS_URL"))
             # Initialize job hash so status is available immediately
             with contextlib.suppress(Exception):
-                await redis_client.hset(f"ffmpeg:job:{job_id}", mapping={"status": "processing", "progress": 0, "message": "started", "in_bytes": str(in_bytes)})
+                await redis_client.hset(
+                    f"ffmpeg:job:{job_id}",
+                    mapping={"status": "processing", "progress": 0, "message": "started", "in_bytes": str(in_bytes)},
+                )
         except Exception:
             redis_client = None
 
@@ -202,7 +213,7 @@ async def run_ffmpeg(
                 pct = (current_out_time / duration * 100.0) if duration and duration > 0 else 0.0
                 message = f"encoding {pct:.1f}%"
 
-                # Try to read the current output file size (non-blocking)       
+                # Try to read the current output file size (non-blocking)
                 out_bytes = 0
                 try:
                     loop = asyncio.get_event_loop()
@@ -231,8 +242,14 @@ async def run_ffmpeg(
                 if redis_client and progress_channel:
                     try:
                         await redis_client.publish(progress_channel, json.dumps(payload))
-                        # store numeric values as strings to keep Redis simple  
-                        store_map = {"progress": payload["progress"], "message": message, "status": "processing", "out_bytes": str(out_bytes), "in_bytes": str(in_bytes)}
+                        # store numeric values as strings to keep Redis simple
+                        store_map = {
+                            "progress": payload["progress"],
+                            "message": message,
+                            "status": "processing",
+                            "out_bytes": str(out_bytes),
+                            "in_bytes": str(in_bytes),
+                        }
                         if progress_by_size is not None:
                             store_map["progress_by_size"] = str(progress_by_size)
                         await redis_client.hset(f"ffmpeg:job:{job_id}", mapping=store_map)
@@ -256,14 +273,16 @@ async def run_ffmpeg(
                             else:
                                 # Best-effort for Windows: send CTRL_BREAK to process group
                                 try:
-                                    proc.send_signal(signal.CTRL_BREAK_EVENT)   
+                                    proc.send_signal(signal.CTRL_BREAK_EVENT)
                                 except Exception:
                                     proc.kill()
                         except Exception:
                             with contextlib.suppress(Exception):
                                 proc.kill()
                         with contextlib.suppress(Exception):
-                            await redis_client.hset(f"ffmpeg:job:{job_id}", mapping={"status": "cancelled", "message": "cancelled by user"})
+                            await redis_client.hset(
+                                f"ffmpeg:job:{job_id}", mapping={"status": "cancelled", "message": "cancelled by user"}
+                            )
                         return False, "cancelled"
                 except Exception:
                     pass
@@ -288,10 +307,30 @@ async def run_ffmpeg(
                     except Exception:
                         final_out = 0
 
-                    finished_map = {"progress": 100, "message": "encoding finished", "status": "processing", "output": output_path, "out_bytes": str(final_out), "in_bytes": str(in_bytes), "output_filename": os.path.basename(output_path)}
+                    finished_map = {
+                        "progress": 100,
+                        "message": "encoding finished",
+                        "status": "processing",
+                        "output": output_path,
+                        "out_bytes": str(final_out),
+                        "in_bytes": str(in_bytes),
+                        "output_filename": os.path.basename(output_path),
+                    }
                     await redis_client.hset(f"ffmpeg:job:{job_id}", mapping=finished_map)
                     if progress_channel:
-                        await redis_client.publish(progress_channel, json.dumps({"job_id": job_id, "progress": 100, "message": "encoding finished", "output": output_path, "out_bytes": final_out, "in_bytes": in_bytes}))
+                        await redis_client.publish(
+                            progress_channel,
+                            json.dumps(
+                                {
+                                    "job_id": job_id,
+                                    "progress": 100,
+                                    "message": "encoding finished",
+                                    "output": output_path,
+                                    "out_bytes": final_out,
+                                    "in_bytes": in_bytes,
+                                }
+                            ),
+                        )
                 except Exception:
                     pass
             return True, output_path
@@ -300,9 +339,20 @@ async def run_ffmpeg(
             err = stderr.decode(errors="ignore")[:1000]
             if redis_client:
                 try:
-                    await redis_client.hset(f"ffmpeg:job:{job_id}", mapping={"status": "error", "message": err, "out_bytes": str(out_bytes) if 'out_bytes' in locals() else "0", "in_bytes": str(in_bytes)})
+                    await redis_client.hset(
+                        f"ffmpeg:job:{job_id}",
+                        mapping={
+                            "status": "error",
+                            "message": err,
+                            "out_bytes": str(out_bytes) if "out_bytes" in locals() else "0",
+                            "in_bytes": str(in_bytes),
+                        },
+                    )
                     if progress_channel:
-                        await redis_client.publish(progress_channel, json.dumps({"job_id": job_id, "progress": 0, "message": "error", "error": err}))
+                        await redis_client.publish(
+                            progress_channel,
+                            json.dumps({"job_id": job_id, "progress": 0, "message": "error", "error": err}),
+                        )
                 except Exception:
                     pass
             return False, err

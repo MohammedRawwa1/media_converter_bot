@@ -110,15 +110,22 @@ except Exception:
     _web = None
 
 
-async def _start_aiohttp_debug_server():
+async def _start_healthcheck_server():
+    """Start a minimal HTTP server for Railway healthchecks on $PORT.
+
+    Exposes:
+      /health       — Simple liveness check (always returns 200)
+      /debug/health — Detailed health with Redis status (requires token if TELETHON_DEBUG_TOKEN is set)
+      /debug/telethon-log — Serve local Telethon log file (requires token if set)
+    """
     if _web is None:
-        logger.debug("aiohttp not installed; debug HTTP server disabled")
+        logger.debug("aiohttp not installed; healthcheck HTTP server disabled")
         return None
-    port = int(os.environ.get("TELETHON_DEBUG_PORT", "8081"))
+
+    port = int(os.environ.get("PORT", os.environ.get("TELETHON_DEBUG_PORT", "8081")))
 
     async def _handle_log(request):
         try:
-            # optional token protection
             token_env = os.environ.get("TELETHON_DEBUG_TOKEN")
             if token_env:
                 provided = request.headers.get("X-Debug-Token") or request.rel_url.query.get("debug_token")
@@ -132,6 +139,11 @@ async def _start_aiohttp_debug_server():
             return _web.json_response({"error": "internal"}, status=500)
 
     async def _handle_health(request):
+        """Simple liveness check for Railway healthchecks — no auth required."""
+        return _web.json_response({"service": "telethon_ingest", "ok": True, "healthy": True})
+
+    async def _handle_debug_health(request):
+        """Detailed health with Redis connectivity — requires token if configured."""
         try:
             token_env = os.environ.get("TELETHON_DEBUG_TOKEN")
             if token_env:
@@ -162,22 +174,23 @@ async def _start_aiohttp_debug_server():
             status["last_fetch_ts"] = globals().get("LAST_FETCH_TS")
             return _web.json_response(status)
         except Exception:
-            logger.exception("telethon_ingest: health handler error")
+            logger.exception("telethon_ingest: debug health handler error")
             return _web.json_response({"error": "internal"}, status=500)
 
     app = _web.Application()
+    app.router.add_get("/health", _handle_health)
+    app.router.add_get("/debug/health", _handle_debug_health)
     app.router.add_get("/debug/telethon-log", _handle_log)
-    app.router.add_get("/debug/health", _handle_health)
     runner = _web.AppRunner(app)
     try:
         await runner.setup()
-        bind_host = os.environ.get("TELETHON_DEBUG_HOST", "127.0.0.1")
+        bind_host = os.environ.get("TELETHON_DEBUG_HOST", "0.0.0.0")  # noqa: S104
         site = _web.TCPSite(runner, bind_host, port)
         await site.start()
-        logger.info("telethon_ingest: debug HTTP server started on %s:%s", bind_host, port)
+        logger.info("telethon_ingest: healthcheck HTTP server started on %s:%s", bind_host, port)
         return runner
     except Exception:
-        logger.exception("telethon_ingest: failed to start debug HTTP server")
+        logger.exception("telethon_ingest: failed to start healthcheck HTTP server")
         with contextlib.suppress(Exception):
             await runner.cleanup()
         return None
@@ -796,7 +809,7 @@ async def main():
     # Start aiohttp debug server (serves local /tmp/telethon_ingest.log) if available
     http_runner = None
     try:
-        http_runner = await _start_aiohttp_debug_server()
+        http_runner = await _start_healthcheck_server()
     except Exception:
         logger.exception("telethon_ingest: debug HTTP server failed to start")
 

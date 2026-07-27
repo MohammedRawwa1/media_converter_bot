@@ -1,0 +1,81 @@
+# .railwayignore — Files/directories to exclude from Railway deployments
+# This is used by `railway up` CLI and by the GitHub integration.
+# Format follows .gitignore-style patterns.
+
+# ── Version control ──
+.git/
+.gitignore
+.gitkeep
+.gitattributes
+
+# ── CI / GitHub ──
+.github/
+
+# ── Python bytecode cache ──
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*$py.class
+
+# ── Virtual environments ──
+.venv/
+venv/
+env/
+ENV/
+.venv.bak/
+venv.bak/
+env.bak/
+
+# ── Secrets & environment files ──
+.env
+.env.*
+*.session
+*.session-journal
+*.session.lock
+*.session.json
+
+# ── Runtime data directories (created on startup) ──
+storage/
+logs/
+*.log
+
+# ── Tool caches ──
+.ruff_cache/
+.mypy_cache/
+.pytest_cache/
+
+# ── IDE / Editor directories ──
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# ── Build & packaging artifacts ──
+*.egg-info/
+*.egg
+dist/
+build/
+*.whl
+*.tar.gz
+
+# ── Tests (not needed in production) ──
+tests/
+coverage/
+.coverage
+htmlcov/
+
+# ── Temporary files ──
+*.tmp
+*.temp
+validation_results.txt
+
+# ── Deployment config that is read by the platform, not needed in the deployed image ──
+.dockerignore
+docker-compose*.yml
+docker-compose*.yaml
+
+# ── Documentation (READMEs inside storage/ are excluded via storage/ rule) ──
+# Keep root README.md and DEPLOY.md — they're small and useful

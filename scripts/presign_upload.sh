@@ -6,7 +6,7 @@ usage() {
 Usage: $0 /path/to/file [WEB_UPLOAD_URL] [UPLOAD_SECRET]
 WEB_UPLOAD_URL defaults to env WEB_UPLOAD_URL. UPLOAD_SECRET defaults to env UPLOAD_SECRET.
 Example:
-  $0 ./video.mp4 https://media-converter-bot-1.onrender.com "8pAV..."
+  $0 ./video.mp4 $WEB_UPLOAD_URL "8pAV..."
 EOF
   exit 1
 }

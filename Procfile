@@ -1,5 +1,5 @@
 # ── Memory-conscious configuration ──
-# Render free tier has ~512MB RAM. Using 2 workers (instead of 4) leaves
+# Free tier plans typically have limited RAM. Using 2 workers (instead of 4) leaves
 # headroom for the in-process ffmpeg worker, OS overhead, and Redis/Mongo
 # connections. Each uvicorn worker consumes ~50-80MB.
 # Upgrade to workers=4 on paid plans (1GB+ RAM).

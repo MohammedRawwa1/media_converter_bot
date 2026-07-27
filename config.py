@@ -47,7 +47,9 @@ BOT_TOKEN = os.getenv("BOT_TOKEN") or ""
 # Relay group for large file downloads (bot forwards file here, userbot downloads from here)
 RELAY_CHAT_ID = os.getenv("RELAY_CHAT_ID", "")
 WEBHOOK_URL = os.getenv("WEBHOOK_URL") or ""
-WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET") or os.getenv("TELEGRAM_SECRET_TOKEN") or os.getenv("WEBHOOK_SECRET_TOKEN") or ""
+WEBHOOK_SECRET = (
+    os.getenv("WEBHOOK_SECRET") or os.getenv("TELEGRAM_SECRET_TOKEN") or os.getenv("WEBHOOK_SECRET_TOKEN") or ""
+)
 
 # Storage and limits
 STORAGE_PATH = os.getenv("STORAGE_PATH", os.path.join(ROOT_DIR, "storage"))
@@ -87,6 +89,7 @@ REDIS_URL = os.getenv("REDIS_URL", "")
 # Admin and ACL
 _allowed_file = os.path.join(STORAGE_PATH, "allowed_users.json")
 
+
 def _load_allowed_users() -> set[int]:
     s: set[int] = set()
     # First, read from ALLOWED_USER_IDS env var if present
@@ -118,6 +121,7 @@ def _load_allowed_users() -> set[int]:
 
 
 ALLOWED_USER_IDS: set[int] = _load_allowed_users()
+
 
 def persist_allowed_users() -> None:
     """Persist current `ALLOWED_USER_IDS` to the storage file.
@@ -161,10 +165,13 @@ def is_user_allowed(user_id: int) -> bool:
     except Exception:
         logging.getLogger(__name__).warning("ACL check failed for user %s; defaulting to allowed", user_id)
         return True  # default to allowed on error to avoid locking out users
+
+
 # Normalize MongoDB environment variable names for compatibility.
-# Some deployments (Render, Docker) may set variables using references
+# Some deployments (Railway, Docker) may set variables using references
 # like "$MONGO_URI" which are not expanded by the platform. Resolve
 # simple $VAR or ${VAR} references so the canonical value is usable.
+
 
 def _resolve_env_reference(val: str | None) -> str | None:
     if not val:
@@ -175,6 +182,7 @@ def _resolve_env_reference(val: str | None) -> str | None:
     if m:
         ref = m.group(1)
         return os.getenv(ref) or None
+
     # Replace embedded ${VAR} or $VAR occurrences with their env values (best-effort)
     def _repl(m):
         name = m.group(1)
@@ -224,7 +232,11 @@ def validate_env() -> None:
         missing.append("BOT_TOKEN")
 
     # Storage backend requirements
-    backend = os.getenv("STORAGE_BACKEND", STORAGE_BACKEND).lower() if "STORAGE_BACKEND" in globals() else os.getenv("STORAGE_BACKEND", "local")
+    backend = (
+        os.getenv("STORAGE_BACKEND", STORAGE_BACKEND).lower()
+        if "STORAGE_BACKEND" in globals()
+        else os.getenv("STORAGE_BACKEND", "local")
+    )
     if backend in ("s3", "r2") and (not os.getenv("S3_BUCKET") or not os.getenv("S3_ENDPOINT")):
         missing.append("S3_BUCKET/S3_ENDPOINT")
 

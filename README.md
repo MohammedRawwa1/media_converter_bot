@@ -1,6 +1,6 @@
 # 🎉 Media Conversion Telegram Bot - PRODUCTION READY
 
-**Status:** 🟢 **RENDER DEPLOYMENT READY**  
+**Status:** 🟢 **RAILWAY DEPLOYMENT READY**  
 **Python:** 3.11.7  
 **Database:** MongoDB  
 **Date:** January 13, 2026
@@ -10,10 +10,10 @@
 ## ✅ What You Have
 
 ### 🚀 Deployment Configuration
-- ✅ **render.yaml** - Render deployment manifest
+- ✅ **railway.json** - Railway deployment manifest
 - ✅ **runtime.txt** - Python 3.11.7 specified
 - ✅ **requirements.txt** - All dependencies (motor, pymongo, FFmpeg)
-- ✅ **Procfile** - Also compatible with Render
+- ✅ **Dockerfile** - Container-based deployment ready
 
 ### 💻 Core Application
 - ✅ **main.py** - Bot entry point with 11 command routes + handlers
@@ -91,19 +91,19 @@ python main.py
 # 3. Send /start to bot in Telegram
 ```
 
-### Render Deployment
+### Railway Deployment
 ```bash
 # 1. Push to GitHub
 git push origin main
 
-# 2. Create Render Service
-# - Go to render.com
-# - Click New → Web Service
-# - Connect GitHub repo
+# 2. Create Railway Project
+# - Go to railway.app
+# - Click New Project → Deploy from GitHub repo
+# - Connect your repository
 # - Set BOT_TOKEN environment variable
 # - Click Deploy
 
-# 3. Monitor logs in Render dashboard
+# 3. Monitor logs in Railway dashboard
 # 4. Send /start to bot in Telegram
 ```
 
@@ -114,14 +114,14 @@ git push origin main
 ```
 Routes:              ✅ 11 Commands + 3 Messages + Callbacks
 MongoDB:             ✅ Async Integration Ready
-Python:              ✅ 3.11.7 (Render compatible)
+Python:              ✅ 3.11.7 (Railway compatible)
 Error Handling:      ✅ 11 Categories
 Timeout Protection:  ✅ 18000s FFmpeg
 Tests:               ⚠️ No integrated tests included in this repository
 Code Quality:        ✅ Verified
 ```
 
-**Status: 🟢 READY FOR RENDER PRODUCTION DEPLOYMENT**
+**Status: 🟢 READY FOR RAILWAY PRODUCTION DEPLOYMENT**
 
 ---
 
@@ -191,7 +191,7 @@ SENTRY_DSN=
 ## 🎯 Deployment Timeline
 
 1. **Immediate:** Push to GitHub
-2. **5 minutes:** Create Render service
+2. **5 minutes:** Create Railway project
 3. **1 minute:** Set BOT_TOKEN
 4. **1 click:** Deploy
 5. **Instant:** Bot running and accepting users
@@ -212,12 +212,12 @@ Pushes and pull requests to `main` will trigger the workflow.
 
 ## 🧰 Monitoring (Sentry)
 
-You can enable Sentry error monitoring by setting the `SENTRY_DSN` environment variable in Render or your deployment environment. The bot will attempt to initialize Sentry at startup when this variable is present.
+You can enable Sentry error monitoring by setting the `SENTRY_DSN` environment variable in Railway or your deployment environment. The bot will attempt to initialize Sentry at startup when this variable is present.
 
 Environment variable:
 - `SENTRY_DSN` (optional) — your Sentry DSN string
 
-Example (Render): set `SENTRY_DSN` in the Environment settings for your service.
+Example (Railway): set `SENTRY_DSN` in the Environment settings for your service.
 
 ## ✅ Webhook Integration
 
@@ -252,10 +252,8 @@ Your bot is **complete, fully tested, and production-ready**:
 - ✅ All deployment files ready
  - ⚠️ Integrated tests removed from repository
 - ✅ Clean project structure (README.md only)
-- ✅ Python 3.11.7 - Render optimized
-- ✅ Procfile configured
+- ✅ Python 3.11.7 - Railway optimized
+- ✅ railway.json configured for all services
 - ✅ Clean project structure
 
 **Status: 🟢 READY TO DEPLOY**
-
-Set BOT_TOKEN and run `python main.py` or deploy to Heroku!

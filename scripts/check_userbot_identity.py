@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Check who the userbot is logged in as (run on the Render server)."""
+"""Check who the userbot is logged in as (run on the deployment server)."""
 
 import asyncio
 import os
@@ -20,9 +20,10 @@ async def main():
     print("Userbot identity:")
     print(f"  ID: {me.id}")
     print(f"  Name: {me.first_name or ''} {me.last_name or ''}")
-    if hasattr(me, 'phone_number'):
+    if hasattr(me, "phone_number"):
         print(f"  Phone: +{me.phone_number}")
     print("\nThis is the account that needs to be added to group -1004367325292")
     await client.stop()
+
 
 asyncio.run(main())

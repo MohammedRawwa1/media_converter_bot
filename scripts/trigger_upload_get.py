@@ -3,34 +3,36 @@ import sys
 from urllib import parse, request
 
 # load .env
-env_path = os.path.join(os.path.dirname(__file__), '..', '.env')
+env_path = os.path.join(os.path.dirname(__file__), "..", ".env")
 if os.path.exists(env_path):
-    with open(env_path, encoding='utf-8') as f:
+    with open(env_path, encoding="utf-8") as f:
         for line in f:
-            line=line.strip()
-            if not line or line.startswith('#'):
+            line = line.strip()
+            if not line or line.startswith("#"):
                 continue
-            if '=' in line:
-                k,v=line.split('=',1)
-                v=v.strip()
+            if "=" in line:
+                k, v = line.split("=", 1)
+                v = v.strip()
                 if (v.startswith('"') and v.endswith('"')) or (v.startswith("'") and v.endswith("'")):
-                    v=v[1:-1]
+                    v = v[1:-1]
                 os.environ.setdefault(k.strip(), v)
 
-secret = os.environ.get('UPLOAD_SECRET')
+secret = os.environ.get("UPLOAD_SECRET")
 if not secret:
-    print('UPLOAD_SECRET not set in .env')
+    print("UPLOAD_SECRET not set in .env")
     sys.exit(2)
 
 forward_hash = sys.argv[1] if len(sys.argv) > 1 else None
 if not forward_hash:
-    print('Usage: python trigger_upload_get.py <forward_hash>')
+    print("Usage: python trigger_upload_get.py <forward_hash>")
     sys.exit(1)
 
-url = 'https://media-converter-bot-1.onrender.com/upload'
-qs = parse.urlencode({'forward_hash': forward_hash})
+# Fall back to WEB_UPLOAD_URL env var or a generic placeholder (set this to your actual deployment URL)
+default_upload_url = os.environ.get("WEB_UPLOAD_URL") or "https://your-deployment-url.example.com/upload"
+url = default_upload_url
+qs = parse.urlencode({"forward_hash": forward_hash})
 full = f"{url}?{qs}"
-req = request.Request(full, headers={'X-Upload-Token': secret}, method='GET')  # noqa: S310 - URL is hardcoded and validated below
+req = request.Request(full, headers={"X-Upload-Token": secret}, method="GET")  # noqa: S310 - URL is hardcoded and validated below
 
 try:
     # Validate URL scheme to prevent SSRF via file:// or internal IPs
@@ -39,11 +41,12 @@ try:
         print(f"Blocked urlopen with scheme={parsed_url.scheme}")
         raise ValueError(f"Unsupported URL scheme: {parsed_url.scheme}")
     with request.urlopen(req, timeout=60) as resp:  # nosec # noqa: S310 - URL validated above
-        body = resp.read().decode('utf-8', errors='replace')
-        print('HTTP', resp.status)
+        body = resp.read().decode("utf-8", errors="replace")
+        print("HTTP", resp.status)
         print(body)
 except Exception as e:
-    print('Request failed:', e)
+    print("Request failed:", e)
     import traceback
+
     traceback.print_exc()
     sys.exit(3)

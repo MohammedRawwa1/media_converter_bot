@@ -3,7 +3,10 @@
 .gitignore
 .env
 .env.*
-*.pyc
+*.py[cod]
+*.pyo
+*.pyd
+*$py.class
 __pycache__/
 .venv/
 venv/

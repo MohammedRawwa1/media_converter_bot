@@ -1,0 +1,6 @@
+✅ railway.json: VALID
+✅ fetcher/railway.json: VALID
+✅ workers/railway.json: VALID
+✅ tools/railway.json: VALID
+
+✅✅✅ ALL 4 railway.json files pass Railway schema validation!

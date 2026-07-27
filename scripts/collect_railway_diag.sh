@@ -11,6 +11,14 @@ if [ -z "$JOB_ID" ]; then
   exit 1
 fi
 
+echo "=== RAILWAY ENVIRONMENT INFO ==="
+echo "RAILWAY_PROJECT_NAME=${RAILWAY_PROJECT_NAME:-unset}"
+echo "RAILWAY_SERVICE_NAME=${RAILWAY_SERVICE_NAME:-unset}"
+echo "RAILWAY_ENVIRONMENT_NAME=${RAILWAY_ENVIRONMENT_NAME:-unset}"
+echo "RAILWAY_PUBLIC_DOMAIN=${RAILWAY_PUBLIC_DOMAIN:-unset}"
+echo "RAILWAY_PRIVATE_DOMAIN=${RAILWAY_PRIVATE_DOMAIN:-unset}"
+
+echo
 echo "=== PS (top processes by RSS) ==="
 python3 "$SCRIPT_DIR/diagnose_job.py" --action ps || echo "ps action failed"
 

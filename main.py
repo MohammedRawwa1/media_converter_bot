@@ -91,11 +91,12 @@ except Exception:
 logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Ensure directories exist early (important for Render/ASGI import-time logging)
+# Ensure directories exist early (important for Railway/ASGI import-time logging)
 try:
     from contextlib import suppress as _suppress
 
     from setup_directory import setup_bot_directories
+
     with _suppress(Exception):
         setup_bot_directories()
 except Exception:
@@ -127,6 +128,7 @@ METRICS = {
     "dispatch_attempts": 0,
 }
 METRICS_LOCK = threading.Lock()
+
 
 class AwaitingLoginFilter(filters.MessageFilter):
     """Filter text messages only for users in the login flow."""
@@ -201,12 +203,12 @@ async def _dispatch_update_task(update):
         logger.exception("Error dispatching update: %s", exc)
 
 
-
 async def check_ffmpeg_available() -> bool:
     """Return True if ffmpeg is callable from PATH or configured FFMPEG_PATH.
 
     This runs the check in a thread to avoid blocking the event loop.
     """
+
     def _probe():
         try:
             proc = subprocess.run([FFMPEG_PATH, "-version"], capture_output=True, text=True, timeout=5)
@@ -338,7 +340,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Cancel current operation."""
     await update.message.reply_text(
-        "❌ Operation cancelled.\n\n" "Send /start to see available options.",
+        "❌ Operation cancelled.\n\nSend /start to see available options.",
     )
 
 
@@ -411,6 +413,7 @@ def setup_handlers(application: Application) -> None:
         threshold = float(os.getenv("HANDLER_LATENCY_THRESHOLD", "1.0"))
 
         if inspect.iscoroutinefunction(fn):
+
             @functools.wraps(fn)
             async def _wrapped(*args, **kwargs):
                 start = time.time()
@@ -473,7 +476,11 @@ def setup_handlers(application: Application) -> None:
                 # Allow short server-selection/connect timeouts to fail fast
                 # when MongoDB is unreachable. Values are in milliseconds.
                 try:
-                    srv_timeout = int(os.environ.get("MONGO_SERVER_SELECTION_TIMEOUT_MS", os.environ.get("MONGO_SERVER_TIMEOUT_MS", "5000")))
+                    srv_timeout = int(
+                        os.environ.get(
+                            "MONGO_SERVER_SELECTION_TIMEOUT_MS", os.environ.get("MONGO_SERVER_TIMEOUT_MS", "5000")
+                        )
+                    )
                 except Exception:
                     srv_timeout = 5000
                 try:
@@ -482,8 +489,14 @@ def setup_handlers(application: Application) -> None:
                     conn_timeout = 5000
 
                 try:
-                    client = AsyncIOMotorClient(mongo_uri, serverSelectionTimeoutMS=srv_timeout, connectTimeoutMS=conn_timeout)
-                    logger.info("Mongo client created with serverSelectionTimeoutMS=%sms connectTimeoutMS=%sms", srv_timeout, conn_timeout)
+                    client = AsyncIOMotorClient(
+                        mongo_uri, serverSelectionTimeoutMS=srv_timeout, connectTimeoutMS=conn_timeout
+                    )
+                    logger.info(
+                        "Mongo client created with serverSelectionTimeoutMS=%sms connectTimeoutMS=%sms",
+                        srv_timeout,
+                        conn_timeout,
+                    )
                 except Exception:
                     # Fallback to default constructor when custom kwargs cause issues
                     client = AsyncIOMotorClient(mongo_uri)
@@ -531,6 +544,7 @@ def setup_handlers(application: Application) -> None:
         json_file_exists = False
         try:
             from utils.telethon_session import _get_persisted_session_path, _load_all_sessions_from_file_async
+
             _p = _get_persisted_session_path()
             json_file_exists = os.path.exists(_p)
             json_session = await _load_all_sessions_from_file_async()
@@ -542,9 +556,14 @@ def setup_handlers(application: Application) -> None:
 
         # ── Telethon session availability ──
         telethon_ready = False
-        telethon_status = {"ready": False, "source": "missing", "details": "No Telethon session configured or persisted"}
+        telethon_status = {
+            "ready": False,
+            "source": "missing",
+            "details": "No Telethon session configured or persisted",
+        }
         try:
             from utils.telethon_session import get_telethon_session_status
+
             telethon_status = await get_telethon_session_status(
                 user_id=user_id,
                 db_model=context.application.bot_data.get("db_model"),
@@ -553,6 +572,7 @@ def setup_handlers(application: Application) -> None:
         except Exception:
             try:
                 from utils.telethon_session import has_usable_telethon_session
+
                 telethon_ready = has_usable_telethon_session()
             except Exception:
                 pass
@@ -561,13 +581,21 @@ def setup_handlers(application: Application) -> None:
         pyrogram_ready = False
         try:
             from utils.telethon_session import get_pyrogram_session_string
+
             pyrogram_ready = bool(get_pyrogram_session_string())
         except Exception:
             pass
 
         # ── Credentials check ──
-        has_api_id = bool(os.getenv("API_ID") or os.getenv("USERBOT_API_ID") or os.getenv("api_id") or os.getenv("userbot_api_id"))
-        has_api_hash = bool(os.getenv("API_HASH") or os.getenv("USERBOT_API_HASH") or os.getenv("api_hash") or os.getenv("userbot_api_hash"))
+        has_api_id = bool(
+            os.getenv("API_ID") or os.getenv("USERBOT_API_ID") or os.getenv("api_id") or os.getenv("userbot_api_id")
+        )
+        has_api_hash = bool(
+            os.getenv("API_HASH")
+            or os.getenv("USERBOT_API_HASH")
+            or os.getenv("api_hash")
+            or os.getenv("userbot_api_hash")
+        )
         userbot_enabled = os.environ.get("ENABLE_USERBOT", "").lower() in ("1", "true", "yes")
 
         # ── Active login flow context ──
@@ -597,8 +625,9 @@ def setup_handlers(application: Application) -> None:
             "**Userbot enabled:** " + ("✅ Yes" if userbot_enabled else "❌ No"),
             "**API credentials:** " + ("✅ Set" if has_api_id and has_api_hash else "⚠️ Missing API_ID/API_HASH"),
             "",
-            "**Telethon session:** " + (
-                "✅ Available (" + (telethon_status.get('source', 'unknown') if telethon_ready else '') + ")"
+            "**Telethon session:** "
+            + (
+                "✅ Available (" + (telethon_status.get("source", "unknown") if telethon_ready else "") + ")"
                 if telethon_ready
                 else "❌ Not configured"
             ),
@@ -635,18 +664,30 @@ def setup_handlers(application: Application) -> None:
         # In case the helper isn't available for any reason, fall back safely.
         media_filter = filters.ALL & ~filters.TEXT
 
-    application.add_handler(MessageHandler(media_filter, latency_wrapper(handler_manager.handle_media_message, "handle_media_message")))
+    application.add_handler(
+        MessageHandler(media_filter, latency_wrapper(handler_manager.handle_media_message, "handle_media_message"))
+    )
 
     try:
         url_filter = filters.Regex(r"https?://") & ~filters.COMMAND
-        application.add_handler(MessageHandler(url_filter, latency_wrapper(handler_manager.handle_media_message, "handle_media_url_message"), block=True))
+        application.add_handler(
+            MessageHandler(
+                url_filter,
+                latency_wrapper(handler_manager.handle_media_message, "handle_media_url_message"),
+                block=True,
+            )
+        )
     except Exception:
         logger.debug("URL text handler not registered; Regex filter unavailable")
 
     # Ensure a fallback handler is present for non-command, non-text messages.
     try:
         fallback_filter = filters.ALL & ~filters.COMMAND & ~filters.TEXT
-        application.add_handler(MessageHandler(fallback_filter, latency_wrapper(handler_manager.handle_media_message, "handle_media_message_fallback")))
+        application.add_handler(
+            MessageHandler(
+                fallback_filter, latency_wrapper(handler_manager.handle_media_message, "handle_media_message_fallback")
+            )
+        )
         logger.info("Fallback media handler registered for non-command non-text messages")
     except Exception:
         logger.debug("Fallback media handler not registered")
@@ -776,14 +817,10 @@ def setup_handlers(application: Application) -> None:
                     f"✅ Logged out and removed Telethon session files:\n{chr(10).join(removed)}"
                 )
             else:
-                await update.message.reply_text(
-                    "No local Telethon session file was found to remove."
-                )
+                await update.message.reply_text("No local Telethon session file was found to remove.")
         except Exception as exc:
             logger.exception("/logout failed: %s", exc)
-            await update.message.reply_text(
-                "Failed to remove the Telethon session. Check server logs for details."
-            )
+            await update.message.reply_text("Failed to remove the Telethon session. Check server logs for details.")
 
     application.add_handler(CommandHandler("logout", latency_wrapper(logout_command, "logout_command")))
 
@@ -904,7 +941,9 @@ def setup_handlers(application: Application) -> None:
                     wait = getattr(e, "seconds", None) or getattr(e, "timeout", None) or 60
                     until = time.time() + int(wait)
                     context.user_data["login_flood_wait_until"] = until
-                    await update.message.reply_text(f"Too many requests; please wait {int(wait)} seconds before retrying.")
+                    await update.message.reply_text(
+                        f"Too many requests; please wait {int(wait)} seconds before retrying."
+                    )
                     logger.warning("FloodWait during clearflood resend for %s: wait=%s", phone, wait)
                     return
             except Exception:
@@ -929,7 +968,9 @@ def setup_handlers(application: Application) -> None:
         except Exception:
             pass
 
-        await update.message.reply_text("Cleared FloodWait and resent login code (best-effort). Check your Telegram app for the code.")
+        await update.message.reply_text(
+            "Cleared FloodWait and resent login code (best-effort). Check your Telegram app for the code."
+        )
 
     application.add_handler(CommandHandler("clearflood", latency_wrapper(clearflood_command, "clearflood_command")))
 
@@ -947,9 +988,7 @@ def setup_handlers(application: Application) -> None:
         try:
             checker = get_session_healthchecker()
             if not checker.last_health:
-                await update.message.reply_text(
-                    "🩺 Running session health check... (please wait a moment)"
-                )
+                await update.message.reply_text("🩺 Running session health check... (please wait a moment)")
                 await checker.run_once()
             text = checker.format_status_text()
             await update.message.reply_text(text, parse_mode="Markdown")
@@ -957,7 +996,9 @@ def setup_handlers(application: Application) -> None:
             logger.exception("/sessionstatus failed: %s", e)
             await update.message.reply_text(f"❌ Failed to check session health: {e}")
 
-    application.add_handler(CommandHandler("sessionstatus", latency_wrapper(sessionstatus_command, "sessionstatus_command")))
+    application.add_handler(
+        CommandHandler("sessionstatus", latency_wrapper(sessionstatus_command, "sessionstatus_command"))
+    )
 
     def _clear_login_flow(user_id, context):
         with contextlib.suppress(Exception):
@@ -1040,12 +1081,7 @@ def setup_handlers(application: Application) -> None:
         _ec_phone = context.user_data.get("awaiting_login_phone")
         _ec_code = context.user_data.get("awaiting_login_code")
         _ec_password = context.user_data.get("awaiting_login_password")
-        _ec_active = bool(
-            (_ec_pf is not None and not _ec_pf.done())
-            or _ec_phone
-            or _ec_code
-            or _ec_password
-        )
+        _ec_active = bool((_ec_pf is not None and not _ec_pf.done()) or _ec_phone or _ec_code or _ec_password)
         if not _ec_active:
             # No active login flow — fall through to single cleanup below
             pass
@@ -1093,6 +1129,7 @@ def setup_handlers(application: Application) -> None:
             # 1. Check the persisted JSON file first
             try:
                 from utils.telethon_session import _load_session_string_from_file_async
+
                 saved_session_str = await _load_session_string_from_file_async(client_type="telethon")
             except Exception:
                 pass
@@ -1104,10 +1141,7 @@ def setup_handlers(application: Application) -> None:
                     if db_model_l is not None:
                         sess_data = await db_model_l.load_session(user_id)
                         if sess_data and isinstance(sess_data, dict):
-                            saved_session_str = (
-                                sess_data.get("telethon_session")
-                                or sess_data.get("string_session")
-                            )
+                            saved_session_str = sess_data.get("telethon_session") or sess_data.get("string_session")
                 except Exception as load_err:
                     logger.warning("Failed to load Telethon session from MongoDB: %s", load_err)
                     saved_session_str = None
@@ -1117,13 +1151,14 @@ def setup_handlers(application: Application) -> None:
                     client = TelegramClient(StringSession(saved_session_str), api_id, api_hash)
                     logger.info(
                         "Loaded saved Telethon session from MongoDB for user=%s (%d chars)",
-                        user_id, len(saved_session_str),
+                        user_id,
+                        len(saved_session_str),
                     )
                 except Exception as session_err:
                     logger.warning(
-                        "Stored Telethon session string is invalid for user=%s: %s; "
-                        "starting fresh login",
-                        user_id, session_err,
+                        "Stored Telethon session string is invalid for user=%s: %s; starting fresh login",
+                        user_id,
+                        session_err,
                     )
                     saved_session_str = None
                     client = TelegramClient(StringSession(), api_id, api_hash)
@@ -1147,7 +1182,6 @@ def setup_handlers(application: Application) -> None:
                 # Telethon's _run_code_callback() properly awaits async callbacks by
                 # checking iscoroutinefunction(). The async callback creates an asyncio.Future
                 # that the PTB message handler resolves with the user's input.
-
 
                 async def _do_start():
                     from telethon.errors import FloodWaitError, PhoneCodeExpiredError, SessionPasswordNeededError
@@ -1177,12 +1211,30 @@ def setup_handlers(application: Application) -> None:
                             _code = await _future
                             # Normalize code (Unicode digits -> ASCII)
                             try:
-                                _trans = str.maketrans({
-                                    "\u0660": "0", "\u0661": "1", "\u0662": "2", "\u0663": "3", "\u0664": "4",
-                                    "\u0665": "5", "\u0666": "6", "\u0667": "7", "\u0668": "8", "\u0669": "9",
-                                    "\u06F0": "0", "\u06F1": "1", "\u06F2": "2", "\u06F3": "3", "\u06F4": "4",
-                                    "\u06F5": "5", "\u06F6": "6", "\u06F7": "7", "\u06F8": "8", "\u06F9": "9",
-                                })
+                                _trans = str.maketrans(
+                                    {
+                                        "\u0660": "0",
+                                        "\u0661": "1",
+                                        "\u0662": "2",
+                                        "\u0663": "3",
+                                        "\u0664": "4",
+                                        "\u0665": "5",
+                                        "\u0666": "6",
+                                        "\u0667": "7",
+                                        "\u0668": "8",
+                                        "\u0669": "9",
+                                        "\u06f0": "0",
+                                        "\u06f1": "1",
+                                        "\u06f2": "2",
+                                        "\u06f3": "3",
+                                        "\u06f4": "4",
+                                        "\u06f5": "5",
+                                        "\u06f6": "6",
+                                        "\u06f7": "7",
+                                        "\u06f8": "8",
+                                        "\u06f9": "9",
+                                    }
+                                )
                                 _code = (_code or "").translate(_trans)
                                 _code = "".join(c for c in _code if c.isdigit())
                             except Exception:
@@ -1203,7 +1255,9 @@ def setup_handlers(application: Application) -> None:
                         for _attempt in range(2):
                             try:
                                 logger.info(
-                                    "Login via client.start() for %s (attempt %d/2)", phone, _attempt + 1,
+                                    "Login via client.start() for %s (attempt %d/2)",
+                                    phone,
+                                    _attempt + 1,
                                 )
                                 await client.start(
                                     phone=phone,
@@ -1253,6 +1307,7 @@ def setup_handlers(application: Application) -> None:
                             # Save to local JSON file (bridges to downloader/uploader fallback chain)
                             try:
                                 from utils.telethon_session import save_session_string_to_file_async
+
                                 if await save_session_string_to_file_async(str(session_str), client_type="telethon"):
                                     saved_to.append("JSON file")
                             except Exception:
@@ -1262,14 +1317,11 @@ def setup_handlers(application: Application) -> None:
                             # so both sessions are in the file right after /login.
                             try:
                                 from utils.telethon_session import save_session_string_to_file_async as _pyro_save
+
                                 _pyro_env = os.getenv("PYROGRAM_SESSION")
-                                if _pyro_env and await _pyro_save(
-                                    _pyro_env, client_type="pyrogram"
-                                ):
+                                if _pyro_env and await _pyro_save(_pyro_env, client_type="pyrogram"):
                                     saved_to.append("Pyrogram JSON")
-                                    logger.info(
-                                        "Eagerly persisted PYROGRAM_SESSION to JSON (during /login)"
-                                    )
+                                    logger.info("Eagerly persisted PYROGRAM_SESSION to JSON (during /login)")
                             except Exception:
                                 pass
 
@@ -1282,7 +1334,7 @@ def setup_handlers(application: Application) -> None:
                         else:
                             await context.bot.send_message(
                                 chat_id=update.effective_chat.id,
-                                text="Login completed but session is not authorized. Please run /login again."
+                                text="Login completed but session is not authorized. Please run /login again.",
                             )
 
                     except Exception as start_exc:
@@ -1292,17 +1344,17 @@ def setup_handlers(application: Application) -> None:
                                 wait = getattr(start_exc, "seconds", None) or getattr(start_exc, "timeout", None) or 60
                                 await context.bot.send_message(
                                     chat_id=update.effective_chat.id,
-                                    text=f"Too many attempts. Please wait {int(wait)} seconds before retrying."
+                                    text=f"Too many attempts. Please wait {int(wait)} seconds before retrying.",
                                 )
                             else:
                                 await context.bot.send_message(
                                     chat_id=update.effective_chat.id,
-                                    text="Login failed. Check server logs for details. Please run /login again."
+                                    text="Login failed. Check server logs for details. Please run /login again.",
                                 )
                         except Exception:
                             await context.bot.send_message(
                                 chat_id=update.effective_chat.id,
-                                text="Login failed unexpectedly. Please run /login again."
+                                text="Login failed unexpectedly. Please run /login again.",
                             )
 
                     finally:
@@ -1316,8 +1368,6 @@ def setup_handlers(application: Application) -> None:
                         except Exception:
                             pass
                         _clear_login_flow(user_id, context)
-
-
 
                 # Start the background task that handles the entire login flow.
                 # _do_start() uses client.start() which manages the full auth
@@ -1348,9 +1398,7 @@ def setup_handlers(application: Application) -> None:
             client = context.user_data.get("login_client")
             phone = context.user_data.get("login_phone")
             if client is None or not phone:
-                await update.message.reply_text(
-                    "Session state lost. Please run /login again to start a fresh login."
-                )
+                await update.message.reply_text("Session state lost. Please run /login again to start a fresh login.")
                 _clear_login_flow(user_id, context)
                 return
 
@@ -1361,12 +1409,30 @@ def setup_handlers(application: Application) -> None:
                 _input = update.message.text.strip()
                 if pending_type == "code":
                     # Normalize code input (handle Unicode digits)
-                    trans_digits = str.maketrans({
-                        "\u0660": "0", "\u0661": "1", "\u0662": "2", "\u0663": "3", "\u0664": "4",
-                        "\u0665": "5", "\u0666": "6", "\u0667": "7", "\u0668": "8", "\u0669": "9",
-                        "\u06F0": "0", "\u06F1": "1", "\u06F2": "2", "\u06F3": "3", "\u06F4": "4",
-                        "\u06F5": "5", "\u06F6": "6", "\u06F7": "7", "\u06F8": "8", "\u06F9": "9",
-                    })
+                    trans_digits = str.maketrans(
+                        {
+                            "\u0660": "0",
+                            "\u0661": "1",
+                            "\u0662": "2",
+                            "\u0663": "3",
+                            "\u0664": "4",
+                            "\u0665": "5",
+                            "\u0666": "6",
+                            "\u0667": "7",
+                            "\u0668": "8",
+                            "\u0669": "9",
+                            "\u06f0": "0",
+                            "\u06f1": "1",
+                            "\u06f2": "2",
+                            "\u06f3": "3",
+                            "\u06f4": "4",
+                            "\u06f5": "5",
+                            "\u06f6": "6",
+                            "\u06f7": "7",
+                            "\u06f8": "8",
+                            "\u06f9": "9",
+                        }
+                    )
                     norm_code = (_input or "").translate(trans_digits)
                     norm_code = "".join([c for c in norm_code if c.isdigit()])
                     resolved_value = norm_code
@@ -1376,7 +1442,8 @@ def setup_handlers(application: Application) -> None:
                 pending_future.set_result(resolved_value)
                 logger.info(
                     "Telethon login %s resolved via client.start() for user=%s",
-                    pending_type or "input", user_id,
+                    pending_type or "input",
+                    user_id,
                 )
                 return
             except Exception as exc:
@@ -1442,7 +1509,12 @@ async def main(background: bool = False) -> None:
         http_read_timeout = 30.0
 
     try:
-        req = Request(connection_pool_size=http_pool_size, pool_timeout=http_pool_timeout, connect_timeout=http_connect_timeout, read_timeout=http_read_timeout)
+        req = Request(
+            connection_pool_size=http_pool_size,
+            pool_timeout=http_pool_timeout,
+            connect_timeout=http_connect_timeout,
+            read_timeout=http_read_timeout,
+        )
         bot_instance = Bot(token=BOT_TOKEN, request=req)
         application = Application.builder().bot(bot_instance).build()
     except Exception:
@@ -1464,7 +1536,12 @@ async def main(background: bool = False) -> None:
             try:
                 gu_pool_size = int(os.environ.get("GET_UPDATES_POOL_SIZE", "5"))
                 gu_pool_timeout = float(os.environ.get("GET_UPDATES_POOL_TIMEOUT", str(http_pool_timeout)))
-                gu_req = Request(connection_pool_size=gu_pool_size, pool_timeout=gu_pool_timeout, connect_timeout=http_connect_timeout, read_timeout=http_read_timeout)
+                gu_req = Request(
+                    connection_pool_size=gu_pool_size,
+                    pool_timeout=gu_pool_timeout,
+                    connect_timeout=http_connect_timeout,
+                    read_timeout=http_read_timeout,
+                )
                 GET_UPDATES_BOT = Bot(token=BOT_TOKEN, request=gu_req)
                 logger.info("Dedicated get_updates client initialized (pool=%s)", gu_pool_size)
             except Exception as e:
@@ -1509,11 +1586,17 @@ async def main(background: bool = False) -> None:
     # across workers/processes. Otherwise fall back to in-memory limiter.
     try:
         if application.bot_data.get("redis_url"):
-            conversion_limiter = ConversionRateLimiterRedis(conversions_per_hour=int(os.environ.get("CONVERSIONS_PER_HOUR", "360")))
+            conversion_limiter = ConversionRateLimiterRedis(
+                conversions_per_hour=int(os.environ.get("CONVERSIONS_PER_HOUR", "360"))
+            )
         else:
-            conversion_limiter = ConversionRateLimiter(conversions_per_hour=int(os.environ.get("CONVERSIONS_PER_HOUR", "360")))
+            conversion_limiter = ConversionRateLimiter(
+                conversions_per_hour=int(os.environ.get("CONVERSIONS_PER_HOUR", "360"))
+            )
     except Exception:
-        conversion_limiter = ConversionRateLimiter(conversions_per_hour=int(os.environ.get("CONVERSIONS_PER_HOUR", "360")))
+        conversion_limiter = ConversionRateLimiter(
+            conversions_per_hour=int(os.environ.get("CONVERSIONS_PER_HOUR", "360"))
+        )
 
     # Attach rate limiters to application context
     application.bot_data["api_rate_limiter"] = api_limiter
@@ -1525,7 +1608,10 @@ async def main(background: bool = False) -> None:
             try:
                 storage_backend = await get_storage_backend()
                 application.bot_data["storage_backend"] = storage_backend
-                logger.info("Storage backend initialized: %s", (os.getenv("STORAGE_BACKEND") or getattr(cfg, "STORAGE_BACKEND", "local")))
+                logger.info(
+                    "Storage backend initialized: %s",
+                    (os.getenv("STORAGE_BACKEND") or getattr(cfg, "STORAGE_BACKEND", "local")),
+                )
             except Exception as e:
                 logger.warning("Storage backend initialization failed: %s", e)
     except Exception:
@@ -1574,7 +1660,7 @@ async def main(background: bool = False) -> None:
         logger.error(f"Failed to start session healthcheck: {e}")
 
     # ── Eagerly persist env var session strings to JSON file on startup ──
-    # After a rebuild on Render the persisted JSON file is empty, so the
+    # After a rebuild on Railway the persisted JSON file is empty, so the
     # "/loginstatus" command shows "Pyrogram in JSON: ❌" even though the
     # PYROGRAM_SESSION env var is set and usable.  The healthchecker would
     # eventually write it (after ~1 hour), but we do it here immediately
@@ -1590,35 +1676,31 @@ async def main(background: bool = False) -> None:
         # Persist Pyrogram session from env var if different from JSON
         pyro_env = os.getenv("PYROGRAM_SESSION")
         if pyro_env and existing_json.get("pyrogram_session") != pyro_env:
-            saved = await save_session_string_to_file_async(
-                pyro_env, client_type="pyrogram"
-            )
+            saved = await save_session_string_to_file_async(pyro_env, client_type="pyrogram")
             if saved:
-                logger.info(
-                    "Eagerly persisted PYROGRAM_SESSION env var to JSON file"
-                )
+                logger.info("Eagerly persisted PYROGRAM_SESSION env var to JSON file")
                 # Update the in-memory snapshot so the check below sees it
                 existing_json = await _load_all_sessions_from_file_async()
 
         # Persist Telethon session from env var if different from JSON
         telethon_env = None
         for _k in (
-            "API_SESSION", "SESSION", "api_session",
-            "USERBOT_SESSION", "userbot_session",
-            "TELETHON_SESSION", "telethon_session",
+            "API_SESSION",
+            "SESSION",
+            "api_session",
+            "USERBOT_SESSION",
+            "userbot_session",
+            "TELETHON_SESSION",
+            "telethon_session",
         ):
             _v = os.getenv(_k)
             if _v:
                 telethon_env = _v
                 break
         if telethon_env and existing_json.get("telethon_session") != telethon_env:
-            saved = await save_session_string_to_file_async(
-                telethon_env, client_type="telethon"
-            )
+            saved = await save_session_string_to_file_async(telethon_env, client_type="telethon")
             if saved:
-                logger.info(
-                    "Eagerly persisted Telethon session env var to JSON file"
-                )
+                logger.info("Eagerly persisted Telethon session env var to JSON file")
     except Exception as exc:
         logger.debug("Eager env-var-to-JSON persistence skipped: %s", exc)
 
@@ -1635,9 +1717,7 @@ async def main(background: bool = False) -> None:
                     ADMIN_USER_ID,
                     {"pyrogram_session": _mongo_pyro},
                 )
-                logger.info(
-                    "Eagerly persisted PYROGRAM_SESSION to MongoDB (at startup)"
-                )
+                logger.info("Eagerly persisted PYROGRAM_SESSION to MongoDB (at startup)")
     except Exception as exc:
         logger.debug("Eager Pyrogram->MongoDB persistence skipped: %s", exc)
 
@@ -1723,7 +1803,9 @@ async def main(background: bool = False) -> None:
                     has_dispatcher_proc = bool(dispatcher and hasattr(dispatcher, "process_update"))
                     app_has_proc = hasattr(application, "process_update")
                     if not has_dispatcher_proc and not app_has_proc:
-                        logger.warning("Dispatcher not available after Application.start(); enabling FORCE_POLLING fallback")
+                        logger.warning(
+                            "Dispatcher not available after Application.start(); enabling FORCE_POLLING fallback"
+                        )
                         force_polling = True
             except Exception:
                 logger.exception("Failed to evaluate dispatcher presence for FORCE_POLLING fallback")
@@ -1765,6 +1847,7 @@ async def main(background: bool = False) -> None:
                 _longpoll_redis_lock = None
                 try:
                     from utils.redis_lock import RedisLock
+
                     _longpoll_redis_lock = RedisLock("longpoller", ttl=35)
                 except Exception:
                     _longpoll_redis_lock = None
@@ -1850,7 +1933,7 @@ async def main(background: bool = False) -> None:
                     logger.exception("Failed to start background long-poller")
 
             # Start the ffmpeg worker as a background task so the web service
-            # can process jobs whenever it is awake (critical for Render free tier
+            # can process jobs whenever it is awake (critical for free tier
             # where separate worker services may spin down).
             worker_task = None
             if create_worker_task is not None:
@@ -1863,17 +1946,23 @@ async def main(background: bool = False) -> None:
             else:
                 logger.info("create_worker_task not available; background worker disabled")
 
-            # Start keep-alive heartbeat to prevent Render free tier spin-down.
+            # Start keep-alive heartbeat to prevent free tier spin-down.
             # Periodically makes an HTTP GET to our own /health endpoint,
-            # which counts as inbound traffic and resets the 15-min inactivity timer.
+            # which counts as inbound traffic and resets the inactivity timer.
             keep_alive_task = None
             _ka_enabled = os.environ.get("KEEP_ALIVE_DISABLED", "").lower() not in ("1", "true", "yes")
             if _ka_enabled:
                 try:
-                    _ka_url = (os.environ.get("KEEP_ALIVE_URL") or os.environ.get("RENDER_EXTERNAL_URL") or "")
+                    _ka_url = os.environ.get("KEEP_ALIVE_URL") or ""
+                    if not _ka_url:
+                        _railway_domain = os.environ.get("RAILWAY_PUBLIC_DOMAIN") or ""
+                        if _railway_domain:
+                            # Railway provides RAILWAY_PUBLIC_DOMAIN as a hostname without protocol
+                            _ka_url = f"https://{_railway_domain}"
                     if not _ka_url:
                         try:
                             from urllib.parse import urlparse as _urlparse
+
                             _parsed = _urlparse(WEBHOOK_URL or "")
                             if _parsed.netloc:
                                 _ka_url = f"{_parsed.scheme}://{_parsed.netloc}"
@@ -1886,7 +1975,7 @@ async def main(background: bool = False) -> None:
                         _ka_interval = max(60, min(840, int(os.environ.get("KEEP_ALIVE_INTERVAL", "600"))))
 
                         async def _keep_alive_loop():
-                            """Periodically ping /health to prevent Render free tier spin-down."""
+                            """Periodically ping /health to prevent free tier spin-down."""
                             logger.info("Keep-alive heartbeat started: pinging %s every %ss", _health_url, _ka_interval)
                             try:
                                 async with aiohttp.ClientSession() as _session:
@@ -1911,7 +2000,9 @@ async def main(background: bool = False) -> None:
 
                         keep_alive_task = asyncio.create_task(_keep_alive_loop())
                     else:
-                        logger.info("Keep-alive heartbeat disabled: no public URL available (set KEEP_ALIVE_URL, RENDER_EXTERNAL_URL, or WEBHOOK_URL)")
+                        logger.info(
+                            "Keep-alive heartbeat disabled: no public URL available (set KEEP_ALIVE_URL, RAILWAY_PUBLIC_DOMAIN, or WEBHOOK_URL)"
+                        )
                 except Exception as _ka_err:
                     logger.warning("Failed to start keep-alive heartbeat: %s", _ka_err)
                     keep_alive_task = None
@@ -1927,7 +2018,7 @@ async def main(background: bool = False) -> None:
                 logger.info("Background bot task cancelled; stopping application")
             finally:
                 # CRITICAL: Do NOT delete the webhook on graceful shutdown.
-                # On Render's free tier, the service spins down after 15 minutes
+                # On some platforms the service spins down after inactivity
                 # of inactivity. The webhook MUST persist so that Telegram's
                 # next update POST can wake the service back up. If we delete
                 # the webhook here, Telegram has no URL to send updates to,
@@ -2072,6 +2163,7 @@ try:
         @app.get("/upload")
         async def _upload_redirect():
             return RedirectResponse(url="/flask/upload")
+
         logger.info("Mounted Flask web UI at /flask and redirect /upload -> /flask/upload")
 
         # Expose a couple of convenient root-level endpoints that mirror the
@@ -2084,209 +2176,221 @@ try:
 
             @app.get("/status/{job_id}")
             async def root_status(job_id: str):
-                        try:
-                            job_hash = None
+                try:
+                    job_hash = None
 
-                            # 1) Try Flask helper if available
+                    # 1) Try Flask helper if available
+                    try:
+                        if getattr(flask_webapp, "aioredis_available", False):
                             try:
-                                if getattr(flask_webapp, "aioredis_available", False):
-                                    try:
-                                        job_hash = await flask_webapp._get_job_hash(job_id)
-                                    except Exception:
-                                        job_hash = None
+                                job_hash = await flask_webapp._get_job_hash(job_id)
                             except Exception:
                                 job_hash = None
+                    except Exception:
+                        job_hash = None
 
-                            # 2) Fallback: try to read directly from Redis using job_queue.get_redis
-                            if not job_hash:
-                                try:
-                                    from utils.job_queue import get_redis
+                    # 2) Fallback: try to read directly from Redis using job_queue.get_redis
+                    if not job_hash:
+                        try:
+                            from utils.job_queue import get_redis
 
-                                    r = await get_redis()
-                                    try:
-                                        raw = await r.hgetall(f"ffmpeg:job:{job_id}")
-                                    finally:
-                                        with contextlib.suppress(Exception):
-                                            await r.close()
-                                    if raw:
-                                        # aioredis returns a dict possibly with bytes; decode keys/values
-                                        decoded = {}
-                                        for k, v in raw.items():
-                                            key = k.decode() if isinstance(k, bytes) else k
-                                            val = v.decode() if isinstance(v, bytes) else v
-                                            decoded[key] = val
-                                        job_hash = decoded
-                                except Exception:
-                                    job_hash = None
-
-                            # 3) If we have a job hash, normalize and return
-                            if job_hash:
-                                progress = float(job_hash.get("progress") or 0.0)
-                                message = job_hash.get("message") or "queued"
-                                status = job_hash.get("status") or ("done" if job_hash.get("output") else "processing")
-                                out = job_hash.get("output")
-                                resp = {"job_id": job_id, "progress": progress, "message": message, "status": status, "output": out}
-                                try:
-                                    if job_hash.get("out_bytes") is not None:
-                                        resp["out_bytes"] = int(job_hash.get("out_bytes"))
-                                except Exception:
-                                    pass
-                                try:
-                                    if job_hash.get("in_bytes") is not None:
-                                        resp["in_bytes"] = int(job_hash.get("in_bytes"))
-                                except Exception:
-                                    pass
-                                try:
-                                    if job_hash.get("progress_by_size") is not None:
-                                        resp["progress_by_size"] = float(job_hash.get("progress_by_size"))
-                                except Exception:
-                                    pass
-                                return resp
-
-                            # 4) Fallback to the in-memory JOB_STORE from the Flask app
+                            r = await get_redis()
                             try:
-                                local = flask_webapp.JOB_STORE.get(job_id)
-                            except Exception:
-                                local = None
-                            if local:
-                                return {
-                                    "job_id": job_id,
-                                    "progress": float(local.get("progress", 0.0)),
-                                    "message": local.get("message", "processing" if local.get("status") != "done" else "done"),
-                                    "status": local.get("status", "processing"),
-                                    "output": local.get("output"),
-                                }
+                                raw = await r.hgetall(f"ffmpeg:job:{job_id}")
+                            finally:
+                                with contextlib.suppress(Exception):
+                                    await r.close()
+                            if raw:
+                                # aioredis returns a dict possibly with bytes; decode keys/values
+                                decoded = {}
+                                for k, v in raw.items():
+                                    key = k.decode() if isinstance(k, bytes) else k
+                                    val = v.decode() if isinstance(v, bytes) else v
+                                    decoded[key] = val
+                                job_hash = decoded
+                        except Exception:
+                            job_hash = None
 
-                            # 5) Check for a stored output file in Flask's OUTPUT_DIR if available
-                            try:
-                                out_dir = getattr(flask_webapp, "OUTPUT_DIR", None)
-                            except Exception:
-                                out_dir = None
-                            if out_dir:
-                                out_path = os.path.join(out_dir, f"{job_id}.mp4")
-                                if os.path.exists(out_path):
-                                    return {"job_id": job_id, "progress": 100.0, "message": "done", "status": "done", "output": out_path}
+                    # 3) If we have a job hash, normalize and return
+                    if job_hash:
+                        progress = float(job_hash.get("progress") or 0.0)
+                        message = job_hash.get("message") or "queued"
+                        status = job_hash.get("status") or ("done" if job_hash.get("output") else "processing")
+                        out = job_hash.get("output")
+                        resp = {
+                            "job_id": job_id,
+                            "progress": progress,
+                            "message": message,
+                            "status": status,
+                            "output": out,
+                        }
+                        try:
+                            if job_hash.get("out_bytes") is not None:
+                                resp["out_bytes"] = int(job_hash.get("out_bytes"))
+                        except Exception:
+                            pass
+                        try:
+                            if job_hash.get("in_bytes") is not None:
+                                resp["in_bytes"] = int(job_hash.get("in_bytes"))
+                        except Exception:
+                            pass
+                        try:
+                            if job_hash.get("progress_by_size") is not None:
+                                resp["progress_by_size"] = float(job_hash.get("progress_by_size"))
+                        except Exception:
+                            pass
+                        return resp
 
-                            # 6) Default queued response
-                            return {"job_id": job_id, "progress": 0.0, "message": "queued", "status": "queued"}
-                        except Exception as e:
-                            logger.exception("Diagnostics error: %s", e)
-                            return {"error": "Internal error. Check server logs."}
+                    # 4) Fallback to the in-memory JOB_STORE from the Flask app
+                    try:
+                        local = flask_webapp.JOB_STORE.get(job_id)
+                    except Exception:
+                        local = None
+                    if local:
+                        return {
+                            "job_id": job_id,
+                            "progress": float(local.get("progress", 0.0)),
+                            "message": local.get("message", "processing" if local.get("status") != "done" else "done"),
+                            "status": local.get("status", "processing"),
+                            "output": local.get("output"),
+                        }
+
+                    # 5) Check for a stored output file in Flask's OUTPUT_DIR if available
+                    try:
+                        out_dir = getattr(flask_webapp, "OUTPUT_DIR", None)
+                    except Exception:
+                        out_dir = None
+                    if out_dir:
+                        out_path = os.path.join(out_dir, f"{job_id}.mp4")
+                        if os.path.exists(out_path):
+                            return {
+                                "job_id": job_id,
+                                "progress": 100.0,
+                                "message": "done",
+                                "status": "done",
+                                "output": out_path,
+                            }
+
+                    # 6) Default queued response
+                    return {"job_id": job_id, "progress": 0.0, "message": "queued", "status": "queued"}
+                except Exception as e:
+                    logger.exception("Diagnostics error: %s", e)
+                    return {"error": "Internal error. Check server logs."}
 
             @app.get("/internal/diag")
             async def root_diag(request: Request, job_id: str | None = None, token: str | None = None):
-                    # Token validation mirrors the Flask endpoint behavior
-                    DIAG_TOKEN = os.environ.get("DIAG_TOKEN")
-                    incoming = request.headers.get("X-DIAG-TOKEN") or token
-                    if not DIAG_TOKEN:
-                        raise HTTPException(status_code=403, detail="DIAG_TOKEN not configured on server")
-                    if incoming != DIAG_TOKEN:
-                        raise HTTPException(status_code=401, detail="unauthorized")
+                # Token validation mirrors the Flask endpoint behavior
+                DIAG_TOKEN = os.environ.get("DIAG_TOKEN")
+                incoming = request.headers.get("X-DIAG-TOKEN") or token
+                if not DIAG_TOKEN:
+                    raise HTTPException(status_code=403, detail="DIAG_TOKEN not configured on server")
+                if incoming != DIAG_TOKEN:
+                    raise HTTPException(status_code=401, detail="unauthorized")
 
-                    result = {"env": {}, "redis": {}, "logs": {}, "ps": None}
-                    # Minimal masked env snapshot
-                    for k in ("REDIS_URL", "WEB_UPLOAD_URL", "UPLOAD_SECRET", "S3_BUCKET", "AWS_ACCESS_KEY_ID"):
-                        v = os.environ.get(k)
-                        if k == "REDIS_URL" and v:
-                            result["env"][k] = re.sub(r"(redis://[^:]*:)[^@]+@", r"\1****@", v)
-                        elif k == "UPLOAD_SECRET":
-                            result["env"][k] = "****" if v else None
-                        else:
-                            result["env"][k] = v
+                result = {"env": {}, "redis": {}, "logs": {}, "ps": None}
+                # Minimal masked env snapshot
+                for k in ("REDIS_URL", "WEB_UPLOAD_URL", "UPLOAD_SECRET", "S3_BUCKET", "AWS_ACCESS_KEY_ID"):
+                    v = os.environ.get(k)
+                    if k == "REDIS_URL" and v:
+                        result["env"][k] = re.sub(r"(redis://[^:]*:)[^@]+@", r"\1****@", v)
+                    elif k == "UPLOAD_SECRET":
+                        result["env"][k] = "****" if v else None
+                    else:
+                        result["env"][k] = v
 
-                    # Redis diagnostics (best-effort) - try async first, then sync fallback
-                    try:
-                        red_url = os.environ.get("REDIS_URL")
-                        if red_url:
-                            # try async redis helper
-                            try:
-                                from utils.job_queue import get_redis
-
-                                r = await get_redis()
-                                try:
-                                        result["redis"]["ping"] = await r.ping()
-                                        try:
-                                            result["redis"]["ffmpeg_jobs"] = await r.lrange("ffmpeg:jobs", 0, 50)
-                                        except Exception:
-                                            result["redis"]["ffmpeg_jobs"] = []
-                                        try:
-                                            keys = await r.keys("ffmpeg:job:*")
-                                            result["redis"]["job_keys_count"] = len(keys)
-                                            result["redis"]["job_keys_sample"] = keys[:50]
-                                        except Exception:
-                                            result["redis"]["job_keys_count"] = 0
-                                        if job_id:
-                                            try:
-                                                result["redis"]["job_hash"] = await r.hgetall(f"ffmpeg:job:{job_id}")
-                                            except Exception:
-                                                result["redis"]["job_hash"] = {}
-                                finally:
-                                    with contextlib.suppress(Exception):
-                                        await r.close()
-                            except Exception:
-                                # sync fallback
-                                try:
-                                    r2 = flask_webapp.redis_sync.from_url(red_url, decode_responses=True)
-                                    result["redis"]["ping"] = r2.ping()
-                                    try:
-                                        result["redis"]["ffmpeg_jobs"] = r2.lrange("ffmpeg:jobs", 0, 50)
-                                    except Exception:
-                                        result["redis"]["ffmpeg_jobs"] = []
-                                    try:
-                                        keys = r2.keys("ffmpeg:job:*")
-                                        result["redis"]["job_keys_count"] = len(keys)
-                                        result["redis"]["job_keys_sample"] = keys[:50]
-                                    except Exception:
-                                        result["redis"]["job_keys_count"] = 0
-                                    if job_id:
-                                        try:
-                                            result["redis"]["job_hash"] = r2.hgetall(f"ffmpeg:job:{job_id}")
-                                        except Exception:
-                                            result["redis"]["job_hash"] = {}
-                                except Exception as e:
-                                    result["redis"]["error"] = str(e)
-                        else:
-                            result["redis"]["error"] = "REDIS_URL not set"
-                    except Exception as e:
-                        result["redis"]["error"] = str(e)
-
-                    # Tail project logs
-                    try:
-                        logs_dir = os.path.join(os.getcwd(), "logs")
-                        if os.path.isdir(logs_dir):
-                            for fname in sorted(os.listdir(logs_dir))[-10:]:
-                                path = os.path.join(logs_dir, fname)
-                                if os.path.isfile(path):
-                                    with open(path, encoding="utf-8", errors="replace") as fh:
-                                        lines = fh.readlines()[-500:]
-                                        result["logs"][fname] = "".join(lines)
-                        # Also include worker log if present for quick debugging
+                # Redis diagnostics (best-effort) - try async first, then sync fallback
+                try:
+                    red_url = os.environ.get("REDIS_URL")
+                    if red_url:
+                        # try async redis helper
                         try:
-                            worker_log = os.path.join(tempfile.gettempdir(), "worker.log")
-                            if os.path.isfile(worker_log):
-                                with open(worker_log, encoding="utf-8", errors="replace") as fh:
-                                    lines = fh.readlines()[-1000:]
-                                    result["logs"]["worker.log"] = "".join(lines)
+                            from utils.job_queue import get_redis
+
+                            r = await get_redis()
+                            try:
+                                result["redis"]["ping"] = await r.ping()
+                                try:
+                                    result["redis"]["ffmpeg_jobs"] = await r.lrange("ffmpeg:jobs", 0, 50)
+                                except Exception:
+                                    result["redis"]["ffmpeg_jobs"] = []
+                                try:
+                                    keys = await r.keys("ffmpeg:job:*")
+                                    result["redis"]["job_keys_count"] = len(keys)
+                                    result["redis"]["job_keys_sample"] = keys[:50]
+                                except Exception:
+                                    result["redis"]["job_keys_count"] = 0
+                                if job_id:
+                                    try:
+                                        result["redis"]["job_hash"] = await r.hgetall(f"ffmpeg:job:{job_id}")
+                                    except Exception:
+                                        result["redis"]["job_hash"] = {}
+                            finally:
+                                with contextlib.suppress(Exception):
+                                    await r.close()
                         except Exception:
-                            pass
-                    except Exception:
-                        result["logs"]["error"] = traceback.format_exc()
+                            # sync fallback
+                            try:
+                                r2 = flask_webapp.redis_sync.from_url(red_url, decode_responses=True)
+                                result["redis"]["ping"] = r2.ping()
+                                try:
+                                    result["redis"]["ffmpeg_jobs"] = r2.lrange("ffmpeg:jobs", 0, 50)
+                                except Exception:
+                                    result["redis"]["ffmpeg_jobs"] = []
+                                try:
+                                    keys = r2.keys("ffmpeg:job:*")
+                                    result["redis"]["job_keys_count"] = len(keys)
+                                    result["redis"]["job_keys_sample"] = keys[:50]
+                                except Exception:
+                                    result["redis"]["job_keys_count"] = 0
+                                if job_id:
+                                    try:
+                                        result["redis"]["job_hash"] = r2.hgetall(f"ffmpeg:job:{job_id}")
+                                    except Exception:
+                                        result["redis"]["job_hash"] = {}
+                            except Exception as e:
+                                result["redis"]["error"] = str(e)
+                    else:
+                        result["redis"]["error"] = "REDIS_URL not set"
+                except Exception as e:
+                    result["redis"]["error"] = str(e)
 
-                    # Basic process list snapshot
+                # Tail project logs
+                try:
+                    logs_dir = os.path.join(os.getcwd(), "logs")
+                    if os.path.isdir(logs_dir):
+                        for fname in sorted(os.listdir(logs_dir))[-10:]:
+                            path = os.path.join(logs_dir, fname)
+                            if os.path.isfile(path):
+                                with open(path, encoding="utf-8", errors="replace") as fh:
+                                    lines = fh.readlines()[-500:]
+                                    result["logs"][fname] = "".join(lines)
+                    # Also include worker log if present for quick debugging
                     try:
-                        ps_out = subprocess.check_output(["ps", "aux"], stderr=subprocess.STDOUT, text=True)
-                        result["ps"] = "\n".join(ps_out.splitlines()[:200])
+                        worker_log = os.path.join(tempfile.gettempdir(), "worker.log")
+                        if os.path.isfile(worker_log):
+                            with open(worker_log, encoding="utf-8", errors="replace") as fh:
+                                lines = fh.readlines()[-1000:]
+                                result["logs"]["worker.log"] = "".join(lines)
                     except Exception:
-                        result["ps"] = None
+                        pass
+                except Exception:
+                    result["logs"]["error"] = traceback.format_exc()
 
-                    return result
+                # Basic process list snapshot
+                try:
+                    ps_out = subprocess.check_output(["ps", "aux"], stderr=subprocess.STDOUT, text=True)
+                    result["ps"] = "\n".join(ps_out.splitlines()[:200])
+                except Exception:
+                    result["ps"] = None
+
+                return result
 
             @app.post("/internal/diag/run")
             async def run_diag_action(request: Request):
                 """Execute limited diagnostics actions (ffprobe/remux/reencode/tail_logs/job_info).
 
                 Protected by `DIAG_TOKEN` header (X-DIAG-TOKEN). Intended for short-lived diagnostics
-                on the running Render instance; commands have timeouts to avoid long blocking.
+                on the running instance; commands have timeouts to avoid long blocking.
                 """
                 DIAG_TOKEN = os.environ.get("DIAG_TOKEN")
                 incoming = request.headers.get("X-DIAG-TOKEN")
@@ -2306,13 +2410,17 @@ try:
                 out = {"action": action}
 
                 # Resolve ffmpeg/ffprobe paths
-                ffprobe = getattr(cfg, "FFPROBE_PATH", None) or (FFMPEG_PATH.replace("ffmpeg", "ffprobe") if "ffmpeg" in FFMPEG_PATH else "ffprobe")
+                ffprobe = getattr(cfg, "FFPROBE_PATH", None) or (
+                    FFMPEG_PATH.replace("ffmpeg", "ffprobe") if "ffmpeg" in FFMPEG_PATH else "ffprobe"
+                )
                 ffmpeg = FFMPEG_PATH
 
                 # Helper to run commands without blocking the ASGI loop
                 async def _run(cmd, timeout=600):
                     try:
-                        proc = await asyncio.to_thread(subprocess.run, cmd, capture_output=True, text=True, timeout=timeout)
+                        proc = await asyncio.to_thread(
+                            subprocess.run, cmd, capture_output=True, text=True, timeout=timeout
+                        )
                         return {"returncode": proc.returncode, "stdout": proc.stdout, "stderr": proc.stderr}
                     except Exception as e:
                         logger.exception("Diagnostic hash fetch error: %s", e)
@@ -2327,12 +2435,23 @@ try:
                         raise HTTPException(status_code=404, detail=f"file not found: {safe_name}")
 
                 if action == "ffprobe":
-                    cmd = [ffprobe, "-v", "error", "-print_format", "json", "-show_format", "-show_streams", target_path]
+                    cmd = [
+                        ffprobe,
+                        "-v",
+                        "error",
+                        "-print_format",
+                        "json",
+                        "-show_format",
+                        "-show_streams",
+                        target_path,
+                    ]
                     out["result"] = await _run(cmd, timeout=60)
                     return out
 
                 if action == "remux":
-                    dst = payload.get("out") or os.path.join(os.getcwd(), "storage", "temp", os.path.splitext(os.path.basename(target_path))[0] + ".mkv")
+                    dst = payload.get("out") or os.path.join(
+                        os.getcwd(), "storage", "temp", os.path.splitext(os.path.basename(target_path))[0] + ".mkv"
+                    )
                     os.makedirs(os.path.dirname(dst), exist_ok=True)
                     cmd = [ffmpeg, "-y", "-hide_banner", "-loglevel", "error", "-i", target_path, "-c", "copy", dst]
                     out["dst"] = dst
@@ -2340,9 +2459,35 @@ try:
                     return out
 
                 if action == "reencode":
-                    dst = payload.get("out") or os.path.join(os.getcwd(), "storage", "output", os.path.splitext(os.path.basename(target_path))[0] + "_reencoded.mp4")
+                    dst = payload.get("out") or os.path.join(
+                        os.getcwd(),
+                        "storage",
+                        "output",
+                        os.path.splitext(os.path.basename(target_path))[0] + "_reencoded.mp4",
+                    )
                     os.makedirs(os.path.dirname(dst), exist_ok=True)
-                    cmd = [ffmpeg, "-y", "-hide_banner", "-loglevel", "error", "-fflags", "+genpts", "-i", target_path, "-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-c:a", "aac", "-b:a", "128k", dst]
+                    cmd = [
+                        ffmpeg,
+                        "-y",
+                        "-hide_banner",
+                        "-loglevel",
+                        "error",
+                        "-fflags",
+                        "+genpts",
+                        "-i",
+                        target_path,
+                        "-c:v",
+                        "libx264",
+                        "-preset",
+                        "veryfast",
+                        "-crf",
+                        "23",
+                        "-c:a",
+                        "aac",
+                        "-b:a",
+                        "128k",
+                        dst,
+                    ]
                     out["dst"] = dst
                     out["result"] = await _run(cmd, timeout=1800)
                     return out
@@ -2364,10 +2509,12 @@ try:
                         worker_log = os.path.join(tempfile.gettempdir(), "worker.log")
                         if os.path.isfile(worker_log):
                             with open(worker_log, encoding="utf-8", errors="replace") as fh:
-                                logs[os.path.basename(worker_log)] = "".join(fh.readlines()[-(lines * 5):])
+                                logs[os.path.basename(worker_log)] = "".join(fh.readlines()[-(lines * 5) :])
                     except Exception as e:
                         logger.exception("Failed to fetch job metadata: %s", e)
-                        raise HTTPException(status_code=500, detail="Failed to fetch job metadata. Check server logs for details.") from e
+                        raise HTTPException(
+                            status_code=500, detail="Failed to fetch job metadata. Check server logs for details."
+                        ) from e
                 out["logs"] = logs
                 return out
 
@@ -2510,7 +2657,9 @@ try:
                                 await r.close()
                     except Exception as e:
                         logger.exception("Failed to fetch job metadata: %s", e)
-                        raise HTTPException(status_code=500, detail="Failed to fetch job metadata. Check server logs for details.") from e
+                        raise HTTPException(
+                            status_code=500, detail="Failed to fetch job metadata. Check server logs for details."
+                        ) from e
                     return out
 
                 if action == "cancel_job":
@@ -2621,7 +2770,6 @@ try:
             "error": getattr(app.state, "startup_error", None),
         }
 
-
     @app.get("/")
     async def root_index():
         """Root endpoint for platform health checks."""
@@ -2629,7 +2777,6 @@ try:
             return {"status": "ok", "bot_ready": bool(BOT_READY.is_set())}
         except Exception:
             return {"status": "ok"}
-
 
     @app.head("/telegram/webhook")
     async def telegram_webhook_head(request: Request):
@@ -2694,11 +2841,11 @@ try:
                         with METRICS_LOCK:
                             METRICS["updates_dispatched"] += 1
                         logger.info(
-                            f"Background dispatched update {getattr(u, 'update_id', 'unknown')} on attempt {i+1}"
+                            f"Background dispatched update {getattr(u, 'update_id', 'unknown')} on attempt {i + 1}"
                         )
                         return True
                 except Exception as e:
-                    logger.debug(f"Background dispatch attempt {i+1} failed: {e}")
+                    logger.debug(f"Background dispatch attempt {i + 1} failed: {e}")
                     with METRICS_LOCK:
                         METRICS["dispatch_failures"] += 1
                 await asyncio.sleep(delay)
@@ -2720,7 +2867,7 @@ try:
                     )
                     return {"ok": True, "update_id": getattr(update, "update_id", None), "dispatched": True}
                 except Exception as e:
-                    logger.warning(f"Failed to schedule dispatch task (attempt {i+1}): {e}")
+                    logger.warning(f"Failed to schedule dispatch task (attempt {i + 1}): {e}")
                     try:
                         with METRICS_LOCK:
                             METRICS["dispatch_failures"] += 1
@@ -2844,7 +2991,9 @@ try:
                     "telethon_api_id_present": bool(os.environ.get("API_ID") or os.environ.get("USERBOT_API_ID")),
                     "telethon_api_hash_present": bool(os.environ.get("API_HASH") or os.environ.get("USERBOT_API_HASH")),
                     "telethon_session_present": bool(
-                        os.environ.get("API_SESSION") or os.environ.get("TELETHON_SESSION") or os.environ.get("USERBOT_SESSION")
+                        os.environ.get("API_SESSION")
+                        or os.environ.get("TELETHON_SESSION")
+                        or os.environ.get("USERBOT_SESSION")
                     ),
                 }
             )
@@ -2913,7 +3062,11 @@ try:
                 has_dispatcher_proc = bool(dispatcher and hasattr(dispatcher, "process_update"))
                 app_has_proc = hasattr(BOT_APPLICATION, "process_update")
                 if force_polling_env or (not has_dispatcher_proc and not app_has_proc):
-                    logger.warning("ASGI startup: starting fallback long-poller (FORCE_POLLING=%s, dispatcher_present=%s)", force_polling_env, has_dispatcher_proc)
+                    logger.warning(
+                        "ASGI startup: starting fallback long-poller (FORCE_POLLING=%s, dispatcher_present=%s)",
+                        force_polling_env,
+                        has_dispatcher_proc,
+                    )
 
                     async def _asgi_longpoll_loop():
                         offset = None
@@ -2960,7 +3113,10 @@ try:
                                     logger.warning("ASGI long-poller timed out (pool exhausted): %s. Backing off 5s", e)
                                     await asyncio.sleep(5)
                                 except Conflict as e:
-                                    logger.error("ASGI long-poller conflict (another getUpdates active): %s. Stopping long-poller", e)
+                                    logger.error(
+                                        "ASGI long-poller conflict (another getUpdates active): %s. Stopping long-poller",
+                                        e,
+                                    )
                                     break
                                 except Exception as e:
                                     logger.exception("ASGI long-poller error: %s", e)

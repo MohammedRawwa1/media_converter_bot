@@ -8,11 +8,10 @@ fi
 
 # NOTE: The in-process ffmpeg worker task in main.py handles job processing.
 # We do NOT start a separate worker process here because:
-# 1. Render free tier has only ~512MB RAM — two ffmpeg processes would exhaust it
-# 2. The in-process worker inside uvicorn/main.py already picks and processes jobs
-# 3. A separate dedicated ffmpeg-worker service is defined in render.yaml for scaling
+# 1. The in-process worker inside uvicorn/main.py already picks and processes jobs
+# 2. A separate dedicated ffmpeg-worker service is defined in railway.json for scaling
 # To re-enable the separate worker, set START_WORKER=true as an env var.
-# See render.yaml for the dedicated ffmpeg-worker service definition.
+# See railway.json for the dedicated ffmpeg-worker service definition.
 START_WORKER="${START_WORKER:-false}"
 
 if [ "$START_WORKER" = "true" ]; then
