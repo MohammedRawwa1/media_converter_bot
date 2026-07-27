@@ -2004,7 +2004,7 @@ async def _start_healthcheck_server():
     try:
         from aiohttp import web
 
-        port = int(os.environ.get("PORT", os.environ.get("HEALTHCHECK_PORT", "8000")))
+        port = int(os.environ.get("HEALTHCHECK_PORT", os.environ.get("PORT", "8000")))
 
         async def _handle_health(request):
             return web.json_response({"service": "ffmpeg_worker", "healthy": True, "ok": True})
