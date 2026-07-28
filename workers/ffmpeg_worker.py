@@ -1297,59 +1297,25 @@ async def handle_job(job: dict):
                         bot_api_max_mb = int(os.environ.get("BOT_API_MAX_SIZE_MB", "50"))
                         bot_api_max_bytes = bot_api_max_mb * 1024 * 1024
 
-                        # ── Preferred: Bot API sendVideo via S3 presigned URL ──
-                        # If we uploaded the output to S3 and have a presigned GET URL, use Bot API's
-                        # sendVideo(vector=url) directly. Telegram's servers download the file from
-                        # the URL, probe it fresh for metadata (duration/width/height/thumbnail), and
-                        # the video appears from the bot — no userbot needed, works for any file size.
-                        # The ContentDisposition header set during S3 upload ensures the correct filename.
-                        if upload_success and get_url and chat_id and bot_token:
-                            if await _check_upload_cancelled(job_id):
-                                logger.info("Upload cancelled by user — skipping presigned URL send for job %s", job_id)
-                            else:
-                                try:
-                                    async with Bot(token=bot_token) as bot:
-                                        await bot.sendVideo(
-                                            chat_id=chat_id,
-                                            video=get_url,
-                                            caption=caption or "",
-                                            supports_streaming=True,
-                                        )
-                                    logger.info("Sent output via presigned URL for job %s", job_id)
-                                    sent = True
-                                except Exception:
-                                    logger.exception("Failed to send via presigned URL for job %s", job_id)
-                                    sent = False
-
-                        # Fallback: if presigned URL didn't work and file is large, try userbot
+                        # ── Preferred: Userbot delivery for large files (Telethon) ──
+                        # Telethon auto-detects all metadata (duration/width/height/thumbnail)
+                        # and sends a proper video to the user's DM — matching the old proven
+                        # approach from commit 2160ee0.
                         if not sent and chat_id and file_size > bot_api_max_bytes and enable_userbot:
                             if await _check_upload_cancelled(job_id):
-                                logger.info(
-                                    "Upload cancelled by user — skipping preferred userbot send for job %s", job_id
-                                )
+                                logger.info("Upload cancelled by user — skipping userbot send for job %s", job_id)
                                 sent = False
                             else:
                                 try:
                                     from utils.userbot_uploader import send_file_via_userbot
 
                                     _up_cb = _make_upload_progress_callback(job_id, progress_channel)
-                                    # Direct userbot delivery to user's DM.
-                                    # Telethon handles all metadata (duration/width/height/thumbnail).
-                                    _pre_vm, _pre_tp = await _probe_output_metadata(out)
-                                    try:
-                                        ok = await send_file_via_userbot(
-                                            chat_id,
-                                            out,
-                                            caption=caption,
-                                            progress_callback=_up_cb,
-                                            video_meta=_pre_vm,
-                                            thumb_path=_pre_tp,
-                                        )
-                                    finally:
-                                        if _pre_tp:
-                                            with contextlib.suppress(Exception):
-                                                os.remove(_pre_tp)
-                                                shutil.rmtree(os.path.dirname(_pre_tp), ignore_errors=True)
+                                    ok = await send_file_via_userbot(
+                                        chat_id,
+                                        out,
+                                        caption=caption,
+                                        progress_callback=_up_cb,
+                                    )
                                     if ok:
                                         logger.info("Sent output via Telethon userbot for job %s", job_id)
                                         sent = True
@@ -1357,7 +1323,7 @@ async def handle_job(job: dict):
                                         logger.error("Userbot send failed for job %s", job_id)
                                         sent = False
                                 except Exception:
-                                    logger.exception("Preferred userbot send raised exception for job %s", job_id)
+                                    logger.exception("Userbot send raised exception for job %s", job_id)
                                     sent = False
                         elif not sent and chat_id and bot_token:
                             # Try Bot API file upload
@@ -1696,23 +1662,12 @@ async def handle_job(job: dict):
                                     from utils.userbot_uploader import send_file_via_userbot
 
                                     _up_cb = _make_upload_progress_callback(job_id, progress_channel)
-                                    # Direct userbot delivery to user's DM (fallback).
-                                    # Telethon handles all metadata (duration/width/height/thumbnail).
-                                    _pre_vm, _pre_tp = await _probe_output_metadata(out)
-                                    try:
-                                        ok = await send_file_via_userbot(
-                                            chat_id,
-                                            out,
-                                            caption=caption,
-                                            progress_callback=_up_cb,
-                                            video_meta=_pre_vm,
-                                            thumb_path=_pre_tp,
-                                        )
-                                    finally:
-                                        if _pre_tp:
-                                            with contextlib.suppress(Exception):
-                                                os.remove(_pre_tp)
-                                                shutil.rmtree(os.path.dirname(_pre_tp), ignore_errors=True)
+                                    ok = await send_file_via_userbot(
+                                        chat_id,
+                                        out,
+                                        caption=caption,
+                                        progress_callback=_up_cb,
+                                    )
                                     if ok:
                                         logger.info("Sent output via Telethon userbot for job %s", job_id)
                                         sent = True
