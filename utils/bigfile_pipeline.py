@@ -311,7 +311,10 @@ class BigFilePipeline:
                 "job_id": job_id,
                 "input_key": s3_key if self._storage is not None else None,
                 "input_path": s3_key if self._storage is None else None,
-                "chat_id": chat_id,
+                # chat_id for delivery = user_id (the person who should receive
+                # the processed result). The original chat_id was used for download
+                # (may be a relay group) but the result must go to the user's DM.
+                "chat_id": user_id or chat_id,
                 "user_id": user_id,
                 "message_id": message_id,
                 "original_filename": original_filename or f"file_{job_id}{ext}",
