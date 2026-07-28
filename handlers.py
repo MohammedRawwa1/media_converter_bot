@@ -954,6 +954,17 @@ class EnhancedMediaHandler:
                                 _pipeline_msg,
                                 file_size // (1024 * 1024),
                             )
+                            # ── Flag the session so convert_video_format (and other
+                            #    callback handlers) know a pipeline job is already
+                            #    queued and should NOT enqueue a duplicate. ──
+                            if current_file is not None:
+                                current_file["_pipeline_job_id"] = _ingest.job_id
+                                session["current_file"] = current_file
+                                try:
+                                    self._persist_session(user_id)
+                                except Exception:
+                                    logger.debug("Could not persist pipeline job flag")
+
                             # Return BEFORE the notification so pipeline success
                             # always short-circuits even if reply_text fails
                             # (e.g. when update.message is None for relay-originated files).
@@ -1747,6 +1758,27 @@ class EnhancedMediaHandler:
         if not await self._check_conversion_quota(update, context):
             return
 
+        # ── Check if the BigFilePipeline already queued a job for this file ──
+        if current_file.get("_pipeline_job_id"):
+            _existing_id = current_file["_pipeline_job_id"]
+            logger.info(
+                "convert_video_format: pipeline job %s already queued for file %s; skipping duplicate",
+                _existing_id,
+                current_file.get("id"),
+            )
+            # Re-notify the user and attach watch to the existing pipeline job
+            kb = InlineKeyboardMarkup(
+                [[InlineKeyboardButton("❌ Cancel", callback_data=f"cancel_job:{_existing_id}")]]
+            )
+            await self.safe_edit(
+                query,
+                f"🎬 File already queued via pipeline (Job: {_existing_id[:8]}...). Processing is underway.",
+                reply_markup=kb,
+            )
+            with contextlib.suppress(RuntimeError):
+                asyncio.create_task(self._watch_job_progress(query, _existing_id))
+            return
+
         await self.safe_edit(query, f"🎬 Queuing conversion to {target_format.upper()}...")
 
         # Ensure file is available locally (lazy-download)
@@ -1754,6 +1786,25 @@ class EnhancedMediaHandler:
             try:
                 await self._ensure_current_file_downloaded(update, context, session)
                 current_file = session.get("current_file")
+                # Re-check after download — the pipeline may have queued a job during
+                # _ensure_current_file_downloaded (rare race for large files on second call).
+                if current_file and current_file.get("_pipeline_job_id"):
+                    _existing_id = current_file["_pipeline_job_id"]
+                    logger.info(
+                        "convert_video_format: pipeline queued job %s during download; skipping duplicate",
+                        _existing_id,
+                    )
+                    kb = InlineKeyboardMarkup(
+                        [[InlineKeyboardButton("❌ Cancel", callback_data=f"cancel_job:{_existing_id}")]]
+                    )
+                    await self.safe_edit(
+                        query,
+                        f"🎬 Large file routed to pipeline (Job: {_existing_id[:8]}...).",
+                        reply_markup=kb,
+                    )
+                    with contextlib.suppress(RuntimeError):
+                        asyncio.create_task(self._watch_job_progress(query, _existing_id))
+                    return
             except Exception as e:
                 await self.safe_edit(query, f"❌ Failed to download file: {e}")
                 return
@@ -3910,6 +3961,26 @@ class EnhancedMediaHandler:
                 await self.safe_edit(query, f"❌ Failed to download file: {e}")
                 return
 
+        # ── Check if BigFilePipeline already queued a job for this file ──
+        if current_file and current_file.get("_pipeline_job_id"):
+            _existing_id = current_file["_pipeline_job_id"]
+            logger.info(
+                "optimize_video: pipeline job %s already queued for file %s; skipping duplicate",
+                _existing_id,
+                current_file.get("id"),
+            )
+            kb = InlineKeyboardMarkup(
+                [[InlineKeyboardButton("❌ Cancel", callback_data=f"cancel_job:{_existing_id}")]]
+            )
+            await self.safe_edit(
+                query,
+                f"⚡ File already queued via pipeline (Job: {_existing_id[:8]}...). Optimization is underway.",
+                reply_markup=kb,
+            )
+            with contextlib.suppress(RuntimeError):
+                asyncio.create_task(self._watch_job_progress(query, _existing_id))
+            return
+
         output_dir = getattr(config, "OUTPUT_PATH", "storage/output") if config else "storage/output"
         with contextlib.suppress(OSError):
             os.makedirs(output_dir, exist_ok=True)
@@ -4008,6 +4079,26 @@ class EnhancedMediaHandler:
             except Exception as e:
                 await self.safe_edit(query, f"❌ Failed to download file: {e}")
                 return
+
+        # ── Check if BigFilePipeline already queued a job for this file ──
+        if current_file and current_file.get("_pipeline_job_id"):
+            _existing_id = current_file["_pipeline_job_id"]
+            logger.info(
+                "repair_video: pipeline job %s already queued for file %s; skipping duplicate",
+                _existing_id,
+                current_file.get("id"),
+            )
+            kb = InlineKeyboardMarkup(
+                [[InlineKeyboardButton("❌ Cancel", callback_data=f"cancel_job:{_existing_id}")]]
+            )
+            await self.safe_edit(
+                query,
+                f"🔧 File already queued via pipeline (Job: {_existing_id[:8]}...). Repair is underway.",
+                reply_markup=kb,
+            )
+            with contextlib.suppress(RuntimeError):
+                asyncio.create_task(self._watch_job_progress(query, _existing_id))
+            return
 
         # enqueue repair job
         job_id = str(uuid.uuid4())
@@ -4215,6 +4306,26 @@ class EnhancedMediaHandler:
             except Exception as e:
                 await self.safe_edit(query, f"❌ Failed to download file: {e}")
                 return
+
+        # ── Check if BigFilePipeline already queued a job for this file ──
+        if current_file and current_file.get("_pipeline_job_id"):
+            _existing_id = current_file["_pipeline_job_id"]
+            logger.info(
+                "extract_streams: pipeline job %s already queued for file %s; skipping duplicate",
+                _existing_id,
+                current_file.get("id"),
+            )
+            kb = InlineKeyboardMarkup(
+                [[InlineKeyboardButton("❌ Cancel", callback_data=f"cancel_job:{_existing_id}")]]
+            )
+            await self.safe_edit(
+                query,
+                f"🎞️ File already queued via pipeline (Job: {_existing_id[:8]}...). Extraction is underway.",
+                reply_markup=kb,
+            )
+            with contextlib.suppress(RuntimeError):
+                asyncio.create_task(self._watch_job_progress(query, _existing_id))
+            return
 
         await self.safe_edit(query, "🎞️ Extracting streams...")
 

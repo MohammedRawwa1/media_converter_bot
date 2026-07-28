@@ -39,7 +39,7 @@ async def _send_with_telethon(
     file_path: str,
     caption: str | None = None,
     progress_callback: Callable[[int, int], None] | None = None,
-) -> bool:
+) -> int | None:
     """Send a file using Telethon.
 
     Args:
@@ -47,9 +47,12 @@ async def _send_with_telethon(
         file_path: Path to the file to send.
         caption: Optional caption text.
         progress_callback: Optional callable(sent_bytes, total_bytes) for upload progress.
+
+    Returns:
+        The sent message ID on success, or None on failure.
     """
     if TelegramClient is None:
-        return False
+        return None
 
     from utils.telethon_session import build_telethon_client, get_userbot_credentials, has_usable_telethon_session
 
@@ -57,7 +60,7 @@ async def _send_with_telethon(
     # client.start() prompting for a phone number on stdin (EOFError).
     if not has_usable_telethon_session():
         logger.info("userbot: Telethon session not configured; skipping Telethon upload")
-        return False
+        return None
 
     api_id, api_hash = get_userbot_credentials()
 
@@ -96,25 +99,26 @@ async def _send_with_telethon(
                 kwargs["thumb"] = thumb_path
             if progress_callback is not None:
                 kwargs["progress_callback"] = progress_callback
-            await client.send_file(target, file_path, **kwargs)
+            msg = await client.send_file(target, file_path, **kwargs)
             logger.info(
-                "userbot: Telethon sent video %s to %s (meta=%s, thumb=%s)",
+                "userbot: Telethon sent video %s to %s (meta=%s, thumb=%s, msg_id=%s)",
                 file_path,
                 target,
                 video_meta,
                 bool(thumb_path),
+                getattr(msg, "id", None),
             )
         else:
             # Fallback: generic file send
             kwargs = {"file": file_path, "caption": caption}
             if progress_callback is not None:
                 kwargs["progress_callback"] = progress_callback
-            await client.send_file(target, **kwargs)
-            logger.info("userbot: Telethon sent file %s to %s", file_path, target)
-        return True
+            msg = await client.send_file(target, **kwargs)
+            logger.info("userbot: Telethon sent file %s to %s (msg_id=%s)", file_path, target, getattr(msg, "id", None))
+        return getattr(msg, "id", None)
     except Exception:
         logger.exception("userbot: Telethon failed to send file %s", file_path)
-        return False
+        return None
     finally:
         # Clean up temp thumbnail directory
         if _temp_cleanup:
@@ -211,7 +215,7 @@ async def _send_with_pyrogram(
     file_path: str,
     caption: str | None = None,
     progress_callback: Callable[[int, int], None] | None = None,
-) -> bool:
+) -> int | None:
     """Send a file using Pyrogram (session string fallback).
 
     Probes the video for duration / dimensions and extracts a thumbnail
@@ -224,9 +228,12 @@ async def _send_with_pyrogram(
         caption: Optional caption text.
         progress_callback: Optional callable(current, total) for upload progress.
                            Pyrogram progress callback is synchronous.
+
+    Returns:
+        The sent message ID on success, or None on failure.
     """
     if PyrogramClient is None:
-        return False
+        return None
 
     from utils.telethon_session import build_pyrogram_client, get_userbot_credentials
 
@@ -234,7 +241,7 @@ async def _send_with_pyrogram(
 
     client = build_pyrogram_client(api_id, api_hash)
     if client is None:
-        return False
+        return None
 
     # Pre-fetch video metadata and thumbnail before connecting to Telegram
     # so we can bail early if the file is problematic.
@@ -265,18 +272,19 @@ async def _send_with_pyrogram(
         if thumb_path is not None:
             kwargs["thumb"] = thumb_path
 
-        await client.send_video(target, file_path, **kwargs)
+        msg = await client.send_video(target, file_path, **kwargs)
         logger.info(
-            "userbot: Pyrogram sent video %s to %s (meta=%s, thumb=%s)",
+            "userbot: Pyrogram sent video %s to %s (meta=%s, thumb=%s, msg_id=%s)",
             file_path,
             target,
             video_meta,
             bool(thumb_path),
+            getattr(msg, "id", None),
         )
-        return True
+        return getattr(msg, "id", None)
     except Exception:
         logger.exception("userbot: Pyrogram failed to send file %s", file_path)
-        return False
+        return None
     finally:
         # Clean up temp thumbnail directory
         if _temp_cleanup:
@@ -291,7 +299,7 @@ async def send_file_via_userbot(
     file_path: str,
     caption: str | None = None,
     progress_callback: Callable[[int, int], None] | None = None,
-) -> bool:
+) -> int | None:
     """Send a file using a user account.
 
     Tries Telethon first (when a session is available), then falls back to
@@ -305,7 +313,9 @@ async def send_file_via_userbot(
         progress_callback: Optional callable(sent_bytes, total_bytes) for upload progress.
                            Both Telethon and Pyrogram callbacks follow this signature.
 
-    Returns True on success, False on failure. Raises RuntimeError for missing config.
+    Returns:
+        The sent message ID on success, or None on failure.
+        Raises RuntimeError for missing config.
     """
     if TelegramClient is None and PyrogramClient is None:
         raise RuntimeError(
@@ -318,9 +328,9 @@ async def send_file_via_userbot(
     # Try Telethon first only when a usable session exists.
     if TelegramClient is not None and has_usable_telethon_session():
         try:
-            result = await _send_with_telethon(chat_id, file_path, caption, progress_callback=progress_callback)
-            if result:
-                return True
+            msg_id = await _send_with_telethon(chat_id, file_path, caption, progress_callback=progress_callback)
+            if msg_id is not None:
+                return msg_id
             logger.info("userbot: Telethon send failed; trying Pyrogram fallback")
         except Exception as e:
             logger.warning("userbot: Telethon send error (%s); trying Pyrogram fallback", e)
@@ -329,9 +339,9 @@ async def send_file_via_userbot(
 
     # Fall back to Pyrogram (requires PYROGRAM_SESSION env var)
     if PyrogramClient is not None:
-        result = await _send_with_pyrogram(chat_id, file_path, caption, progress_callback=progress_callback)
-        if result:
-            return True
+        msg_id = await _send_with_pyrogram(chat_id, file_path, caption, progress_callback=progress_callback)
+        if msg_id is not None:
+            return msg_id
 
     logger.warning("userbot: all send methods failed for %s", chat_id)
-    return False
+    return None

@@ -1212,15 +1212,53 @@ async def handle_job(job: dict):
                                     from utils.userbot_uploader import send_file_via_userbot
 
                                     _up_cb = _make_upload_progress_callback(job_id, progress_channel)
-                                    ok = await send_file_via_userbot(
-                                        chat_id, out, caption=caption, progress_callback=_up_cb
-                                    )
-                                    if ok:
-                                        logger.info("Sent output via Telethon userbot (preferred) for job %s", job_id)
-                                        sent = True
+                                    _relay_chat = os.environ.get("RELAY_CHAT_ID", "")
+                                    if _relay_chat and bot_token:
+                                        # ── Relay+copy approach: userbot uploads to relay channel,
+                                        #    then Bot API copyMessage delivers to user's DM.
+                                        #    The final message appears from the bot with full
+                                        #    video metadata preserved. ──
+                                        try:
+                                            _relay_id = int(_relay_chat)
+                                            relay_msg_id = await send_file_via_userbot(
+                                                _relay_id, out, caption=caption, progress_callback=_up_cb
+                                            )
+                                            if relay_msg_id is not None:
+                                                async with Bot(token=bot_token) as _bot_copy:
+                                                    await _bot_copy.copy_message(
+                                                        chat_id=chat_id,
+                                                        from_chat_id=_relay_id,
+                                                        message_id=relay_msg_id,
+                                                        caption=caption,
+                                                    )
+                                                    # Clean up the relay message immediately
+                                                    with contextlib.suppress(Exception):
+                                                        await _bot_copy.delete_message(
+                                                            chat_id=_relay_id,
+                                                            message_id=relay_msg_id,
+                                                        )
+                                                logger.info(
+                                                    "Sent output via relay+copy for job %s (relay_msg=%s)",
+                                                    job_id, relay_msg_id,
+                                                )
+                                                sent = True
+                                            else:
+                                                logger.error("Relay send failed for job %s", job_id)
+                                                sent = False
+                                        except Exception:
+                                            logger.exception("Relay+copy send failed for job %s", job_id)
+                                            sent = False
                                     else:
-                                        logger.error("Preferred userbot send failed for job %s", job_id)
-                                        sent = False
+                                        # No relay configured — direct userbot send (legacy)
+                                        ok = await send_file_via_userbot(
+                                            chat_id, out, caption=caption, progress_callback=_up_cb
+                                        )
+                                        if ok:
+                                            logger.info("Sent output via Telethon userbot (preferred) for job %s", job_id)
+                                            sent = True
+                                        else:
+                                            logger.error("Preferred userbot send failed for job %s", job_id)
+                                            sent = False
                                 except Exception:
                                     logger.exception("Preferred userbot send raised exception for job %s", job_id)
                                     sent = False
@@ -1688,14 +1726,45 @@ async def handle_job(job: dict):
                                     from utils.userbot_uploader import send_file_via_userbot
 
                                     _up_cb = _make_upload_progress_callback(job_id, progress_channel)
-                                    ok = await send_file_via_userbot(
-                                        chat_id, out, caption=caption, progress_callback=_up_cb
-                                    )
-                                    if ok:
-                                        logger.info("Sent output via Telethon userbot fallback for job %s", job_id)
-                                        sent = True
+                                    _relay_chat = os.environ.get("RELAY_CHAT_ID", "")
+                                    if _relay_chat and bot_token:
+                                        # ── Relay+copy fallback ──
+                                        try:
+                                            _relay_id = int(_relay_chat)
+                                            relay_msg_id = await send_file_via_userbot(
+                                                _relay_id, out, caption=caption, progress_callback=_up_cb
+                                            )
+                                            if relay_msg_id is not None:
+                                                async with Bot(token=bot_token) as _bot_copy:
+                                                    await _bot_copy.copy_message(
+                                                        chat_id=chat_id,
+                                                        from_chat_id=_relay_id,
+                                                        message_id=relay_msg_id,
+                                                        caption=caption,
+                                                    )
+                                                    with contextlib.suppress(Exception):
+                                                        await _bot_copy.delete_message(
+                                                            chat_id=_relay_id,
+                                                            message_id=relay_msg_id,
+                                                        )
+                                                logger.info(
+                                                    "Sent output via relay+copy fallback for job %s", job_id
+                                                )
+                                                sent = True
+                                            else:
+                                                logger.error("Relay fallback send failed for job %s", job_id)
+                                        except Exception:
+                                            logger.exception("Relay+copy fallback failed for job %s", job_id)
                                     else:
-                                        logger.error("Userbot fallback failed for job %s", job_id)
+                                        # No relay — direct userbot fallback (legacy)
+                                        ok = await send_file_via_userbot(
+                                            chat_id, out, caption=caption, progress_callback=_up_cb
+                                        )
+                                        if ok:
+                                            logger.info("Sent output via Telethon userbot fallback for job %s", job_id)
+                                            sent = True
+                                        else:
+                                            logger.error("Userbot fallback failed for job %s", job_id)
                                 except Exception:
                                     logger.exception("Userbot fallback raised exception for job %s", job_id)
 
