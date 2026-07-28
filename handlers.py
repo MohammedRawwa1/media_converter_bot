@@ -959,6 +959,13 @@ class EnhancedMediaHandler:
                             #    queued and should NOT enqueue a duplicate. ──
                             if current_file is not None:
                                 current_file["_pipeline_job_id"] = _ingest.job_id
+                                # Also persist the S3 input_key so that
+                                # _ensure_current_file_downloaded's early-return
+                                # check (input_key or path.exists) catches this
+                                # on subsequent calls from ANY handler, preventing
+                                # a second pipeline run entirely.
+                                if _ingest.s3_key:
+                                    current_file["input_key"] = _ingest.s3_key
                                 session["current_file"] = current_file
                                 try:
                                     self._persist_session(user_id)
