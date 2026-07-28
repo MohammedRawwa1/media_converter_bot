@@ -1327,106 +1327,31 @@ async def handle_job(job: dict):
                                     from utils.userbot_uploader import send_file_via_userbot
 
                                     _up_cb = _make_upload_progress_callback(job_id, progress_channel)
-                                    _relay_chat = os.environ.get("RELAY_CHAT_ID", "")
-                                    if _relay_chat and bot_token:
-                                        # ── Relay+copy: Telethon uploads to relay, then Bot API delivers to
-                                        #    user's DM via sendVideo(file_id, supports_streaming=True).
-                                        #    Final message appears from the bot with full timestamps. ──
-                                        _relay_id = int(_relay_chat)
-                                        _pre_vm, _pre_tp = await _probe_output_metadata(out)
-                                        try:
-                                            relay_msg_id = await send_file_via_userbot(
-                                                _relay_id,
-                                                out,
-                                                caption=caption,
-                                                progress_callback=_up_cb,
-                                                video_meta=_pre_vm,
-                                                thumb_path=_pre_tp,
-                                            )
-                                        finally:
-                                            if _pre_tp:
-                                                with contextlib.suppress(Exception):
-                                                    os.remove(_pre_tp)
-                                                    shutil.rmtree(os.path.dirname(_pre_tp), ignore_errors=True)
-                                        if relay_msg_id is not None:
-                                            async with Bot(token=bot_token) as _bot:
-                                                # Forward within relay to extract video.file_id
-                                                # without flashing a "Forwarded from" message to the user.
-                                                # Then sendVideo directly with supports_streaming=True and all metadata.
-                                                _fwd = await _bot.forward_message(
-                                                    chat_id=_relay_id,
-                                                    from_chat_id=_relay_id,
-                                                    message_id=relay_msg_id,
-                                                )
-                                                if _fwd and _fwd.video:
-                                                    _file_id = _fwd.video.file_id
-                                                    with contextlib.suppress(Exception):
-                                                        await _bot.delete_message(
-                                                            chat_id=_relay_id,
-                                                            message_id=_fwd.message_id,
-                                                        )
-                                                    _send_kwargs = {
-                                                        "chat_id": chat_id,
-                                                        "video": _file_id,
-                                                        "caption": caption or "",
-                                                        "supports_streaming": True,
-                                                    }
-                                                    if _pre_vm and _pre_vm.get("duration"):
-                                                        _send_kwargs["duration"] = _pre_vm["duration"]
-                                                    if _pre_vm and _pre_vm.get("width"):
-                                                        _send_kwargs["width"] = _pre_vm["width"]
-                                                    if _pre_vm and _pre_vm.get("height"):
-                                                        _send_kwargs["height"] = _pre_vm["height"]
-                                                    if _pre_tp and os.path.exists(_pre_tp):
-                                                        with open(_pre_tp, "rb") as _tf:
-                                                            _send_kwargs["thumbnail"] = _tf
-                                                            await _bot.send_video(**_send_kwargs)
-                                                    else:
-                                                        await _bot.send_video(**_send_kwargs)
-                                                else:
-                                                    # Fallback: copy_message if forward didn't yield a video
-                                                    await _bot.copy_message(
-                                                        chat_id=chat_id,
-                                                        from_chat_id=_relay_id,
-                                                        message_id=relay_msg_id,
-                                                        caption=caption,
-                                                    )
-                                                # Delete relay message only after successful delivery
-                                                with contextlib.suppress(Exception):
-                                                    await _bot.delete_message(
-                                                        chat_id=_relay_id,
-                                                        message_id=relay_msg_id,
-                                                    )
-                                            logger.info("Sent output via relay+copy for job %s", job_id)
-                                            sent = True
-                                        else:
-                                            logger.error("Relay send failed for job %s", job_id)
-                                            sent = False
+                                    # Direct userbot delivery to user's DM.
+                                    # Telethon handles all metadata (duration/width/height/thumbnail).
+                                    _pre_vm, _pre_tp = await _probe_output_metadata(out)
+                                    try:
+                                        ok = await send_file_via_userbot(
+                                            chat_id,
+                                            out,
+                                            caption=caption,
+                                            progress_callback=_up_cb,
+                                            video_meta=_pre_vm,
+                                            thumb_path=_pre_tp,
+                                        )
+                                    finally:
+                                        if _pre_tp:
+                                            with contextlib.suppress(Exception):
+                                                os.remove(_pre_tp)
+                                                shutil.rmtree(os.path.dirname(_pre_tp), ignore_errors=True)
+                                    if ok:
+                                        logger.info(
+                                            "Sent output via Telethon userbot for job %s", job_id
+                                        )
+                                        sent = True
                                     else:
-                                        # No relay configured — direct userbot (legacy)
-                                        _pre_vm, _pre_tp = await _probe_output_metadata(out)
-                                        try:
-                                            ok = await send_file_via_userbot(
-                                                chat_id,
-                                                out,
-                                                caption=caption,
-                                                progress_callback=_up_cb,
-                                                video_meta=_pre_vm,
-                                                thumb_path=_pre_tp,
-                                            )
-                                        finally:
-                                            if _pre_tp:
-                                                with contextlib.suppress(Exception):
-                                                    os.remove(_pre_tp)
-                                                    shutil.rmtree(os.path.dirname(_pre_tp), ignore_errors=True)
-                                        if ok:
-                                            logger.info(
-                                                "Sent output via Telethon userbot (no relay) for job %s", job_id
-                                            )
-                                            sent = True
-                                        else:
-                                            logger.error("Userbot send failed for job %s", job_id)
-                                            sent = False
+                                        logger.error("Userbot send failed for job %s", job_id)
+                                        sent = False
                                 except Exception:
                                     logger.exception("Preferred userbot send raised exception for job %s", job_id)
                                     sent = False
@@ -1772,102 +1697,30 @@ async def handle_job(job: dict):
                                     from utils.userbot_uploader import send_file_via_userbot
 
                                     _up_cb = _make_upload_progress_callback(job_id, progress_channel)
-                                    _relay_chat = os.environ.get("RELAY_CHAT_ID", "")
-                                    if _relay_chat and bot_token:
-                                        # ── Relay+copy (fallback) ──
-                                        _relay_id = int(_relay_chat)
-                                        _pre_vm, _pre_tp = await _probe_output_metadata(out)
-                                        try:
-                                            relay_msg_id = await send_file_via_userbot(
-                                                _relay_id,
-                                                out,
-                                                caption=caption,
-                                                progress_callback=_up_cb,
-                                                video_meta=_pre_vm,
-                                                thumb_path=_pre_tp,
-                                            )
-                                        finally:
-                                            if _pre_tp:
-                                                with contextlib.suppress(Exception):
-                                                    os.remove(_pre_tp)
-                                                    shutil.rmtree(os.path.dirname(_pre_tp), ignore_errors=True)
-                                        if relay_msg_id is not None:
-                                            async with Bot(token=bot_token) as _bot:
-                                                # Forward within relay to extract video.file_id
-                                                # without flashing a "Forwarded from" message to the user.
-                                                # Then sendVideo directly with supports_streaming=True and all metadata.
-                                                _fwd = await _bot.forward_message(
-                                                    chat_id=_relay_id,
-                                                    from_chat_id=_relay_id,
-                                                    message_id=relay_msg_id,
-                                                )
-                                                if _fwd and _fwd.video:
-                                                    _file_id = _fwd.video.file_id
-                                                    with contextlib.suppress(Exception):
-                                                        await _bot.delete_message(
-                                                            chat_id=_relay_id,
-                                                            message_id=_fwd.message_id,
-                                                        )
-                                                    _send_kwargs = {
-                                                        "chat_id": chat_id,
-                                                        "video": _file_id,
-                                                        "caption": caption or "",
-                                                        "supports_streaming": True,
-                                                    }
-                                                    if _pre_vm and _pre_vm.get("duration"):
-                                                        _send_kwargs["duration"] = _pre_vm["duration"]
-                                                    if _pre_vm and _pre_vm.get("width"):
-                                                        _send_kwargs["width"] = _pre_vm["width"]
-                                                    if _pre_vm and _pre_vm.get("height"):
-                                                        _send_kwargs["height"] = _pre_vm["height"]
-                                                    if _pre_tp and os.path.exists(_pre_tp):
-                                                        with open(_pre_tp, "rb") as _tf:
-                                                            _send_kwargs["thumbnail"] = _tf
-                                                            await _bot.send_video(**_send_kwargs)
-                                                    else:
-                                                        await _bot.send_video(**_send_kwargs)
-                                                else:
-                                                    # Fallback: copy_message if forward didn't yield a video
-                                                    await _bot.copy_message(
-                                                        chat_id=chat_id,
-                                                        from_chat_id=_relay_id,
-                                                        message_id=relay_msg_id,
-                                                        caption=caption,
-                                                    )
-                                                # Delete relay message only after successful delivery
-                                                with contextlib.suppress(Exception):
-                                                    await _bot.delete_message(
-                                                        chat_id=_relay_id,
-                                                        message_id=relay_msg_id,
-                                                    )
-                                            logger.info("Sent output via relay+copy (fallback) for job %s", job_id)
-                                            sent = True
-                                        else:
-                                            logger.error("Relay fallback send failed for job %s", job_id)
+                                    # Direct userbot delivery to user's DM (fallback).
+                                    # Telethon handles all metadata (duration/width/height/thumbnail).
+                                    _pre_vm, _pre_tp = await _probe_output_metadata(out)
+                                    try:
+                                        ok = await send_file_via_userbot(
+                                            chat_id,
+                                            out,
+                                            caption=caption,
+                                            progress_callback=_up_cb,
+                                            video_meta=_pre_vm,
+                                            thumb_path=_pre_tp,
+                                        )
+                                    finally:
+                                        if _pre_tp:
+                                            with contextlib.suppress(Exception):
+                                                os.remove(_pre_tp)
+                                                shutil.rmtree(os.path.dirname(_pre_tp), ignore_errors=True)
+                                    if ok:
+                                        logger.info(
+                                            "Sent output via Telethon userbot for job %s", job_id
+                                        )
+                                        sent = True
                                     else:
-                                        # No relay configured — direct userbot (legacy fallback)
-                                        _pre_vm, _pre_tp = await _probe_output_metadata(out)
-                                        try:
-                                            ok = await send_file_via_userbot(
-                                                chat_id,
-                                                out,
-                                                caption=caption,
-                                                progress_callback=_up_cb,
-                                                video_meta=_pre_vm,
-                                                thumb_path=_pre_tp,
-                                            )
-                                        finally:
-                                            if _pre_tp:
-                                                with contextlib.suppress(Exception):
-                                                    os.remove(_pre_tp)
-                                                    shutil.rmtree(os.path.dirname(_pre_tp), ignore_errors=True)
-                                        if ok:
-                                            logger.info(
-                                                "Sent output via Telethon userbot (no relay) for job %s", job_id
-                                            )
-                                            sent = True
-                                        else:
-                                            logger.error("Userbot send failed for job %s", job_id)
+                                        logger.error("Userbot send failed for job %s", job_id)
                                 except Exception:
                                     logger.exception("Userbot fallback raised exception for job %s", job_id)
 
