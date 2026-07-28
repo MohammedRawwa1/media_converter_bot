@@ -856,6 +856,41 @@ class EnhancedMediaHandler:
             if file_size and file_size > bot_api_max_mb * 1024 * 1024 and _bigfile_pipeline is not None:
                 _bot_chat, _bot_msg = _extract_large_file_source(current_file)
                 if _bot_chat and _bot_msg:
+                    # ── Redis-based pipeline dedup: if this file_unique_id was already
+                    #    pipelined (e.g. from a previous callback where the session didn't
+                    #    persist _pipeline_job_id), skip the pipeline entirely. This prevents
+                    #    double Pyrogram downloads even when the session is reloaded. ──
+                    _dedup_key = None
+                    _file_uid = current_file.get("file_unique_id")
+                    if user_id and _file_uid:
+                        _dedup_key = f"ffmpeg:pipeline_dedup:{user_id}:{_file_uid}"
+                        try:
+                            from utils.job_queue import get_redis
+                            _r_dedup = await get_redis()
+                            try:
+                                _already = await _r_dedup.get(_dedup_key)
+                                if _already:
+                                    _stored_job_id = _already.decode() if isinstance(_already, bytes) else _already
+                                    logger.info(
+                                        "Pipeline dedup: file %s already processed by pipeline "
+                                        "(redis flag=%s), skipping for user %s",
+                                        _file_uid, _stored_job_id, user_id,
+                                    )
+                                    # Set _pipeline_job_id in current_file so the
+                                    # caller (convert_video_format etc.) sees the
+                                    # existing job and attaches a watcher instead
+                                    # of trying to enqueue a new local job.
+                                    if current_file is not None:
+                                        current_file["_pipeline_job_id"] = _stored_job_id
+                                        session["current_file"] = current_file
+                                    return
+                            finally:
+                                try:
+                                    await _r_dedup.close()
+                                except Exception:
+                                    pass
+                        except Exception:
+                            pass
                     # ── Relay-forward for pipeline: userbot may not have access to the
                     #    original chat (direct bot-user chat). If RELAY_CHAT_ID is configured,
                     #    forward the message there first so the userbot can download it.
@@ -971,6 +1006,25 @@ class EnhancedMediaHandler:
                                     self._persist_session(user_id)
                                 except Exception:
                                     logger.debug("Could not persist pipeline job flag")
+
+                            # ── Set Redis dedup flag so the pipeline won't re-run
+                            #    even if the session is lost or reloaded. ──
+                            if _dedup_key:
+                                try:
+                                    _r_dedup_save = await get_redis()
+                                    try:
+                                        await _r_dedup_save.set(_dedup_key, _ingest.job_id, ex=86400)
+                                        logger.info(
+                                            "Pipeline dedup: set redis flag %s = %s (TTL 2h)",
+                                            _dedup_key, _ingest.job_id,
+                                        )
+                                    finally:
+                                        try:
+                                            await _r_dedup_save.close()
+                                        except Exception:
+                                            pass
+                                except Exception:
+                                    pass
 
                             # Return BEFORE the notification so pipeline success
                             # always short-circuits even if reply_text fails

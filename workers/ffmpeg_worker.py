@@ -248,6 +248,94 @@ async def _send_video_result(
                     os.remove(_cleanup_thumb)
 
 
+async def _probe_output_metadata(out_path: str) -> tuple[dict | None, str | None]:
+    """Probe a video file for metadata (duration, width, height) and generate a thumbnail.
+
+    This is used as a fallback probe before calling ``send_file_via_userbot`` so that
+    even if the internal probe inside Telethon/Pyrogram fails, the video still arrives
+    with proper duration/timestamps and a thumbnail in the user's DM.
+
+    Returns:
+        Tuple of (video_meta dict or None, thumb_path str or None).
+        ``video_meta`` has keys ``duration`` (int), ``width`` (int), ``height`` (int).
+        ``thumb_path`` is a path to a JPEG thumbnail file (caller cleans up via os.remove).
+    """
+    if not out_path or not os.path.exists(out_path):
+        return None, None
+
+    video_meta = None
+    thumb_path = None
+
+    # ── ffprobe for duration / dimensions ──
+    ffprobe_bin = getattr(config, "FFPROBE_PATH", None) or getattr(config, "FFMPEG_PATH", "ffmpeg").replace(
+        "ffmpeg", "ffprobe"
+    )
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            ffprobe_bin,
+            "-v",
+            "quiet",
+            "-print_format",
+            "json",
+            "-show_entries",
+            "stream=width,height,codec_type:format=duration",
+            out_path,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=15)
+        if proc.returncode == 0:
+            data = json.loads(stdout.decode())
+            meta = {}
+            for s in data.get("streams", []):
+                if s.get("codec_type") == "video":
+                    if "width" in s:
+                        meta["width"] = s["width"]
+                    if "height" in s:
+                        meta["height"] = s["height"]
+                    break
+            fmt = data.get("format", {})
+            if fmt.get("duration"):
+                with contextlib.suppress(ValueError, TypeError):
+                    meta["duration"] = int(float(fmt["duration"]))
+            if meta:
+                video_meta = meta
+    except Exception:
+        logger.debug("Worker: fallback metadata probe failed for %s", out_path)
+
+    # ── ffmpeg thumbnail at 1s ──
+    ffmpeg_bin = getattr(config, "FFMPEG_PATH", "ffmpeg")
+    try:
+        _td = tempfile.mkdtemp(prefix="worker_thumb_")
+        _tp = os.path.join(_td, "thumb.jpg")
+        proc = await asyncio.create_subprocess_exec(
+            ffmpeg_bin,
+            "-y",
+            "-ss",
+            "00:00:01",
+            "-i",
+            out_path,
+            "-vframes",
+            "1",
+            "-q:v",
+            "2",
+            _tp,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        await asyncio.wait_for(proc.communicate(), timeout=30)
+        if proc.returncode == 0 and os.path.exists(_tp) and os.path.getsize(_tp) > 0:
+            thumb_path = _tp
+        else:
+            shutil.rmtree(_td, ignore_errors=True)
+    except Exception:
+        logger.debug("Worker: fallback thumbnail generation failed for %s", out_path)
+        with contextlib.suppress(Exception):
+            shutil.rmtree(_td, ignore_errors=True)
+
+    return video_meta, thumb_path
+
+
 async def _forward_pubsub_listener(stop_event: asyncio.Event | None, event: asyncio.Event) -> None:
     """Background task: subscribe to forward publish channel and set `event` when a notification arrives.
 
@@ -1220,9 +1308,20 @@ async def handle_job(job: dict):
                                         #    video metadata preserved. ──
                                         try:
                                             _relay_id = int(_relay_chat)
-                                            relay_msg_id = await send_file_via_userbot(
-                                                _relay_id, out, caption=caption, progress_callback=_up_cb
-                                            )
+                                            # ── Fallback metadata probe: ensures the video arrives with
+                                            #    duration/timestamps even if send_file_via_userbot's
+                                            #    internal ffprobe fails. ──
+                                            _pre_vm, _pre_tp = await _probe_output_metadata(out)
+                                            try:
+                                                relay_msg_id = await send_file_via_userbot(
+                                                    _relay_id, out, caption=caption, progress_callback=_up_cb,
+                                                    video_meta=_pre_vm, thumb_path=_pre_tp,
+                                                )
+                                            finally:
+                                                if _pre_tp:
+                                                    with contextlib.suppress(Exception):
+                                                        os.remove(_pre_tp)
+                                                        shutil.rmtree(os.path.dirname(_pre_tp), ignore_errors=True)
                                             if relay_msg_id is not None:
                                                 async with Bot(token=bot_token) as _bot_copy:
                                                     await _bot_copy.copy_message(
@@ -1731,9 +1830,20 @@ async def handle_job(job: dict):
                                         # ── Relay+copy fallback ──
                                         try:
                                             _relay_id = int(_relay_chat)
-                                            relay_msg_id = await send_file_via_userbot(
-                                                _relay_id, out, caption=caption, progress_callback=_up_cb
-                                            )
+                                            # ── Fallback metadata probe: ensures the video arrives with
+                                            #    duration/timestamps even if send_file_via_userbot's
+                                            #    internal ffprobe fails. ──
+                                            _pre_vm, _pre_tp = await _probe_output_metadata(out)
+                                            try:
+                                                relay_msg_id = await send_file_via_userbot(
+                                                    _relay_id, out, caption=caption, progress_callback=_up_cb,
+                                                    video_meta=_pre_vm, thumb_path=_pre_tp,
+                                                )
+                                            finally:
+                                                if _pre_tp:
+                                                    with contextlib.suppress(Exception):
+                                                        os.remove(_pre_tp)
+                                                        shutil.rmtree(os.path.dirname(_pre_tp), ignore_errors=True)
                                             if relay_msg_id is not None:
                                                 async with Bot(token=bot_token) as _bot_copy:
                                                     await _bot_copy.copy_message(

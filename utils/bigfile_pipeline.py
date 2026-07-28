@@ -36,8 +36,6 @@ DEFAULT_BOT_API_MAX_MB = int(os.getenv("BOT_API_MAX_MB", "20"))
 DEFAULT_BOT_API_MAX_BYTES = DEFAULT_BOT_API_MAX_MB * 1024 * 1024
 
 # Files up to this size (200MB) get streamed through memory instead of temp disk
-IN_MEMORY_MAX_BYTES = int(os.getenv("BIGFILE_IN_MEMORY_MAX_MB", "200")) * 1024 * 1024
-
 # Imports — all guarded for optional dependencies
 try:
     from utils.storage import get_storage_backend
@@ -100,6 +98,11 @@ class BigFilePipeline:
     ) -> IngestResult:
         """Download a large file via Pyrogram userbot, upload to S3, enqueue a processing job.
 
+        This path uses a single disk-based download (no in-memory streaming) to avoid
+        double-Pyrogram downloads. For files up to 200MB the previous in-memory path
+        often failed silently, causing a fallback disk download that looked like two
+        separate Pyrogram calls.
+
         Args:
             chat_id: Telegram chat ID where the file was sent.
             message_id: Telegram message ID of the file.
@@ -128,16 +131,10 @@ class BigFilePipeline:
 
         actual_size = 0
         s3_key = input_s3_key
-        _in_memory_success = False
 
-        # Try in-memory streaming for files 50-200MB when S3 is available
-        _use_in_memory = (
-            self._storage is not None and file_size > DEFAULT_BOT_API_MAX_BYTES and file_size <= IN_MEMORY_MAX_BYTES
-        )
-
-        # ── Check Redis byte cache before downloading ──
+        # ── Check Redis byte cache before downloading (fast path) ──
         _cache_hit = False
-        if _use_in_memory and self._cache and file_unique_id:
+        if self._cache and file_unique_id:
             try:
                 cached_data = await self._cache.get_cached_file_bytes(file_unique_id)
                 if cached_data is not None and len(cached_data) > 0:
@@ -147,10 +144,9 @@ class BigFilePipeline:
                         len(cached_data) // (1024 * 1024),
                     )
                     actual_size = len(cached_data)
-                    await self._storage.upload_bytes(cached_data, s3_key)
-                    _in_memory_success = True
+                    if self._storage is not None:
+                        await self._storage.upload_bytes(cached_data, s3_key)
                     _cache_hit = True
-                    # Cache file metadata
                     if self._cache:
                         with contextlib.suppress(Exception):
                             await self._cache.cache_file_info(
@@ -173,72 +169,11 @@ class BigFilePipeline:
             except Exception as e:
                 logger.debug("BigFilePipeline: cache check failed: %s", e)
 
-        if not _cache_hit and _use_in_memory:
-            try:
-                from utils.userbot_downloader import download_bytes_via_userbot
-
-                logger.info(
-                    "BigFilePipeline: in-memory download chat=%s msg=%s size=%dMB",
-                    chat_id,
-                    message_id,
-                    file_size // (1024 * 1024),
-                )
-                data = await download_bytes_via_userbot(chat_id, message_id, progress_callback=progress_callback)
-                if data is not None and len(data) > 0:
-                    actual_size = len(data)
-                    logger.info(
-                        "BigFilePipeline: in-memory download complete, size=%dMB, uploading to S3",
-                        actual_size // (1024 * 1024),
-                    )
-                    await self._storage.upload_bytes(data, s3_key)
-                    logger.info("BigFilePipeline: S3 upload via bytes complete")
-                    _in_memory_success = True
-
-                    # Cache the raw file bytes in Redis for future use
-                    if self._cache and file_unique_id:
-                        try:
-                            await self._cache.cache_file_bytes(file_unique_id, data)
-                            logger.info(
-                                "BigFilePipeline: cached %d bytes for file_unique_id=%s",
-                                actual_size,
-                                file_unique_id,
-                            )
-                        except Exception as cache_err:
-                            logger.debug("BigFilePipeline: failed to cache file bytes: %s", cache_err)
-
-                    # Cache file info
-                    if self._cache and file_unique_id:
-                        with contextlib.suppress(Exception):
-                            await self._cache.cache_file_info(
-                                file_unique_id,
-                                {
-                                    "job_id": job_id,
-                                    "size": actual_size,
-                                    "path": s3_key,
-                                    "chat_id": chat_id,
-                                    "message_id": message_id,
-                                },
-                                ttl=86400,
-                            )
-
-                    logger.info(
-                        "BigFilePipeline: in-memory pipeline succeeded for %s/%s (%d bytes)",
-                        chat_id,
-                        message_id,
-                        actual_size,
-                    )
-                else:
-                    logger.info(
-                        "BigFilePipeline: in-memory download returned None; falling back to disk-based path",
-                    )
-            except Exception as e:
-                logger.warning(
-                    "BigFilePipeline: in-memory path failed (%s); falling back to disk-based download",
-                    e,
-                )
-
-        if not _in_memory_success:
-            # Fallback: download to temp file, upload to S3, clean up
+        # ── Disk-based download (single Pyrogram call, always used) ──
+        # The previous in-memory path (download_bytes_via_userbot) often failed for files
+        # 20-200MB, causing a fallback disk download that looked like two Pyrogram calls.
+        # Now we always use the single disk-based path with progress callback support.
+        if not _cache_hit:
             try:
                 temp_dir = os.path.join(os.getenv("STORAGE_PATH", "storage"), "temp")
                 os.makedirs(temp_dir, exist_ok=True)
@@ -252,7 +187,12 @@ class BigFilePipeline:
                     temp_path,
                 )
 
-                download_ok = await self._download_via_pyrogram(chat_id, message_id, temp_path)
+                download_ok = await self._download_via_pyrogram(
+                    chat_id,
+                    message_id,
+                    temp_path,
+                    progress_callback=progress_callback,
+                )
                 if not download_ok or not os.path.exists(temp_path) or os.path.getsize(temp_path) == 0:
                     return IngestResult(
                         ok=False,
@@ -262,7 +202,7 @@ class BigFilePipeline:
                 actual_size = os.path.getsize(temp_path)
                 logger.info("BigFilePipeline: disk download complete, actual_size=%dMB", actual_size // (1024 * 1024))
 
-                # Cache file info
+                # Cache file info in Redis
                 if self._cache and file_unique_id:
                     with contextlib.suppress(Exception):
                         await self._cache.cache_file_info(
@@ -337,8 +277,23 @@ class BigFilePipeline:
             logger.exception("BigFilePipeline: enqueue failed: %s", e)
             return IngestResult(ok=False, error=f"Enqueue error: {e}")
 
-    async def _download_via_pyrogram(self, chat_id: int, message_id: int, dest_path: str) -> bool:
-        """Download a message using Pyrogram userbot."""
+    async def _download_via_pyrogram(
+        self,
+        chat_id: int,
+        message_id: int,
+        dest_path: str,
+        progress_callback: Callable[[int, int], None] | None = None,
+    ) -> bool:
+        """Download a message using Pyrogram userbot.
+
+        Args:
+            chat_id: Telegram chat ID where the file is.
+            message_id: Telegram message ID of the file.
+            dest_path: Local path to save the downloaded file.
+            progress_callback: Optional callable(current_bytes, total_bytes) for progress.
+
+        Returns True on success, False on failure.
+        """
         try:
             from utils.userbot_downloader import download_forward_via_userbot
 
@@ -346,6 +301,7 @@ class BigFilePipeline:
                 chat_id=chat_id,
                 message_id=message_id,
                 dest_path=dest_path,
+                progress_callback=progress_callback,
             )
             return ok
         except Exception as e:
