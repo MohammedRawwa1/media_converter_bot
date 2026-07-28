@@ -100,7 +100,20 @@ async def run_ffmpeg(
     # Use veryfast preset to reduce memory usage on memory-constrained hosts.
     # The -preset fast default was consuming too much RAM alongside multiple uvicorn workers.
     # veryfast uses ~30% less memory at the cost of slightly larger output files.
-    ffmpeg_args = ffmpeg_args or ["-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart"]
+    ffmpeg_args = ffmpeg_args or [
+        "-c:v",
+        "libx264",
+        "-preset",
+        "veryfast",
+        "-crf",
+        "23",
+        "-c:a",
+        "aac",
+        "-b:a",
+        "128k",
+        "-movflags",
+        "+faststart",
+    ]
 
     # Validate input path before probing/starting ffmpeg
     if not input_path:

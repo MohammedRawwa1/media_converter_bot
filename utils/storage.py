@@ -367,8 +367,9 @@ class S3AsyncBackend(AsyncStorageBackend):
         if self._use_aioboto3:
             async with self._session.client("s3", **self._client_kwargs()) as client:
                 # generate_presigned_post is a local signing operation (no network)
-                post = client.generate_presigned_post(Bucket=self.bucket, Key=key, ExpiresIn=expires)
-                get_url = client.generate_presigned_url(
+                # but aioboto3 still wraps it as a coroutine — await it.
+                post = await client.generate_presigned_post(Bucket=self.bucket, Key=key, ExpiresIn=expires)
+                get_url = await client.generate_presigned_url(
                     "get_object", Params={"Bucket": self.bucket, "Key": key}, ExpiresIn=expires * 24
                 )
             return {"url": post["url"], "fields": post["fields"], "key": key, "get_url": get_url}
@@ -390,7 +391,7 @@ class S3AsyncBackend(AsyncStorageBackend):
         expires = expires or config.PRESIGN_EXPIRES
         if self._use_aioboto3:
             async with self._session.client("s3", **self._client_kwargs()) as client:
-                url = client.generate_presigned_url(
+                url = await client.generate_presigned_url(
                     "get_object", Params={"Bucket": self.bucket, "Key": key}, ExpiresIn=expires
                 )
             return url

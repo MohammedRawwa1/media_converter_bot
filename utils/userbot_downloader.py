@@ -782,7 +782,6 @@ async def _attempt_recovery_download(
 
     # ---- Step 1: Find the message ----
     msg = None
-    used_raw_peer = None
     for _peer in candidates:
         try:
             messages = await client.get_messages(_peer, message_ids=[message_id])
@@ -802,8 +801,7 @@ async def _attempt_recovery_download(
                     )
                     if _m is not None and getattr(_m, "media", None):
                         msg = _m
-                        used_raw_peer = channel_peer
-                        break
+                    break
         except Exception:
             continue
 
@@ -831,8 +829,7 @@ async def _attempt_recovery_download(
     #    via the relay group, so this extra forward is unnecessary.
     #    We skip straight to session recycling (Step 4). ──
     logger.info(
-        "userbot: recovery \u2014 skipping forward to Saved Messages (disabled), "
-        "trying session recycle instead"
+        "userbot: recovery \u2014 skipping forward to Saved Messages (disabled), trying session recycle instead"
     )
 
     # ---- Step 4: Session recycling + final retry ----

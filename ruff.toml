@@ -2,7 +2,7 @@
 # https://docs.astral.sh/ruff/configuration/
 
 # Target Python version
-target-version = "py311"
+target-version = "py312"
 line-length = 120
 
 # Exclude directories (in addition to .gitignore)

@@ -368,7 +368,9 @@ async def send_file_via_userbot(
     if TelegramClient is not None and has_usable_telethon_session():
         try:
             msg_id = await _send_with_telethon(
-                chat_id, file_path, caption,
+                chat_id,
+                file_path,
+                caption,
                 progress_callback=progress_callback,
                 video_meta=video_meta,
                 thumb_path=thumb_path,
@@ -384,7 +386,9 @@ async def send_file_via_userbot(
     # Fall back to Pyrogram (requires PYROGRAM_SESSION env var)
     if PyrogramClient is not None:
         msg_id = await _send_with_pyrogram(
-            chat_id, file_path, caption,
+            chat_id,
+            file_path,
+            caption,
             progress_callback=progress_callback,
             video_meta=video_meta,
             thumb_path=thumb_path,

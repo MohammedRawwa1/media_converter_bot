@@ -1,7 +1,7 @@
 # 🎉 Media Conversion Telegram Bot - PRODUCTION READY
 
 **Status:** 🟢 **RAILWAY DEPLOYMENT READY**  
-**Python:** 3.11.7  
+**Python:** 3.12.8  
 **Database:** MongoDB  
 **Date:** January 13, 2026
 
@@ -11,7 +11,7 @@
 
 ### 🚀 Deployment Configuration
 - ✅ **railway.json** - Railway deployment manifest
-- ✅ **runtime.txt** - Python 3.11.7 specified
+- ✅ **runtime.txt** - Python 3.12.8 specified
 - ✅ **requirements.txt** - All dependencies (motor, pymongo, FFmpeg)
 - ✅ **Dockerfile** - Container-based deployment ready
 
@@ -114,7 +114,7 @@ git push origin main
 ```
 Routes:              ✅ 11 Commands + 3 Messages + Callbacks
 MongoDB:             ✅ Async Integration Ready
-Python:              ✅ 3.11.7 (Railway compatible)
+Python:              ✅ 3.12.8 (Railway compatible)
 Error Handling:      ✅ 11 Categories
 Timeout Protection:  ✅ 18000s FFmpeg
 Tests:               ⚠️ No integrated tests included in this repository
@@ -204,7 +204,7 @@ SENTRY_DSN=
 
 This repository includes a GitHub Actions workflow at `.github/workflows/ci.yml` that:
 
- - Installs dependencies from `requirements.txt` using Python 3.11
+ - Installs dependencies from `requirements.txt` using Python 3.12
  - Runs a syntax check via `python -m py_compile`
  - Runs `flake8` linting
 
@@ -252,7 +252,7 @@ Your bot is **complete, fully tested, and production-ready**:
 - ✅ All deployment files ready
  - ⚠️ Integrated tests removed from repository
 - ✅ Clean project structure (README.md only)
-- ✅ Python 3.11.7 - Railway optimized
+- ✅ Python 3.12.8 - Railway optimized
 - ✅ railway.json configured for all services
 - ✅ Clean project structure
 

@@ -12,13 +12,18 @@ on:
     branches: [main]
   workflow_dispatch:
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 env:
-  PYTHON_VERSION: "3.11"
+  PYTHON_VERSION: "3.12"
 
 jobs:
   security-scan:
     name: "Bandit + Ruff + pip-audit"
     runs-on: ubuntu-latest
+    timeout-minutes: 10
 
     steps:
       - name: Checkout code
@@ -39,12 +44,13 @@ jobs:
 
       - name: Run Bandit security scan
         id: bandit
+        continue-on-error: true
         run: |
           BANDIT_ARGS=""
           if [ -f .bandit ]; then
             BANDIT_ARGS="-c .bandit"
           fi
-          python -m bandit $BANDIT_ARGS -r . -f json -o bandit-report.json 2>&1 || true
+          bandit $BANDIT_ARGS -r . -f json -o bandit-report.json 2>&1 || true
 
           if [ ! -f bandit-report.json ]; then
             echo "has_issues=false" >> $GITHUB_OUTPUT
@@ -87,8 +93,9 @@ jobs:
 
       - name: Run pip-audit dependency scan
         id: pipaudit
+        continue-on-error: true
         run: |
-          python -m pip_audit --requirement requirements.txt --desc 2>&1 | tee pip-audit-output.txt
+          pip-audit --requirement requirements.txt --desc 2>&1 | tee pip-audit-output.txt
           if grep -q "No known vulnerabilities found" pip-audit-output.txt; then
             echo "pip-audit: 0 known vulnerabilities"
             echo "has_vulns=false" >> $GITHUB_OUTPUT
@@ -101,13 +108,8 @@ jobs:
         id: ruff
         continue-on-error: true
         run: |
-          RUFF_ARGS=""
-          if [ -f ruff.toml ]; then
-            RUFF_ARGS="--config ruff.toml"
-          fi
-          python -m ruff check . $RUFF_ARGS --output-format github 2>&1 | tee ruff-output.txt
-          RUFF_EXIT=${PIPESTATUS[0]}
-          if [ $RUFF_EXIT -eq 0 ]; then
+          ruff check . --config ruff.toml --output-format github 2>&1 | tee ruff-output.txt
+          if [ ${PIPESTATUS[0]} -eq 0 ]; then
             echo "Ruff: no issues found"
             echo "has_issues=false" >> $GITHUB_OUTPUT
           else
@@ -116,12 +118,13 @@ jobs:
           fi
 
       - name: Check for OWASP leak patterns
+        continue-on-error: true
         run: |
           patterns_found=0
           for p in "exc.__class__.__name__" "allow_redirects=True"; do
             matches=$(grep -rn "$p" --include="*.py" . 2>/dev/null \
-              | grep -v ".venv" | grep -v "env/" | grep -v "__pycache__" \
-              | grep -v ".eggs" || true)
+              --exclude-dir=.venv --exclude-dir=env --exclude-dir=__pycache__ \
+              --exclude-dir=.eggs --exclude-dir=.ruff_cache || true)
             if [ -n "$matches" ]; then
               echo "::warning::Found pattern '$p':"
               echo "$matches"

@@ -866,6 +866,7 @@ class EnhancedMediaHandler:
                         _dedup_key = f"ffmpeg:pipeline_dedup:{user_id}:{_file_uid}"
                         try:
                             from utils.job_queue import get_redis
+
                             _r_dedup = await get_redis()
                             try:
                                 _already = await _r_dedup.get(_dedup_key)
@@ -883,7 +884,14 @@ class EnhancedMediaHandler:
                                             _status = _old_hash.get(b"status") or _old_hash.get("status")
                                             if _status:
                                                 _s = _status.decode() if isinstance(_status, bytes) else str(_status)
-                                                _active = _s in ("processing", "queued", "waiting", "started", "uploading", "sending")
+                                                _active = _s in (
+                                                    "processing",
+                                                    "queued",
+                                                    "waiting",
+                                                    "started",
+                                                    "uploading",
+                                                    "sending",
+                                                )
                                     except Exception:
                                         _active = False
 
@@ -891,7 +899,9 @@ class EnhancedMediaHandler:
                                         logger.info(
                                             "Pipeline dedup: file %s is still being processed "
                                             "by job %s; skipping duplicate for user %s",
-                                            _file_uid, _stored_job_id, user_id,
+                                            _file_uid,
+                                            _stored_job_id,
+                                            user_id,
                                         )
                                         if current_file is not None:
                                             current_file["_pipeline_job_id"] = _stored_job_id
@@ -903,15 +913,14 @@ class EnhancedMediaHandler:
                                         logger.info(
                                             "Pipeline dedup: job %s for file %s is no longer "
                                             "active (stale/done); clearing dedup and reprocessing",
-                                            _stored_job_id, _file_uid,
+                                            _stored_job_id,
+                                            _file_uid,
                                         )
                                         await _r_dedup.delete(_dedup_key)
                                         # Do NOT return — fall through to normal pipeline processing
                             finally:
-                                try:
+                                with contextlib.suppress(Exception):
                                     await _r_dedup.close()
-                                except Exception:
-                                    pass
                         except Exception:
                             pass
                     # ── Relay-forward for pipeline: userbot may not have access to the
@@ -1039,13 +1048,12 @@ class EnhancedMediaHandler:
                                         await _r_dedup_save.set(_dedup_key, _ingest.job_id, ex=86400)
                                         logger.info(
                                             "Pipeline dedup: set redis flag %s = %s (TTL 2h)",
-                                            _dedup_key, _ingest.job_id,
+                                            _dedup_key,
+                                            _ingest.job_id,
                                         )
                                     finally:
-                                        try:
+                                        with contextlib.suppress(Exception):
                                             await _r_dedup_save.close()
-                                        except Exception:
-                                            pass
                                 except Exception:
                                     pass
 
@@ -1847,9 +1855,7 @@ class EnhancedMediaHandler:
                 current_file.get("id"),
             )
             # Re-notify the user and attach watch to the existing pipeline job
-            kb = InlineKeyboardMarkup(
-                [[InlineKeyboardButton("❌ Cancel", callback_data=f"cancel_job:{_existing_id}")]]
-            )
+            kb = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data=f"cancel_job:{_existing_id}")]])
             await self.safe_edit(
                 query,
                 f"🎬 File already queued via pipeline (Job: {_existing_id[:8]}...). Processing is underway.",
@@ -4049,9 +4055,7 @@ class EnhancedMediaHandler:
                 _existing_id,
                 current_file.get("id"),
             )
-            kb = InlineKeyboardMarkup(
-                [[InlineKeyboardButton("❌ Cancel", callback_data=f"cancel_job:{_existing_id}")]]
-            )
+            kb = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data=f"cancel_job:{_existing_id}")]])
             await self.safe_edit(
                 query,
                 f"⚡ File already queued via pipeline (Job: {_existing_id[:8]}...). Optimization is underway.",
@@ -4168,9 +4172,7 @@ class EnhancedMediaHandler:
                 _existing_id,
                 current_file.get("id"),
             )
-            kb = InlineKeyboardMarkup(
-                [[InlineKeyboardButton("❌ Cancel", callback_data=f"cancel_job:{_existing_id}")]]
-            )
+            kb = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data=f"cancel_job:{_existing_id}")]])
             await self.safe_edit(
                 query,
                 f"🔧 File already queued via pipeline (Job: {_existing_id[:8]}...). Repair is underway.",
@@ -4395,9 +4397,7 @@ class EnhancedMediaHandler:
                 _existing_id,
                 current_file.get("id"),
             )
-            kb = InlineKeyboardMarkup(
-                [[InlineKeyboardButton("❌ Cancel", callback_data=f"cancel_job:{_existing_id}")]]
-            )
+            kb = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data=f"cancel_job:{_existing_id}")]])
             await self.safe_edit(
                 query,
                 f"🎞️ File already queued via pipeline (Job: {_existing_id[:8]}...). Extraction is underway.",

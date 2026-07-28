@@ -27,7 +27,6 @@ from prometheus_client import Counter, Gauge, Histogram, start_http_server
 from telegram import Bot
 
 import config
-from media_converter import ExtendedMediaConverter
 from tasks import (
     create_archive,
     extract_streams,
@@ -231,7 +230,10 @@ async def _send_video_result(
                 _send_kwargs["height"] = vid_height
             logger.info(
                 "Worker: sending video file=%s size=%s thumb=%s duration=%s supports_streaming=True",
-                file_path, file_size, bool(thumb_path), _send_kwargs.get("duration"),
+                file_path,
+                file_size,
+                bool(thumb_path),
+                _send_kwargs.get("duration"),
             )
             if thumb_path:
                 try:
@@ -281,9 +283,7 @@ async def _probe_output_metadata(out_path: str) -> tuple[dict | None, str | None
         _fhash = None
         try:
             if _cache and out_path and os.path.exists(out_path):
-                _fhash = hashlib.sha256(
-                    f"{out_path}:{os.path.getsize(out_path)}".encode()
-                ).hexdigest()[:16]
+                _fhash = hashlib.sha256(f"{out_path}:{os.path.getsize(out_path)}".encode()).hexdigest()[:16]
                 _cached = await _cache.get(f"cache:probe_meta:{_fhash}")
                 if _cached:
                     video_meta = _cached
@@ -324,9 +324,7 @@ async def _probe_output_metadata(out_path: str) -> tuple[dict | None, str | None
                     # Cache the result
                     try:
                         if _cache:
-                            await _cache.set(
-                                f"cache:probe_meta:{_fhash}", video_meta, ttl=86400
-                            )
+                            await _cache.set(f"cache:probe_meta:{_fhash}", video_meta, ttl=86400)
                             logger.debug("Worker: cached ffprobe result for %s", out_path)
                     except Exception:
                         logger.debug("Worker: failed to cache ffprobe result for %s", out_path)
@@ -824,7 +822,6 @@ async def handle_job(job: dict):
         logger.exception("Failed to compute output_path from original_filename")
 
     attempt = 0
-    ExtendedMediaConverter() if ExtendedMediaConverter else None
     # optional memory sampler task (helpful for remote debugging)
     memory_sampler_task = None
 
@@ -1339,8 +1336,12 @@ async def handle_job(job: dict):
                                         _pre_vm, _pre_tp = await _probe_output_metadata(out)
                                         try:
                                             relay_msg_id = await send_file_via_userbot(
-                                                _relay_id, out, caption=caption, progress_callback=_up_cb,
-                                                video_meta=_pre_vm, thumb_path=_pre_tp,
+                                                _relay_id,
+                                                out,
+                                                caption=caption,
+                                                progress_callback=_up_cb,
+                                                video_meta=_pre_vm,
+                                                thumb_path=_pre_tp,
                                             )
                                         finally:
                                             if _pre_tp:
@@ -1360,7 +1361,8 @@ async def handle_job(job: dict):
                                                 )
                                                 with contextlib.suppress(Exception):
                                                     await _bot.delete_message(
-                                                        chat_id=_relay_id, message_id=relay_msg_id,
+                                                        chat_id=_relay_id,
+                                                        message_id=relay_msg_id,
                                                     )
                                             logger.info("Sent output via relay+copy for job %s", job_id)
                                             sent = True
@@ -1372,8 +1374,12 @@ async def handle_job(job: dict):
                                         _pre_vm, _pre_tp = await _probe_output_metadata(out)
                                         try:
                                             ok = await send_file_via_userbot(
-                                                chat_id, out, caption=caption, progress_callback=_up_cb,
-                                                video_meta=_pre_vm, thumb_path=_pre_tp,
+                                                chat_id,
+                                                out,
+                                                caption=caption,
+                                                progress_callback=_up_cb,
+                                                video_meta=_pre_vm,
+                                                thumb_path=_pre_tp,
                                             )
                                         finally:
                                             if _pre_tp:
@@ -1381,7 +1387,9 @@ async def handle_job(job: dict):
                                                     os.remove(_pre_tp)
                                                     shutil.rmtree(os.path.dirname(_pre_tp), ignore_errors=True)
                                         if ok:
-                                            logger.info("Sent output via Telethon userbot (no relay) for job %s", job_id)
+                                            logger.info(
+                                                "Sent output via Telethon userbot (no relay) for job %s", job_id
+                                            )
                                             sent = True
                                         else:
                                             logger.error("Userbot send failed for job %s", job_id)
@@ -1403,7 +1411,11 @@ async def handle_job(job: dict):
 
                                     # Use _probe_output_metadata for metadata + thumbnail
                                     # (replaces separate ffprobe + auto-thumbnail generation)
-                                    _probe_vm, _probe_tp = await _probe_output_metadata(out) if out and os.path.exists(out) else (None, None)
+                                    _probe_vm, _probe_tp = (
+                                        await _probe_output_metadata(out)
+                                        if out and os.path.exists(out)
+                                        else (None, None)
+                                    )
                                     kind = "doc"
                                     _vid_duration = _probe_vm.get("duration") if _probe_vm else None
                                     _vid_width = _probe_vm.get("width") if _probe_vm else None
@@ -1418,7 +1430,11 @@ async def handle_job(job: dict):
                                         kind = "doc"
                                     logger.info(
                                         "Worker: Bot API probe for %s: kind=%s duration=%s width=%s height=%s",
-                                        out, kind, _vid_duration, _vid_width, _vid_height,
+                                        out,
+                                        kind,
+                                        _vid_duration,
+                                        _vid_width,
+                                        _vid_height,
                                     )
                                     try:
                                         # Use async Bot API methods directly and close the client when done
@@ -1730,8 +1746,12 @@ async def handle_job(job: dict):
                                         _pre_vm, _pre_tp = await _probe_output_metadata(out)
                                         try:
                                             relay_msg_id = await send_file_via_userbot(
-                                                _relay_id, out, caption=caption, progress_callback=_up_cb,
-                                                video_meta=_pre_vm, thumb_path=_pre_tp,
+                                                _relay_id,
+                                                out,
+                                                caption=caption,
+                                                progress_callback=_up_cb,
+                                                video_meta=_pre_vm,
+                                                thumb_path=_pre_tp,
                                             )
                                         finally:
                                             if _pre_tp:
@@ -1751,7 +1771,8 @@ async def handle_job(job: dict):
                                                 )
                                                 with contextlib.suppress(Exception):
                                                     await _bot.delete_message(
-                                                        chat_id=_relay_id, message_id=relay_msg_id,
+                                                        chat_id=_relay_id,
+                                                        message_id=relay_msg_id,
                                                     )
                                             logger.info("Sent output via relay+copy (fallback) for job %s", job_id)
                                             sent = True
@@ -1762,8 +1783,12 @@ async def handle_job(job: dict):
                                         _pre_vm, _pre_tp = await _probe_output_metadata(out)
                                         try:
                                             ok = await send_file_via_userbot(
-                                                chat_id, out, caption=caption, progress_callback=_up_cb,
-                                                video_meta=_pre_vm, thumb_path=_pre_tp,
+                                                chat_id,
+                                                out,
+                                                caption=caption,
+                                                progress_callback=_up_cb,
+                                                video_meta=_pre_vm,
+                                                thumb_path=_pre_tp,
                                             )
                                         finally:
                                             if _pre_tp:
@@ -1771,7 +1796,9 @@ async def handle_job(job: dict):
                                                     os.remove(_pre_tp)
                                                     shutil.rmtree(os.path.dirname(_pre_tp), ignore_errors=True)
                                         if ok:
-                                            logger.info("Sent output via Telethon userbot (no relay) for job %s", job_id)
+                                            logger.info(
+                                                "Sent output via Telethon userbot (no relay) for job %s", job_id
+                                            )
                                             sent = True
                                         else:
                                             logger.error("Userbot send failed for job %s", job_id)
