@@ -237,10 +237,82 @@ async def publish_update(channel: str, payload: dict) -> None:
 
 
 async def cancel_job(job_id: str) -> None:
-    """Set cancel flag for a job."""
+    """Cancel a job: set cancel=1 flag in the hash and release the input lock.
+
+    Running workers detect cancel=1 in the hash and stop processing. The hash
+    is preserved (with cancel=1) so the worker sees it; cleanup is handled by
+    the hash's TTL (default 1 day).
+    """
+    import hashlib as _hl
+
     r = await get_redis()
     try:
-        await r.hset(f"ffmpeg:job:{job_id}", mapping={"cancel": "1"})
+        key = f"ffmpeg:job:{job_id}"
+
+        # 1. Read the job hash before deleting to extract lock inputs
+        try:
+            stored = await r.hgetall(key)
+        except Exception:
+            stored = {}
+
+        # 2. Set cancel flag in the hash so running workers detect it
+        #    and stop processing. The hash will be cleaned up by TTL.
+        try:
+            await r.hset(
+                key,
+                mapping={
+                    "cancel": "1",
+                    "status": "cancelled",
+                    "message": "cancelled by user",
+                    "progress": "0",
+                },
+            )
+        except Exception:
+            logger.warning("cancel_job: failed to set cancel flag for %s", job_id)
+
+        # 3. Remove the job from the queue list so a worker doesn't pop it later.
+        #    Uses a Lua script to atomically scan and remove matching entries.
+        try:
+            _prune_script = """
+                local key = KEYS[1]
+                local target_job_id = ARGV[1]
+                local removed = 0
+                local limit = 500
+                -- Scan the list for matching entries (limited to 500 to avoid blocking)
+                local items = redis.call('lrange', key, 0, limit)
+                for _, item in ipairs(items) do
+                    local ok, parsed = pcall(cjson.decode, item)
+                    if ok and type(parsed) == 'table' and parsed.job_id == target_job_id then
+                        redis.call('lrem', key, 1, item)
+                        removed = removed + 1
+                    end
+                end
+                return removed
+            """
+            _removed = await r.eval(_prune_script, 1, JOB_LIST, job_id)
+            if _removed and int(_removed) > 0:
+                logger.info("cancel_job: pruned %s entries from queue list for job %s", _removed, job_id)
+        except Exception:
+            logger.debug("cancel_job: failed to prune queue list for %s (best-effort)", job_id)
+
+        # 4. Compute and release the input lock so new jobs with the same
+        #    input can acquire it.
+        #    Matches the worker's lock key computation:
+        #      lock_name = (input_key or input_path or source_url or job_id)
+        #      lock_hash = sha256(lock_name).hexdigest()
+        #      lock_key  = f"ffmpeg:lock:{lock_hash}"
+        lock_name = (
+            (stored or {}).get("input_key") or (stored or {}).get("input") or (stored or {}).get("source_url") or job_id
+        )
+        lock_hash = _hl.sha256(str(lock_name).encode()).hexdigest()
+        lock_key = f"ffmpeg:lock:{lock_hash}"
+        try:
+            await release_input_lock(lock_key, job_id, redis_client=r)
+            logger.info("cancel_job: released lock %s for job %s", lock_key, job_id)
+        except Exception:
+            logger.debug("cancel_job: lock release failed for %s", job_id)
+
+        logger.info("cancel_job: cancelled job %s (cancel=1 set in hash)", job_id)
     finally:
         await r.close()
 

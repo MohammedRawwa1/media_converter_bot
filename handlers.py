@@ -4,6 +4,7 @@ import contextlib
 import json
 import logging
 import os
+import time
 from datetime import datetime
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto, Update
@@ -72,6 +73,10 @@ except Exception:
     user_settings = None
 
 logger = logging.getLogger(__name__)
+
+# Registry for cancel-download flags: key="chat_id:msg_id" -> [bool]
+# Used by _try_userbot_download() progress callback and the cancel_dl: callback handler.
+_download_cancel_flags: dict[str, list] = {}
 
 
 def _extract_large_file_source(current_file: dict | None) -> tuple[int | None, int | None]:
@@ -212,7 +217,7 @@ class EnhancedMediaHandler:
                 for file_info in session["merge_list"]:
                     temp_path = file_info.get("path")
                     if temp_path and os.path.exists(temp_path):
-                        with contextlib.suppress(Exception):
+                        with contextlib.suppress(OSError):
                             os.remove(temp_path)
         finally:
             # Remove session
@@ -271,8 +276,23 @@ class EnhancedMediaHandler:
         except Exception:
             logger.exception("Failed to finalize media_group %s for user %s", media_group_id, user_id)
 
-    async def _watch_job_progress(self, query, job_id: str, poll_interval: float = 1.0):
-        """Background task: poll Redis job hash for progress and update the callback message."""
+    async def _watch_job_progress(
+        self,
+        query,
+        job_id: str,
+        poll_interval: float = 1.0,
+        progress_msg=None,
+    ):
+        """Background task: poll Redis job hash for progress and update the progress message.
+
+        Args:
+            query: A CallbackQuery to edit (required for Cancel button reply_markup).
+            job_id: The job ID to poll.
+            poll_interval: Seconds between polls.
+            progress_msg: Optional Message object to edit instead of the query's message.
+                          When provided, the query is still used for the Cancel button reply_markup
+                          but the main progress text is edited on progress_msg instead.
+        """
         try:
             try:
                 from utils.job_queue import get_redis
@@ -289,6 +309,15 @@ class EnhancedMediaHandler:
                 logger.debug("_watch_job_progress could not connect to redis: %s", e)
                 return
             last_text = None
+
+            async def _edit(text, **kwargs):
+                """Edit either progress_msg or the callback query message."""
+                if progress_msg:
+                    with contextlib.suppress(BadRequest):
+                        await progress_msg.edit_text(text, **kwargs)
+                else:
+                    await self.safe_edit(query, text, **kwargs)
+
             while True:
                 try:
                     data = await r.hgetall(f"ffmpeg:job:{job_id}")
@@ -305,7 +334,20 @@ class EnhancedMediaHandler:
                     progress = info.get("progress")
                     message = info.get("message") or ""
 
-                    text = f"🔄 Job {job_id} — {status or 'processing'}\nProgress: {progress or '0'}%\n{message}"
+                    # Phase-aware emoji prefix based on the message content
+                    _emoji = "🔄"
+                    _msg_lower = (message or "").lower()
+                    if "upload" in _msg_lower or "sending" in _msg_lower:
+                        _emoji = "📤"
+                    elif "convert" in _msg_lower or "process" in _msg_lower or "ffmpeg" in _msg_lower:
+                        _emoji = "🎬"
+                    elif "done" in _msg_lower or "delivered" in _msg_lower:
+                        _emoji = "✅"
+                    elif "error" in _msg_lower or "fail" in _msg_lower:
+                        _emoji = "❌"
+                    elif "cancel" in _msg_lower or _msg_lower == "cancelled":
+                        _emoji = "⏹️"
+                    text = f"{_emoji} Job {job_id} — {status or 'processing'}\nProgress: {progress or '0'}%\n{message}"
                     # Build an inline keyboard with Cancel and an optional Progress (web) link
                     status_url = None
                     try:
@@ -335,7 +377,7 @@ class EnhancedMediaHandler:
                             [[InlineKeyboardButton("❌ Cancel", callback_data=f"cancel_job:{job_id}")]]
                         )
                     if text != last_text:
-                        await self.safe_edit(query, text, reply_markup=kb)
+                        await _edit(text, reply_markup=kb)
                         last_text = text
 
                     if status in ("done", "error", "cancelled"):
@@ -379,11 +421,17 @@ class EnhancedMediaHandler:
                                     logger.debug("handlers: operation failed")
                     except Exception:
                         logger.debug("handlers: operation failed")
-                    await self.safe_edit(query, f"✅ Job {job_id} finished. Output: {display_output}")
+                    await _edit(f"✅ Job {job_id} finished. Output: {display_output}")
                 elif status == "cancelled":
-                    await self.safe_edit(query, f"⏹️ Job {job_id} was cancelled.")
+                    # If cancel_notified flag is set, the cancel button handler
+                    # already edited the message — skip to avoid overwriting.
+                    # If absent (e.g. /canceljob admin command path), edit here.
+                    if info.get("cancel_notified"):
+                        pass
+                    else:
+                        await _edit(f"⏹️ Job {job_id} was cancelled.")
                 else:
-                    await self.safe_edit(query, f"⚠️ Job {job_id} finished with status: {status}")
+                    await _edit(f"⚠️ Job {job_id} finished with status: {status}")
             except Exception:
                 logger.debug("handlers: final fetch for output or error")
             try:
@@ -412,7 +460,7 @@ class EnhancedMediaHandler:
                 # remove existing file if session cleared
                 path = self._session_file(user_id)
                 if os.path.exists(path):
-                    with contextlib.suppress(Exception):
+                    with contextlib.suppress(OSError):
                         os.remove(path)
                 return
             minimal = {
@@ -434,7 +482,7 @@ class EnhancedMediaHandler:
                         if loop.is_running():
                             asyncio.create_task(self.db_model.save_session(user_id, minimal))
                         else:
-                            with contextlib.suppress(Exception):
+                            with contextlib.suppress(RuntimeError):
                                 loop.run_until_complete(self.db_model.save_session(user_id, minimal))
                     except Exception:
                         logger.exception("Failed scheduling DB session save for %s", user_id)
@@ -692,7 +740,6 @@ class EnhancedMediaHandler:
                     _thumb_path = _gen_thumb
                     _cleanup_thumb = True
                 else:
-                    _sp_run = contextlib.suppress(Exception)
                     _sp_run = None
                     try:
                         import shutil as _shutil
@@ -791,7 +838,7 @@ class EnhancedMediaHandler:
             ext = os.path.splitext(name)[1] or ""
 
         input_dir = getattr(config, "INPUT_PATH", "storage/input")
-        with contextlib.suppress(Exception):
+        with contextlib.suppress(OSError):
             os.makedirs(input_dir, exist_ok=True)
         file_path = os.path.join(input_dir, f"{user_id}_{file_id}{ext}")
 
@@ -926,6 +973,63 @@ class EnhancedMediaHandler:
                         message_id,
                         file_path,
                     )
+
+                    # ── Download progress bar: edit callback message with Cancel button ──
+                    _dl_progress_msg = None
+                    _dl_loop = None
+                    _cancel_key = f"{chat_id}:{message_id}"
+                    _cancel_flag = [False]  # thread-safe via list mutation
+                    _download_cancel_flags[_cancel_key] = _cancel_flag
+                    try:
+                        # Prefer editing the callback query message for continuity
+                        _cq = getattr(update, "callback_query", None)
+                        _kb_cancel = InlineKeyboardMarkup(
+                            [[InlineKeyboardButton("❌ Cancel", callback_data=f"cancel_dl:{_cancel_key}")]]
+                        )
+                        if _cq:
+                            _dl_progress_msg = _cq.message
+                            await _dl_progress_msg.edit_text("⬇️ Starting download...", reply_markup=_kb_cancel)
+                        else:
+                            _dl_progress_msg = await update.effective_message.reply_text(
+                                "⬇️ Starting download...", reply_markup=_kb_cancel
+                            )
+                        _dl_loop = asyncio.get_running_loop()
+                    except Exception:
+                        pass
+
+                    _dl_last_pct = [-1]
+                    _dl_last_time = [0.0]
+
+                    def _dl_progress_cb(sent, total):
+                        """Sync callback called by Pyrogram/Telethon download_media.
+
+                        Raises an exception when the user presses the Cancel button
+                        so the download aborts and propagates up.
+                        """
+                        if not _dl_progress_msg or not _dl_loop or total <= 0:
+                            return
+                        try:
+                            # Check if user pressed Cancel
+                            if _cancel_flag[0]:
+                                raise asyncio.CancelledError("Download cancelled by user")
+                            pct = min(int(sent * 100 / total), 100)
+                            now = time.time()
+                            if pct == _dl_last_pct[0] and (now - _dl_last_time[0]) < 1.0:
+                                return
+                            _dl_last_pct[0] = pct
+                            _dl_last_time[0] = now
+                            mb_sent = sent // (1024 * 1024)
+                            mb_total = total // (1024 * 1024)
+                            text = f"⬇️ Downloading: {pct}% ({mb_sent}MB / {mb_total}MB)"
+                            asyncio.run_coroutine_threadsafe(
+                                _dl_progress_msg.edit_text(text, reply_markup=_kb_cancel),
+                                _dl_loop,
+                            )
+                        except asyncio.CancelledError:
+                            raise
+                        except Exception:
+                            pass
+
                     ok = await download_forward_via_userbot(
                         chat_id,
                         message_id,
@@ -934,6 +1038,7 @@ class EnhancedMediaHandler:
                         or current_file.get("date")
                         or current_file.get("registered_at"),
                         file_unique_id=current_file.get("file_unique_id"),
+                        progress_callback=_dl_progress_cb,
                     )
                     logger.info(
                         "Userbot download fallback (%s) result for %s/%s: ok=%s exists=%s",
@@ -943,6 +1048,15 @@ class EnhancedMediaHandler:
                         bool(ok),
                         os.path.exists(file_path),
                     )
+                    # Update progress message to reflect final state
+                    if _dl_progress_msg:
+                        try:
+                            if ok and os.path.exists(file_path):
+                                await _dl_progress_msg.edit_text("✅ Download complete!")
+                            else:
+                                await _dl_progress_msg.edit_text("❌ Download failed")
+                        except Exception:
+                            pass
                     if ok and os.path.exists(file_path):
                         current_file["path"] = file_path
                         session["current_file"] = current_file
@@ -950,9 +1064,21 @@ class EnhancedMediaHandler:
                             self._persist_session(user_id)
                         except Exception:
                             logger.debug("Could not persist session after userbot download (%s)", reason)
+                        _download_cancel_flags.pop(_cancel_key, None)
                         return True
+                except asyncio.CancelledError:
+                    # User cancelled the download — update message and return False
+                    # NOTE: do NOT re-raise — `CancelledError` is a `BaseException` in
+                    # Python 3.12+ so it would blast through all `except Exception:`
+                    # blocks in the call stack and crash the PTB handler.
+                    if _dl_progress_msg:
+                        with contextlib.suppress(BadRequest):
+                            await _dl_progress_msg.edit_text("⏹️ Download cancelled.")
+                    return False
                 except Exception:
                     logger.exception("Userbot download fallback failed (%s) for %s/%s", reason, chat_id, message_id)
+                finally:
+                    _download_cancel_flags.pop(_cancel_key, None)
                 return False
 
             # For large-file bot API failures, try the userbot fallback first.
@@ -1015,7 +1141,7 @@ class EnhancedMediaHandler:
             # handling behavior so the bot can persist metadata or provide upload guidance.
             if "file is too big" in err_text.lower() or "too big" in err_text.lower():
                 try:
-                    fh = await self._handle_large_forward(update, current_file, err_text, upload_url)
+                    fh = await self._handle_large_forward(update, context, current_file, err_text, upload_url)
                     if fh:
                         raise Exception(
                             "Telegram reports the file is too big to download via the bot. "
@@ -1042,88 +1168,9 @@ class EnhancedMediaHandler:
                         )
                     ) from None
 
-            forward = current_file.get("forward") if current_file else None
-            if enable_userbot and forward and forward.get("chat_id") and forward.get("message_id"):
-                try:
-                    from utils.userbot_downloader import download_forward_via_userbot
-
-                    ok = await download_forward_via_userbot(
-                        forward.get("chat_id"), forward.get("message_id"), file_path
-                    )
-                    if ok and os.path.exists(file_path):
-                        current_file["path"] = file_path
-                        session["current_file"] = current_file
-                        try:
-                            self._persist_session(user_id)
-                        except Exception:
-                            logger.debug("Could not persist session after userbot download")
-                        return
-                except Exception:
-                    logger.exception("Userbot download fallback failed (origin forward)")
-
-            try:
-                try:
-                    bot_api_max_mb = int(os.environ.get("BOT_API_MAX_MB", "20"))
-                except Exception:
-                    bot_api_max_mb = 20
-                file_size = current_file.get("size") or 0
-                bot_chat = current_file.get("chat_id")
-                bot_msg = current_file.get("msg_id") or current_file.get("message_id")
-                if enable_userbot and file_size and file_size > bot_api_max_mb * 1024 * 1024 and bot_chat and bot_msg:
-                    try:
-                        from utils.userbot_downloader import download_forward_via_userbot
-
-                        ok = await download_forward_via_userbot(bot_chat, bot_msg, file_path)
-                        if ok and os.path.exists(file_path):
-                            current_file["path"] = file_path
-                            session["current_file"] = current_file
-                            try:
-                                self._persist_session(user_id)
-                            except Exception:
-                                logger.debug("Could not persist session after userbot download (bot chat)")
-                            return
-                    except Exception:
-                        logger.exception("Userbot download fallback failed (bot chat immediate) for large file")
-            except Exception:
-                logger.exception("Error checking BOT_API_MAX_MB fallback")
-
-            if enable_userbot:
-                try:
-                    bot_chat = current_file.get("chat_id")
-                    bot_msg = current_file.get("msg_id")
-                except Exception:
-                    bot_chat = None
-                    bot_msg = None
-
-                if not bot_chat or not bot_msg:
-                    try:
-                        if getattr(update, "message", None) and getattr(update.message, "chat", None):
-                            bot_chat = getattr(update.message.chat, "id", None)
-                            bot_msg = getattr(update.message, "message_id", None)
-                        elif getattr(update, "callback_query", None) and getattr(
-                            update.callback_query, "message", None
-                        ):
-                            bot_chat = getattr(update.callback_query.message.chat, "id", None)
-                            bot_msg = getattr(update.callback_query.message, "message_id", None)
-                    except Exception:
-                        logger.debug("handlers: operation failed")
-
-                if bot_chat and bot_msg:
-                    try:
-                        from utils.userbot_downloader import download_forward_via_userbot
-
-                        ok = await download_forward_via_userbot(bot_chat, bot_msg, file_path)
-                        if ok and os.path.exists(file_path):
-                            current_file["path"] = file_path
-                            session["current_file"] = current_file
-                            try:
-                                self._persist_session(user_id)
-                            except Exception:
-                                logger.debug("Could not persist session after userbot download (bot chat)")
-                            return
-                    except Exception:
-                        logger.exception("Userbot download fallback failed (bot chat)")
-
+            # All userbot download attempts have been exhausted above.
+            # Re-raise the original get_file/API error without retrying
+            # the same dead-end fallbacks again.
             raise
 
         # Check if we should stream directly to remote storage (S3/R2), skipping local disk
@@ -1164,7 +1211,14 @@ class EnhancedMediaHandler:
         except Exception:
             logger.debug("Could not persist session after download")
 
-    async def _handle_large_forward(self, update: Update, current_file: dict, err_text: str, upload_url: str):
+    async def _handle_large_forward(
+        self,
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+        current_file: dict,
+        err_text: str,
+        upload_url: str,
+    ):
         """Persist forward metadata, optionally auto-fetch and enqueue, or raise an instruction.
 
         This centralizes the previous inline logic for handling "file is too big" errors
@@ -1184,17 +1238,13 @@ class EnhancedMediaHandler:
                 "registered_at": datetime.utcnow().isoformat(),
             }
             fh = await save_forward_metadata(metadata)
-            with contextlib.suppress(Exception):
-                logger.info("Saved forward metadata id=%s for file_id=%s", fh, metadata.get("file_id"))
+            logger.info("Saved forward metadata id=%s for file_id=%s", fh, metadata.get("file_id"))
 
             auto_fetch = os.environ.get("AUTO_FETCH_FORWARDS", "").lower() in ("1", "true", "yes")
             web_upload_url = os.environ.get("WEB_UPLOAD_URL") or os.environ.get("WEBAPP_URL")
 
             # Diagnostic logging to help trace fallback behavior in production
-            with contextlib.suppress(Exception):
-                logger.info(
-                    "_handle_large_forward: fh=%s auto_fetch=%s web_upload_url=%s", fh, auto_fetch, web_upload_url
-                )
+            logger.info("_handle_large_forward: fh=%s auto_fetch=%s web_upload_url=%s", fh, auto_fetch, web_upload_url)
 
             # Extra debug: record which fetch paths we will try
             try:
@@ -1211,15 +1261,10 @@ class EnhancedMediaHandler:
 
             if auto_fetch:
                 # Prepare local paths
-                try:
-                    import uuid as _uuid
-
-                    jid = str(_uuid.uuid4())
-                except Exception:
-                    jid = None
+                jid = str(uuid.uuid4())
 
                 input_dir = getattr(config, "INPUT_PATH", "storage/input") if config else "storage/input"
-                with contextlib.suppress(Exception):
+                with contextlib.suppress(OSError):
                     os.makedirs(input_dir, exist_ok=True)
 
                 ext = os.path.splitext(metadata.get("name") or "")[1] or ".mp4"
@@ -1228,172 +1273,216 @@ class EnhancedMediaHandler:
                 fetched = False
 
                 # Try local userbot downloader first when enabled
-                try:
-                    enable_userbot = os.environ.get("ENABLE_USERBOT", "").lower() in ("1", "true", "yes")
-                    logger.info("_handle_large_forward: enable_userbot=%s for fh=%s", enable_userbot, fh)
-                except Exception:
-                    enable_userbot = False
+                enable_userbot = os.environ.get("ENABLE_USERBOT", "").lower() in ("1", "true", "yes")
+                logger.info("_handle_large_forward: enable_userbot=%s for fh=%s", enable_userbot, fh)
 
-                try:
-                    if enable_userbot:
+                if enable_userbot:
+                    try:
+                        from utils.userbot_downloader import download_forward_via_userbot
+                    except Exception as e:
+                        logger.exception("Failed to import userbot_downloader: %s", e)
+                        download_forward_via_userbot = None
+
+                    if download_forward_via_userbot is not None:
+                        # ── Cancel-download setup for this fallback path ──
+                        _chat_id = metadata.get("chat_id")
+                        _msg_id = metadata.get("message_id") or metadata.get("msg_id")
+                        _cancel_key = f"{_chat_id}:{_msg_id}" if _chat_id and _msg_id else f"fh:{fh}"
+                        _cancel_flag = [False]
+                        _download_cancel_flags[_cancel_key] = _cancel_flag
+                        _dl_progress_msg = None
+                        _dl_loop = None
                         try:
-                            from utils.userbot_downloader import download_forward_via_userbot
-                        except Exception as e:
-                            logger.exception("Failed to import userbot_downloader: %s", e)
-                            download_forward_via_userbot = None
+                            _cq = getattr(update, "callback_query", None)
+                            _kb_cancel = InlineKeyboardMarkup(
+                                [[InlineKeyboardButton("❌ Cancel", callback_data=f"cancel_dl:{_cancel_key}")]]
+                            )
+                            if _cq:
+                                _dl_progress_msg = _cq.message
+                                await _dl_progress_msg.edit_text("⬇️ Fetching via userbot...", reply_markup=_kb_cancel)
+                            else:
+                                _dl_progress_msg = await update.effective_message.reply_text(
+                                    "⬇️ Fetching via userbot...", reply_markup=_kb_cancel
+                                )
+                            _dl_loop = asyncio.get_running_loop()
+                        except Exception:
+                            pass
 
-                        if download_forward_via_userbot is not None:
+                        _dl_last_pct = [-1]
+                        _dl_last_time = [0.0]
+
+                        def _dl_progress_cb(sent, total):
+                            """Sync callback called by Pyrogram/Telethon download_media."""
+                            if not _dl_progress_msg or not _dl_loop or total <= 0:
+                                return
                             try:
-                                logger.info(
-                                    "Attempting userbot download for fh=%s chat=%s msg=%s -> %s",
-                                    fh,
-                                    metadata.get("chat_id"),
-                                    metadata.get("message_id") or metadata.get("msg_id"),
-                                    input_path,
+                                if _cancel_flag[0]:
+                                    raise asyncio.CancelledError("Download cancelled by user")
+                                pct = min(int(sent * 100 / total), 100)
+                                now = time.time()
+                                if pct == _dl_last_pct[0] and (now - _dl_last_time[0]) < 1.0:
+                                    return
+                                _dl_last_pct[0] = pct
+                                _dl_last_time[0] = now
+                                mb_sent = sent // (1024 * 1024)
+                                mb_total = total // (1024 * 1024)
+                                text = f"⬇️ Fetching: {pct}% ({mb_sent}MB / {mb_total}MB)"
+                                asyncio.run_coroutine_threadsafe(
+                                    _dl_progress_msg.edit_text(text, reply_markup=_kb_cancel),
+                                    _dl_loop,
                                 )
-                                ok = await download_forward_via_userbot(
-                                    metadata.get("chat_id"),
-                                    metadata.get("message_id") or metadata.get("msg_id"),
-                                    input_path,
-                                    msg_date=metadata.get("registered_at") or metadata.get("created_at"),
-                                    file_unique_id=metadata.get("file_unique_id"),
-                                )
-                                logger.info(
-                                    "userbot download result for fh=%s: ok=%s exists=%s",
-                                    fh,
-                                    bool(ok),
-                                    os.path.exists(input_path),
-                                )
-                                if ok and os.path.exists(input_path):
-                                    fetched = True
+                            except asyncio.CancelledError:
+                                raise
                             except Exception:
-                                logger.exception("auto-fetch via userbot failed for %s", fh)
-                except Exception:
-                    logger.exception("auto-fetch userbot path error for %s", fh)
+                                pass
+
+                        ok = False
+                        try:
+                            logger.info(
+                                "Attempting userbot download for fh=%s chat=%s msg=%s -> %s",
+                                fh,
+                                _chat_id,
+                                _msg_id,
+                                input_path,
+                            )
+                            ok = await download_forward_via_userbot(
+                                _chat_id,
+                                _msg_id,
+                                input_path,
+                                msg_date=metadata.get("registered_at") or metadata.get("created_at"),
+                                file_unique_id=metadata.get("file_unique_id"),
+                                progress_callback=_dl_progress_cb,
+                            )
+                            logger.info(
+                                "userbot download result for fh=%s: ok=%s exists=%s",
+                                fh,
+                                bool(ok),
+                                os.path.exists(input_path),
+                            )
+                            if ok and os.path.exists(input_path):
+                                fetched = True
+                        except asyncio.CancelledError:
+                            # User cancelled — update message and do NOT re-raise (see _try_userbot_download)
+                            if _dl_progress_msg:
+                                with contextlib.suppress(BadRequest):
+                                    await _dl_progress_msg.edit_text("⏹️ Fetch cancelled.")
+                        except Exception:
+                            logger.exception("auto-fetch via userbot failed for %s", fh)
+                        finally:
+                            _download_cancel_flags.pop(_cancel_key, None)
+                            # Update progress message to reflect final state
+                            if _dl_progress_msg and not _cancel_flag[0]:
+                                try:
+                                    if ok and os.path.exists(input_path):
+                                        await _dl_progress_msg.edit_text("✅ Fetch complete!")
+                                    else:
+                                        await _dl_progress_msg.edit_text("❌ Fetch failed")
+                                except Exception:
+                                    pass
 
                 # If local fetch failed and web upload endpoint is configured, ask webapp to fetch
                 if not fetched and web_upload_url:
-                    try:
-                        logger.info("Attempting server fetch via web upload URL %s for fh=%s", web_upload_url, fh)
+                    logger.info("Attempting server fetch via web upload URL %s for fh=%s", web_upload_url, fh)
 
-                        def _post_fetch():
-                            try:
-                                import requests
-                            except Exception:
-                                return None
-                            headers = {}
-                            upload_secret = os.environ.get("UPLOAD_SECRET")
-                            if upload_secret:
-                                headers["X-Upload-Token"] = upload_secret
-                            try:
-                                resp = requests.post(
-                                    web_upload_url, data={"forward_hash": fh}, headers=headers, timeout=60
-                                )
-                                return resp
-                            except Exception as e:
-                                with contextlib.suppress(Exception):
-                                    logger.exception("Webapp fetch POST failed (thread): %s", e)
-                                return None
+                    def _post_fetch():
+                        headers = {}
+                        import requests
 
-                        resp = await asyncio.get_event_loop().run_in_executor(None, _post_fetch)
-                        with contextlib.suppress(Exception):
-                            logger.info(
-                                "Webapp fetch response for fh=%s: resp=%s", fh, getattr(resp, "status_code", None)
-                            )
-
-                        if resp is not None and getattr(resp, "status_code", None) == 200:
-                            try:
-                                j = resp.json()
-                                queued_job = j.get("job_id")
-                                # notify user
-                                try:
-                                    if getattr(update, "callback_query", None):
-                                        await self.safe_edit(
-                                            update.callback_query,
-                                            f"✅ Server fetched and queued conversion (job {queued_job}).",
-                                        )
-                                    elif getattr(update, "message", None):
-                                        await update.message.reply_text(
-                                            f"✅ Server fetched and queued conversion (job {queued_job})."
-                                        )
-                                except Exception:
-                                    logger.debug("handlers: notify user")
-                                # delete saved forward metadata to avoid duplicates
-                                with contextlib.suppress(Exception):
-                                    await delete_forward_metadata(fh)
-                                return fh
-                            except Exception:
-                                logger.exception("Failed to parse webapp enqueue response for %s", fh)
-                    except Exception:
-                        logger.exception("Webapp fetch request failed for %s", fh)
-
-                # If we successfully fetched locally, enqueue the job directly
-                if fetched:
-                    try:
-                        import uuid as _uuid
-
-                        job_id = str(_uuid.uuid4())
-                        output_dir = getattr(config, "OUTPUT_PATH", "storage/output") if config else "storage/output"
-                        with contextlib.suppress(Exception):
-                            os.makedirs(output_dir, exist_ok=True)
-                        base_name = os.path.splitext(metadata.get("name") or os.path.basename(input_path))[0]
-                        output_path = os.path.join(output_dir, f"{base_name}_{job_id}.mp4")
-                        job = {
-                            "job_id": job_id,
-                            "input_path": input_path,
-                            "output_path": output_path,
-                            "original_filename": metadata.get("name") or os.path.basename(input_path),
-                            "output_filename": os.path.basename(output_path),
-                            "ffmpeg_args": [
-                                "-c:v",
-                                "libx264",
-                                "-preset",
-                                "veryfast",
-                                "-crf",
-                                "23",
-                                "-c:a",
-                                "aac",
-                                "-b:a",
-                                "128k",
-                            ],
-                            "progress_channel": f"ffmpeg:progress:{job_id}",
-                            "chat_id": update.effective_chat.id
-                            if update and getattr(update, "effective_chat", None)
-                            else None,
-                            "thumbnail": metadata.get("thumbnail"),
-                            "cleanup_input": True,
-                            "cleanup_output": False,
-                        }
+                        upload_secret = os.environ.get("UPLOAD_SECRET")
+                        if upload_secret:
+                            headers["X-Upload-Token"] = upload_secret
                         try:
-                            from utils.job_queue import enqueue_job as _enqueue
+                            resp = requests.post(web_upload_url, data={"forward_hash": fh}, headers=headers, timeout=60)
+                            return resp
+                        except requests.RequestException as e:
+                            logger.exception("Webapp fetch POST failed: %s", e)
+                            return None
 
-                            await _enqueue(job)
-                            # notify user (prefer editing the callback message when available)
+                    resp = await asyncio.get_event_loop().run_in_executor(None, _post_fetch)
+                    logger.info("Webapp fetch response for fh=%s: resp=%s", fh, getattr(resp, "status_code", None))
+
+                    if resp is not None and getattr(resp, "status_code", None) == 200:
+                        try:
+                            j = resp.json()
+                            queued_job = j.get("job_id")
+                            # notify user
                             try:
-                                q = getattr(update, "callback_query", None)
-                                if q is not None:
+                                if getattr(update, "callback_query", None):
                                     await self.safe_edit(
-                                        q, f"✅ Fetched forwarded media and queued conversion (job {job_id})."
+                                        update.callback_query,
+                                        f"✅ Server fetched and queued conversion (job {queued_job}).",
                                     )
-                                    with contextlib.suppress(Exception):
-                                        asyncio.create_task(self._watch_job_progress(q, job_id))
-                                else:
-                                    # fallback to replying in chat when no callback_query
-                                    if getattr(update, "message", None):
-                                        with contextlib.suppress(Exception):
-                                            await update.message.reply_text(
-                                                f"✅ Fetched forwarded media and queued conversion (job {job_id})."
-                                            )
+                                elif getattr(update, "message", None):
+                                    await update.message.reply_text(
+                                        f"✅ Server fetched and queued conversion (job {queued_job})."
+                                    )
                             except Exception:
-                                logger.exception("Failed to notify user after enqueue for %s", fh)
-                            # cleanup saved forward metadata
-                            with contextlib.suppress(Exception):
+                                logger.debug("handlers: notify user")
+                            # delete saved forward metadata to avoid duplicates
+                            # Best-effort cleanup: storage backends may raise OSError or RuntimeError
+                            with contextlib.suppress(OSError, RuntimeError):
                                 await delete_forward_metadata(fh)
                             return fh
                         except Exception:
-                            logger.exception("Failed to enqueue job after fetch for %s", fh)
+                            logger.exception("Failed to parse webapp enqueue response for %s", fh)
+
+                # If we successfully fetched locally, enqueue the job directly
+                if fetched:
+                    job_id = str(uuid.uuid4())
+                    output_dir = getattr(config, "OUTPUT_PATH", "storage/output") if config else "storage/output"
+                    with contextlib.suppress(OSError):
+                        os.makedirs(output_dir, exist_ok=True)
+                    base_name = os.path.splitext(metadata.get("name") or os.path.basename(input_path))[0]
+                    output_path = os.path.join(output_dir, f"{base_name}_{job_id}.mp4")
+                    job = {
+                        "job_id": job_id,
+                        "input_path": input_path,
+                        "output_path": output_path,
+                        "original_filename": metadata.get("name") or os.path.basename(input_path),
+                        "output_filename": os.path.basename(output_path),
+                        "ffmpeg_args": [
+                            "-c:v",
+                            "libx264",
+                            "-preset",
+                            "veryfast",
+                            "-crf",
+                            "23",
+                            "-c:a",
+                            "aac",
+                            "-b:a",
+                            "128k",
+                        ],
+                        "progress_channel": f"ffmpeg:progress:{job_id}",
+                        "chat_id": update.effective_chat.id
+                        if update and getattr(update, "effective_chat", None)
+                        else None,
+                        "thumbnail": metadata.get("thumbnail"),
+                        "cleanup_input": True,
+                        "cleanup_output": False,
+                    }
+                    # enqueue_job is already imported at module level
+                    await enqueue_job(job)
+                    # notify user (prefer editing the callback message when available)
+                    try:
+                        q = getattr(update, "callback_query", None)
+                        if q is not None:
+                            await self.safe_edit(q, f"✅ Fetched forwarded media and queued conversion (job {job_id}).")
+                            with contextlib.suppress(RuntimeError):
+                                asyncio.create_task(self._watch_job_progress(q, job_id))
+                        else:
+                            # fallback to replying in chat when no callback_query
+                            if getattr(update, "message", None):
+                                with contextlib.suppress(BadRequest):
+                                    await update.message.reply_text(
+                                        f"✅ Fetched forwarded media and queued conversion (job {job_id})."
+                                    )
                     except Exception:
-                        logger.exception("Failed to create job after fetch for %s", fh)
+                        logger.exception("Failed to notify user after enqueue for %s", fh)
+                    # cleanup saved forward metadata
+                    # Best-effort cleanup: storage backends may raise OSError or RuntimeError
+                    with contextlib.suppress(OSError, RuntimeError):
+                        await delete_forward_metadata(fh)
+                    return fh
 
             # Fallback: return instruction to user with forward-hash and web upload link
             raise Exception(
@@ -1508,7 +1597,7 @@ class EnhancedMediaHandler:
             try:
                 chat_id = None
                 if getattr(update, "callback_query", None):
-                    with contextlib.suppress(Exception):
+                    with contextlib.suppress(BadRequest):
                         await update.callback_query.answer()
                     if getattr(update.callback_query, "message", None) and getattr(
                         update.callback_query.message, "chat", None
@@ -1608,7 +1697,7 @@ class EnhancedMediaHandler:
         input_path = current_file["path"]
         output_ext = f".{target_format}"
         output_dir = getattr(config, "OUTPUT_PATH", "storage/output") if config else "storage/output"
-        with contextlib.suppress(Exception):
+        with contextlib.suppress(OSError):
             os.makedirs(output_dir, exist_ok=True)
         output_path = os.path.join(output_dir, f"{current_file['id']}_converted{output_ext}")
         job_id = str(uuid.uuid4())
@@ -1643,7 +1732,7 @@ class EnhancedMediaHandler:
             await self.safe_edit(
                 query, f"✅ Job queued (ID: {job_id}). I'll send the file when ready.", reply_markup=kb
             )
-            with contextlib.suppress(Exception):
+            with contextlib.suppress(RuntimeError):
                 asyncio.create_task(self._watch_job_progress(query, job_id))
         except Exception:
             await self.safe_edit(query, f"✅ Job queued (ID: {job_id}). I'll send the file when ready.")
@@ -1688,7 +1777,7 @@ class EnhancedMediaHandler:
                 return
         except Exception:
             # If ACL check fails for any reason, default to deny-safe
-            with contextlib.suppress(Exception):
+            with contextlib.suppress(BadRequest):
                 await update.message.reply_text("Access denied. (ACL check failed)")
             return
 
@@ -1741,7 +1830,7 @@ class EnhancedMediaHandler:
                     await update.message.reply_text("📥 Downloading thumbnail photo and saving as default...")
                     file = await context.bot.get_file(file_obj.file_id)
                     thumb_dir = config.THUMBNAIL_PATH if hasattr(config, "THUMBNAIL_PATH") else "storage/thumbnails"
-                    with contextlib.suppress(Exception):
+                    with contextlib.suppress(OSError):
                         os.makedirs(thumb_dir, exist_ok=True)
                     thumb_path = os.path.join(thumb_dir, f"{user_id}_{file_obj.file_id}.jpg")
                     await file.download_to_drive(thumb_path)
@@ -1813,7 +1902,7 @@ class EnhancedMediaHandler:
                     file_obj = photos[-1]
                     file = await context.bot.get_file(file_obj.file_id)
                     input_dir = getattr(config, "INPUT_PATH", "storage/input")
-                    with contextlib.suppress(Exception):
+                    with contextlib.suppress(OSError):
                         os.makedirs(input_dir, exist_ok=True)
                     photo_path = os.path.join(input_dir, f"{user_id}_{file_obj.file_id}.jpg")
                     await file.download_to_drive(photo_path)
@@ -1873,7 +1962,7 @@ class EnhancedMediaHandler:
                 for url in urls:
                     job_id = str(uuid.uuid4())
                     output_dir = getattr(config, "OUTPUT_PATH", "storage/output") if config else "storage/output"
-                    with contextlib.suppress(Exception):
+                    with contextlib.suppress(OSError):
                         os.makedirs(output_dir, exist_ok=True)
                     output_path = os.path.join(output_dir, f"{job_id}.mp4")
                     job = {
@@ -1984,14 +2073,13 @@ class EnhancedMediaHandler:
             "file_unique_id": file_unique_id,
         }
 
-        with contextlib.suppress(Exception):
-            logger.info(
-                "registered current_file for user %s id=%s forward=%s size=%s",
-                user_id,
-                file_id,
-                forward_info,
-                video.file_size,
-            )
+        logger.info(
+            "registered current_file for user %s id=%s forward=%s size=%s",
+            user_id,
+            file_id,
+            forward_info,
+            video.file_size,
+        )
         try:
             self._persist_session(user_id)
         except Exception:
@@ -2078,14 +2166,13 @@ class EnhancedMediaHandler:
             "file_unique_id": file_unique_id,
         }
 
-        with contextlib.suppress(Exception):
-            logger.info(
-                "registered current_file for user %s id=%s forward=%s size=%s",
-                user_id,
-                audio.file_id,
-                forward_info,
-                audio.file_size,
-            )
+        logger.info(
+            "registered current_file for user %s id=%s forward=%s size=%s",
+            user_id,
+            audio.file_id,
+            forward_info,
+            audio.file_size,
+        )
 
         await update.message.reply_text(
             f"✅ Audio registered!\n🎵 {audio.title or 'Unknown title'}\nChoose an action:",
@@ -2110,7 +2197,7 @@ class EnhancedMediaHandler:
             await update.message.reply_text("📥 Downloading subtitle file...")
             file = await context.bot.get_file(document.file_id)
             input_dir = getattr(config, "INPUT_PATH", "storage/input") if config else "storage/input"
-            with contextlib.suppress(Exception):
+            with contextlib.suppress(OSError):
                 os.makedirs(input_dir, exist_ok=True)
             subtitle_path = os.path.join(input_dir, f"{user_id}_{document.file_id}{file_ext}")
             await file.download_to_drive(subtitle_path)
@@ -2123,7 +2210,7 @@ class EnhancedMediaHandler:
 
             video_path = current["path"]
             output_dir = getattr(config, "OUTPUT_PATH", "storage/output") if config else "storage/output"
-            with contextlib.suppress(Exception):
+            with contextlib.suppress(OSError):
                 os.makedirs(output_dir, exist_ok=True)
             out_path = os.path.join(output_dir, f"{user_id}_subtitled_{os.path.basename(video_path)}")
 
@@ -2247,14 +2334,13 @@ class EnhancedMediaHandler:
         except Exception:
             logger.debug("Could not persist session after registering document")
 
-        with contextlib.suppress(Exception):
-            logger.info(
-                "registered current_file for user %s id=%s forward=%s size=%s",
-                user_id,
-                document.file_id,
-                forward_info,
-                document.file_size,
-            )
+        logger.info(
+            "registered current_file for user %s id=%s forward=%s size=%s",
+            user_id,
+            document.file_id,
+            forward_info,
+            document.file_size,
+        )
 
         await update.message.reply_text(
             f"✅ {file_type.capitalize()} registered!\n📁 {file_name}\nChoose an action:",
@@ -2302,7 +2388,7 @@ class EnhancedMediaHandler:
             return
         ext = os.path.splitext(input_path)[1] or ".mp3"
         output_dir = getattr(config, "OUTPUT_PATH", "storage/output") if config else "storage/output"
-        with contextlib.suppress(Exception):
+        with contextlib.suppress(OSError):
             os.makedirs(output_dir, exist_ok=True)
         output_path = os.path.join(output_dir, f"{current_file.get('id', 'unknown')}_faded{ext}")
 
@@ -2354,7 +2440,7 @@ class EnhancedMediaHandler:
 
         # Validate callback payload
         if not isinstance(data, str):
-            with contextlib.suppress(Exception):
+            with contextlib.suppress(BadRequest):
                 await query.answer()
             await self.safe_edit(query, "⚠️ Invalid button payload.")
             logger.warning(f"Invalid callback data type: {type(data)} data={data}")
@@ -2596,7 +2682,7 @@ class EnhancedMediaHandler:
                     input_path = current_file["path"]
                     ext = os.path.splitext(input_path)[1] or ".mp4"
                     output_dir = getattr(config, "OUTPUT_PATH", "storage/output") if config else "storage/output"
-                    with contextlib.suppress(Exception):
+                    with contextlib.suppress(OSError):
                         os.makedirs(output_dir, exist_ok=True)
                     output_path = os.path.join(output_dir, f"{current_file.get('id', 'unknown')}_optimized{ext}")
                     success = await self.converter.optimize_video(input_path, output_path, preset="medium", crf=23)
@@ -2714,7 +2800,7 @@ class EnhancedMediaHandler:
                     query,
                     f"➕ Added to merge list. Total files: {len(session['merge_list'])}",
                 )
-                with contextlib.suppress(Exception):
+                with contextlib.suppress(BadRequest):
                     await query.answer("Added to merge list")
 
             elif isinstance(data, str) and data.startswith("merge_view"):
@@ -2767,7 +2853,7 @@ class EnhancedMediaHandler:
                 except Exception:
                     logger.debug("Could not persist session after merge_clear")
                 await self.safe_edit(query, "🗑️ Merge list cleared.")
-                with contextlib.suppress(Exception):
+                with contextlib.suppress(BadRequest):
                     await query.answer("Merge list cleared")
 
             elif data == "framerate_menu":
@@ -2970,7 +3056,7 @@ class EnhancedMediaHandler:
                             output_dir = (
                                 getattr(config, "OUTPUT_PATH", "storage/output") if config else "storage/output"
                             )
-                            with contextlib.suppress(Exception):
+                            with contextlib.suppress(OSError):
                                 os.makedirs(output_dir, exist_ok=True)
                             out_path = os.path.join(output_dir, f"{f.get('id')}_bulk.mp4")
                             job = {
@@ -3095,7 +3181,7 @@ class EnhancedMediaHandler:
                     try:
                         new = user_settings.toggle_user_setting(user_id, key)
                         await self.safe_edit(query, f"✅ `{key}` set to {new}", parse_mode="Markdown")
-                        with contextlib.suppress(Exception):
+                        with contextlib.suppress(BadRequest):
                             await query.answer("Setting updated")
                     except Exception:
                         logger.exception("Failed to toggle setting %s for user %s", key, user_id)
@@ -3109,7 +3195,7 @@ class EnhancedMediaHandler:
                     try:
                         user_settings.clear_user_settings(user_id)
                         await self.safe_edit(query, "✅ Your settings have been reset to defaults.")
-                        with contextlib.suppress(Exception):
+                        with contextlib.suppress(BadRequest):
                             await query.answer("Settings reset")
                     except Exception:
                         logger.exception("Failed to reset settings for user %s", user_id)
@@ -3124,15 +3210,48 @@ class EnhancedMediaHandler:
                     return
 
                 try:
-                    from utils.job_queue import cancel_job
+                    from utils.job_queue import cancel_job, get_redis
+
+                    # Set cancel_notified=1 first so _watch_job_progress() sees it
+                    # before cancel_job() sets status=cancelled (eliminates race window).
+                    try:
+                        _r = await get_redis()
+                        await _r.hset(f"ffmpeg:job:{job_id}", "cancel_notified", "1")
+                        try:
+                            _aclose = getattr(_r, "aclose", None)
+                            if _aclose is not None:
+                                await _aclose()
+                            else:
+                                await _r.close()
+                        except Exception:
+                            pass
+                    except Exception:
+                        pass
 
                     await cancel_job(job_id)
-                    await self.safe_edit(query, f"⏹️ Cancellation requested for job {job_id}.")
-                    with contextlib.suppress(Exception):
-                        await query.answer("Cancellation requested")
+                    await self.safe_edit(query, f"⏹️ Job {job_id} cancelled and removed from queue.")
+                    with contextlib.suppress(BadRequest):
+                        await query.answer("Job removed")
                 except Exception:
-                    logger.exception("Failed to request cancellation for job %s", job_id)
-                    await self.safe_edit(query, "⚠️ Failed to request cancellation.")
+                    logger.exception("Failed to cancel job %s", job_id)
+                    await self.safe_edit(query, "⚠️ Failed to cancel job.")
+
+            elif isinstance(data, str) and data.startswith("cancel_dl:"):
+                # User pressed the Cancel button during a userbot download
+                try:
+                    key = data.split(":", 1)[1]
+                except Exception:
+                    await self.safe_edit(query, "⚠️ Invalid cancel request.")
+                    return
+
+                cancel_flag = _download_cancel_flags.get(key)
+                if cancel_flag is not None:
+                    cancel_flag[0] = True
+                    await self.safe_edit(query, "⏹️ Cancelling download...")
+                    with contextlib.suppress(BadRequest):
+                        await query.answer("Cancellation requested")
+                else:
+                    await self.safe_edit(query, "⏳ Download already completed or not found.")
 
             elif data == "add_thumb_instruction":
                 # Provide instructions to the user for adding a custom thumbnail
@@ -3181,7 +3300,7 @@ class EnhancedMediaHandler:
 
             elif data == "noop":
                 # Non-actionable placeholder button pressed; acknowledge silently.
-                with contextlib.suppress(Exception):
+                with contextlib.suppress(BadRequest):
                     await query.answer()
                 return
 
@@ -3290,7 +3409,7 @@ class EnhancedMediaHandler:
         async def do_conversion():
             # Lock the input file to prevent concurrent access
             output_dir = getattr(config, "OUTPUT_PATH", "storage/output") if config else "storage/output"
-            with contextlib.suppress(Exception):
+            with contextlib.suppress(OSError):
                 os.makedirs(output_dir, exist_ok=True)
             output_path = os.path.join(output_dir, f"{current_file['id']}_audio.mp3")
 
@@ -3429,7 +3548,7 @@ class EnhancedMediaHandler:
 
         async def do_compression():
             output_dir = getattr(config, "OUTPUT_PATH", "storage/output") if config else "storage/output"
-            with contextlib.suppress(Exception):
+            with contextlib.suppress(OSError):
                 os.makedirs(output_dir, exist_ok=True)
             output_path = os.path.join(output_dir, f"{current_file['id']}_compressed.mp4")
 
@@ -3498,7 +3617,7 @@ class EnhancedMediaHandler:
         await self.safe_edit(query, f"🔀 Merging {len(session['merge_list'])} videos...")
 
         output_dir = getattr(config, "OUTPUT_PATH", "storage/output") if config else "storage/output"
-        with contextlib.suppress(Exception):
+        with contextlib.suppress(OSError):
             os.makedirs(output_dir, exist_ok=True)
         output_path = os.path.join(output_dir, f"merged_{int(datetime.now().timestamp())}.mp4")
         success = await self.converter.merge_videos(session["merge_list"], output_path)
@@ -3538,7 +3657,7 @@ class EnhancedMediaHandler:
         await self.safe_edit(query, f"🔀 Merging {len(session['merge_list'])} audio files...")
 
         output_dir = getattr(config, "OUTPUT_PATH", "storage/output") if config else "storage/output"
-        with contextlib.suppress(Exception):
+        with contextlib.suppress(OSError):
             os.makedirs(output_dir, exist_ok=True)
         output_path = os.path.join(output_dir, f"merged_{int(datetime.now().timestamp())}.mp3")
         success = await self.converter.merge_audios(session["merge_list"], output_path)
@@ -3587,7 +3706,7 @@ class EnhancedMediaHandler:
                 return
 
         output_dir = getattr(config, "OUTPUT_PATH", "storage/output") if config else "storage/output"
-        with contextlib.suppress(Exception):
+        with contextlib.suppress(OSError):
             os.makedirs(output_dir, exist_ok=True)
         output_path = os.path.join(output_dir, f"{current_file['id']}_no_audio.mp4")
         success = await self.converter.remove_audio(current_file["path"], output_path)
@@ -3658,7 +3777,7 @@ class EnhancedMediaHandler:
                 return
 
         output_dir = getattr(config, "OUTPUT_PATH", "storage/output") if config else "storage/output"
-        with contextlib.suppress(Exception):
+        with contextlib.suppress(OSError):
             os.makedirs(output_dir, exist_ok=True)
         output_path = os.path.join(output_dir, f"{current_file['id']}_{width}x{height}.mp4")
         success = await self.converter.change_resolution(current_file["path"], output_path, width, height)
@@ -3727,7 +3846,7 @@ class EnhancedMediaHandler:
                 return
 
         output_dir = getattr(config, "OUTPUT_PATH", "storage/output") if config else "storage/output"
-        with contextlib.suppress(Exception):
+        with contextlib.suppress(OSError):
             os.makedirs(output_dir, exist_ok=True)
         output_path = os.path.join(output_dir, f"{current_file['id']}_optimized.mp4")
 
@@ -3780,7 +3899,7 @@ class EnhancedMediaHandler:
                 await self.safe_edit(
                     query, f"✅ Optimization job queued (ID: {job_id}). I'll update you with progress.", reply_markup=kb
                 )
-                with contextlib.suppress(Exception):
+                with contextlib.suppress(RuntimeError):
                     asyncio.create_task(self._watch_job_progress(query, job_id))
             except Exception:
                 await self.safe_edit(query, f"✅ Optimization job queued (ID: {job_id}).")
@@ -3828,7 +3947,7 @@ class EnhancedMediaHandler:
         # enqueue repair job
         job_id = str(uuid.uuid4())
         output_dir = getattr(config, "OUTPUT_PATH", "storage/output") if config else "storage/output"
-        with contextlib.suppress(Exception):
+        with contextlib.suppress(OSError):
             os.makedirs(output_dir, exist_ok=True)
         output_path = os.path.join(output_dir, f"{current_file['id']}_repaired.mp4")
         job = {
@@ -3852,7 +3971,7 @@ class EnhancedMediaHandler:
                 job["request_id"] = None
             await enqueue_job(job)
             await self.safe_edit(query, f"✅ Repair job queued (ID: {job_id}). I'll send the file when ready.")
-            with contextlib.suppress(Exception):
+            with contextlib.suppress(RuntimeError):
                 asyncio.create_task(self._watch_job_progress(query, job_id))
         except Exception:
             logger.exception("Failed to enqueue repair job")
@@ -3953,7 +4072,7 @@ class EnhancedMediaHandler:
         await self.safe_edit(query, f"🖼️ Taking screenshot at {time_str}...")
 
         output_dir = getattr(config, "OUTPUT_PATH", "storage/output") if config else "storage/output"
-        with contextlib.suppress(Exception):
+        with contextlib.suppress(OSError):
             os.makedirs(output_dir, exist_ok=True)
         output_path = os.path.join(output_dir, f"{current_file.get('id', 'unknown')}_screenshot.jpg")
         success = await self.converter.take_screenshot_at_time(current_file["path"], output_path, time_str)
@@ -3992,7 +4111,7 @@ class EnhancedMediaHandler:
         await self.safe_edit(query, "🖼️ Creating thumbnail grid...")
 
         output_dir = getattr(config, "OUTPUT_PATH", "storage/output") if config else "storage/output"
-        with contextlib.suppress(Exception):
+        with contextlib.suppress(OSError):
             os.makedirs(output_dir, exist_ok=True)
         output_path = os.path.join(output_dir, f"{current_file['id']}_grid.jpg")
         success = await self.converter.extract_thumbnail_grid(current_file["path"], output_path, 3, 3)
@@ -4038,7 +4157,7 @@ class EnhancedMediaHandler:
         job_id = str(uuid.uuid4())
         out_base = getattr(config, "OUTPUT_PATH", "storage/output") if config else "storage/output"
         out_dir = os.path.join(out_base, f"{current_file['id']}_streams")
-        with contextlib.suppress(Exception):
+        with contextlib.suppress(OSError):
             os.makedirs(out_dir, exist_ok=True)
         archive_path = f"{out_dir}.zip"
         job = {
@@ -4065,7 +4184,7 @@ class EnhancedMediaHandler:
         await enqueue_job(job)
         kb = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data=f"cancel_job:{job_id}")]])
         await self.safe_edit(query, f"⏳ Job queued: {job_id} — extracting streams", reply_markup=kb)
-        with contextlib.suppress(Exception):
+        with contextlib.suppress(RuntimeError):
             asyncio.create_task(self._watch_job_progress(query, job_id))
         return
 
@@ -4101,7 +4220,7 @@ class EnhancedMediaHandler:
                 return
 
         output_base = getattr(config, "OUTPUT_PATH", "storage/output") if config else "storage/output"
-        with contextlib.suppress(Exception):
+        with contextlib.suppress(OSError):
             os.makedirs(output_base, exist_ok=True)
         output_path = os.path.join(output_base, f"{current_file['id']}_converted.{format_type}")
         success = await self.converter.convert_audio_format(current_file["path"], output_path, format_type)
@@ -4158,7 +4277,7 @@ class EnhancedMediaHandler:
         await self.safe_edit(query, f"🎚️ Setting bitrate to {bitrate}...")
 
         output_base = getattr(config, "OUTPUT_PATH", "storage/output") if config else "storage/output"
-        with contextlib.suppress(Exception):
+        with contextlib.suppress(OSError):
             os.makedirs(output_base, exist_ok=True)
         output_path = os.path.join(output_base, f"{current_file['id']}_{bitrate}.mp3")
 
@@ -4205,7 +4324,7 @@ class EnhancedMediaHandler:
         await self.safe_edit(query, "🔊 Normalizing audio...")
 
         output_base = getattr(config, "OUTPUT_PATH", "storage/output") if config else "storage/output"
-        with contextlib.suppress(Exception):
+        with contextlib.suppress(OSError):
             os.makedirs(output_base, exist_ok=True)
         output_path = os.path.join(output_base, f"{current_file['id']}_normalized.mp3")
 
@@ -4271,7 +4390,7 @@ class EnhancedMediaHandler:
                 return
 
         output_base = getattr(config, "OUTPUT_PATH", "storage/output") if config else "storage/output"
-        with contextlib.suppress(Exception):
+        with contextlib.suppress(OSError):
             os.makedirs(output_base, exist_ok=True)
         output_path = os.path.join(output_base, f"{current_file['id']}_subtitles.srt")
         success = await self.converter.extract_subtitles(current_file["path"], output_path)
@@ -4386,7 +4505,7 @@ class EnhancedMediaHandler:
         # Get all files in output directory for this user
         user_id = update.effective_user.id
         output_dir = getattr(config, "OUTPUT_PATH", "storage/output") if config else "storage/output"
-        with contextlib.suppress(Exception):
+        with contextlib.suppress(OSError):
             os.makedirs(output_dir, exist_ok=True)
         user_files = [f for f in os.listdir(output_dir) if f.startswith(str(user_id))]
 
@@ -4416,7 +4535,7 @@ class EnhancedMediaHandler:
         await enqueue_job(job)
         kb = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data=f"cancel_job:{job_id}")]])
         await self.safe_edit(query, f"⏳ Job queued: {job_id} — creating archive", reply_markup=kb)
-        with contextlib.suppress(Exception):
+        with contextlib.suppress(RuntimeError):
             asyncio.create_task(self._watch_job_progress(query, job_id))
 
     async def show_media_info(self, update: Update, context: ContextTypes.DEFAULT_TYPE, session: dict):
@@ -4465,8 +4584,7 @@ class EnhancedMediaHandler:
                         db_name=os.environ.get("MONGODB_NAME", None) or "media_conversion_bot",
                     )
                     # Cache on the handler so subsequent calls reuse the same model
-                    with contextlib.suppress(Exception):
-                        self.db_model = model
+                    self.db_model = model
 
                     # Ensure indexes asynchronously (best-effort)
                     try:
@@ -4549,7 +4667,7 @@ class EnhancedMediaHandler:
                     # Perform trim
                     await update.message.reply_text(f"✂️ Trimming from {start} to {user_input}...")
                     output_base = getattr(config, "OUTPUT_PATH", "storage/output") if config else "storage/output"
-                    with contextlib.suppress(Exception):
+                    with contextlib.suppress(OSError):
                         os.makedirs(output_base, exist_ok=True)
                     output_path = os.path.join(
                         output_base, f"{current_file['id']}_trim_{int(start_s)}_{int(end_s)}.mp4"
@@ -4607,7 +4725,7 @@ class EnhancedMediaHandler:
                         f"✂️ Trimming from {start} for duration {user_input} (to {end_str})..."
                     )
                     output_base = getattr(config, "OUTPUT_PATH", "storage/output") if config else "storage/output"
-                    with contextlib.suppress(Exception):
+                    with contextlib.suppress(OSError):
                         os.makedirs(output_base, exist_ok=True)
                     output_path = os.path.join(
                         output_base, f"{current_file['id']}_trim_{int(start_s)}_{int(end_s)}.mp4"
@@ -4722,7 +4840,7 @@ class EnhancedMediaHandler:
                     await update.message.reply_text(f"📐 Changing resolution to {width}x{height}...")
 
                     output_base = getattr(config, "OUTPUT_PATH", "storage/output") if config else "storage/output"
-                    with contextlib.suppress(Exception):
+                    with contextlib.suppress(OSError):
                         os.makedirs(output_base, exist_ok=True)
                     output_path = os.path.join(output_base, f"{current_file['id']}_{width}x{height}.mp4")
                     success = await self.converter.change_resolution(current_file["path"], output_path, width, height)
@@ -4787,7 +4905,7 @@ class EnhancedMediaHandler:
                             output_base = (
                                 getattr(config, "OUTPUT_PATH", "storage/output") if config else "storage/output"
                             )
-                            with contextlib.suppress(Exception):
+                            with contextlib.suppress(OSError):
                                 os.makedirs(output_base, exist_ok=True)
                             out = os.path.join(output_base, f"{current_file['id']}_split_{int(start)}_{int(end)}.mp4")
                             if hasattr(self.converter, "split_video"):
@@ -4916,7 +5034,7 @@ class EnhancedMediaHandler:
                     return
 
                 output_base = getattr(config, "OUTPUT_PATH", "storage/output") if config else "storage/output"
-                with contextlib.suppress(Exception):
+                with contextlib.suppress(OSError):
                     os.makedirs(output_base, exist_ok=True)
                 output_path = os.path.join(output_base, f"{current_file['id']}_trimmed.mp4")
                 success = await self.converter.trim_video(current_file["path"], output_path, start_time, end_time)
@@ -4937,7 +5055,7 @@ class EnhancedMediaHandler:
             await update.message.reply_text(f"🖼️ Taking screenshot at {user_input}...")
 
             output_base = getattr(config, "OUTPUT_PATH", "storage/output") if config else "storage/output"
-            with contextlib.suppress(Exception):
+            with contextlib.suppress(OSError):
                 os.makedirs(output_base, exist_ok=True)
             output_path = os.path.join(output_base, f"{current_file['id']}_screenshot.jpg")
             success = await self.converter.take_screenshot_at_time(current_file["path"], output_path, user_input)
@@ -4997,7 +5115,7 @@ class EnhancedMediaHandler:
                 fps = float(user_input)
                 await update.message.reply_text(f"⏱️ Changing framerate to {fps} fps...")
                 output_base = getattr(config, "OUTPUT_PATH", "storage/output") if config else "storage/output"
-                with contextlib.suppress(Exception):
+                with contextlib.suppress(OSError):
                     os.makedirs(output_base, exist_ok=True)
                 output_path = os.path.join(output_base, f"{current_file['id']}_fr_{int(fps)}.mp4")
                 success = await self.converter.change_framerate(current_file["path"], output_path, fps)
@@ -5035,7 +5153,7 @@ class EnhancedMediaHandler:
                 await update.message.reply_text(f"⚡ Optimizing with preset={preset}, crf={crf}, bitrate={bitrate}...")
 
                 output_base = getattr(config, "OUTPUT_PATH", "storage/output") if config else "storage/output"
-                with contextlib.suppress(Exception):
+                with contextlib.suppress(OSError):
                     os.makedirs(output_base, exist_ok=True)
                 output_path = os.path.join(output_base, f"{current_file['id']}_optimized.mp4")
                 cmd = [
@@ -5077,7 +5195,7 @@ class EnhancedMediaHandler:
             try:
                 metadata = json.loads(user_input)
                 output_base = getattr(config, "OUTPUT_PATH", "storage/output") if config else "storage/output"
-                with contextlib.suppress(Exception):
+                with contextlib.suppress(OSError):
                     os.makedirs(output_base, exist_ok=True)
                 output_path = os.path.join(output_base, f"{current_file['id']}_with_metadata.mp4")
 

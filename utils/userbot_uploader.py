@@ -61,6 +61,19 @@ async def _send_with_telethon(
 
     api_id, api_hash = get_userbot_credentials()
 
+    # Pre-fetch video metadata and thumbnail before connecting.
+    # Gracefully fall back to a generic send if ffprobe isn't available.
+    video_meta = {}
+    thumb_path = None
+    _temp_cleanup = None
+    try:
+        video_meta = await _probe_video_metadata(file_path) or {}
+        thumb_path = await _generate_video_thumbnail(file_path)
+        if thumb_path:
+            _temp_cleanup = os.path.dirname(thumb_path)
+    except Exception:
+        logger.warning("userbot: metadata probe failed, sending without metadata")
+
     client = build_telethon_client(api_id, api_hash)
     try:
         # Pass a phone callback that raises instead of prompting stdin.
@@ -69,16 +82,44 @@ async def _send_with_telethon(
 
         await client.start(phone=_no_phone)
         target = await _normalize_target(chat_id, client)
-        kwargs = {"file": file_path, "caption": caption}
-        if progress_callback is not None:
-            kwargs["progress_callback"] = progress_callback
-        await client.send_file(target, **kwargs)
-        logger.info("userbot: Telethon sent file %s to %s", file_path, target)
+
+        # If we detected video metadata, send as video with full metadata
+        if video_meta.get("duration"):
+            kwargs = {
+                "caption": caption or "",
+                "supports_streaming": True,
+                "duration": video_meta.get("duration"),
+                "width": video_meta.get("width", 0),
+                "height": video_meta.get("height", 0),
+            }
+            if thumb_path is not None:
+                kwargs["thumb"] = thumb_path
+            if progress_callback is not None:
+                kwargs["progress_callback"] = progress_callback
+            await client.send_file(target, file_path, **kwargs)
+            logger.info(
+                "userbot: Telethon sent video %s to %s (meta=%s, thumb=%s)",
+                file_path,
+                target,
+                video_meta,
+                bool(thumb_path),
+            )
+        else:
+            # Fallback: generic file send
+            kwargs = {"file": file_path, "caption": caption}
+            if progress_callback is not None:
+                kwargs["progress_callback"] = progress_callback
+            await client.send_file(target, **kwargs)
+            logger.info("userbot: Telethon sent file %s to %s", file_path, target)
         return True
     except Exception:
         logger.exception("userbot: Telethon failed to send file %s", file_path)
         return False
     finally:
+        # Clean up temp thumbnail directory
+        if _temp_cleanup:
+            with contextlib.suppress(Exception):
+                shutil.rmtree(_temp_cleanup, ignore_errors=True)
         with contextlib.suppress(Exception):
             await client.disconnect()
 

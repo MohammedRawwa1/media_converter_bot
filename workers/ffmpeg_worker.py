@@ -66,6 +66,22 @@ _cache = None
 LAST_FORWARD_NOTIFICATION: dict | None = None
 
 
+async def _check_upload_cancelled(job_id: str) -> bool:
+    """Quick Redis check: return True if this job has been cancelled."""
+    if not job_id:
+        return False
+    try:
+        r = await get_redis()
+        try:
+            cancel_val = await r.hget(f"ffmpeg:job:{job_id}", "cancel")
+            return cancel_val is not None and cancel_val in (b"1", "1")
+        finally:
+            with contextlib.suppress(Exception):
+                await r.close()
+    except Exception:
+        return False
+
+
 async def _update_upload_progress(job_id: str, progress_channel: str, pct: int, message: str) -> None:
     """Update Redis job hash and publish progress for Telegram upload."""
     try:
@@ -118,6 +134,27 @@ def _make_upload_progress_callback(job_id: str, progress_channel: str):
                 mb_sent = sent_bytes // (1024 * 1024)
                 mb_total = total_bytes // (1024 * 1024)
                 msg = f"Uploading to Telegram: {pct}% ({mb_sent}MB / {mb_total}MB)"
+
+                # Cancel check: every ~5% bucket, check Redis cancel flag
+                # Sync redis.from_url() call in this sync callback.
+                if pct % 5 == 0 or pct == 100:
+                    try:
+                        import redis as _redis
+
+                        _redis_url = os.environ.get("REDIS_URL")
+                        if _redis_url:
+                            _rr = _redis.from_url(_redis_url, socket_timeout=2)
+                            try:
+                                _cancel_val = _rr.hget(f"ffmpeg:job:{job_id}", "cancel")
+                                if _cancel_val == b"1":
+                                    raise asyncio.CancelledError("Upload cancelled by user")
+                            finally:
+                                _rr.close()
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception:
+                        pass
+
                 try:
                     loop = asyncio.get_running_loop()
                     asyncio.run_coroutine_threadsafe(
@@ -352,6 +389,11 @@ async def handle_job(job: dict):
                 logger.debug("ffmpeg worker: in _sval()")
     except Exception:
         logger.debug('ffmpeg worker: before we decide there is "no input".')
+
+    # Early cancel check: if the job was cancelled (hash has cancel=1), bail out now.
+    if job_id and await _check_upload_cancelled(job_id):
+        logger.info("Job %s was cancelled — skipping processing entirely", job_id)
+        return
 
     # If job references a remote storage key (S3/MinIO), prefer to download it
     # when the local `input_path` is missing or the file is not present on disk.
@@ -1143,40 +1185,57 @@ async def handle_job(job: dict):
                         # If we uploaded the output and generated a presigned GET URL, only send it if
                         # explicit link delivery is enabled. Otherwise keep delivery inside Telegram.
                         if send_link and upload_success and get_url and chat_id and bot_token:
-                            try:
-                                job_type = job.get("type") if isinstance(job, dict) else None
-                                if file_size > bot_api_max_bytes or (job_type and job_type != "generate_sample"):
-                                    async with Bot(token=bot_token) as bot:
-                                        text = f"Your video is ready: {get_url}"
-                                        await bot.send_message(chat_id=chat_id, text=text)
-                                    logger.info("Sent presigned URL to chat %s for job %s", chat_id, job_id)
-                                    sent = True
-                            except Exception:
-                                logger.exception("Failed to send presigned URL for job %s", job_id)
-                                sent = False
+                            if await _check_upload_cancelled(job_id):
+                                logger.info("Upload cancelled by user — skipping presigned URL send for job %s", job_id)
+                            else:
+                                try:
+                                    job_type = job.get("type") if isinstance(job, dict) else None
+                                    if file_size > bot_api_max_bytes or (job_type and job_type != "generate_sample"):
+                                        async with Bot(token=bot_token) as bot:
+                                            text = f"Your video is ready: {get_url}"
+                                            await bot.send_message(chat_id=chat_id, text=text)
+                                        logger.info("Sent presigned URL to chat %s for job %s", chat_id, job_id)
+                                        sent = True
+                                except Exception:
+                                    logger.exception("Failed to send presigned URL for job %s", job_id)
+                                    sent = False
 
                         # If output is large and userbot is enabled, prefer userbot for delivery
                         if chat_id and file_size > bot_api_max_bytes and enable_userbot:
-                            try:
-                                from utils.userbot_uploader import send_file_via_userbot
-
-                                _up_cb = _make_upload_progress_callback(job_id, progress_channel)
-                                ok = await send_file_via_userbot(
-                                    chat_id, out, caption=caption, progress_callback=_up_cb
+                            if await _check_upload_cancelled(job_id):
+                                logger.info(
+                                    "Upload cancelled by user — skipping preferred userbot send for job %s", job_id
                                 )
-                                if ok:
-                                    logger.info("Sent output via Telethon userbot (preferred) for job %s", job_id)
-                                    sent = True
-                                else:
-                                    logger.error("Preferred userbot send failed for job %s", job_id)
-                                    sent = False
-                            except Exception:
-                                logger.exception("Preferred userbot send raised exception for job %s", job_id)
                                 sent = False
+                            else:
+                                try:
+                                    from utils.userbot_uploader import send_file_via_userbot
+
+                                    _up_cb = _make_upload_progress_callback(job_id, progress_channel)
+                                    ok = await send_file_via_userbot(
+                                        chat_id, out, caption=caption, progress_callback=_up_cb
+                                    )
+                                    if ok:
+                                        logger.info("Sent output via Telethon userbot (preferred) for job %s", job_id)
+                                        sent = True
+                                    else:
+                                        logger.error("Preferred userbot send failed for job %s", job_id)
+                                        sent = False
+                                except Exception:
+                                    logger.exception("Preferred userbot send raised exception for job %s", job_id)
+                                    sent = False
                         else:
                             # Try Bot API first if configured
                             if chat_id and bot_token:
                                 try:
+                                    # Cancel check before Bot API send
+                                    if await _check_upload_cancelled(job_id):
+                                        logger.info(
+                                            "Upload cancelled by user — skipping Bot API send for job %s", job_id
+                                        )
+                                        sent = False
+                                        raise asyncio.CancelledError()
+
                                     # Determine media kind. Prefer probing the output file for a video stream
                                     kind = "doc"
                                     # Always-bounded sentinel for video metadata extracted during probe
@@ -1607,29 +1666,38 @@ async def handle_job(job: dict):
                                                     except Exception:
                                                         logger.debug("ffmpeg worker: operation failed")
                                         sent = True
+                                    except asyncio.CancelledError:
+                                        pass  # cancelled, sent already False
                                     except Exception as e:
                                         logger.warning("Bot API send failed for job %s: %s", job_id, e)
                                         sent = False
+                                except asyncio.CancelledError:
+                                    pass  # cancelled, sent already False
                                 except Exception as e:
                                     logger.warning("Bot init failed for job %s: %s", job_id, e)
                                     sent = False
 
                         # Fallback: if not sent and Telethon userbot is enabled, attempt userbot
                         if not sent and chat_id and enable_userbot:
-                            try:
-                                from utils.userbot_uploader import send_file_via_userbot
-
-                                _up_cb = _make_upload_progress_callback(job_id, progress_channel)
-                                ok = await send_file_via_userbot(
-                                    chat_id, out, caption=caption, progress_callback=_up_cb
+                            if await _check_upload_cancelled(job_id):
+                                logger.info(
+                                    "Upload cancelled by user — skipping fallback userbot send for job %s", job_id
                                 )
-                                if ok:
-                                    logger.info("Sent output via Telethon userbot fallback for job %s", job_id)
-                                    sent = True
-                                else:
-                                    logger.error("Userbot fallback failed for job %s", job_id)
-                            except Exception:
-                                logger.exception("Userbot fallback raised exception for job %s", job_id)
+                            else:
+                                try:
+                                    from utils.userbot_uploader import send_file_via_userbot
+
+                                    _up_cb = _make_upload_progress_callback(job_id, progress_channel)
+                                    ok = await send_file_via_userbot(
+                                        chat_id, out, caption=caption, progress_callback=_up_cb
+                                    )
+                                    if ok:
+                                        logger.info("Sent output via Telethon userbot fallback for job %s", job_id)
+                                        sent = True
+                                    else:
+                                        logger.error("Userbot fallback failed for job %s", job_id)
+                                except Exception:
+                                    logger.exception("Userbot fallback raised exception for job %s", job_id)
 
                         if not sent and chat_id:
                             logger.warning(

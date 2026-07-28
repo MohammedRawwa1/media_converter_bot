@@ -109,6 +109,26 @@ async def _resolve_pyrogram_peer(client, peer_id: int | str) -> int:
             e,
         )
 
+    # Final fallback: scan recent dialogs for the peer
+    try:
+        async for dialog in client.get_dialogs(limit=200):
+            chat = getattr(dialog, "chat", None)
+            if chat and getattr(chat, "id", None) == peer_id:
+                cached_id = getattr(chat, "id", None)
+                logger.info(
+                    "userbot: resolve_pyrogram_peer: resolved %s via dialog scan -> id=%s type=%s",
+                    peer_id,
+                    cached_id,
+                    type(chat).__name__,
+                )
+                return cached_id
+    except Exception as e:
+        logger.debug(
+            "userbot: resolve_pyrogram_peer: dialog scan for %s failed: %s",
+            peer_id,
+            e,
+        )
+
     logger.info(
         "userbot: resolve_pyrogram_peer: could not resolve %s, will try as-is",
         peer_id,
@@ -638,12 +658,16 @@ async def _try_relay_fallback(
     dest_path: str,
     relay_chat_id: int | str | None = None,
     client_type: str = "pyrogram",
+    progress_callback=None,
 ) -> bool:
     """Try a relay-group fallback by forwarding the original message to a trusted chat
     and retrying the download from the forwarded copy.
 
     This is used when direct peer/message resolution fails for the original
     source chat, which is common for large channels and stale peer state.
+
+    Args:
+        progress_callback: Optional ``(current, total)`` callback for download progress.
     """
     if not relay_chat_id:
         return False
@@ -698,7 +722,7 @@ async def _try_relay_fallback(
             if (
                 relay_msg
                 and getattr(relay_msg, "media", None)
-                and await _download_and_ensure_path(client, relay_msg, dest_path)
+                and await _download_and_ensure_path(client, relay_msg, dest_path, progress_callback=progress_callback)
             ):
                 return True
         logger.warning(
@@ -716,6 +740,7 @@ async def _attempt_recovery_download(
     chat_id,
     message_id: int,
     dest_path: str,
+    progress_callback=None,
 ) -> bool:
     """Attempt to recover a download that failed with persistent ``-503 Timeout``.
 
@@ -726,6 +751,9 @@ async def _attempt_recovery_download(
            that may route to a healthy storage node, then retry download.
         4. Try **session recycling** \u2014 disconnect/reconnect, then retry one more
            time on the original message.
+
+    Args:
+        progress_callback: Optional ``(current, total)`` callback for download progress.
 
     Returns ``True`` on success, ``False`` if all recovery methods failed.
     """
@@ -790,7 +818,7 @@ async def _attempt_recovery_download(
     probe_ok = await _probe_file_wakeup(client, msg)
     if probe_ok:
         logger.info("userbot: recovery \u2014 probe succeeded, retrying download immediately")
-        if await _download_and_ensure_path(client, msg, dest_path):
+        if await _download_and_ensure_path(client, msg, dest_path, progress_callback=progress_callback):
             return True
         logger.info("userbot: recovery \u2014 probe retry still failed, continuing...")
     else:
@@ -845,7 +873,7 @@ async def _attempt_recovery_download(
                         me.id,
                         fwd_msg_id,
                     )
-                    if await _download_and_ensure_path(client, fwd_msg, dest_path):
+                    if await _download_and_ensure_path(client, fwd_msg, dest_path, progress_callback=progress_callback):
                         return True
         except Exception as exc:
             logger.warning(
@@ -857,7 +885,7 @@ async def _attempt_recovery_download(
     recycled = await _recycle_client_session(client)
     if recycled:
         logger.info("userbot: recovery \u2014 session recycled, final retry on original msg")
-        if await _download_and_ensure_path(client, msg, dest_path):
+        if await _download_and_ensure_path(client, msg, dest_path, progress_callback=progress_callback):
             return True
 
     logger.warning(
@@ -874,8 +902,13 @@ async def _download_with_telethon(
     dest_path: str,
     msg_date: str | None = None,
     file_unique_id: str | None = None,
+    progress_callback=None,
 ) -> bool:
-    """Download using Telethon client."""
+    """Download using Telethon client.
+
+    Args:
+        progress_callback: Optional ``(current, total)`` callback for download progress.
+    """
     if TelegramClient is None:
         logger.debug("Telethon not installed; skipping Telethon download")
         return False
@@ -970,7 +1003,8 @@ async def _download_with_telethon(
                         chat_id,
                         bot_user_id,
                     )
-                    bot_entity = await client.get_entity(bot_user_id)
+                    # Use _resolve_telethon_entity which has built-in dialog scan fallback
+                    bot_entity = await _resolve_telethon_entity(client, bot_user_id)
                     if bot_entity is not None:
                         logger.info("userbot: Telethon resolved bot entity, trying get_messages from bot DM")
                         bot_msgs = await client.get_messages(bot_entity, ids=message_id)
@@ -999,8 +1033,11 @@ async def _download_with_telethon(
                             getattr(msg, "id", None),
                             dest_path,
                         )
+                        dl_kwargs = {"file": dest_path, "part_size_kb": chunk_size_kb}
+                        if progress_callback is not None:
+                            dl_kwargs["progress_callback"] = progress_callback
                         dl_result = await asyncio.wait_for(
-                            client.download_media(msg, file=dest_path, part_size_kb=chunk_size_kb),
+                            client.download_media(msg, **dl_kwargs),
                             timeout=TELETHON_DOWNLOAD_TIMEOUT,
                         )
                         _reconcile_download_path(dl_result, dest_path)
@@ -1042,8 +1079,11 @@ async def _download_with_telethon(
                         if getattr(m, "media", None):
                             for _ in range(3):
                                 try:
+                                    _dl_kwargs = {"file": dest_path, "part_size_kb": chunk_size_kb}
+                                    if progress_callback is not None:
+                                        _dl_kwargs["progress_callback"] = progress_callback
                                     dl_result = await asyncio.wait_for(
-                                        client.download_media(m, file=dest_path, part_size_kb=chunk_size_kb),
+                                        client.download_media(m, **_dl_kwargs),
                                         timeout=TELETHON_DOWNLOAD_TIMEOUT,
                                     )
                                     _reconcile_download_path(dl_result, dest_path)
@@ -1073,8 +1113,11 @@ async def _download_with_telethon(
                     if getattr(m, "media", None):
                         for _ in range(3):
                             try:
+                                _scan_kwargs = {"file": dest_path, "part_size_kb": chunk_size_kb}
+                                if progress_callback is not None:
+                                    _scan_kwargs["progress_callback"] = progress_callback
                                 dl_result = await asyncio.wait_for(
-                                    client.download_media(m, file=dest_path, part_size_kb=chunk_size_kb),
+                                    client.download_media(m, **_scan_kwargs),
                                     timeout=TELETHON_DOWNLOAD_TIMEOUT,
                                 )
                                 _reconcile_download_path(dl_result, dest_path)
@@ -1105,6 +1148,7 @@ async def _download_with_telethon(
                 dest_path,
                 relay_chat_id=relay_chat_id,
                 client_type="telethon",
+                progress_callback=progress_callback,
             ):
                 return True
 
@@ -1216,7 +1260,7 @@ async def _get_messages_via_raw_channel_api(
     return None
 
 
-async def _download_and_ensure_path(client, msg, dest_path):
+async def _download_and_ensure_path(client, msg, dest_path, progress_callback=None):
     """Download media from *msg* and ensure the file ends up at *dest_path*.
 
     Pyrogram 2.0.106's ``download_media`` resolves relative paths against
@@ -1226,10 +1270,19 @@ async def _download_and_ensure_path(client, msg, dest_path):
     Uses ``_download_media_with_retry`` so that transient ``-503 Timeout``
     errors are automatically retried with exponential backoff.
 
+    Args:
+        client: An active Pyrogram client.
+        msg: A Pyrogram ``Message`` with media.
+        dest_path: Destination file path.
+        progress_callback: Optional ``(current, total)`` callback for download progress.
+
     Returns ``True`` on success, ``False`` otherwise.
     """
     try:
-        _dl = await _download_media_with_retry(client, msg, file_name=dest_path)
+        _dl_kwargs = {"file_name": dest_path}
+        if progress_callback is not None:
+            _dl_kwargs["progress"] = progress_callback
+        _dl = await _download_media_with_retry(client, msg, **_dl_kwargs)
     except Exception as exc:
         logger.warning(
             "userbot: download_media_with_retry failed for %s: %s",
@@ -1348,17 +1401,13 @@ async def _download_bytes_with_pyrogram(
                 if messages:
                     msg = messages[0] if isinstance(messages, list) else messages
                     if msg and getattr(msg, "media", None):
+                        _has_media = bool(getattr(msg, "media", None))
                         logger.info(
-                            "userbot: Pyrogram in-memory downloading %s/%s (peer=%s)",
+                            "userbot: Pyrogram in-memory downloading %s/%s (peer=%s, media=%s)",
                             _peer,
                             message_id,
                             _peer,
-                        )
-                        logger.info(
-                            "userbot: resolved message payload for in-memory download: peer=%s msg_id=%s media=%s",
-                            _peer,
-                            getattr(msg, "id", None),
-                            bool(getattr(msg, "media", None)),
+                            _has_media,
                         )
                         dl_kwargs = {"in_memory": True}
                         if progress_callback is not None:
@@ -1508,7 +1557,9 @@ async def _download_bytes_with_pyrogram(
             f"recovery_{chat_id}_{message_id}.tmp",
         )
         try:
-            if await _attempt_recovery_download(client, chat_id, message_id, _tmp_path):
+            if await _attempt_recovery_download(
+                client, chat_id, message_id, _tmp_path, progress_callback=progress_callback
+            ):
                 with open(_tmp_path, "rb") as _fh:
                     data = _fh.read()
                 logger.info(
@@ -1542,8 +1593,16 @@ async def _download_with_pyrogram(
     chat_id: int | str,
     message_id: int,
     dest_path: str,
+    progress_callback=None,
 ) -> bool:
-    """Download using Pyrogram client (session string fallback)."""
+    """Download using Pyrogram client (session string fallback).
+
+    Args:
+        chat_id: Origin chat or bot chat ID.
+        message_id: Message ID in that chat.
+        dest_path: Destination file path.
+        progress_callback: Optional ``(current, total)`` callback for download progress.
+    """
     if PyrogramClient is None:
         logger.info("userbot: Pyrogram not installed; skipping")
         return False
@@ -1608,14 +1667,16 @@ async def _download_with_pyrogram(
                 if messages:
                     msg = messages[0] if isinstance(messages, list) else messages
                     if msg:
-                        _found_msg = True
+                        _has_media = bool(getattr(msg, "media", None))
                         logger.info(
                             "userbot: Pyrogram get_messages returned msg id=%s peer=%s has_media=%s",
                             getattr(msg, "id", None),
                             _peer,
-                            bool(getattr(msg, "media", None)),
+                            _has_media,
                         )
-                    if msg and getattr(msg, "media", None):
+                        if _has_media:
+                            _found_msg = True
+                    if msg and _has_media:
                         logger.info(
                             "userbot: Pyrogram downloading %s/%s -> %s (peer=%s)",
                             _peer,
@@ -1629,7 +1690,7 @@ async def _download_with_pyrogram(
                             getattr(msg, "id", None),
                             bool(getattr(msg, "media", None)),
                         )
-                        if await _download_and_ensure_path(client, msg, dest_path):
+                        if await _download_and_ensure_path(client, msg, dest_path, progress_callback=progress_callback):
                             return True
                         logger.warning(
                             "userbot: Pyrogram download failed for %s/%s (peer=%s)",
@@ -1676,7 +1737,9 @@ async def _download_with_pyrogram(
                                     "userbot: raw API got msg %s with media, downloading...",
                                     message_id,
                                 )
-                                if await _download_and_ensure_path(client, msg, dest_path):
+                                if await _download_and_ensure_path(
+                                    client, msg, dest_path, progress_callback=progress_callback
+                                ):
                                     return True
                                 logger.warning(
                                     "userbot: raw API download failed validation for %s/%s",
@@ -1729,7 +1792,7 @@ async def _download_with_pyrogram(
             )
             if msg is None or not getattr(msg, "media", None):
                 return None
-            if await _download_and_ensure_path(client, msg, dest_path):
+            if await _download_and_ensure_path(client, msg, dest_path, progress_callback=progress_callback):
                 return True
             return None
 
@@ -1749,7 +1812,7 @@ async def _download_with_pyrogram(
                             message_id,
                             _peer,
                         )
-                        if await _download_and_ensure_path(client, msg, dest_path):
+                        if await _download_and_ensure_path(client, msg, dest_path, progress_callback=progress_callback):
                             return True
                         break
             except ValueError as e:
@@ -1788,7 +1851,9 @@ async def _download_with_pyrogram(
                             msg = messages[0] if isinstance(messages, list) else messages
                             if msg and getattr(msg, "media", None):
                                 _found_msg = True
-                                if await _download_and_ensure_path(client, msg, dest_path):
+                                if await _download_and_ensure_path(
+                                    client, msg, dest_path, progress_callback=progress_callback
+                                ):
                                     return True
                 except ValueError as e:
                     if "Peer id invalid" in str(e):
@@ -1833,6 +1898,7 @@ async def _download_with_pyrogram(
                     dest_path,
                     relay_chat_id=relay_chat_id,
                     client_type="pyrogram",
+                    progress_callback=progress_callback,
                 ):
                     logger.info(
                         "userbot: relay fallback download succeeded for %s/%s",
@@ -1841,13 +1907,15 @@ async def _download_with_pyrogram(
                     )
                     return True
 
-            # ---- Final recovery: attempt advanced techniques for persistent -503 ----
+                    # ---- Final recovery: attempt advanced techniques for persistent -503 ----
             logger.info(
                 "userbot: all standard download methods failed for %s/%s, trying recovery (forward+probe+recycle)...",
                 chat_id,
                 message_id,
             )
-            if await _attempt_recovery_download(client, chat_id, message_id, dest_path):
+            if await _attempt_recovery_download(
+                client, chat_id, message_id, dest_path, progress_callback=progress_callback
+            ):
                 logger.info(
                     "userbot: recovery download succeeded for %s/%s",
                     chat_id,
@@ -1874,6 +1942,7 @@ async def download_forward_via_userbot(
     dest_path: str,
     msg_date: str | None = None,
     file_unique_id: str | None = None,
+    progress_callback=None,
 ) -> bool:
     """Download a message media using a user account.
 
@@ -1886,6 +1955,7 @@ async def download_forward_via_userbot(
       dest_path: destination file path to save to
       msg_date: ISO datetime string of the original message (optional)
       file_unique_id: Telegram Bot API file_unique_id (optional)
+      progress_callback: Optional ``(current, total)`` callback for download progress.
 
     Returns True on success, False on failure. Raises RuntimeError for missing config.
     """
@@ -1906,7 +1976,7 @@ async def download_forward_via_userbot(
     # interactive Telethon login prompts on server environments.
     if PyrogramClient is not None and pyrogram_session_configured:
         try:
-            result = await _download_with_pyrogram(chat_id, message_id, dest_path)
+            result = await _download_with_pyrogram(chat_id, message_id, dest_path, progress_callback=progress_callback)
             if result:
                 return True
             logger.info("userbot: Pyrogram download failed; trying Telethon fallback")
@@ -1916,7 +1986,9 @@ async def download_forward_via_userbot(
     # Try Telethon only when a usable session exists.
     if TelegramClient is not None and has_usable_telethon_session():
         try:
-            result = await _download_with_telethon(chat_id, message_id, dest_path, msg_date, file_unique_id)
+            result = await _download_with_telethon(
+                chat_id, message_id, dest_path, msg_date, file_unique_id, progress_callback=progress_callback
+            )
             if result:
                 return True
             logger.info("userbot: Telethon download failed; no further fallback")
