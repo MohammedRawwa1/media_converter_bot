@@ -871,19 +871,42 @@ class EnhancedMediaHandler:
                                 _already = await _r_dedup.get(_dedup_key)
                                 if _already:
                                     _stored_job_id = _already.decode() if isinstance(_already, bytes) else _already
-                                    logger.info(
-                                        "Pipeline dedup: file %s already processed by pipeline "
-                                        "(redis flag=%s), skipping for user %s",
-                                        _file_uid, _stored_job_id, user_id,
-                                    )
-                                    # Set _pipeline_job_id in current_file so the
-                                    # caller (convert_video_format etc.) sees the
-                                    # existing job and attaches a watcher instead
-                                    # of trying to enqueue a new local job.
-                                    if current_file is not None:
-                                        current_file["_pipeline_job_id"] = _stored_job_id
-                                        session["current_file"] = current_file
-                                    return
+                                    # ── Active-job guard: only skip if the old job is still
+                                    #    actively processing.  After a redeploy the job hash
+                                    #    may be gone or the job already completed — in either
+                                    #    case clear the dedup flag and re-process so the user
+                                    #    actually gets the video, not a stale "done" message. ──
+                                    _active = False
+                                    try:
+                                        _old_hash = await _r_dedup.hgetall(f"ffmpeg:job:{_stored_job_id}")
+                                        if _old_hash:
+                                            _status = _old_hash.get(b"status") or _old_hash.get("status")
+                                            if _status:
+                                                _s = _status.decode() if isinstance(_status, bytes) else str(_status)
+                                                _active = _s in ("processing", "queued", "waiting", "started", "uploading", "sending")
+                                    except Exception:
+                                        _active = False
+
+                                    if _active:
+                                        logger.info(
+                                            "Pipeline dedup: file %s is still being processed "
+                                            "by job %s; skipping duplicate for user %s",
+                                            _file_uid, _stored_job_id, user_id,
+                                        )
+                                        if current_file is not None:
+                                            current_file["_pipeline_job_id"] = _stored_job_id
+                                            session["current_file"] = current_file
+                                        return
+                                    else:
+                                        # Job is done, cancelled, errored, or hash doesn't exist
+                                        # → clear dedup and allow re-processing
+                                        logger.info(
+                                            "Pipeline dedup: job %s for file %s is no longer "
+                                            "active (stale/done); clearing dedup and reprocessing",
+                                            _stored_job_id, _file_uid,
+                                        )
+                                        await _r_dedup.delete(_dedup_key)
+                                        # Do NOT return — fall through to normal pipeline processing
                             finally:
                                 try:
                                     await _r_dedup.close()
