@@ -159,6 +159,58 @@ class _ProgressFileWrapper:
         return getattr(self._fh, name)
 
 
+async def _send_video_result(
+    bot,
+    chat_id: int,
+    file_path: str,
+    caption: str = "",
+    *,
+    file_size: int = 0,
+    progress_channel: str | None = None,
+    job_id: str | None = None,
+    thumb_path: str | None = None,
+    _temp_thumb: str | None = None,
+    vid_duration: int | None = None,
+    vid_width: int | None = None,
+    vid_height: int | None = None,
+) -> None:
+    """Open a video file, wrap with upload progress, and send_video with metadata."""
+    _bot_up_cb = _make_upload_progress_callback(job_id, progress_channel) if job_id and progress_channel else None
+    _cleanup_thumb = _temp_thumb
+    try:
+        with open(file_path, "rb") as _fh:
+            _fh = _ProgressFileWrapper(_fh, file_size, _bot_up_cb) if file_size and _bot_up_cb else _fh
+            _send_kwargs = {
+                "chat_id": chat_id,
+                "video": _fh,
+                "caption": caption,
+                "supports_streaming": True,
+            }
+            if vid_duration is not None:
+                _send_kwargs["duration"] = vid_duration
+            if vid_width is not None:
+                _send_kwargs["width"] = vid_width
+            if vid_height is not None:
+                _send_kwargs["height"] = vid_height
+            if thumb_path:
+                try:
+                    with open(thumb_path, "rb") as _tf:
+                        _send_kwargs["thumb"] = _tf
+                        await bot.send_video(**_send_kwargs)
+                except Exception:
+                    await bot.send_video(**_send_kwargs)
+            else:
+                await bot.send_video(**_send_kwargs)
+    finally:
+        if _cleanup_thumb and os.path.exists(_cleanup_thumb):
+            try:
+                _d = os.path.dirname(_cleanup_thumb)
+                shutil.rmtree(_d, ignore_errors=True)
+            except Exception:
+                with contextlib.suppress(Exception):
+                    os.remove(_cleanup_thumb)
+
+
 async def _forward_pubsub_listener(stop_event: asyncio.Event | None, event: asyncio.Event) -> None:
     """Background task: subscribe to forward publish channel and set `event` when a notification arrives.
 
@@ -1474,46 +1526,20 @@ async def handle_job(job: dict):
                                                 except Exception:
                                                     thumb_path = None
 
-                                                _bot_up_cb = _make_upload_progress_callback(job_id, progress_channel)
-                                                try:
-                                                    with open(out, "rb") as fh:
-                                                        fh = (
-                                                            _ProgressFileWrapper(fh, file_size, _bot_up_cb)
-                                                            if file_size
-                                                            else fh
-                                                        )
-                                                        # Build send_video kwargs with available metadata
-                                                        _send_kwargs = {
-                                                            "chat_id": chat_id,
-                                                            "video": fh,
-                                                            "caption": caption,
-                                                            "supports_streaming": True,
-                                                        }
-                                                        if _vid_duration is not None:
-                                                            _send_kwargs["duration"] = _vid_duration
-                                                        if _vid_width is not None:
-                                                            _send_kwargs["width"] = _vid_width
-                                                        if _vid_height is not None:
-                                                            _send_kwargs["height"] = _vid_height
-                                                        if thumb_path:
-                                                            try:
-                                                                with open(thumb_path, "rb") as tf:
-                                                                    _send_kwargs["thumb"] = tf
-                                                                    await bot.send_video(**_send_kwargs)
-                                                            except Exception:
-                                                                await bot.send_video(**_send_kwargs)
-                                                        else:
-                                                            await bot.send_video(**_send_kwargs)
-                                                finally:
-                                                    try:
-                                                        if _temp_thumb and os.path.exists(_temp_thumb):
-                                                            try:
-                                                                _d = os.path.dirname(_temp_thumb)
-                                                                shutil.rmtree(_d, ignore_errors=True)
-                                                            except Exception:
-                                                                os.remove(_temp_thumb)
-                                                    except Exception:
-                                                        logger.debug("ffmpeg worker: operation failed")
+                                                await _send_video_result(
+                                                    bot,
+                                                    chat_id,
+                                                    out,
+                                                    caption=caption,
+                                                    file_size=file_size,
+                                                    progress_channel=progress_channel,
+                                                    job_id=job_id,
+                                                    thumb_path=thumb_path,
+                                                    _temp_thumb=_temp_thumb,
+                                                    vid_duration=_vid_duration,
+                                                    vid_width=_vid_width,
+                                                    vid_height=_vid_height,
+                                                )
                                             else:
                                                 # non-video non-zip fallback
                                                 thumb_path = None

@@ -86,15 +86,13 @@ EXTRACT_ALL_STREAMS = "extract_all_streams"
 REMOVE_AUDIO = "remove_audio"
 ADD_AUDIO = "merge_av_menu"
 OPTIMIZE_PREFIX = "optimize_"
-SAMPLE = "generate_sample"
 THUMBNAIL_GRID = "thumbnail_grid"
 EDIT_METADATA = "edit_metadata"
 NORMALIZE_AUDIO = "normalize_audio"
 TRIM_VIDEO = "trim_video"
 TRIM_AUDIO = "trim_audio"
 
-# Trimmer submenu and specific trimmer modes
-TRIM_MENU = "trim_menu"
+# Trimmer modes
 TRIMMER_1 = "trimmer_1"
 TRIMMER_2 = "trimmer_2"
 

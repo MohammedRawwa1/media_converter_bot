@@ -31,7 +31,6 @@ from .callbacks import (
     OPTIMIZE_MENU,
     REMOVE_AUDIO,
     RESOLUTION_MENU,
-    SAMPLE,
     SCREENSHOTS_MENU,
     STREAM_EXTRACTOR,
     STREAM_REMOVER,
@@ -73,14 +72,15 @@ class MediaMenuBuilder:
         split_label = "🔪 Videos Splitter" if is_video else "🔪 Split"
 
         buttons: list[list[InlineKeyboardButton]] = [
-            row("🖼️ Thumbnail Extractor", THUMBNAIL_EXTRACTOR, "✏️ Caption And Buttons Editor", CAPTION_EDITOR),
+            row("🖼️ Thumbnail Extractor", THUMBNAIL_EXTRACTOR, "🗑️ Delete Thumbnail", "delete_custom_thumb"),
+            row("✏️ Caption And Buttons Editor", CAPTION_EDITOR, "🔀 Batch Process", "batch_process"),
             row("📝 Metadata Editor", EDIT_METADATA, "📤 Media Forwarder", MEDIA_FORWARDER),
             row("🔇 Stream Remover", STREAM_REMOVER, "🎵 Stream Extractor", STREAM_EXTRACTOR),
             row("✂️ Video Trimmer", TRIM_VIDEO, "➕ Video Merger", MERGE_MENU),
             row("🔉 Remove Audio", REMOVE_AUDIO, "🔀 Merge And", MERGE_VIEW),
             row(conv_label, conv_cb, split_label, VIDEOS_SPLITTER),
             row("🖼️ Screenshots", SCREENSHOTS_MENU, "🖼️ Manual Shots", MANUAL_SHOTS),
-            row("🎞️ Generate Sample", SAMPLE, "🎵 Video To Audio", VIDEO_TO_AUDIO),
+            row("🎵 Video To Audio", VIDEO_TO_AUDIO, "📉 Compress", COMPRESS_MENU),
             row("⚡ Video Optimizer", OPTIMIZE_MENU, "🔗 Subtitle Merger", SUBTITLE_MERGER),
             row("✏️ Video Renamer", VIDEO_RENAMER, "🛈 Media Information", INFO),
             # Single-button rows for create/archive and final cancel button
@@ -337,6 +337,10 @@ class MediaMenuBuilder:
                 InlineKeyboardButton("📉 Compress", callback_data=COMPRESS_MENU),
             ],
             [
+                InlineKeyboardButton("🔄 Convert To Video", callback_data="convert_to_video"),
+                InlineKeyboardButton("🔄 Convert To File", callback_data="convert_to_file"),
+            ],
+            [
                 InlineKeyboardButton("📐 Resolution", callback_data=RESOLUTION_MENU),
                 InlineKeyboardButton("⏱️ Framerate", callback_data="framerate_menu"),
             ],
@@ -382,9 +386,6 @@ class MediaMenuBuilder:
             ],
             [
                 InlineKeyboardButton("📊 Media Info", callback_data=INFO),
-                InlineKeyboardButton("🎞️ Sample", callback_data=SAMPLE),
-            ],
-            [
                 InlineKeyboardButton("🖼️ Thumbnail", callback_data=THUMBNAIL_GRID),
                 InlineKeyboardButton("✏️ Metadata", callback_data=EDIT_METADATA),
             ],

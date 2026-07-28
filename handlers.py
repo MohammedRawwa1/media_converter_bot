@@ -614,6 +614,128 @@ class EnhancedMediaHandler:
             logger.debug("Conversion quota check failed, allowing conversion")
         return True
 
+    # ── Video delivery helper: send_video with rich metadata ──────────────
+    async def _send_video_result(
+        self,
+        bot,
+        chat_id: int,
+        file_path: str,
+        caption: str = "",
+        thumb_path: str | None = None,
+    ) -> None:
+        """Send a video file with probed metadata (duration, width, height, thumbnail).
+
+        Probes the file with ffprobe to extract video metadata, generates a
+        thumbnail if none provided, then calls send_video with all available
+        info so Telegram shows the video's duration, dimensions, and thumbnail.
+        """
+        import json as _json
+        import subprocess as _sp
+        import tempfile as _tf
+
+        _vid_duration = None
+        _vid_width = None
+        _vid_height = None
+        _thumb_path = thumb_path
+        _cleanup_thumb = False
+
+        # ── Probe video metadata with ffprobe ──
+        try:
+            _ffprobe_bin = getattr(config, "FFMPEG_PATH", "ffmpeg").replace("ffmpeg", "ffprobe")
+            _p = await asyncio.to_thread(
+                lambda: _sp.run(  # noqa: S603
+                    [_ffprobe_bin, "-v", "quiet", "-print_format", "json", "-show_streams", "-show_format", file_path],
+                    capture_output=True,
+                    timeout=15,
+                )
+            )
+            if _p.returncode == 0:
+                _probe = _json.loads(_p.stdout.decode() or "{}")
+                _streams = _probe.get("streams", [])
+                for s in _streams:
+                    if s.get("codec_type") == "video":
+                        if "width" in s:
+                            _vid_width = s["width"]
+                        if "height" in s:
+                            _vid_height = s["height"]
+                        break
+                _fmt = _probe.get("format", {})
+                if _fmt.get("duration"):
+                    with contextlib.suppress(ValueError, TypeError):
+                        _vid_duration = int(float(_fmt["duration"]))
+        except Exception:
+            pass
+
+        # ── Auto-generate thumbnail if none provided ──
+        if not _thumb_path and os.path.exists(file_path):
+            try:
+                _tmpdir = _tf.mkdtemp(prefix="auto_thumb_")
+                _gen_thumb = os.path.join(_tmpdir, "thumb.jpg")
+                _ffmpeg_bin = getattr(config, "FFMPEG_PATH", "ffmpeg")
+                _tp = await asyncio.create_subprocess_exec(
+                    _ffmpeg_bin,
+                    "-y",
+                    "-ss",
+                    "00:00:01",
+                    "-i",
+                    file_path,
+                    "-vframes",
+                    "1",
+                    "-q:v",
+                    "2",
+                    _gen_thumb,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                await asyncio.wait_for(_tp.communicate(), timeout=30)
+                if _tp.returncode == 0 and os.path.exists(_gen_thumb) and os.path.getsize(_gen_thumb) > 0:
+                    _thumb_path = _gen_thumb
+                    _cleanup_thumb = True
+                else:
+                    _sp_run = contextlib.suppress(Exception)
+                    _sp_run = None
+                    try:
+                        import shutil as _shutil
+
+                        _shutil.rmtree(_tmpdir, ignore_errors=True)
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+
+        # ── Send with all available metadata ──
+        try:
+            with open(file_path, "rb") as _fh:
+                _send_kwargs = {
+                    "chat_id": chat_id,
+                    "video": _fh,
+                    "caption": caption,
+                    "supports_streaming": True,
+                }
+                if _vid_duration is not None:
+                    _send_kwargs["duration"] = _vid_duration
+                if _vid_width is not None:
+                    _send_kwargs["width"] = _vid_width
+                if _vid_height is not None:
+                    _send_kwargs["height"] = _vid_height
+                if _thumb_path:
+                    try:
+                        with open(_thumb_path, "rb") as _tf:
+                            _send_kwargs["thumb"] = _tf
+                            await bot.send_video(**_send_kwargs)
+                    except Exception:
+                        await bot.send_video(**_send_kwargs)
+                else:
+                    await bot.send_video(**_send_kwargs)
+        finally:
+            if _cleanup_thumb and _thumb_path:
+                try:
+                    import shutil as _shutil
+
+                    _shutil.rmtree(os.path.dirname(_thumb_path), ignore_errors=True)
+                except Exception:
+                    pass
+
     async def _ensure_current_file_downloaded(self, update: Update, context: ContextTypes.DEFAULT_TYPE, session: dict):
         """Ensure the session's current_file is downloaded locally. Raises Exception on failure."""
         user_id = update.effective_user.id if update and update.effective_user else None
@@ -768,9 +890,7 @@ class EnhancedMediaHandler:
                 _userbot_enabled = os.environ.get("ENABLE_USERBOT", "").lower() in ("1", "true", "yes")
                 if not _userbot_enabled:
                     _upload_url_early = (
-                        os.environ.get("WEB_UPLOAD_URL")
-                        or os.environ.get("WEBAPP_URL")
-                        or "<your-server>/upload"
+                        os.environ.get("WEB_UPLOAD_URL") or os.environ.get("WEBAPP_URL") or "<your-server>/upload"
                     )
                     raise Exception(
                         f"File is {file_size // (1024 * 1024)} MB, which exceeds the "
@@ -2676,14 +2796,13 @@ class EnhancedMediaHandler:
             elif data == "fade_both":
                 await self._apply_fade(update, context, session, fade_in=3.0, fade_out=3.0)
             elif data == "cancel":
-                # Clear any awaiting inputs and notify user
+                # Clear any awaiting inputs and notify user, close the menu
                 for key in list(context.user_data.keys()):
                     if key.startswith("awaiting_"):
                         del context.user_data[key]
                 await self.safe_edit(
                     query,
                     "❌ Operation cancelled.",
-                    reply_markup=MediaMenuBuilder.get_main_menu(current_file["type"] if current_file else None),
                 )
 
             elif data == "confirm":
@@ -2924,10 +3043,7 @@ class EnhancedMediaHandler:
                 )
 
             elif data == "batch_process":
-                await self.safe_edit(
-                    query,
-                    "🔀 **Batch Processing**\nComing soon! Send multiple files to process.",
-                )
+                await self.show_bulk_menu(update, context)
 
             # Settings pagination and toggle handlers
             elif isinstance(data, str) and data.startswith("settings_page:"):
@@ -3041,9 +3157,6 @@ class EnhancedMediaHandler:
 
             elif data == "thumbnail_grid":
                 await self.create_thumbnail_grid(update, context, session)
-
-            elif data == "generate_sample":
-                await self.generate_sample(update, context, session)
 
             elif data == "add_subtitles":
                 await self.safe_edit(query, "➕ **Add Subtitles**\nSend subtitle file (.srt, .ass):")
@@ -3345,13 +3458,12 @@ class EnhancedMediaHandler:
                     )
                     os.remove(output_path)
                 else:
-                    with open(output_path, "rb") as video_file:
-                        await context.bot.send_video(
-                            chat_id=update.effective_chat.id,
-                            video=video_file,
-                            caption=f"✅ Compressed (CRF {crf})",
-                            supports_streaming=True,
-                        )
+                    await self._send_video_result(
+                        context.bot,
+                        update.effective_chat.id,
+                        output_path,
+                        caption=f"✅ Compressed (CRF {crf})",
+                    )
                     os.remove(output_path)
             else:
                 await self.safe_edit(query, "❌ Compression failed.")
@@ -3390,15 +3502,13 @@ class EnhancedMediaHandler:
             os.makedirs(output_dir, exist_ok=True)
         output_path = os.path.join(output_dir, f"merged_{int(datetime.now().timestamp())}.mp4")
         success = await self.converter.merge_videos(session["merge_list"], output_path)
-
         if success and os.path.exists(output_path):
-            with open(output_path, "rb") as video_file:
-                await context.bot.send_video(
-                    chat_id=update.effective_chat.id,
-                    video=video_file,
-                    caption=f"✅ Merged {len(session['merge_list'])} videos",
-                    supports_streaming=True,
-                )
+            await self._send_video_result(
+                context.bot,
+                update.effective_chat.id,
+                output_path,
+                caption=f"✅ Merged {len(session['merge_list'])} videos",
+            )
 
             # Cleanup
             os.remove(output_path)
@@ -3483,13 +3593,12 @@ class EnhancedMediaHandler:
         success = await self.converter.remove_audio(current_file["path"], output_path)
 
         if success and os.path.exists(output_path):
-            with open(output_path, "rb") as video_file:
-                await context.bot.send_video(
-                    chat_id=update.effective_chat.id,
-                    video=video_file,
-                    caption="✅ Audio removed",
-                    supports_streaming=True,
-                )
+            await self._send_video_result(
+                context.bot,
+                update.effective_chat.id,
+                output_path,
+                caption="✅ Audio removed",
+            )
             os.remove(output_path)
         else:
             await self.safe_edit(query, "❌ Failed to remove audio.")
@@ -3555,13 +3664,12 @@ class EnhancedMediaHandler:
         success = await self.converter.change_resolution(current_file["path"], output_path, width, height)
 
         if success and os.path.exists(output_path):
-            with open(output_path, "rb") as video_file:
-                await context.bot.send_video(
-                    chat_id=update.effective_chat.id,
-                    video=video_file,
-                    caption=f"✅ Resolution: {width}x{height}",
-                    supports_streaming=True,
-                )
+            await self._send_video_result(
+                context.bot,
+                update.effective_chat.id,
+                output_path,
+                caption=f"✅ Resolution: {width}x{height}",
+            )
             os.remove(output_path)
         else:
             await self.safe_edit(query, "❌ Failed to change resolution.")
@@ -3682,13 +3790,12 @@ class EnhancedMediaHandler:
         success, _ = await self.converter.execute_ffmpeg(cmd, current_file["path"], output_path)
 
         if success and os.path.exists(output_path):
-            with open(output_path, "rb") as video_file:
-                await context.bot.send_video(
-                    chat_id=update.effective_chat.id,
-                    video=video_file,
-                    caption=f"✅ Optimized for {preset}",
-                    supports_streaming=True,
-                )
+            await self._send_video_result(
+                context.bot,
+                update.effective_chat.id,
+                output_path,
+                caption=f"✅ Optimized for {preset}",
+            )
             os.remove(output_path)
         else:
             await self.safe_edit(query, "❌ Optimization failed.")
@@ -4312,57 +4419,6 @@ class EnhancedMediaHandler:
         with contextlib.suppress(Exception):
             asyncio.create_task(self._watch_job_progress(query, job_id))
 
-    async def generate_sample(self, update: Update, context: ContextTypes.DEFAULT_TYPE, session: dict):
-        """Generate sample/preview of media."""
-        if not await self._require_callback(update):
-            return
-        query = update.callback_query
-        current_file = session.get("current_file")
-
-        if not current_file:
-            await self.safe_edit(query, "❌ No file found.")
-            return
-
-        if not await self._check_conversion_quota(update, context):
-            return
-
-        await self.safe_edit(query, "🎬 Generating 30-second sample...")
-        # Ensure file downloaded (lazy-download)
-        if not current_file.get("path") or not os.path.exists(current_file.get("path") or ""):
-            try:
-                await self._ensure_current_file_downloaded(update, context, session)
-                current_file = session.get("current_file")
-            except Exception as e:
-                await self.safe_edit(query, f"❌ Failed to download file: {e}")
-                return
-
-        job_id = str(uuid.uuid4())
-        output_base = getattr(config, "OUTPUT_PATH", "storage/output") if config else "storage/output"
-        with contextlib.suppress(Exception):
-            os.makedirs(output_base, exist_ok=True)
-        output_path = os.path.join(output_base, f"{current_file['id']}_sample")
-        if current_file["type"] == "video":
-            output_path += ".mp4"
-        else:
-            output_path += ".mp3"
-
-        job = {
-            "job_id": job_id,
-            "type": "generate_sample",
-            "input_path": current_file["path"],
-            "input_key": current_file.get("input_key"),
-            "output_path": output_path,
-            "duration": 30,
-            "progress_channel": f"ffmpeg:progress:{job_id}",
-            "chat_id": update.effective_chat.id if update and update.effective_chat else None,
-        }
-
-        await enqueue_job(job)
-        kb = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data=f"cancel_job:{job_id}")]])
-        await self.safe_edit(query, f"⏳ Job queued: {job_id} — generating sample", reply_markup=kb)
-        with contextlib.suppress(Exception):
-            asyncio.create_task(self._watch_job_progress(query, job_id))
-
     async def show_media_info(self, update: Update, context: ContextTypes.DEFAULT_TYPE, session: dict):
         """Show basic media information."""
         if not await self._require_callback(update):
@@ -4503,13 +4559,12 @@ class EnhancedMediaHandler:
                     )
 
                     if success and os.path.exists(output_path):
-                        with open(output_path, "rb") as vf:
-                            await context.bot.send_video(
-                                chat_id=update.effective_chat.id,
-                                video=vf,
-                                caption=f"✅ Trimmed {start} to {user_input}",
-                                supports_streaming=True,
-                            )
+                        await self._send_video_result(
+                            context.bot,
+                            update.effective_chat.id,
+                            output_path,
+                            caption=f"✅ Trimmed {start} to {user_input}",
+                        )
                         os.remove(output_path)
                     else:
                         await update.message.reply_text("❌ Failed to trim video.")
@@ -4560,13 +4615,12 @@ class EnhancedMediaHandler:
                     success = await self.converter.trim_video(current_file["path"], output_path, start, end_str)
 
                     if success and os.path.exists(output_path):
-                        with open(output_path, "rb") as vf:
-                            await context.bot.send_video(
-                                chat_id=update.effective_chat.id,
-                                video=vf,
-                                caption=f"✅ Trimmed {start} + {user_input}",
-                                supports_streaming=True,
-                            )
+                        await self._send_video_result(
+                            context.bot,
+                            update.effective_chat.id,
+                            output_path,
+                            caption=f"✅ Trimmed {start} + {user_input}",
+                        )
                         os.remove(output_path)
                     else:
                         await update.message.reply_text("❌ Failed to trim video.")
@@ -4674,13 +4728,12 @@ class EnhancedMediaHandler:
                     success = await self.converter.change_resolution(current_file["path"], output_path, width, height)
 
                     if success and os.path.exists(output_path):
-                        with open(output_path, "rb") as video_file:
-                            await context.bot.send_video(
-                                chat_id=update.effective_chat.id,
-                                video=video_file,
-                                caption=f"✅ Resolution: {width}x{height}",
-                                supports_streaming=True,
-                            )
+                        await self._send_video_result(
+                            context.bot,
+                            update.effective_chat.id,
+                            output_path,
+                            caption=f"✅ Resolution: {width}x{height}",
+                        )
                         os.remove(output_path)
                     else:
                         await update.message.reply_text("❌ Failed to change resolution.")
@@ -4740,12 +4793,12 @@ class EnhancedMediaHandler:
                             if hasattr(self.converter, "split_video"):
                                 success = await self.converter.split_video(current_file["path"], start, end, out)
                                 if success and os.path.exists(out):
-                                    with open(out, "rb") as vf:
-                                        await context.bot.send_video(
-                                            chat_id=update.effective_chat.id,
-                                            video=vf,
-                                            caption="✅ Split part",
-                                        )
+                                    await self._send_video_result(
+                                        context.bot,
+                                        update.effective_chat.id,
+                                        out,
+                                        caption="✅ Split part",
+                                    )
                                     os.remove(out)
                                 else:
                                     await update.message.reply_text("⚠️ Split finished but no file produced.")
@@ -4804,8 +4857,12 @@ class EnhancedMediaHandler:
                         if current_file.get("type") == "video":
                             # Prefer send_video; fallback to send_document on failure
                             try:
-                                with open(path, "rb") as f:
-                                    await context.bot.send_video(chat_id=dest_chat.id, video=f, caption=caption)
+                                await self._send_video_result(
+                                    context.bot,
+                                    dest_chat.id,
+                                    path,
+                                    caption=caption,
+                                )
                             except Exception:
                                 logger.exception("send_video failed, trying send_document as fallback")
                                 with open(path, "rb") as f:
@@ -4865,13 +4922,12 @@ class EnhancedMediaHandler:
                 success = await self.converter.trim_video(current_file["path"], output_path, start_time, end_time)
 
                 if success and os.path.exists(output_path):
-                    with open(output_path, "rb") as video_file:
-                        await context.bot.send_video(
-                            chat_id=update.effective_chat.id,
-                            video=video_file,
-                            caption=f"✅ Trimmed {start_time}-{end_time}",
-                            supports_streaming=True,
-                        )
+                    await self._send_video_result(
+                        context.bot,
+                        update.effective_chat.id,
+                        output_path,
+                        caption=f"✅ Trimmed {start_time}-{end_time}",
+                    )
                     os.remove(output_path)
                 else:
                     await update.message.reply_text("❌ Failed to trim video.")
@@ -4947,13 +5003,12 @@ class EnhancedMediaHandler:
                 success = await self.converter.change_framerate(current_file["path"], output_path, fps)
 
                 if success and os.path.exists(output_path):
-                    with open(output_path, "rb") as video_file:
-                        await context.bot.send_video(
-                            chat_id=update.effective_chat.id,
-                            video=video_file,
-                            caption=f"✅ Framerate changed to {fps} fps",
-                            supports_streaming=True,
-                        )
+                    await self._send_video_result(
+                        context.bot,
+                        update.effective_chat.id,
+                        output_path,
+                        caption=f"✅ Framerate changed to {fps} fps",
+                    )
                     os.remove(output_path)
                 else:
                     await update.message.reply_text("❌ Failed to change framerate.")
@@ -5001,13 +5056,12 @@ class EnhancedMediaHandler:
                 success, _ = await self.converter.execute_ffmpeg(cmd, current_file["path"], output_path)
 
                 if success and os.path.exists(output_path):
-                    with open(output_path, "rb") as video_file:
-                        await context.bot.send_video(
-                            chat_id=update.effective_chat.id,
-                            video=video_file,
-                            caption="✅ Custom optimization",
-                            supports_streaming=True,
-                        )
+                    await self._send_video_result(
+                        context.bot,
+                        update.effective_chat.id,
+                        output_path,
+                        caption="✅ Custom optimization",
+                    )
                     os.remove(output_path)
                 else:
                     await update.message.reply_text("❌ Optimization failed.")
@@ -5030,13 +5084,12 @@ class EnhancedMediaHandler:
                 success = await self.converter.edit_metadata(current_file["path"], output_path, metadata)
 
                 if success and os.path.exists(output_path):
-                    with open(output_path, "rb") as video_file:
-                        await context.bot.send_video(
-                            chat_id=update.effective_chat.id,
-                            video=video_file,
-                            caption="✅ Metadata updated",
-                            supports_streaming=True,
-                        )
+                    await self._send_video_result(
+                        context.bot,
+                        update.effective_chat.id,
+                        output_path,
+                        caption="✅ Metadata updated",
+                    )
                     os.remove(output_path)
                 else:
                     await update.message.reply_text("❌ Failed to update metadata.")
