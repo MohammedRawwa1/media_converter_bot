@@ -1410,7 +1410,6 @@ async def handle_job(job: dict):
                                                 logger.debug("ffmpeg worker: Try cache first for ffprobe results")
 
                                             if probe_info is None:  # cache miss
-
                                                 def _probe():
                                                     try:
                                                         return subprocess.run(
@@ -1427,28 +1426,31 @@ async def handle_job(job: dict):
                                                         )
                                                     except Exception:
                                                         return None
-
                                                 p = await asyncio.to_thread(_probe)
-                                            if p and getattr(p, "returncode", 1) == 0:
-                                                try:
-                                                    probe_info = json.loads(p.stdout.decode() or "{}")
-                                                    # Cache ffprobe result
+                                                if p and getattr(p, "returncode", 1) == 0:
                                                     try:
-                                                        if _cache and out and os.path.exists(out) and probe_info:
-                                                            _fhash = _hl.sha256(
-                                                                f"{out}:{os.path.getsize(out)}".encode()
-                                                            ).hexdigest()[:16]
-                                                            await _cache.set(
-                                                                f"cache:probe:{_fhash}", probe_info, ttl=86400
-                                                            )
-                                                            logger.debug("Worker: cached ffprobe result for %s", out)
+                                                        probe_info = json.loads(p.stdout.decode() or "{}")
+                                                        # Cache ffprobe result
+                                                        try:
+                                                            if _cache and out and os.path.exists(out) and probe_info:
+                                                                _fhash = _hl.sha256(
+                                                                    f"{out}:{os.path.getsize(out)}".encode()
+                                                                ).hexdigest()[:16]
+                                                                await _cache.set(
+                                                                    f"cache:probe:{_fhash}", probe_info, ttl=86400
+                                                                )
+                                                                logger.debug("Worker: cached ffprobe result for %s", out)
+                                                        except Exception:
+                                                            logger.debug("ffmpeg worker: Cache ffprobe result")
                                                     except Exception:
-                                                        logger.debug("ffmpeg worker: Cache ffprobe result")
+                                                        pass
+                                            # ── Extract metadata from probe_info (cache hit or fresh probe) ──
+                                            if probe_info:
+                                                try:
                                                     streams = probe_info.get("streams", [])
                                                     if any(s.get("codec_type") == "video" for s in streams):
                                                         kind = "video"
                                                     else:
-                                                        # not a video stream; fall back to extension-based
                                                         if str(out).lower().endswith(".zip"):
                                                             kind = "zip"
                                                         elif str(out).lower().endswith((".mp4", ".mov", ".mkv")):
@@ -1476,7 +1478,7 @@ async def handle_job(job: dict):
                                                     else:
                                                         kind = "doc"
                                             else:
-                                                # probe failed -> extension fallback
+                                                # probe failed (cache miss + ffprobe error) -> extension fallback
                                                 if str(out).lower().endswith(".zip"):
                                                     kind = "zip"
                                                 elif str(out).lower().endswith((".mp4", ".mov", ".mkv")):
