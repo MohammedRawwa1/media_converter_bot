@@ -673,12 +673,16 @@ class EnhancedMediaHandler:
             os.makedirs(input_dir, exist_ok=True)
         file_path = os.path.join(input_dir, f"{user_id}_{file_id}{ext}")
 
+        # Track whether the BigFilePipeline already forwarded this file to the relay
+        # group, so the error handler below can avoid a duplicate forward.
+        _relay_forwarded_already = False
+
         # Attempt to fetch file via Telegram API (bot). If Telegram refuses due to
         # file size or access rules, prefer a user-account (userbot) fallback when
         # configured via env (`ENABLE_USERBOT` + API_ID/API_HASH).
         try:
             # -- Big files pipeline: route files > BOT_API_MAX_MB through Pyrogram->S3->Worker
-            bot_api_max_mb = int(os.environ.get("BOT_API_MAX_MB", "50"))
+            bot_api_max_mb = int(os.environ.get("BOT_API_MAX_MB", "20"))
             file_size = current_file.get("size") or 0
             if file_size and file_size > bot_api_max_mb * 1024 * 1024 and _bigfile_pipeline is not None:
                 _bot_chat, _bot_msg = _extract_large_file_source(current_file)
@@ -706,6 +710,8 @@ class EnhancedMediaHandler:
                             if _forwarded and getattr(_forwarded, "message_id", None):
                                 _pipeline_chat = _rid
                                 _pipeline_msg = _forwarded.message_id
+                                # Mark this file as already forwarded to prevent double relay
+                                _relay_forwarded_already = True
                                 logger.info(
                                     "Big files pipeline: relay forwarded to %s/%s",
                                     _rid,
@@ -756,6 +762,30 @@ class EnhancedMediaHandler:
                             _pipeline_chat,
                             _pipeline_msg,
                         )
+
+            # ── Clean early error: file > Bot API download limit but no fallback available ──
+            if file_size and file_size > bot_api_max_mb * 1024 * 1024 and _bigfile_pipeline is None:
+                _userbot_enabled = os.environ.get("ENABLE_USERBOT", "").lower() in ("1", "true", "yes")
+                if not _userbot_enabled:
+                    _upload_url_early = (
+                        os.environ.get("WEB_UPLOAD_URL")
+                        or os.environ.get("WEBAPP_URL")
+                        or "<your-server>/upload"
+                    )
+                    raise Exception(
+                        f"File is {file_size // (1024 * 1024)} MB, which exceeds the "
+                        f"{bot_api_max_mb} MB download limit.\n\n"
+                        "To process files larger than this size, configure one of these:\n"
+                        "• Set ENABLE_USERBOT=true and configure PYROGRAM_SESSION "
+                        "(or API_ID/API_HASH + API_SESSION) so the bot can use a user account.\n"
+                        f"• Upload the file via the web uploader at {_upload_url_early}."
+                    )
+                logger.info(
+                    "BigFilePipeline unavailable but userbot fallback is enabled — "
+                    "will attempt userbot download for %dMB file",
+                    file_size // (1024 * 1024),
+                )
+
             file = await context.bot.get_file(file_id)
         except Exception as e:
             logger.exception("get_file failed for %s: %s", file_id, e)
@@ -806,7 +836,10 @@ class EnhancedMediaHandler:
                 return False
 
             # For large-file bot API failures, try the userbot fallback first.
+            # Guard: skip relay group fallback if the bigfile pipeline already
+            # forwarded this file to the relay group.
             if enable_userbot and ("file is too big" in err_text.lower() or "too big" in err_text.lower()):
+                _relay_already_done = _relay_forwarded_already
                 forward = current_file.get("forward") if current_file else None
                 if (
                     forward
@@ -823,8 +856,10 @@ class EnhancedMediaHandler:
 
                 # Relay group fallback: forward the file to a shared group/channel
                 # where the userbot account has access, then download from there.
+                # Guard: skip if the bigfile pipeline already forwarded to the relay group
+                # for this file (prevents double forwarding).
                 _relay_chat_id = os.environ.get("RELAY_CHAT_ID", "")
-                if _relay_chat_id and bot_chat and bot_msg:
+                if _relay_chat_id and bot_chat and bot_msg and not _relay_already_done:
                     try:
                         _relay_chat_id = int(_relay_chat_id)
                         logger.info(
@@ -908,9 +943,9 @@ class EnhancedMediaHandler:
 
             try:
                 try:
-                    bot_api_max_mb = int(os.environ.get("BOT_API_MAX_MB", "50"))
+                    bot_api_max_mb = int(os.environ.get("BOT_API_MAX_MB", "20"))
                 except Exception:
-                    bot_api_max_mb = 50
+                    bot_api_max_mb = 20
                 file_size = current_file.get("size") or 0
                 bot_chat = current_file.get("chat_id")
                 bot_msg = current_file.get("msg_id") or current_file.get("message_id")

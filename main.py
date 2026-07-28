@@ -2162,7 +2162,8 @@ try:
         app.mount("/flask", WSGIMiddleware(flask_webapp.app))
 
         # Provide a compatibility redirect so requests to /upload still work.
-        @app.get("/upload")
+        # Accept both GET (browser navigation) and POST (internal server fetch from handlers.py).
+        @app.route("/upload", methods=["GET", "POST"])
         async def _upload_redirect():
             return RedirectResponse(url="/flask/upload")
 

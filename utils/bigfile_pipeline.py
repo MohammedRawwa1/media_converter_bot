@@ -32,7 +32,7 @@ from dataclasses import dataclass
 logger = logging.getLogger(__name__)
 
 # Default thresholds
-DEFAULT_BOT_API_MAX_MB = int(os.getenv("BOT_API_MAX_MB", "50"))
+DEFAULT_BOT_API_MAX_MB = int(os.getenv("BOT_API_MAX_MB", "20"))
 DEFAULT_BOT_API_MAX_BYTES = DEFAULT_BOT_API_MAX_MB * 1024 * 1024
 
 # Files up to this size (200MB) get streamed through memory instead of temp disk

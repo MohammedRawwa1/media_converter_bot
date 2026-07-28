@@ -719,32 +719,32 @@ async def _download_with_telethon(
                 target,
                 getattr(msg, "id", None),
                 bool(getattr(msg, "media", None)),
-            )                    if getattr(msg, "media", None):
-                        logger.info("userbot: message found; downloading %s/%s to %s", target, message_id, dest_path)
-                        for attempt in range(3):
-                            try:
-                                logger.debug(
-                                    "userbot: download attempt %s for %s/%s -> %s",
-                                    attempt + 1,
-                                    target,
-                                    getattr(msg, "id", None),
-                                    dest_path,
-                                )
-                                dl_result = await client.download_media(msg, file=dest_path, part_size_kb=chunk_size_kb)
-                                # Telethon may save to a different path; reconcile just like Pyrogram's _download_and_ensure_path
-                                _reconcile_download_path(dl_result, dest_path)
-                                if os.path.exists(dest_path) and os.path.getsize(dest_path) > 0:
-                                    ok = await _ffprobe_ok(dest_path)
-                                    if ok:
-                                        return True
-                                logger.warning(
-                                    "userbot: downloaded file failed validation (attempt %s) %s", attempt + 1, dest_path
-                                )
-                                with contextlib.suppress(Exception):
-                                    os.remove(dest_path)
-                            except Exception as e:
-                                logger.exception("userbot: download attempt %s failed: %s", attempt + 1, e)
-                        logger.debug("userbot: message found but downloads failed validation: %s/%s", target, message_id)
+            )
+            if getattr(msg, "media", None):
+                logger.info("userbot: message found; downloading %s/%s to %s", target, message_id, dest_path)
+                for attempt in range(3):
+                    try:
+                        logger.debug(
+                            "userbot: download attempt %s for %s/%s -> %s",
+                            attempt + 1,
+                            target,
+                            getattr(msg, "id", None),
+                            dest_path,
+                        )
+                        dl_result = await client.download_media(msg, file=dest_path, part_size_kb=chunk_size_kb)
+                        _reconcile_download_path(dl_result, dest_path)
+                        if os.path.exists(dest_path) and os.path.getsize(dest_path) > 0:
+                            ok = await _ffprobe_ok(dest_path)
+                            if ok:
+                                return True
+                        logger.warning(
+                            "userbot: downloaded file failed validation (attempt %s) %s", attempt + 1, dest_path
+                        )
+                        with contextlib.suppress(Exception):
+                            os.remove(dest_path)
+                    except Exception as e:
+                        logger.exception("userbot: download attempt %s failed: %s", attempt + 1, e)
+                logger.debug("userbot: message found but downloads failed validation: %s/%s", target, message_id)
             else:
                 logger.debug("userbot: message found but no media: %s/%s", target, message_id)
 
@@ -786,7 +786,8 @@ async def _download_with_telethon(
                 logger.info(
                     "userbot: Telethon recent-history scan started for target=%s",
                     target,
-                )                    async for m in client.iter_messages(target, limit=200):
+                )
+                async for m in client.iter_messages(target, limit=200):
                     if getattr(m, "media", None):
                         for _ in range(3):
                             try:
