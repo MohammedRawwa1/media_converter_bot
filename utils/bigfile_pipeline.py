@@ -175,7 +175,7 @@ class BigFilePipeline:
         # Now we always use the single disk-based path with progress callback support.
         if not _cache_hit:
             try:
-                temp_dir = os.path.join(os.getenv("STORAGE_PATH", "storage"), "temp")
+                temp_dir = os.path.abspath(os.path.join(os.getenv("STORAGE_PATH", "storage"), "temp"))
                 os.makedirs(temp_dir, exist_ok=True)
 
                 temp_path = os.path.join(temp_dir, f"{job_id}_src{ext}")

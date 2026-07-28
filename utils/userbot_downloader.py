@@ -716,7 +716,10 @@ async def _try_relay_fallback(
             relay_chat_id,
             relay_msg_id,
         )
-        relay_msgs = await client.get_messages(relay_chat_id, message_ids=[relay_msg_id])
+        if client_type == "telethon":
+            relay_msgs = await client.get_messages(relay_chat_id, ids=[relay_msg_id])
+        else:
+            relay_msgs = await client.get_messages(relay_chat_id, message_ids=[relay_msg_id])
         if relay_msgs:
             relay_msg = relay_msgs[0] if isinstance(relay_msgs, list) else relay_msgs
             if (
@@ -984,13 +987,22 @@ async def _download_with_telethon(
                             getattr(msg, "id", None),
                             dest_path,
                         )
-                        dl_kwargs = {"file": dest_path, "part_size_kb": chunk_size_kb}
+                        dl_kwargs = {"file": dest_path}
                         if progress_callback is not None:
                             dl_kwargs["progress_callback"] = progress_callback
-                        dl_result = await asyncio.wait_for(
-                            client.download_media(msg, **dl_kwargs),
-                            timeout=TELETHON_DOWNLOAD_TIMEOUT,
-                        )
+                        # part_size_kb removed in Telethon v1.35+; catch TypeError and retry without
+                        try:
+                            _dl_result = await asyncio.wait_for(
+                                client.download_media(msg, **dl_kwargs, part_size_kb=chunk_size_kb),
+                                timeout=TELETHON_DOWNLOAD_TIMEOUT,
+                            )
+                        except TypeError:
+                            logger.debug("userbot: Telethon does not support part_size_kb, retrying without")
+                            _dl_result = await asyncio.wait_for(
+                                client.download_media(msg, **dl_kwargs),
+                                timeout=TELETHON_DOWNLOAD_TIMEOUT,
+                            )
+                        dl_result = _dl_result
                         _reconcile_download_path(dl_result, dest_path)
                         if os.path.exists(dest_path) and os.path.getsize(dest_path) > 0:
                             ok = await _ffprobe_ok(dest_path)
@@ -1030,13 +1042,20 @@ async def _download_with_telethon(
                         if getattr(m, "media", None):
                             for _ in range(3):
                                 try:
-                                    _dl_kwargs = {"file": dest_path, "part_size_kb": chunk_size_kb}
+                                    _dl_kwargs = {"file": dest_path}
                                     if progress_callback is not None:
                                         _dl_kwargs["progress_callback"] = progress_callback
-                                    dl_result = await asyncio.wait_for(
-                                        client.download_media(m, **_dl_kwargs),
-                                        timeout=TELETHON_DOWNLOAD_TIMEOUT,
-                                    )
+                                    try:
+                                        dl_result = await asyncio.wait_for(
+                                            client.download_media(m, **_dl_kwargs, part_size_kb=chunk_size_kb),
+                                            timeout=TELETHON_DOWNLOAD_TIMEOUT,
+                                        )
+                                    except TypeError:
+                                        logger.debug("userbot: Telethon no part_size_kb (date scan), retrying without")
+                                        dl_result = await asyncio.wait_for(
+                                            client.download_media(m, **_dl_kwargs),
+                                            timeout=TELETHON_DOWNLOAD_TIMEOUT,
+                                        )
                                     _reconcile_download_path(dl_result, dest_path)
                                     if os.path.exists(dest_path) and os.path.getsize(dest_path) > 0:
                                         ok = await _ffprobe_ok(dest_path)
@@ -1064,13 +1083,20 @@ async def _download_with_telethon(
                     if getattr(m, "media", None):
                         for _ in range(3):
                             try:
-                                _scan_kwargs = {"file": dest_path, "part_size_kb": chunk_size_kb}
+                                _scan_kwargs = {"file": dest_path}
                                 if progress_callback is not None:
                                     _scan_kwargs["progress_callback"] = progress_callback
-                                dl_result = await asyncio.wait_for(
-                                    client.download_media(m, **_scan_kwargs),
-                                    timeout=TELETHON_DOWNLOAD_TIMEOUT,
-                                )
+                                try:
+                                    dl_result = await asyncio.wait_for(
+                                        client.download_media(m, **_scan_kwargs, part_size_kb=chunk_size_kb),
+                                        timeout=TELETHON_DOWNLOAD_TIMEOUT,
+                                    )
+                                except TypeError:
+                                    logger.debug("userbot: Telethon no part_size_kb (recent scan), retrying without")
+                                    dl_result = await asyncio.wait_for(
+                                        client.download_media(m, **_scan_kwargs),
+                                        timeout=TELETHON_DOWNLOAD_TIMEOUT,
+                                    )
                                 _reconcile_download_path(dl_result, dest_path)
                                 if os.path.exists(dest_path) and os.path.getsize(dest_path) > 0:
                                     ok = await _ffprobe_ok(dest_path)
