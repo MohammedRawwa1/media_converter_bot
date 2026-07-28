@@ -895,6 +895,47 @@ class EnhancedMediaHandler:
                                 "Big files pipeline: relay forward failed (%s); using original source", _relay_exc
                             )
 
+                    # ── Show progress before pipeline download (no Cancel button —
+                    #    pipeline download is fast and job_id isn't known yet) ──
+                    _pipeline_progress_msg = None
+                    _pipeline_loop = None
+                    try:
+                        _dl_text = f"⬇️ Downloading via pipeline ({file_size // (1024 * 1024)} MB)..."
+                        if update and update.message:
+                            _pipeline_progress_msg = await update.message.reply_text(_dl_text)
+                        elif update and update.effective_user and context and context.bot:
+                            _pipeline_progress_msg = await context.bot.send_message(
+                                chat_id=update.effective_user.id,
+                                text=_dl_text,
+                            )
+                        _pipeline_loop = asyncio.get_running_loop()
+                    except Exception:
+                        pass
+
+                    _pl_last_pct = [-1]
+                    _pl_last_time = [0.0]
+
+                    def _pipeline_progress_cb(sent: int, total: int):
+                        """Sync callback for pipeline download progress."""
+                        if not _pipeline_progress_msg or not _pipeline_loop or total <= 0:
+                            return
+                        try:
+                            pct = min(int(sent * 100 / total), 100)
+                            now = time.time()
+                            if pct == _pl_last_pct[0] and (now - _pl_last_time[0]) < 1.0:
+                                return
+                            _pl_last_pct[0] = pct
+                            _pl_last_time[0] = now
+                            mb_sent = sent // (1024 * 1024)
+                            mb_total = total // (1024 * 1024)
+                            text = f"⬇️ Pipeline download: {pct}% ({mb_sent}MB / {mb_total}MB)"
+                            asyncio.run_coroutine_threadsafe(
+                                _pipeline_progress_msg.edit_text(text),
+                                _pipeline_loop,
+                            )
+                        except Exception:
+                            pass
+
                     try:
                         _ingest = await _bigfile_pipeline.ingest_large_file(
                             chat_id=_pipeline_chat,
@@ -903,6 +944,7 @@ class EnhancedMediaHandler:
                             file_unique_id=current_file.get("file_unique_id"),
                             user_id=user_id,
                             original_filename=current_file.get("name"),
+                            progress_callback=_pipeline_progress_cb,
                         )
                         if _ingest.ok:
                             logger.info(
@@ -912,10 +954,33 @@ class EnhancedMediaHandler:
                                 _pipeline_msg,
                                 file_size // (1024 * 1024),
                             )
-                            await update.message.reply_text(
+                            # Return BEFORE the notification so pipeline success
+                            # always short-circuits even if reply_text fails
+                            # (e.g. when update.message is None for relay-originated files).
+                            _notify_text = (
                                 f"Large file ({file_size // (1024 * 1024)} MB) queued for processing.\n"
                                 f"Job: {_ingest.job_id[:8]}... You will receive the result shortly."
                             )
+                            if _pipeline_progress_msg:
+                                with contextlib.suppress(BadRequest):
+                                    await _pipeline_progress_msg.edit_text(_notify_text)
+                            elif update and update.message:
+                                await update.message.reply_text(_notify_text)
+                            elif update and update.effective_user and context and context.bot:
+                                with contextlib.suppress(Exception):
+                                    await context.bot.send_message(
+                                        chat_id=update.effective_user.id,
+                                        text=_notify_text,
+                                    )
+                            # Start _watch_job_progress so user sees encoding → upload → done
+                            # (the Cancel button appears in the first poll iteration)
+                            if _pipeline_progress_msg:
+                                with contextlib.suppress(RuntimeError):
+                                    asyncio.create_task(
+                                        self._watch_job_progress(
+                                            None, _ingest.job_id, progress_msg=_pipeline_progress_msg
+                                        )
+                                    )
                             return
                         else:
                             logger.warning(
