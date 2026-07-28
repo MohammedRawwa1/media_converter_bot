@@ -990,15 +990,11 @@ class EnhancedMediaHandler:
                                         chat_id=update.effective_user.id,
                                         text=_notify_text,
                                     )
-                            # Start _watch_job_progress so user sees encoding → upload → done
-                            # (the Cancel button appears in the first poll iteration)
-                            if _pipeline_progress_msg:
-                                with contextlib.suppress(RuntimeError):
-                                    asyncio.create_task(
-                                        self._watch_job_progress(
-                                            None, _ingest.job_id, progress_msg=_pipeline_progress_msg
-                                        )
-                                    )
+                            # ── NOTE: We do NOT start _watch_job_progress here because the
+                            #    caller (convert_video_format, optimize_video, etc.) will
+                            #    start its own watcher on the callback message after detecting
+                            #    _pipeline_job_id. Starting a second watcher would create
+                            #    duplicate progress messages and make it look like two jobs. ──
                             return
                         else:
                             logger.warning(

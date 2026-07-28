@@ -747,8 +747,7 @@ async def _attempt_recovery_download(
     Recovery sequence:
         1. Get the message again (needed for probe / forward).
         2. Try a **1-byte probe** \u2014 if it succeeds immediately retry full download.
-        3. Try **forward to Saved Messages** \u2014 gets a fresh ``file_reference``
-           that may route to a healthy storage node, then retry download.
+        3. ~~Forward to Saved Messages~~ (disabled — creates unwanted copies in DM).
         4. Try **session recycling** \u2014 disconnect/reconnect, then retry one more
            time on the original message.
 
@@ -757,7 +756,6 @@ async def _attempt_recovery_download(
 
     Returns ``True`` on success, ``False`` if all recovery methods failed.
     """
-    from pyrogram import raw
 
     logger.info(
         "userbot: starting recovery download for %s/%s -> %s",
@@ -825,61 +823,14 @@ async def _attempt_recovery_download(
         logger.info("userbot: recovery \u2014 probe failed, trying forward + retry")
 
     # ---- Step 3: Forward to Saved Messages + retry with fresh file_reference ----
-    fwd_msg_id = None
-    if used_raw_peer is not None:
-        # Large channel: use raw MTProto forward
-        try:
-            r = await client.invoke(
-                raw.functions.messages.ForwardMessages(
-                    from_peer=used_raw_peer,
-                    id=[message_id],
-                    to_peer=raw.types.InputPeerSelf(),
-                    random_id=[client.rnd_id()],
-                )
-            )
-            if r and r.updates:
-                for update in r.updates:
-                    if hasattr(update, "message") and hasattr(update.message, "id"):
-                        fwd_msg_id = update.message.id
-                        break
-                    if hasattr(update, "id"):
-                        fwd_msg_id = update.id
-                        break
-            if fwd_msg_id is not None:
-                # Brief delay so Telegram indexes the forwarded message
-                await asyncio.sleep(1)
-                logger.info(
-                    "userbot: recovery \u2014 raw API forwarded to Saved Messages -> msg %s",
-                    fwd_msg_id,
-                )
-        except Exception as exc:
-            logger.warning("userbot: recovery \u2014 raw API forward failed: %s", exc)
-    else:
-        # Normal peer: use Pyrogram's high-level forward
-        fwd_msg_id = await _forward_to_saved_messages(client, target, message_id)
-        if fwd_msg_id is not None:
-            # Brief delay so Telegram indexes the forwarded message
-            await asyncio.sleep(1)
-
-    if fwd_msg_id is not None:
-        me = await client.get_me()
-        try:
-            fwd_msgs = await client.get_messages(me.id, message_ids=[fwd_msg_id])
-            if fwd_msgs:
-                fwd_msg = fwd_msgs[0] if isinstance(fwd_msgs, list) else fwd_msgs
-                if fwd_msg and getattr(fwd_msg, "media", None):
-                    logger.info(
-                        "userbot: recovery \u2014 retrying download from forwarded copy (%s/%s)",
-                        me.id,
-                        fwd_msg_id,
-                    )
-                    if await _download_and_ensure_path(client, fwd_msg, dest_path, progress_callback=progress_callback):
-                        return True
-        except Exception as exc:
-            logger.warning(
-                "userbot: recovery \u2014 forward+retry download failed: %s",
-                exc,
-            )
+    # ── DISABLED: forwarding to the userbot's Saved Messages creates an
+    #    unwanted copy in the user's DM.  The file is already accessible
+    #    via the relay group, so this extra forward is unnecessary.
+    #    We skip straight to session recycling (Step 4). ──
+    logger.info(
+        "userbot: recovery \u2014 skipping forward to Saved Messages (disabled), "
+        "trying session recycle instead"
+    )
 
     # ---- Step 4: Session recycling + final retry ----
     recycled = await _recycle_client_session(client)
