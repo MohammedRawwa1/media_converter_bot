@@ -239,6 +239,7 @@ async def _send_video_result(
                         _send_kwargs["thumbnail"] = _tf
                         await bot.send_video(**_send_kwargs)
                 except Exception:
+                    _send_kwargs.pop("thumbnail", None)  # Remove closed file handle before retry
                     await bot.send_video(**_send_kwargs)
             else:
                 await bot.send_video(**_send_kwargs)
@@ -270,40 +271,65 @@ async def _probe_output_metadata(out_path: str) -> tuple[dict | None, str | None
     video_meta = None
     thumb_path = None
 
-    # ── ffprobe for duration / dimensions ──
+    # ── ffprobe for duration / dimensions (with Redis caching) ──
     ffprobe_bin = getattr(config, "FFPROBE_PATH", None) or getattr(config, "FFMPEG_PATH", "ffmpeg").replace(
         "ffmpeg", "ffprobe"
     )
     try:
-        proc = await asyncio.create_subprocess_exec(
-            ffprobe_bin,
-            "-v",
-            "quiet",
-            "-print_format",
-            "json",
-            "-show_entries",
-            "stream=width,height,codec_type:format=duration",
-            out_path,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=15)
-        if proc.returncode == 0:
-            data = json.loads(stdout.decode())
-            meta = {}
-            for s in data.get("streams", []):
-                if s.get("codec_type") == "video":
-                    if "width" in s:
-                        meta["width"] = s["width"]
-                    if "height" in s:
-                        meta["height"] = s["height"]
-                    break
-            fmt = data.get("format", {})
-            if fmt.get("duration"):
-                with contextlib.suppress(ValueError, TypeError):
-                    meta["duration"] = int(float(fmt["duration"]))
-            if meta:
-                video_meta = meta
+        # Try cache first
+        _cached = None
+        _fhash = None
+        try:
+            if _cache and out_path and os.path.exists(out_path):
+                _fhash = hashlib.sha256(
+                    f"{out_path}:{os.path.getsize(out_path)}".encode()
+                ).hexdigest()[:16]
+                _cached = await _cache.get(f"cache:probe_meta:{_fhash}")
+                if _cached:
+                    video_meta = _cached
+                    logger.debug("Worker: ffprobe cache HIT for %s", out_path)
+        except Exception:
+            logger.debug("Worker: ffprobe cache lookup failed for %s", out_path)
+
+        if _cached is None:  # cache miss — run ffprobe
+            proc = await asyncio.create_subprocess_exec(
+                ffprobe_bin,
+                "-v",
+                "quiet",
+                "-print_format",
+                "json",
+                "-show_entries",
+                "stream=width,height,codec_type:format=duration",
+                out_path,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=15)
+            if proc.returncode == 0:
+                data = json.loads(stdout.decode())
+                meta = {}
+                for s in data.get("streams", []):
+                    if s.get("codec_type") == "video":
+                        if "width" in s:
+                            meta["width"] = s["width"]
+                        if "height" in s:
+                            meta["height"] = s["height"]
+                        break
+                fmt = data.get("format", {})
+                if fmt.get("duration"):
+                    with contextlib.suppress(ValueError, TypeError):
+                        meta["duration"] = int(float(fmt["duration"]))
+                if meta:
+                    video_meta = meta
+                    # Cache the result
+                    try:
+                        if _cache:
+                            await _cache.set(
+                                f"cache:probe_meta:{_fhash}", video_meta, ttl=86400
+                            )
+                            logger.debug("Worker: cached ffprobe result for %s", out_path)
+                    except Exception:
+                        logger.debug("Worker: failed to cache ffprobe result for %s", out_path)
     except Exception:
         logger.debug("Worker: fallback metadata probe failed for %s", out_path)
 
@@ -1323,31 +1349,15 @@ async def handle_job(job: dict):
                                                     shutil.rmtree(os.path.dirname(_pre_tp), ignore_errors=True)
                                         if relay_msg_id is not None:
                                             async with Bot(token=bot_token) as _bot:
-                                                _copied = await _bot.copy_message(
+                                                # copy_message delivers the video directly to user's DM.
+                                                # Userbot already uploaded with correct metadata
+                                                # (duration/width/height), so no need to delete and re-send.
+                                                await _bot.copy_message(
                                                     chat_id=chat_id,
                                                     from_chat_id=_relay_id,
                                                     message_id=relay_msg_id,
                                                     caption=caption,
                                                 )
-                                                if _copied and _copied.video:
-                                                    _fid = _copied.video.file_id
-                                                    with contextlib.suppress(Exception):
-                                                        await _bot.delete_message(
-                                                            chat_id=chat_id, message_id=_copied.message_id,
-                                                        )
-                                                    _relay_send_kwargs = {
-                                                        "chat_id": chat_id,
-                                                        "video": _fid,
-                                                        "caption": caption or "",
-                                                        "supports_streaming": True,
-                                                    }
-                                                    if _pre_vm and _pre_vm.get("duration"):
-                                                        _relay_send_kwargs["duration"] = _pre_vm["duration"]
-                                                    if _pre_vm and _pre_vm.get("width"):
-                                                        _relay_send_kwargs["width"] = _pre_vm["width"]
-                                                    if _pre_vm and _pre_vm.get("height"):
-                                                        _relay_send_kwargs["height"] = _pre_vm["height"]
-                                                    await _bot.send_video(**_relay_send_kwargs)
                                                 with contextlib.suppress(Exception):
                                                     await _bot.delete_message(
                                                         chat_id=_relay_id, message_id=relay_msg_id,
@@ -1391,128 +1401,25 @@ async def handle_job(job: dict):
                                         sent = False
                                         raise asyncio.CancelledError()
 
-                                    # Determine media kind. Prefer probing the output file for a video stream
+                                    # Use _probe_output_metadata for metadata + thumbnail
+                                    # (replaces separate ffprobe + auto-thumbnail generation)
+                                    _probe_vm, _probe_tp = await _probe_output_metadata(out) if out and os.path.exists(out) else (None, None)
                                     kind = "doc"
-                                    # Always-bounded sentinel for video metadata extracted during probe
-                                    _vid_duration = None
-                                    _vid_width = None
-                                    _vid_height = None
-                                    try:
-                                        if out and os.path.exists(out):
-                                            # prefer ffprobe if available to detect real video streams
-                                            ffprobe_bin = getattr(config, "FFPROBE_PATH", None) or getattr(
-                                                config, "FFMPEG_PATH", "ffmpeg"
-                                            ).replace("ffmpeg", "ffprobe")
-                                            ffmpeg_bin = getattr(config, "FFMPEG_PATH", "ffmpeg")
-
-                                            # Try cache first for ffprobe results
-                                            probe_info = None
-                                            try:
-                                                if _cache and out and os.path.exists(out):
-                                                    import hashlib as _hl
-
-                                                    _fhash = _hl.sha256(
-                                                        f"{out}:{os.path.getsize(out)}".encode()
-                                                    ).hexdigest()[:16]
-                                                    probe_info = await _cache.get(f"cache:probe:{_fhash}")
-                                                    if probe_info:
-                                                        logger.debug("Worker: ffprobe cache HIT for %s", out)
-                                            except Exception:
-                                                logger.debug("ffmpeg worker: Try cache first for ffprobe results")
-
-                                            if probe_info is None:  # cache miss
-                                                def _probe():
-                                                    try:
-                                                        return subprocess.run(
-                                                            [
-                                                                ffprobe_bin,
-                                                                "-v",
-                                                                "quiet",
-                                                                "-print_format",
-                                                                "json",
-                                                                "-show_streams",
-                                                                "-show_format",
-                                                                out,
-                                                            ],
-                                                            capture_output=True,
-                                                        )
-                                                    except Exception:
-                                                        return None
-                                                p = await asyncio.to_thread(_probe)
-                                                if p and getattr(p, "returncode", 1) == 0:
-                                                    try:
-                                                        probe_info = json.loads(p.stdout.decode() or "{}")
-                                                        # Cache ffprobe result
-                                                        try:
-                                                            if _cache and out and os.path.exists(out) and probe_info:
-                                                                _fhash = _hl.sha256(
-                                                                    f"{out}:{os.path.getsize(out)}".encode()
-                                                                ).hexdigest()[:16]
-                                                                await _cache.set(
-                                                                    f"cache:probe:{_fhash}", probe_info, ttl=86400
-                                                                )
-                                                                logger.debug("Worker: cached ffprobe result for %s", out)
-                                                        except Exception:
-                                                            logger.debug("ffmpeg worker: Cache ffprobe result")
-                                                    except Exception:
-                                                        pass
-                                            # ── Extract metadata from probe_info (cache hit or fresh probe) ──
-                                            if probe_info:
-                                                try:
-                                                    streams = probe_info.get("streams", [])
-                                                    if any(s.get("codec_type") == "video" for s in streams):
-                                                        kind = "video"
-                                                    else:
-                                                        if str(out).lower().endswith(".zip"):
-                                                            kind = "zip"
-                                                        elif str(out).lower().endswith((".mp4", ".mov", ".mkv")):
-                                                            kind = "video"
-                                                        else:
-                                                            kind = "doc"
-                                                    # Extract video metadata for richer send_video payload
-                                                    for s in streams:
-                                                        if s.get("codec_type") == "video":
-                                                            if "width" in s:
-                                                                _vid_width = s["width"]
-                                                            if "height" in s:
-                                                                _vid_height = s["height"]
-                                                            break
-                                                    fmt = probe_info.get("format", {})
-                                                    if fmt.get("duration"):
-                                                        with contextlib.suppress(ValueError, TypeError):
-                                                            _vid_duration = int(float(fmt["duration"]))
-                                                    logger.info(
-                                                        "Worker: Bot API ffprobe probe for %s: kind=%s duration=%s width=%s height=%s",
-                                                        out, kind, _vid_duration, _vid_width, _vid_height,
-                                                    )
-                                                except Exception:
-                                                    # probe parse failed -> extension fallback
-                                                    if str(out).lower().endswith(".zip"):
-                                                        kind = "zip"
-                                                    elif str(out).lower().endswith((".mp4", ".mov", ".mkv")):
-                                                        kind = "video"
-                                                    else:
-                                                        kind = "doc"
-                                            else:
-                                                # probe failed (cache miss + ffprobe error) -> extension fallback
-                                                if str(out).lower().endswith(".zip"):
-                                                    kind = "zip"
-                                                elif str(out).lower().endswith((".mp4", ".mov", ".mkv")):
-                                                    kind = "video"
-                                                else:
-                                                    kind = "doc"
-                                        else:
-                                            kind = "doc"
-                                    except Exception:
-                                        kind = (
-                                            "zip"
-                                            if out and str(out).lower().endswith(".zip")
-                                            else (
-                                                "video"
-                                                if out and str(out).lower().endswith((".mp4", ".mov", ".mkv"))
-                                                else "doc"
-                                            )
-                                        )
+                                    _vid_duration = _probe_vm.get("duration") if _probe_vm else None
+                                    _vid_width = _probe_vm.get("width") if _probe_vm else None
+                                    _vid_height = _probe_vm.get("height") if _probe_vm else None
+                                    if _vid_width is not None or _probe_vm:
+                                        kind = "video"
+                                    elif out and str(out).lower().endswith(".zip"):
+                                        kind = "zip"
+                                    elif out and str(out).lower().endswith((".mp4", ".mov", ".mkv")):
+                                        kind = "video"
+                                    else:
+                                        kind = "doc"
+                                    logger.info(
+                                        "Worker: Bot API probe for %s: kind=%s duration=%s width=%s height=%s",
+                                        out, kind, _vid_duration, _vid_width, _vid_height,
+                                    )
                                     try:
                                         # Use async Bot API methods directly and close the client when done
                                         async with Bot(token=bot_token) as bot:
@@ -1706,44 +1613,10 @@ async def handle_job(job: dict):
                                                         except Exception:
                                                             logger.debug("ffmpeg worker: operation failed")
 
-                                                    # Auto-generate thumbnail from video if none provided
-                                                    if not thumb_path:
-                                                        try:
-                                                            _auto_thumb_dir = tempfile.mkdtemp(prefix="auto_thumb_")
-                                                            _auto_thumb_path = os.path.join(
-                                                                _auto_thumb_dir, "thumb.jpg"
-                                                            )
-                                                            _thumb_proc = await asyncio.create_subprocess_exec(
-                                                                ffmpeg_bin,
-                                                                "-y",
-                                                                "-ss",
-                                                                "00:00:01",
-                                                                "-i",
-                                                                out,
-                                                                "-vframes",
-                                                                "1",
-                                                                "-q:v",
-                                                                "2",
-                                                                _auto_thumb_path,
-                                                                stdout=asyncio.subprocess.PIPE,
-                                                                stderr=asyncio.subprocess.PIPE,
-                                                            )
-                                                            await asyncio.wait_for(
-                                                                _thumb_proc.communicate(), timeout=30
-                                                            )
-                                                            if (
-                                                                _thumb_proc.returncode == 0
-                                                                and os.path.exists(_auto_thumb_path)
-                                                                and os.path.getsize(_auto_thumb_path) > 0
-                                                            ):
-                                                                thumb_path = _auto_thumb_path
-                                                                _temp_thumb = _auto_thumb_path
-                                                            else:
-                                                                shutil.rmtree(_auto_thumb_dir, ignore_errors=True)
-                                                        except Exception:
-                                                            logger.debug(
-                                                                "ffmpeg worker: Auto-generate thumbnail from video if none provided"
-                                                            )
+                                                    # Use thumbnail from _probe_output_metadata if not already set
+                                                    if not thumb_path and _probe_tp:
+                                                        thumb_path = _probe_tp
+                                                        _temp_thumb = _probe_tp
                                                 except Exception:
                                                     thumb_path = None
 
@@ -1867,31 +1740,15 @@ async def handle_job(job: dict):
                                                     shutil.rmtree(os.path.dirname(_pre_tp), ignore_errors=True)
                                         if relay_msg_id is not None:
                                             async with Bot(token=bot_token) as _bot:
-                                                _copied = await _bot.copy_message(
+                                                # copy_message delivers the video directly to user's DM.
+                                                # Userbot already uploaded with correct metadata
+                                                # (duration/width/height), so no need to delete and re-send.
+                                                await _bot.copy_message(
                                                     chat_id=chat_id,
                                                     from_chat_id=_relay_id,
                                                     message_id=relay_msg_id,
                                                     caption=caption,
                                                 )
-                                                if _copied and _copied.video:
-                                                    _fid = _copied.video.file_id
-                                                    with contextlib.suppress(Exception):
-                                                        await _bot.delete_message(
-                                                            chat_id=chat_id, message_id=_copied.message_id,
-                                                        )
-                                                    _relay_send_kwargs = {
-                                                        "chat_id": chat_id,
-                                                        "video": _fid,
-                                                        "caption": caption or "",
-                                                        "supports_streaming": True,
-                                                    }
-                                                    if _pre_vm and _pre_vm.get("duration"):
-                                                        _relay_send_kwargs["duration"] = _pre_vm["duration"]
-                                                    if _pre_vm and _pre_vm.get("width"):
-                                                        _relay_send_kwargs["width"] = _pre_vm["width"]
-                                                    if _pre_vm and _pre_vm.get("height"):
-                                                        _relay_send_kwargs["height"] = _pre_vm["height"]
-                                                    await _bot.send_video(**_relay_send_kwargs)
                                                 with contextlib.suppress(Exception):
                                                     await _bot.delete_message(
                                                         chat_id=_relay_id, message_id=relay_msg_id,
