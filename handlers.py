@@ -403,9 +403,10 @@ class EnhancedMediaHandler:
                 if status == "done" and output:
                     display_output = output
                     try:
-                        # Only generate and display a presigned URL if explicit link delivery is enabled.
-                        send_link = os.environ.get("ENABLE_LINK_SEND", "").lower() in ("1", "true", "yes")
-                        if send_link and not (str(output).startswith("http://") or str(output).startswith("https://")):
+                        # Generate and display a presigned URL when the output is a storage key
+                        # (not already a HTTP URL). The presigned URL is always shown now —
+                        # no ENABLE_LINK_SEND env var gate needed.
+                        if not (str(output).startswith("http://") or str(output).startswith("https://")):
                             try:
                                 from utils.storage import get_storage_backend
 

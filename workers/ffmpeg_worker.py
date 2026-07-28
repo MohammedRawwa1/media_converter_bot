@@ -1227,12 +1227,13 @@ async def handle_job(job: dict):
 
                                 # Update Redis job hash with output metadata for the web UI
                                 try:
-                                    send_link = os.environ.get("ENABLE_LINK_SEND", "").lower() in ("1", "true", "yes")
                                     r = await get_redis()
                                     mapping = {"output_key": dest}
                                     if get_url:
                                         mapping["output_get_url"] = get_url
-                                    mapping["output"] = get_url if get_url and send_link else dest
+                                        mapping["output"] = get_url
+                                    else:
+                                        mapping["output"] = dest
                                     with contextlib.suppress(Exception):
                                         mapping["out_bytes"] = str(os.path.getsize(out))
                                     await r.hset(f"ffmpeg:job:{job_id}", mapping=mapping)
@@ -1296,27 +1297,32 @@ async def handle_job(job: dict):
                         bot_api_max_mb = int(os.environ.get("BOT_API_MAX_SIZE_MB", "50"))
                         bot_api_max_bytes = bot_api_max_mb * 1024 * 1024
 
-                        send_link = os.environ.get("ENABLE_LINK_SEND", "").lower() in ("1", "true", "yes")
-                        # If we uploaded the output and generated a presigned GET URL, only send it if
-                        # explicit link delivery is enabled. Otherwise keep delivery inside Telegram.
-                        if send_link and upload_success and get_url and chat_id and bot_token:
+                        # ── Preferred: Bot API sendVideo via S3 presigned URL ──
+                        # If we uploaded the output to S3 and have a presigned GET URL, use Bot API's
+                        # sendVideo(vector=url) directly. Telegram's servers download the file from
+                        # the URL, probe it fresh for metadata (duration/width/height/thumbnail), and
+                        # the video appears from the bot — no userbot needed, works for any file size.
+                        # The ContentDisposition header set during S3 upload ensures the correct filename.
+                        if upload_success and get_url and chat_id and bot_token:
                             if await _check_upload_cancelled(job_id):
                                 logger.info("Upload cancelled by user — skipping presigned URL send for job %s", job_id)
                             else:
                                 try:
-                                    job_type = job.get("type") if isinstance(job, dict) else None
-                                    if file_size > bot_api_max_bytes or (job_type and job_type != "generate_sample"):
-                                        async with Bot(token=bot_token) as bot:
-                                            text = f"Your video is ready: {get_url}"
-                                            await bot.send_message(chat_id=chat_id, text=text)
-                                        logger.info("Sent presigned URL to chat %s for job %s", chat_id, job_id)
-                                        sent = True
+                                    async with Bot(token=bot_token) as bot:
+                                        await bot.sendVideo(
+                                            chat_id=chat_id,
+                                            video=get_url,
+                                            caption=caption or "",
+                                            supports_streaming=True,
+                                        )
+                                    logger.info("Sent output via presigned URL for job %s", job_id)
+                                    sent = True
                                 except Exception:
-                                    logger.exception("Failed to send presigned URL for job %s", job_id)
+                                    logger.exception("Failed to send via presigned URL for job %s", job_id)
                                     sent = False
 
-                        # If output is large and userbot is enabled, prefer userbot for delivery
-                        if chat_id and file_size > bot_api_max_bytes and enable_userbot:
+                        # Fallback: if presigned URL didn't work and file is large, try userbot
+                        if not sent and chat_id and file_size > bot_api_max_bytes and enable_userbot:
                             if await _check_upload_cancelled(job_id):
                                 logger.info(
                                     "Upload cancelled by user — skipping preferred userbot send for job %s", job_id
@@ -1345,9 +1351,7 @@ async def handle_job(job: dict):
                                                 os.remove(_pre_tp)
                                                 shutil.rmtree(os.path.dirname(_pre_tp), ignore_errors=True)
                                     if ok:
-                                        logger.info(
-                                            "Sent output via Telethon userbot for job %s", job_id
-                                        )
+                                        logger.info("Sent output via Telethon userbot for job %s", job_id)
                                         sent = True
                                     else:
                                         logger.error("Userbot send failed for job %s", job_id)
@@ -1355,268 +1359,54 @@ async def handle_job(job: dict):
                                 except Exception:
                                     logger.exception("Preferred userbot send raised exception for job %s", job_id)
                                     sent = False
-                        else:
-                            # Try Bot API first if configured
-                            if chat_id and bot_token:
-                                try:
-                                    # Cancel check before Bot API send
-                                    if await _check_upload_cancelled(job_id):
-                                        logger.info(
-                                            "Upload cancelled by user — skipping Bot API send for job %s", job_id
-                                        )
-                                        sent = False
-                                        raise asyncio.CancelledError()
+                        elif not sent and chat_id and bot_token:
+                            # Try Bot API file upload
+                            try:
+                                # Cancel check before Bot API send
+                                if await _check_upload_cancelled(job_id):
+                                    logger.info("Upload cancelled by user — skipping Bot API send for job %s", job_id)
+                                    sent = False
+                                    raise asyncio.CancelledError()
 
-                                    # Use _probe_output_metadata for metadata + thumbnail
-                                    # (replaces separate ffprobe + auto-thumbnail generation)
-                                    _probe_vm, _probe_tp = (
-                                        await _probe_output_metadata(out)
-                                        if out and os.path.exists(out)
-                                        else (None, None)
-                                    )
+                                # Use _probe_output_metadata for metadata + thumbnail
+                                # (replaces separate ffprobe + auto-thumbnail generation)
+                                _probe_vm, _probe_tp = (
+                                    await _probe_output_metadata(out) if out and os.path.exists(out) else (None, None)
+                                )
+                                kind = "doc"
+                                _vid_duration = _probe_vm.get("duration") if _probe_vm else None
+                                _vid_width = _probe_vm.get("width") if _probe_vm else None
+                                _vid_height = _probe_vm.get("height") if _probe_vm else None
+                                if _vid_width is not None or _probe_vm:
+                                    kind = "video"
+                                elif out and str(out).lower().endswith(".zip"):
+                                    kind = "zip"
+                                elif out and str(out).lower().endswith((".mp4", ".mov", ".mkv")):
+                                    kind = "video"
+                                else:
                                     kind = "doc"
-                                    _vid_duration = _probe_vm.get("duration") if _probe_vm else None
-                                    _vid_width = _probe_vm.get("width") if _probe_vm else None
-                                    _vid_height = _probe_vm.get("height") if _probe_vm else None
-                                    if _vid_width is not None or _probe_vm:
-                                        kind = "video"
-                                    elif out and str(out).lower().endswith(".zip"):
-                                        kind = "zip"
-                                    elif out and str(out).lower().endswith((".mp4", ".mov", ".mkv")):
-                                        kind = "video"
-                                    else:
-                                        kind = "doc"
-                                    logger.info(
-                                        "Worker: Bot API probe for %s: kind=%s duration=%s width=%s height=%s",
-                                        out,
-                                        kind,
-                                        _vid_duration,
-                                        _vid_width,
-                                        _vid_height,
-                                    )
-                                    try:
-                                        # Use async Bot API methods directly and close the client when done
-                                        async with Bot(token=bot_token) as bot:
-                                            if kind == "zip":
-                                                # Attempt to attach a thumbnail when available
-                                                thumb_path = None
-                                                _temp_thumb = None
-                                                try:
-                                                    # Prefer explicit job field
-                                                    cand = job.get("thumbnail")
-                                                    if cand:
-                                                        if os.path.exists(cand):
-                                                            thumb_path = cand
-                                                        else:
-                                                            try:
-                                                                backend = (
-                                                                    await get_storage_backend()
-                                                                    if get_storage_backend is not None
-                                                                    else None
-                                                                )
-                                                            except Exception:
-                                                                backend = None
-                                                            if backend:
-                                                                temp_dir = os.path.join(
-                                                                    getattr(config, "TEMP_PATH", "storage/temp")
-                                                                )
-                                                                os.makedirs(temp_dir, exist_ok=True)
-                                                                _temp_thumb = os.path.join(
-                                                                    temp_dir,
-                                                                    f"{job_id}_thumb{os.path.splitext(cand)[1] or '.jpg'}",
-                                                                )
-                                                                try:
-                                                                    ok = await backend.download_file(cand, _temp_thumb)
-                                                                    if ok:
-                                                                        thumb_path = _temp_thumb
-                                                                except Exception:
-                                                                    _temp_thumb = None
-                                                    # Fallback: check Redis-stored job hash for thumbnail
-                                                    if not thumb_path:
-                                                        try:
-                                                            r = await get_redis()
-                                                            stored = await r.hgetall(f"ffmpeg:job:{job_id}")
-                                                            sval = stored.get("thumbnail") or stored.get("thumb")
-                                                            if sval:
-                                                                cand = sval
-                                                                if os.path.exists(cand):
-                                                                    thumb_path = cand
-                                                                else:
-                                                                    try:
-                                                                        backend = (
-                                                                            await get_storage_backend()
-                                                                            if get_storage_backend is not None
-                                                                            else None
-                                                                        )
-                                                                    except Exception:
-                                                                        backend = None
-                                                                    if backend:
-                                                                        temp_dir = os.path.join(
-                                                                            getattr(config, "TEMP_PATH", "storage/temp")
-                                                                        )
-                                                                        os.makedirs(temp_dir, exist_ok=True)
-                                                                        _temp_thumb = os.path.join(
-                                                                            temp_dir,
-                                                                            f"{job_id}_thumb{os.path.splitext(cand)[1] or '.jpg'}",
-                                                                        )
-                                                                        try:
-                                                                            ok = await backend.download_file(
-                                                                                cand, _temp_thumb
-                                                                            )
-                                                                            if ok:
-                                                                                thumb_path = _temp_thumb
-                                                                        except Exception:
-                                                                            _temp_thumb = None
-                                                            aclose = getattr(r, "aclose", None)
-                                                            if aclose is not None:
-                                                                await aclose()
-                                                            else:
-                                                                await r.close()
-                                                        except Exception:
-                                                            logger.debug(
-                                                                "ffmpeg worker: Fallback: check Redis-stored job hash for thumbnail"
-                                                            )
-
-                                                except Exception:
-                                                    thumb_path = None
-
-                                                _bot_up_cb = _make_upload_progress_callback(job_id, progress_channel)
-                                                try:
-                                                    with open(out, "rb") as fh:
-                                                        fh = (
-                                                            _ProgressFileWrapper(fh, file_size, _bot_up_cb)
-                                                            if file_size
-                                                            else fh
-                                                        )
-                                                        if thumb_path:
-                                                            try:
-                                                                with open(thumb_path, "rb") as tf:
-                                                                    await bot.send_document(
-                                                                        chat_id=chat_id,
-                                                                        document=fh,
-                                                                        caption=caption,
-                                                                        thumb=tf,
-                                                                    )
-                                                            except Exception:
-                                                                await bot.send_document(
-                                                                    chat_id=chat_id, document=fh, caption=caption
-                                                                )
-                                                        else:
-                                                            await bot.send_document(
-                                                                chat_id=chat_id, document=fh, caption=caption
-                                                            )
-                                                finally:
-                                                    try:
-                                                        if _temp_thumb and os.path.exists(_temp_thumb):
-                                                            os.remove(_temp_thumb)
-                                                    except Exception:
-                                                        logger.debug("ffmpeg worker: operation failed")
-                                            elif kind == "video":
-                                                # Try to attach thumbnail (thumb) when available
-                                                thumb_path = None
-                                                _temp_thumb = None
-                                                try:
-                                                    cand = job.get("thumbnail")
-                                                    if cand:
-                                                        if os.path.exists(cand):
-                                                            thumb_path = cand
-                                                        else:
-                                                            try:
-                                                                backend = (
-                                                                    await get_storage_backend()
-                                                                    if get_storage_backend is not None
-                                                                    else None
-                                                                )
-                                                            except Exception:
-                                                                backend = None
-                                                            if backend:
-                                                                temp_dir = os.path.join(
-                                                                    getattr(config, "TEMP_PATH", "storage/temp")
-                                                                )
-                                                                os.makedirs(temp_dir, exist_ok=True)
-                                                                _temp_thumb = os.path.join(
-                                                                    temp_dir,
-                                                                    f"{job_id}_thumb{os.path.splitext(cand)[1] or '.jpg'}",
-                                                                )
-                                                                try:
-                                                                    ok = await backend.download_file(cand, _temp_thumb)
-                                                                    if ok:
-                                                                        thumb_path = _temp_thumb
-                                                                except Exception:
-                                                                    _temp_thumb = None
-                                                    if not thumb_path:
-                                                        try:
-                                                            r = await get_redis()
-                                                            stored = await r.hgetall(f"ffmpeg:job:{job_id}")
-                                                            sval = stored.get("thumbnail") or stored.get("thumb")
-                                                            if sval:
-                                                                cand = sval
-                                                                if os.path.exists(cand):
-                                                                    thumb_path = cand
-                                                                else:
-                                                                    try:
-                                                                        backend = (
-                                                                            await get_storage_backend()
-                                                                            if get_storage_backend is not None
-                                                                            else None
-                                                                        )
-                                                                    except Exception:
-                                                                        backend = None
-                                                                    if backend:
-                                                                        temp_dir = os.path.join(
-                                                                            getattr(config, "TEMP_PATH", "storage/temp")
-                                                                        )
-                                                                        os.makedirs(temp_dir, exist_ok=True)
-                                                                        _temp_thumb = os.path.join(
-                                                                            temp_dir,
-                                                                            f"{job_id}_thumb{os.path.splitext(cand)[1] or '.jpg'}",
-                                                                        )
-                                                                        try:
-                                                                            ok = await backend.download_file(
-                                                                                cand, _temp_thumb
-                                                                            )
-                                                                            if ok:
-                                                                                thumb_path = _temp_thumb
-                                                                        except Exception:
-                                                                            _temp_thumb = None
-                                                            aclose = getattr(r, "aclose", None)
-                                                            if aclose is not None:
-                                                                await aclose()
-                                                            else:
-                                                                await r.close()
-                                                        except Exception:
-                                                            logger.debug("ffmpeg worker: operation failed")
-
-                                                    # Use thumbnail from _probe_output_metadata if not already set
-                                                    if not thumb_path and _probe_tp:
-                                                        thumb_path = _probe_tp
-                                                        _temp_thumb = _probe_tp
-                                                except Exception:
-                                                    thumb_path = None
-
-                                                await _send_video_result(
-                                                    bot,
-                                                    chat_id,
-                                                    out,
-                                                    caption=caption,
-                                                    file_size=file_size,
-                                                    progress_channel=progress_channel,
-                                                    job_id=job_id,
-                                                    thumb_path=thumb_path,
-                                                    _temp_thumb=_temp_thumb,
-                                                    vid_duration=_vid_duration,
-                                                    vid_width=_vid_width,
-                                                    vid_height=_vid_height,
-                                                )
-                                            else:
-                                                # non-video non-zip fallback
-                                                thumb_path = None
-                                                _temp_thumb = None
-                                                try:
-                                                    cand = job.get("thumbnail")
-                                                    if cand and os.path.exists(cand):
+                                logger.info(
+                                    "Worker: Bot API probe for %s: kind=%s duration=%s width=%s height=%s",
+                                    out,
+                                    kind,
+                                    _vid_duration,
+                                    _vid_width,
+                                    _vid_height,
+                                )
+                                try:
+                                    # Use async Bot API methods directly and close the client when done
+                                    async with Bot(token=bot_token) as bot:
+                                        if kind == "zip":
+                                            # Attempt to attach a thumbnail when available
+                                            thumb_path = None
+                                            _temp_thumb = None
+                                            try:
+                                                # Prefer explicit job field
+                                                cand = job.get("thumbnail")
+                                                if cand:
+                                                    if os.path.exists(cand):
                                                         thumb_path = cand
-                                                    elif cand:
+                                                    else:
                                                         try:
                                                             backend = (
                                                                 await get_storage_backend()
@@ -1640,51 +1430,260 @@ async def handle_job(job: dict):
                                                                     thumb_path = _temp_thumb
                                                             except Exception:
                                                                 _temp_thumb = None
-                                                except Exception:
-                                                    thumb_path = None
-
-                                                _bot_up_cb = _make_upload_progress_callback(job_id, progress_channel)
-                                                try:
-                                                    with open(out, "rb") as fh:
-                                                        fh = (
-                                                            _ProgressFileWrapper(fh, file_size, _bot_up_cb)
-                                                            if file_size
-                                                            else fh
-                                                        )
-                                                        if thumb_path:
-                                                            try:
-                                                                with open(thumb_path, "rb") as tf:
-                                                                    await bot.send_document(
-                                                                        chat_id=chat_id,
-                                                                        document=fh,
-                                                                        caption=caption,
-                                                                        thumb=tf,
+                                                # Fallback: check Redis-stored job hash for thumbnail
+                                                if not thumb_path:
+                                                    try:
+                                                        r = await get_redis()
+                                                        stored = await r.hgetall(f"ffmpeg:job:{job_id}")
+                                                        sval = stored.get("thumbnail") or stored.get("thumb")
+                                                        if sval:
+                                                            cand = sval
+                                                            if os.path.exists(cand):
+                                                                thumb_path = cand
+                                                            else:
+                                                                try:
+                                                                    backend = (
+                                                                        await get_storage_backend()
+                                                                        if get_storage_backend is not None
+                                                                        else None
                                                                     )
-                                                            except Exception:
-                                                                await bot.send_document(
-                                                                    chat_id=chat_id, document=fh, caption=caption
-                                                                )
+                                                                except Exception:
+                                                                    backend = None
+                                                                if backend:
+                                                                    temp_dir = os.path.join(
+                                                                        getattr(config, "TEMP_PATH", "storage/temp")
+                                                                    )
+                                                                    os.makedirs(temp_dir, exist_ok=True)
+                                                                    _temp_thumb = os.path.join(
+                                                                        temp_dir,
+                                                                        f"{job_id}_thumb{os.path.splitext(cand)[1] or '.jpg'}",
+                                                                    )
+                                                                    try:
+                                                                        ok = await backend.download_file(
+                                                                            cand, _temp_thumb
+                                                                        )
+                                                                        if ok:
+                                                                            thumb_path = _temp_thumb
+                                                                    except Exception:
+                                                                        _temp_thumb = None
+                                                        aclose = getattr(r, "aclose", None)
+                                                        if aclose is not None:
+                                                            await aclose()
                                                         else:
+                                                            await r.close()
+                                                    except Exception:
+                                                        logger.debug(
+                                                            "ffmpeg worker: Fallback: check Redis-stored job hash for thumbnail"
+                                                        )
+
+                                            except Exception:
+                                                thumb_path = None
+
+                                            _bot_up_cb = _make_upload_progress_callback(job_id, progress_channel)
+                                            try:
+                                                with open(out, "rb") as fh:
+                                                    fh = (
+                                                        _ProgressFileWrapper(fh, file_size, _bot_up_cb)
+                                                        if file_size
+                                                        else fh
+                                                    )
+                                                    if thumb_path:
+                                                        try:
+                                                            with open(thumb_path, "rb") as tf:
+                                                                await bot.send_document(
+                                                                    chat_id=chat_id,
+                                                                    document=fh,
+                                                                    caption=caption,
+                                                                    thumb=tf,
+                                                                )
+                                                        except Exception:
                                                             await bot.send_document(
                                                                 chat_id=chat_id, document=fh, caption=caption
                                                             )
-                                                finally:
+                                                    else:
+                                                        await bot.send_document(
+                                                            chat_id=chat_id, document=fh, caption=caption
+                                                        )
+                                            finally:
+                                                try:
+                                                    if _temp_thumb and os.path.exists(_temp_thumb):
+                                                        os.remove(_temp_thumb)
+                                                except Exception:
+                                                    logger.debug("ffmpeg worker: operation failed")
+                                        elif kind == "video":
+                                            # Try to attach thumbnail (thumb) when available
+                                            thumb_path = None
+                                            _temp_thumb = None
+                                            try:
+                                                cand = job.get("thumbnail")
+                                                if cand:
+                                                    if os.path.exists(cand):
+                                                        thumb_path = cand
+                                                    else:
+                                                        try:
+                                                            backend = (
+                                                                await get_storage_backend()
+                                                                if get_storage_backend is not None
+                                                                else None
+                                                            )
+                                                        except Exception:
+                                                            backend = None
+                                                        if backend:
+                                                            temp_dir = os.path.join(
+                                                                getattr(config, "TEMP_PATH", "storage/temp")
+                                                            )
+                                                            os.makedirs(temp_dir, exist_ok=True)
+                                                            _temp_thumb = os.path.join(
+                                                                temp_dir,
+                                                                f"{job_id}_thumb{os.path.splitext(cand)[1] or '.jpg'}",
+                                                            )
+                                                            try:
+                                                                ok = await backend.download_file(cand, _temp_thumb)
+                                                                if ok:
+                                                                    thumb_path = _temp_thumb
+                                                            except Exception:
+                                                                _temp_thumb = None
+                                                if not thumb_path:
                                                     try:
-                                                        if _temp_thumb and os.path.exists(_temp_thumb):
-                                                            os.remove(_temp_thumb)
+                                                        r = await get_redis()
+                                                        stored = await r.hgetall(f"ffmpeg:job:{job_id}")
+                                                        sval = stored.get("thumbnail") or stored.get("thumb")
+                                                        if sval:
+                                                            cand = sval
+                                                            if os.path.exists(cand):
+                                                                thumb_path = cand
+                                                            else:
+                                                                try:
+                                                                    backend = (
+                                                                        await get_storage_backend()
+                                                                        if get_storage_backend is not None
+                                                                        else None
+                                                                    )
+                                                                except Exception:
+                                                                    backend = None
+                                                                if backend:
+                                                                    temp_dir = os.path.join(
+                                                                        getattr(config, "TEMP_PATH", "storage/temp")
+                                                                    )
+                                                                    os.makedirs(temp_dir, exist_ok=True)
+                                                                    _temp_thumb = os.path.join(
+                                                                        temp_dir,
+                                                                        f"{job_id}_thumb{os.path.splitext(cand)[1] or '.jpg'}",
+                                                                    )
+                                                                    try:
+                                                                        ok = await backend.download_file(
+                                                                            cand, _temp_thumb
+                                                                        )
+                                                                        if ok:
+                                                                            thumb_path = _temp_thumb
+                                                                    except Exception:
+                                                                        _temp_thumb = None
+                                                        aclose = getattr(r, "aclose", None)
+                                                        if aclose is not None:
+                                                            await aclose()
+                                                        else:
+                                                            await r.close()
                                                     except Exception:
                                                         logger.debug("ffmpeg worker: operation failed")
-                                        sent = True
-                                    except asyncio.CancelledError:
-                                        pass  # cancelled, sent already False
-                                    except Exception as e:
-                                        logger.warning("Bot API send failed for job %s: %s", job_id, e)
-                                        sent = False
+
+                                                # Use thumbnail from _probe_output_metadata if not already set
+                                                if not thumb_path and _probe_tp:
+                                                    thumb_path = _probe_tp
+                                                    _temp_thumb = _probe_tp
+                                            except Exception:
+                                                thumb_path = None
+
+                                            await _send_video_result(
+                                                bot,
+                                                chat_id,
+                                                out,
+                                                caption=caption,
+                                                file_size=file_size,
+                                                progress_channel=progress_channel,
+                                                job_id=job_id,
+                                                thumb_path=thumb_path,
+                                                _temp_thumb=_temp_thumb,
+                                                vid_duration=_vid_duration,
+                                                vid_width=_vid_width,
+                                                vid_height=_vid_height,
+                                            )
+                                        else:
+                                            # non-video non-zip fallback
+                                            thumb_path = None
+                                            _temp_thumb = None
+                                            try:
+                                                cand = job.get("thumbnail")
+                                                if cand and os.path.exists(cand):
+                                                    thumb_path = cand
+                                                elif cand:
+                                                    try:
+                                                        backend = (
+                                                            await get_storage_backend()
+                                                            if get_storage_backend is not None
+                                                            else None
+                                                        )
+                                                    except Exception:
+                                                        backend = None
+                                                    if backend:
+                                                        temp_dir = os.path.join(
+                                                            getattr(config, "TEMP_PATH", "storage/temp")
+                                                        )
+                                                        os.makedirs(temp_dir, exist_ok=True)
+                                                        _temp_thumb = os.path.join(
+                                                            temp_dir,
+                                                            f"{job_id}_thumb{os.path.splitext(cand)[1] or '.jpg'}",
+                                                        )
+                                                        try:
+                                                            ok = await backend.download_file(cand, _temp_thumb)
+                                                            if ok:
+                                                                thumb_path = _temp_thumb
+                                                        except Exception:
+                                                            _temp_thumb = None
+                                            except Exception:
+                                                thumb_path = None
+
+                                            _bot_up_cb = _make_upload_progress_callback(job_id, progress_channel)
+                                            try:
+                                                with open(out, "rb") as fh:
+                                                    fh = (
+                                                        _ProgressFileWrapper(fh, file_size, _bot_up_cb)
+                                                        if file_size
+                                                        else fh
+                                                    )
+                                                    if thumb_path:
+                                                        try:
+                                                            with open(thumb_path, "rb") as tf:
+                                                                await bot.send_document(
+                                                                    chat_id=chat_id,
+                                                                    document=fh,
+                                                                    caption=caption,
+                                                                    thumb=tf,
+                                                                )
+                                                        except Exception:
+                                                            await bot.send_document(
+                                                                chat_id=chat_id, document=fh, caption=caption
+                                                            )
+                                                    else:
+                                                        await bot.send_document(
+                                                            chat_id=chat_id, document=fh, caption=caption
+                                                        )
+                                            finally:
+                                                try:
+                                                    if _temp_thumb and os.path.exists(_temp_thumb):
+                                                        os.remove(_temp_thumb)
+                                                except Exception:
+                                                    logger.debug("ffmpeg worker: operation failed")
+                                    sent = True
                                 except asyncio.CancelledError:
                                     pass  # cancelled, sent already False
                                 except Exception as e:
-                                    logger.warning("Bot init failed for job %s: %s", job_id, e)
+                                    logger.warning("Bot API send failed for job %s: %s", job_id, e)
                                     sent = False
+                            except asyncio.CancelledError:
+                                pass  # cancelled, sent already False
+                            except Exception as e:
+                                logger.warning("Bot init failed for job %s: %s", job_id, e)
+                                sent = False
 
                         # Fallback: if not sent and Telethon userbot is enabled, attempt userbot
                         if not sent and chat_id and enable_userbot:
@@ -1715,9 +1714,7 @@ async def handle_job(job: dict):
                                                 os.remove(_pre_tp)
                                                 shutil.rmtree(os.path.dirname(_pre_tp), ignore_errors=True)
                                     if ok:
-                                        logger.info(
-                                            "Sent output via Telethon userbot for job %s", job_id
-                                        )
+                                        logger.info("Sent output via Telethon userbot for job %s", job_id)
                                         sent = True
                                     else:
                                         logger.error("Userbot send failed for job %s", job_id)

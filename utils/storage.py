@@ -222,19 +222,25 @@ class S3AsyncBackend(AsyncStorageBackend):
                     (self.endpoint_url or "default"),
                 )
 
+                # Derive a clean filename from the destination key so that when
+                # Telegram downloads the file from a presigned URL, the video shows
+                # the correct name instead of a hashed/generic placeholder.
+                _filename = os.path.basename(dest_key)
+                _extra_args = {"ContentDisposition": f'inline; filename="{_filename}"'}
+
                 # Async path (aioboto3)
                 if self._use_aioboto3:
                     async with self._session.client("s3", **self._client_kwargs()) as client:
-                        await client.upload_file(src_path, self.bucket, dest_key)
+                        await client.upload_file(src_path, self.bucket, dest_key, ExtraArgs=_extra_args)
                     return dest_key
 
                 # Sync fallback (boto3)
                 if boto3 is None:
                     raise RuntimeError("boto3 is required when aioboto3 is not installed")
 
-                def _sync_upload():
+                def _sync_upload(_ea=_extra_args):
                     client = boto3.client("s3", **self._client_kwargs())
-                    client.upload_file(src_path, self.bucket, dest_key)
+                    client.upload_file(src_path, self.bucket, dest_key, ExtraArgs=_ea)
 
                 await asyncio.to_thread(_sync_upload)
                 return dest_key
