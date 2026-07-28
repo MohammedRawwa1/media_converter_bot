@@ -229,6 +229,10 @@ async def _send_video_result(
                 _send_kwargs["width"] = vid_width
             if vid_height is not None:
                 _send_kwargs["height"] = vid_height
+            logger.info(
+                "Worker: sending video file=%s size=%s thumb=%s duration=%s supports_streaming=True",
+                file_path, file_size, bool(thumb_path), _send_kwargs.get("duration"),
+            )
             if thumb_path:
                 try:
                     with open(thumb_path, "rb") as _tf:
@@ -1477,6 +1481,10 @@ async def handle_job(job: dict):
                                                     if fmt.get("duration"):
                                                         with contextlib.suppress(ValueError, TypeError):
                                                             _vid_duration = int(float(fmt["duration"]))
+                                                    logger.info(
+                                                        "Worker: Bot API ffprobe probe for %s: kind=%s duration=%s width=%s height=%s",
+                                                        out, kind, _vid_duration, _vid_width, _vid_height,
+                                                    )
                                                 except Exception:
                                                     # probe parse failed -> extension fallback
                                                     if str(out).lower().endswith(".zip"):
