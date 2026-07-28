@@ -683,10 +683,47 @@ class EnhancedMediaHandler:
             if file_size and file_size > bot_api_max_mb * 1024 * 1024 and _bigfile_pipeline is not None:
                 _bot_chat, _bot_msg = _extract_large_file_source(current_file)
                 if _bot_chat and _bot_msg:
+                    # ── Relay-forward for pipeline: userbot may not have access to the
+                    #    original chat (direct bot-user chat). If RELAY_CHAT_ID is configured,
+                    #    forward the message there first so the userbot can download it.
+                    _pipeline_chat = _bot_chat
+                    _pipeline_msg = _bot_msg
+                    _relay_chat_id = os.environ.get("RELAY_CHAT_ID", "")
+                    if _relay_chat_id:
+                        try:
+                            _rid = int(_relay_chat_id)
+                            logger.info(
+                                "Big files pipeline: forwarding %s/%s to relay %s for pipeline download",
+                                _bot_chat,
+                                _bot_msg,
+                                _rid,
+                            )
+                            _forwarded = await context.bot.forward_message(
+                                chat_id=_rid,
+                                from_chat_id=_bot_chat,
+                                message_id=_bot_msg,
+                            )
+                            if _forwarded and getattr(_forwarded, "message_id", None):
+                                _pipeline_chat = _rid
+                                _pipeline_msg = _forwarded.message_id
+                                logger.info(
+                                    "Big files pipeline: relay forwarded to %s/%s",
+                                    _rid,
+                                    _pipeline_msg,
+                                )
+                            else:
+                                logger.warning(
+                                    "Big files pipeline: relay forward returned no message_id; using original source"
+                                )
+                        except Exception as _relay_exc:
+                            logger.warning(
+                                "Big files pipeline: relay forward failed (%s); using original source", _relay_exc
+                            )
+
                     try:
                         _ingest = await _bigfile_pipeline.ingest_large_file(
-                            chat_id=_bot_chat,
-                            message_id=_bot_msg,
+                            chat_id=_pipeline_chat,
+                            message_id=_pipeline_msg,
                             file_size=file_size,
                             file_unique_id=current_file.get("file_unique_id"),
                             user_id=user_id,
@@ -696,8 +733,8 @@ class EnhancedMediaHandler:
                             logger.info(
                                 "Big files pipeline: job %s queued for %s/%s (%dMB)",
                                 _ingest.job_id,
-                                _bot_chat,
-                                _bot_msg,
+                                _pipeline_chat,
+                                _pipeline_msg,
                                 file_size // (1024 * 1024),
                             )
                             await update.message.reply_text(
@@ -706,9 +743,19 @@ class EnhancedMediaHandler:
                             )
                             return
                         else:
-                            logger.warning("Big files pipeline failed: %s; falling back to Bot API", _ingest.error)
+                            logger.warning(
+                                "Big files pipeline failed: %s (chat=%s msg=%s); falling back to Bot API",
+                                _ingest.error,
+                                _pipeline_chat,
+                                _pipeline_msg,
+                            )
                     except Exception as pipeline_exc:
-                        logger.warning("Big files pipeline error: %s; falling back to Bot API", pipeline_exc)
+                        logger.warning(
+                            "Big files pipeline error: %s (chat=%s msg=%s); falling back to Bot API",
+                            pipeline_exc,
+                            _pipeline_chat,
+                            _pipeline_msg,
+                        )
             file = await context.bot.get_file(file_id)
         except Exception as e:
             logger.exception("get_file failed for %s: %s", file_id, e)

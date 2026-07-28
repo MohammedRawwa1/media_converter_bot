@@ -78,6 +78,40 @@ def get_download_chunk_size_kb() -> int:
 
 
 # ---------------------------------------------------------------------------
+# Helper: reconcile Telethon/Pyrogram download path to expected destination
+# ---------------------------------------------------------------------------
+def _reconcile_download_path(dl_result, dest_path: str) -> None:
+    """Move file from Telethon/Pyrogram's actual save path to the expected dest_path.
+
+    Both Telethon and Pyrogram may save to a path different from *dest_path*
+    (e.g. by appending a file extension or resolving a relative path against
+    an internal working directory).  This helper reconciles the two so the
+    caller can check ``dest_path`` directly.
+
+    Args:
+        dl_result: The return value of ``client.download_media()``, or None.
+        dest_path: The path the caller expected the file to be saved at.
+    """
+    if dl_result is None:
+        return
+    _dl_path = str(dl_result)
+    _abs_dest = os.path.abspath(dest_path)
+    if _dl_path != _abs_dest and not os.path.exists(dest_path):
+        if os.path.exists(_dl_path):
+            logger.info(
+                "userbot: reconciling download path %s -> %s",
+                _dl_path,
+                _abs_dest,
+            )
+            shutil.move(_dl_path, _abs_dest)
+        else:
+            logger.warning(
+                "userbot: download_media returned %s but file does not exist",
+                _dl_path,
+            )
+
+
+# ---------------------------------------------------------------------------
 # Helper: detect -503 Timeout / InternalServerError from any MTProto client
 # ---------------------------------------------------------------------------
 def _is_503_timeout(exc: Exception) -> bool:
@@ -685,31 +719,32 @@ async def _download_with_telethon(
                 target,
                 getattr(msg, "id", None),
                 bool(getattr(msg, "media", None)),
-            )
-            if getattr(msg, "media", None):
-                logger.info("userbot: message found; downloading %s/%s to %s", target, message_id, dest_path)
-                for attempt in range(3):
-                    try:
-                        logger.debug(
-                            "userbot: download attempt %s for %s/%s -> %s",
-                            attempt + 1,
-                            target,
-                            getattr(msg, "id", None),
-                            dest_path,
-                        )
-                        await client.download_media(msg, file=dest_path, part_size_kb=chunk_size_kb)
-                        if os.path.exists(dest_path) and os.path.getsize(dest_path) > 0:
-                            ok = await _ffprobe_ok(dest_path)
-                            if ok:
-                                return True
-                        logger.warning(
-                            "userbot: downloaded file failed validation (attempt %s) %s", attempt + 1, dest_path
-                        )
-                        with contextlib.suppress(Exception):
-                            os.remove(dest_path)
-                    except Exception as e:
-                        logger.exception("userbot: download attempt %s failed: %s", attempt + 1, e)
-                logger.debug("userbot: message found but downloads failed validation: %s/%s", target, message_id)
+            )                    if getattr(msg, "media", None):
+                        logger.info("userbot: message found; downloading %s/%s to %s", target, message_id, dest_path)
+                        for attempt in range(3):
+                            try:
+                                logger.debug(
+                                    "userbot: download attempt %s for %s/%s -> %s",
+                                    attempt + 1,
+                                    target,
+                                    getattr(msg, "id", None),
+                                    dest_path,
+                                )
+                                dl_result = await client.download_media(msg, file=dest_path, part_size_kb=chunk_size_kb)
+                                # Telethon may save to a different path; reconcile just like Pyrogram's _download_and_ensure_path
+                                _reconcile_download_path(dl_result, dest_path)
+                                if os.path.exists(dest_path) and os.path.getsize(dest_path) > 0:
+                                    ok = await _ffprobe_ok(dest_path)
+                                    if ok:
+                                        return True
+                                logger.warning(
+                                    "userbot: downloaded file failed validation (attempt %s) %s", attempt + 1, dest_path
+                                )
+                                with contextlib.suppress(Exception):
+                                    os.remove(dest_path)
+                            except Exception as e:
+                                logger.exception("userbot: download attempt %s failed: %s", attempt + 1, e)
+                        logger.debug("userbot: message found but downloads failed validation: %s/%s", target, message_id)
             else:
                 logger.debug("userbot: message found but no media: %s/%s", target, message_id)
 
@@ -732,7 +767,8 @@ async def _download_with_telethon(
                         if getattr(m, "media", None):
                             for _ in range(3):
                                 try:
-                                    await client.download_media(m, file=dest_path, part_size_kb=chunk_size_kb)
+                                    dl_result = await client.download_media(m, file=dest_path, part_size_kb=chunk_size_kb)
+                                    _reconcile_download_path(dl_result, dest_path)
                                     if os.path.exists(dest_path) and os.path.getsize(dest_path) > 0:
                                         ok = await _ffprobe_ok(dest_path)
                                         if ok:
@@ -750,12 +786,12 @@ async def _download_with_telethon(
                 logger.info(
                     "userbot: Telethon recent-history scan started for target=%s",
                     target,
-                )
-                async for m in client.iter_messages(target, limit=200):
+                )                    async for m in client.iter_messages(target, limit=200):
                     if getattr(m, "media", None):
                         for _ in range(3):
                             try:
-                                await client.download_media(m, file=dest_path, part_size_kb=chunk_size_kb)
+                                dl_result = await client.download_media(m, file=dest_path, part_size_kb=chunk_size_kb)
+                                _reconcile_download_path(dl_result, dest_path)
                                 if os.path.exists(dest_path) and os.path.getsize(dest_path) > 0:
                                     ok = await _ffprobe_ok(dest_path)
                                     if ok:
@@ -921,24 +957,11 @@ async def _download_and_ensure_path(client, msg, dest_path):
         logger.warning("userbot: download_media returned None")
         return False
 
-    # If the file was saved to a different path, move it to the expected destination
-    _dl_path = str(_dl)
-    _abs_dest = os.path.abspath(dest_path)
-    if _dl_path != _abs_dest and not os.path.exists(dest_path):
-        if os.path.exists(_dl_path):
-            logger.info(
-                "userbot: moving downloaded file %s -> %s",
-                _dl_path,
-                _abs_dest,
-            )
-            shutil.move(_dl_path, _abs_dest)
-        else:
-            logger.warning(
-                "userbot: download_media returned %s but file does not exist",
-                _dl_path,
-            )
+    # Reconcile Pyrogram's download path to the expected destination
+    _reconcile_download_path(_dl, dest_path)
 
     # Check at the absolute destination path (where the file should be)
+    _abs_dest = os.path.abspath(dest_path)
     if os.path.exists(_abs_dest) and os.path.getsize(_abs_dest) > 0:
         ok = await _ffprobe_ok(_abs_dest)
         if ok:
@@ -1601,7 +1624,12 @@ async def download_forward_via_userbot(
     elif TelegramClient is not None:
         logger.info("userbot: Telethon session not configured; skipping Telethon download")
 
-    logger.warning("userbot: all download methods failed for %s/%s", chat_id, message_id)
+    logger.warning(
+        "userbot: all download methods failed for %s/%s (dest=%s)",
+        chat_id,
+        message_id,
+        dest_path,
+    )
     return False
 
 
@@ -1687,8 +1715,10 @@ async def download_bytes_via_userbot(
             )
 
     logger.warning(
-        "userbot: all in-memory download methods failed for %s/%s",
+        "userbot: all in-memory download methods failed for %s/%s (Pyrogram session=%s Telethon session=%s)",
         chat_id,
         message_id,
+        bool(get_pyrogram_session_string()),
+        has_usable_telethon_session(),
     )
     return None
