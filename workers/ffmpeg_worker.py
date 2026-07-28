@@ -1331,12 +1331,19 @@ async def handle_job(job: dict):
                                                         await _bot.delete_message(
                                                             chat_id=chat_id, message_id=_copied.message_id,
                                                         )
-                                                    await _bot.send_video(
-                                                        chat_id=chat_id,
-                                                        video=_fid,
-                                                        caption=caption or "",
-                                                        supports_streaming=True,
-                                                    )
+                                                    _relay_send_kwargs = {
+                                                        "chat_id": chat_id,
+                                                        "video": _fid,
+                                                        "caption": caption or "",
+                                                        "supports_streaming": True,
+                                                    }
+                                                    if _pre_vm and _pre_vm.get("duration"):
+                                                        _relay_send_kwargs["duration"] = _pre_vm["duration"]
+                                                    if _pre_vm and _pre_vm.get("width"):
+                                                        _relay_send_kwargs["width"] = _pre_vm["width"]
+                                                    if _pre_vm and _pre_vm.get("height"):
+                                                        _relay_send_kwargs["height"] = _pre_vm["height"]
+                                                    await _bot.send_video(**_relay_send_kwargs)
                                                 with contextlib.suppress(Exception):
                                                     await _bot.delete_message(
                                                         chat_id=_relay_id, message_id=relay_msg_id,
@@ -1420,6 +1427,7 @@ async def handle_job(job: dict):
                                                                 "-print_format",
                                                                 "json",
                                                                 "-show_streams",
+                                                                "-show_format",
                                                                 out,
                                                             ],
                                                             capture_output=True,
@@ -1863,12 +1871,19 @@ async def handle_job(job: dict):
                                                         await _bot.delete_message(
                                                             chat_id=chat_id, message_id=_copied.message_id,
                                                         )
-                                                    await _bot.send_video(
-                                                        chat_id=chat_id,
-                                                        video=_fid,
-                                                        caption=caption or "",
-                                                        supports_streaming=True,
-                                                    )
+                                                    _relay_send_kwargs = {
+                                                        "chat_id": chat_id,
+                                                        "video": _fid,
+                                                        "caption": caption or "",
+                                                        "supports_streaming": True,
+                                                    }
+                                                    if _pre_vm and _pre_vm.get("duration"):
+                                                        _relay_send_kwargs["duration"] = _pre_vm["duration"]
+                                                    if _pre_vm and _pre_vm.get("width"):
+                                                        _relay_send_kwargs["width"] = _pre_vm["width"]
+                                                    if _pre_vm and _pre_vm.get("height"):
+                                                        _relay_send_kwargs["height"] = _pre_vm["height"]
+                                                    await _bot.send_video(**_relay_send_kwargs)
                                                 with contextlib.suppress(Exception):
                                                     await _bot.delete_message(
                                                         chat_id=_relay_id, message_id=relay_msg_id,
