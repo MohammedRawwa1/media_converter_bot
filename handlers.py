@@ -250,7 +250,7 @@ class EnhancedMediaHandler:
 
         # Schedule new cleanup
         try:
-            loop = asyncio.get_event_loop()
+            loop = asyncio.get_running_loop()
             handle = loop.call_later(
                 self._session_timeout_seconds,
                 lambda: asyncio.create_task(self._cleanup_session(user_id)),
@@ -324,6 +324,19 @@ class EnhancedMediaHandler:
                 return
             last_text = None
 
+            # ── T14: Subscribe to Redis pub/sub for instant progress updates ──
+            #    Falls back to polling when pub/sub is unavailable.
+            _pubsub_conn = None
+            _pubsub_obj = None
+            try:
+                _pubsub_conn = await get_redis()
+                _pubsub_obj = _pubsub_conn.pubsub()
+                await _pubsub_obj.subscribe(f"ffmpeg:progress:{job_id}")
+                logger.debug("_watch_job_progress: subscribed to ffmpeg:progress:%s", job_id)
+            except Exception:
+                _pubsub_obj = None
+                logger.debug("_watch_job_progress: pubsub unavailable for %s, using polling", job_id)
+
             async def _edit(text, **kwargs):
                 """Edit either progress_msg or the callback query message."""
                 if progress_msg:
@@ -334,6 +347,21 @@ class EnhancedMediaHandler:
 
             while True:
                 try:
+                    # T14: Try pubsub first for near-instant wake-up; fall back to polling sleep
+                    if _pubsub_obj is not None:
+                        try:
+                            _ps_msg = await _pubsub_obj.get_message(
+                                ignore_subscribe_messages=True, timeout=poll_interval
+                            )
+                            # If a pubsub message arrives, poll the hash for fresh data immediately
+                            # (the message itself is just a progress update; the hash has full state)
+                            if _ps_msg and _ps_msg.get("data"):
+                                pass  # Fall through to hgetall below
+                        except Exception:
+                            pass
+                    else:
+                        await asyncio.sleep(poll_interval)
+
                     data = await r.hgetall(f"ffmpeg:job:{job_id}")
                     # hgetall returns bytes keys/values when using aioredis
                     if not data:
@@ -437,7 +465,7 @@ class EnhancedMediaHandler:
                         logger.debug("handlers: operation failed")
 
                     # ── Build a rich result message with video metadata ──
-                    _result_parts = [f"✅ **Conversion complete!**"]
+                    _result_parts = ["✅ **Conversion complete!**"]
 
                     # Try to extract metadata from the Redis job hash first
                     _in_bytes = info.get("in_bytes")
@@ -463,61 +491,92 @@ class EnhancedMediaHandler:
                         except (ValueError, TypeError):
                             pass
 
-                    # ── ffprobe the output file for rich metadata ──
-                    # Only probe if output is a local path (not a URL)
-                    if not str(display_output).startswith("http") and os.path.exists(str(output)):
-                        try:
-                            import json as _rj
-                            import subprocess as _rsp
+                    # ── T10/T15: Use Redis-stored output metadata (avoids re-running ffprobe) ──
+                    _redis_dur = info.get("output_duration")
+                    _redis_w = info.get("output_width")
+                    _redis_h = info.get("output_height")
+                    _redis_vcodec = info.get("output_video_codec")
+                    _redis_acodec = info.get("output_audio_codec")
+                    _redis_vbitrate = info.get("output_video_bitrate")
+                    _redis_fps = info.get("output_fps")
 
-                            _ffprobe_bin = getattr(config, "FFMPEG_PATH", "ffmpeg").replace("ffmpeg", "ffprobe")
-                            _rp = await asyncio.to_thread(
-                                lambda: _rsp.run(
-                                    [_ffprobe_bin, "-v", "quiet", "-print_format", "json",
-                                     "-show_streams", "-show_format", str(output)],
-                                    capture_output=True,
-                                    timeout=15,
+                    _has_redis_meta = bool(_redis_dur and _redis_w and _redis_h)
+
+                    if _has_redis_meta:
+                        # Use Redis-stored metadata (no subprocess needed)
+                        if _redis_w and _redis_h:
+                            _result_parts.append(f"🖥️ Resolution: `{_redis_w}×{_redis_h}`")
+                        if _redis_dur:
+                            try:
+                                _dur_str = _format_seconds_to_hhmmss(float(_redis_dur))
+                                _result_parts.append(f"⏱️ Duration: `{_dur_str}`")
+                            except (ValueError, TypeError):
+                                pass
+                        if _redis_vcodec:
+                            _result_parts.append(f"🎞️ Video: `{_redis_vcodec}`")
+                        if _redis_acodec:
+                            _result_parts.append(f"🔊 Audio: `{_redis_acodec}`")
+                        if _redis_fps:
+                            _result_parts.append(f"⚡ FPS: `{_redis_fps}`")
+                        if _redis_vbitrate:
+                            try:
+                                _vbit_mbps = int(_redis_vbitrate) / 1_000_000
+                                _result_parts.append(f"📊 Bitrate: `{_vbit_mbps:.1f} Mbps`")
+                            except (ValueError, TypeError):
+                                pass
+                    else:
+                        # ── Fallback: ffprobe the output file for rich metadata ──
+                        # Only probe if output is a local path (not a URL)
+                        if not str(display_output).startswith("http") and os.path.exists(str(output)):
+                            try:
+                                import json as _rj
+                                import subprocess as _rsp
+
+                                _ffprobe_bin = getattr(config, "FFMPEG_PATH", "ffmpeg").replace("ffmpeg", "ffprobe")
+                                _rp = await asyncio.to_thread(
+                                    lambda: _rsp.run(  # noqa: S603
+                                        [_ffprobe_bin, "-v", "quiet", "-print_format", "json",
+                                         "-show_streams", "-show_format", str(output)],
+                                        capture_output=True,
+                                        timeout=15,
+                                    )
                                 )
-                            )
-                            if _rp.returncode == 0:
-                                _probe = _rj.loads(_rp.stdout.decode() or "{}")
-                                _streams = _probe.get("streams", [])
-                                _vcodec = None
-                                _acodec = None
-                                _width = None
-                                _height = None
-                                _duration = None
-                                for s in _streams:
-                                    if s.get("codec_type") == "video":
-                                        _vcodec = s.get("codec_name", "unknown")
-                                        _width = s.get("width")
-                                        _height = s.get("height")
-                                    elif s.get("codec_type") == "audio":
-                                        _acodec = s.get("codec_name", "unknown")
-                                _fmt = _probe.get("format", {})
-                                if _fmt.get("duration"):
-                                    with contextlib.suppress(ValueError, TypeError):
-                                        _duration = float(_fmt["duration"])
+                                if _rp.returncode == 0:
+                                    _probe = _rj.loads(_rp.stdout.decode() or "{}")
+                                    _streams = _probe.get("streams", [])
+                                    _vcodec = None
+                                    _acodec = None
+                                    _width = None
+                                    _height = None
+                                    _duration = None
+                                    for s in _streams:
+                                        if s.get("codec_type") == "video":
+                                            _vcodec = s.get("codec_name", "unknown")
+                                            _width = s.get("width")
+                                            _height = s.get("height")
+                                        elif s.get("codec_type") == "audio":
+                                            _acodec = s.get("codec_name", "unknown")
+                                    _fmt = _probe.get("format", {})
+                                    if _fmt.get("duration"):
+                                        with contextlib.suppress(ValueError, TypeError):
+                                            _duration = float(_fmt["duration"])
 
-                                if _width and _height:
-                                    _result_parts.append(f"🖥️ Resolution: `{_width}×{_height}`")
-                                if _duration:
-                                    _dur_str = _format_seconds_to_hhmmss(_duration)
-                                    _result_parts.append(f"⏱️ Duration: `{_dur_str}`")
-                                if _vcodec:
-                                    _result_parts.append(f"🎞️ Video: `{_vcodec}`")
-                                if _acodec:
-                                    _result_parts.append(f"🔊 Audio: `{_acodec}`")
-                        except Exception:
-                            logger.debug("handlers: ffprobe metadata extraction failed for result")
+                                    if _width and _height:
+                                        _result_parts.append(f"🖥️ Resolution: `{_width}×{_height}`")
+                                    if _duration:
+                                        _dur_str = _format_seconds_to_hhmmss(_duration)
+                                        _result_parts.append(f"⏱️ Duration: `{_dur_str}`")
+                                    if _vcodec:
+                                        _result_parts.append(f"🎞️ Video: `{_vcodec}`")
+                                    if _acodec:
+                                        _result_parts.append(f"🔊 Audio: `{_acodec}`")
+                            except Exception:
+                                logger.debug("handlers: ffprobe metadata extraction failed for result")
 
                     _result_parts.append(f"📎 Job: `{job_id[:12]}...`")
                     _result_text = "\n".join(_result_parts)
                     await _edit(_result_text)
                 elif status == "cancelled":
-                    # If cancel_notified flag is set, the cancel button handler
-                    # already edited the message — skip to avoid overwriting.
-                    # If absent (e.g. /canceljob admin command path), edit here.
                     if info.get("cancel_notified"):
                         pass
                     else:
@@ -526,6 +585,19 @@ class EnhancedMediaHandler:
                     await _edit(f"⚠️ Job {job_id} finished with status: {status}")
             except Exception:
                 logger.debug("handlers: final fetch for output or error")
+            # ── T19: Cleanup pubsub subscription and connections ──
+            if _pubsub_obj is not None:
+                with contextlib.suppress(Exception):
+                    await _pubsub_obj.unsubscribe(f"ffmpeg:progress:{job_id}")
+            if _pubsub_conn is not None:
+                try:
+                    aclose = getattr(_pubsub_conn, "aclose", None)
+                    if aclose is not None:
+                        await aclose()
+                    else:
+                        await _pubsub_conn.close()
+                except Exception:
+                    logger.debug("handlers: pubsub connection cleanup failed")
             try:
                 try:
                     aclose = getattr(r, "aclose", None)
@@ -570,12 +642,15 @@ class EnhancedMediaHandler:
             try:
                 if getattr(self, "db_model", None):
                     try:
-                        loop = asyncio.get_event_loop()
-                        if loop.is_running():
+                        try:
+                            loop = asyncio.get_running_loop()
                             asyncio.create_task(self.db_model.save_session(user_id, minimal))
-                        else:
-                            with contextlib.suppress(RuntimeError):
+                        except RuntimeError:
+                            # No running loop — create one and run synchronously
+                            loop = asyncio.new_event_loop()
+                            with contextlib.suppress(Exception):
                                 loop.run_until_complete(self.db_model.save_session(user_id, minimal))
+                            loop.close()
                     except Exception:
                         logger.exception("Failed scheduling DB session save for %s", user_id)
             except Exception:
@@ -600,15 +675,23 @@ class EnhancedMediaHandler:
 
                             def _runner():
                                 try:
-                                    res = _asyncio.run(self.db_model.load_session(user_id))
+                                    # Wrap in wait_for to prevent thread pile-up
+                                    # when MongoDB is unreachable (connection timeout).
+                                    _timeout_coro = _asyncio.wait_for(
+                                        self.db_model.load_session(user_id),
+                                        timeout=2.0,
+                                    )
+                                    res = _asyncio.run(_timeout_coro)
                                     q.put(res)
+                                except TimeoutError:
+                                    q.put(None)
                                 except Exception:
                                     q.put(None)
 
                             t = threading.Thread(target=_runner, daemon=True)
                             t.start()
                             try:
-                                res = q.get(timeout=2)
+                                res = q.get(timeout=3)
                             except Exception:
                                 res = None
                             return res
@@ -754,6 +837,37 @@ class EnhancedMediaHandler:
             logger.debug("Conversion quota check failed, allowing conversion")
         return True
 
+    async def _cancel_auto_enqueue_job(self, session: dict, handler_name: str) -> bool:
+        """Cancel the generic auto-enqueued job (if any) so user's specific settings take effect.
+
+        Returns True if a job was cancelled, False otherwise.
+        """
+        current_file = session.get("current_file")
+        if not current_file:
+            return False
+        _existing_id = current_file.get("_pipeline_job_id")
+        if not _existing_id:
+            return False
+
+        try:
+            from utils.job_queue import get_redis as _cancel_r
+            _r_cancel = await _cancel_r()
+            try:
+                await _r_cancel.hset(f"ffmpeg:job:{_existing_id}", "cancel", "1")
+                logger.info(
+                    "%s: cancelled generic auto-enqueue job %s to apply specific settings",
+                    handler_name, _existing_id,
+                )
+            finally:
+                with contextlib.suppress(Exception):
+                    await _r_cancel.close()
+        except Exception:
+            logger.debug("%s: failed to cancel auto-enqueue job %s", handler_name, _existing_id)
+
+        current_file.pop("_pipeline_job_id", None)
+        session["current_file"] = current_file
+        return True
+
     # ── Video delivery helper: send_video with rich metadata ──────────────
     async def _send_video_result(
         self,
@@ -885,6 +999,31 @@ class EnhancedMediaHandler:
         # If already downloaded (local) or already streamed to S3, nothing to do
         path = current_file.get("path")
         input_key = current_file.get("input_key")
+        # ── Stale-key guard for pipeline-restored sessions: verify the S3 key
+        #    actually exists before reusing it.  Only check when the key came from
+        #    an earlier pipeline run (has _pipeline_job_id).  Freshly-streamed keys
+        #    (set seconds ago in the S3 stream path) skip this check to avoid an
+        #    unnecessary S3 head-object call on every conversion. ──
+        if input_key and current_file.get("_pipeline_job_id"):
+            try:
+                from utils.storage import get_storage_backend as _gsb
+                _bn = (os.getenv("STORAGE_BACKEND") or getattr(config, "STORAGE_BACKEND", "local") or "local").lower()
+                if _bn in ("s3", "r2") and _gsb is not None:
+                    _backend_check = await _gsb()
+                    _exists = await _backend_check.exists(input_key)
+                    if not _exists:
+                        # Key is stale — clear it and proceed with fresh download
+                        logger.warning(
+                            "Stale input_key=%s for user=%s does not exist in S3; clearing and re-downloading",
+                            input_key,
+                            user_id,
+                        )
+                        current_file.pop("input_key", None)
+                        session["current_file"] = current_file
+                        input_key = None
+            except Exception:
+                # If the check fails, conservatively assume the key is valid
+                pass
         if input_key or (path and os.path.exists(path)):
             return
 
@@ -1447,13 +1586,57 @@ class EnhancedMediaHandler:
             logger.debug("handlers: Check if we should stream directly to remote storage (S3/R2), skipp...")
 
         if _use_remote and _backend is not None:
-            # Stream: download bytes from Telegram -> upload directly to S3, no local disk write
-            data = await file.download_as_bytearray()
-            _input_key = f"inputs/{user_id}/{file_id}{ext}"
-            await _backend.upload_bytes(bytes(data), _input_key)
+            # ── Pipeline flow: download to temp → ffprobe → upload with job_id key → metadata in Redis ──
+            _job_id = uuid.uuid4().hex
+            _temp_dir = getattr(config, "TEMP_PATH", "storage/temp")
+            with contextlib.suppress(Exception):
+                os.makedirs(_temp_dir, exist_ok=True)
+            _temp_path = os.path.join(_temp_dir, f"src_{user_id}_{int(time.time())}{ext}")
+
+            # Download to temp file (disk, not bytearray — ffprobe needs a local file)
+            await file.download_to_drive(_temp_path)
+
+            # ── T4: ffprobe source analysis ──
+            _source_meta = {}
+            try:
+                from utils.ffmpeg_runner import probe_media as _probe_media
+                _source_meta = await _probe_media(_temp_path)
+            except Exception:
+                logger.debug("handlers: source ffprobe failed for %s", file_id)
+
+            # Upload to S3 with unified inputs/{job_id}/source.ext key
+            _input_key = f"inputs/{_job_id}/source{ext}"
+            await _backend.upload_file(_temp_path, _input_key)
+
+            # ── Source metadata stored on current_file; enqueue_job in
+            #    _auto_enqueue_pipeline will write it to Redis in a single
+            #    atomic hset call — avoids a separate hset race here. ──
+
+            # Clean up temp file
+            try:
+                os.remove(_temp_path)
+                logger.debug("handlers: cleaned up temp file %s", _temp_path)
+            except Exception:
+                pass
+
             current_file["input_key"] = _input_key
-            current_file["path"] = None  # Not on local disk
-            logger.info("Streamed file directly to S3: %s -> %s (size=%d bytes)", file_id, _input_key, len(data))
+            current_file["_source_job_id"] = _job_id
+            current_file["_source_metadata"] = _source_meta
+            current_file["path"] = None
+
+            logger.info(
+                "Source ffprobe → S3: %s/%s → %s (dur=%s codec=%s %sx%s fps=%s rot=%s audio=%s)",
+                user_id,
+                file_id,
+                _input_key,
+                _source_meta.get("duration", "?"),
+                _source_meta.get("video_codec", "?"),
+                _source_meta.get("width", "?"),
+                _source_meta.get("height", "?"),
+                _source_meta.get("fps", "?"),
+                _source_meta.get("rotation", "?"),
+                _source_meta.get("audio_codec", "?"),
+            )
         else:
             # Fallback: download to local disk
             await file.download_to_drive(file_path)
@@ -1658,7 +1841,7 @@ class EnhancedMediaHandler:
                             logger.exception("Webapp fetch POST failed: %s", e)
                             return None
 
-                    resp = await asyncio.get_event_loop().run_in_executor(None, _post_fetch)
+                    resp = await asyncio.get_running_loop().run_in_executor(None, _post_fetch)
                     logger.info("Webapp fetch response for fh=%s: resp=%s", fh, getattr(resp, "status_code", None))
 
                     if resp is not None and getattr(resp, "status_code", None) == 200:
@@ -1946,24 +2129,9 @@ class EnhancedMediaHandler:
         if not await self._check_conversion_quota(update, context):
             return
 
-        # ── Check if the BigFilePipeline already queued a job for this file ──
+        # ── Cancel generic auto-enqueued job so user's specific settings take effect ──
         if current_file.get("_pipeline_job_id"):
-            _existing_id = current_file["_pipeline_job_id"]
-            logger.info(
-                "convert_video_format: pipeline job %s already queued for file %s; skipping duplicate",
-                _existing_id,
-                current_file.get("id"),
-            )
-            # Re-notify the user and attach watch to the existing pipeline job
-            kb = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data=f"cancel_job:{_existing_id}")]])
-            await self.safe_edit(
-                query,
-                f"🎬 File already queued via pipeline (Job: {_existing_id[:8]}...). Processing is underway.",
-                reply_markup=kb,
-            )
-            with contextlib.suppress(RuntimeError):
-                asyncio.create_task(self._watch_job_progress(query, _existing_id))
-            return
+            await self._cancel_auto_enqueue_job(session, "convert_video_format")
 
         await self.safe_edit(query, f"🎬 Queuing conversion to {target_format.upper()}...")
 
@@ -1988,25 +2156,9 @@ class EnhancedMediaHandler:
             try:
                 await self._ensure_current_file_downloaded(update, context, session)
                 current_file = session.get("current_file")
-                # Re-check after download — the pipeline may have queued a job during
-                # _ensure_current_file_downloaded (rare race for large files on second call).
+                # Re-check after download — cancel if pipeline queued during download
                 if current_file and current_file.get("_pipeline_job_id"):
-                    _existing_id = current_file["_pipeline_job_id"]
-                    logger.info(
-                        "convert_video_format: pipeline queued job %s during download; skipping duplicate",
-                        _existing_id,
-                    )
-                    kb = InlineKeyboardMarkup(
-                        [[InlineKeyboardButton("❌ Cancel", callback_data=f"cancel_job:{_existing_id}")]]
-                    )
-                    await self.safe_edit(
-                        query,
-                        f"🎬 Large file routed to pipeline (Job: {_existing_id[:8]}...) converting to {target_format.upper()}.",
-                        reply_markup=kb,
-                    )
-                    with contextlib.suppress(RuntimeError):
-                        asyncio.create_task(self._watch_job_progress(query, _existing_id))
-                    return
+                    await self._cancel_auto_enqueue_job(session, "convert_video_format")
             except Exception as e:
                 await self.safe_edit(query, f"❌ Failed to download file: {e}")
                 return
@@ -2235,7 +2387,7 @@ class EnhancedMediaHandler:
                         timers = session.setdefault("media_group_timers", {})
                         if mgid not in timers:
                             try:
-                                loop = asyncio.get_event_loop()
+                                loop = asyncio.get_running_loop()
                                 handle = loop.call_later(
                                     1.0, lambda: asyncio.create_task(self._finalize_media_group(user_id, mgid))
                                 )
@@ -2325,6 +2477,170 @@ class EnhancedMediaHandler:
                 "Please send a video, audio, or document file. You can also paste one or more URLs (http/https) to enqueue conversions."
             )
 
+    async def _auto_enqueue_pipeline(
+        self,
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+        session: dict,
+        file_type: str,
+        file_size: int,
+        file_ext: str = ".mp4",
+    ) -> bool:
+        """Auto-enqueue a file immediately after registration (T6 in diagram).
+
+        Flows through:
+          1. Call _ensure_current_file_downloaded() (triggers T3→T4→T5: Bot API download,
+             ffprobe source analysis, S3 upload with inputs/{job_id}/source.ext)
+          2. Build a processing job payload matching the BigFilePipeline format
+          3. Enqueue via enqueue_job() so the worker handles conversion
+          4. Show a progress message with Cancel button and start _watch_job_progress
+
+        Returns True if enqueued successfully, False on failure.
+        """
+        user_id = update.effective_user.id if update and update.effective_user else None
+        if not user_id:
+            return False
+
+        try:
+            # ── Step 1: Ensure file is downloaded → ffprobed → S3 uploaded ──
+            _progress_msg = await update.message.reply_text(
+                f"⬇️ Processing {file_type} ({file_size // (1024 * 1024)} MB)..."
+            )
+
+            await self._ensure_current_file_downloaded(update, context, session)
+            current_file = session.get("current_file")
+            if not current_file:
+                await _progress_msg.edit_text("❌ Session lost during download.")
+                return False
+
+            # ── Step 2: Check if S3 pipeline ran (got _source_job_id) or if
+            #    BigFilePipeline already queued a job (_pipeline_job_id) ──
+            _job_id = current_file.get("_source_job_id")
+            _input_key = current_file.get("input_key")
+            _pipeline_job_id = current_file.get("_pipeline_job_id")
+
+            if not _job_id or not _input_key:
+                if _pipeline_job_id:
+                    # BigFilePipeline already queued this job (file >20MB).
+                    # Start progress watcher on the existing job instead of
+                    # showing the fallback menu.
+                    logger.info(
+                        "Auto-enqueue: BigFilePipeline already queued job %s for user=%s; starting watcher",
+                        _pipeline_job_id,
+                        user_id,
+                    )
+                    asyncio.create_task(
+                        self._watch_job_progress(
+                            query=None,
+                            job_id=_pipeline_job_id,
+                            progress_msg=_progress_msg,
+                        )
+                    )
+                    return True
+
+                # Pipeline didn't run (local storage or error) — fall back to old inline flow
+                logger.info(
+                    "Auto-enqueue: S3 pipeline did not produce a job_id for user=%s file=%s; falling back",
+                    user_id,
+                    current_file.get("id"),
+                )
+                await _progress_msg.edit_text(
+                    f"✅ {file_type.capitalize()} registered!\nChoose an action:",
+                    reply_markup=MediaMenuBuilder.get_main_menu(file_type),
+                )
+                return False
+
+            # ── Step 3: Build job payload (mirrors BigFilePipeline format) ──
+            _source_meta = current_file.get("_source_metadata", {})
+            _out_ext = file_ext  # Preserve original extension by default
+            # For audio, use .mp3; for video, keep .mp4 or original
+            if file_type == "audio":
+                _out_ext = ".mp3"
+            elif file_type == "video":
+                _out_ext = ".mp4"
+
+            job = {
+                "job_id": _job_id,
+                "input_key": _input_key,
+                "input_path": None,  # Always S3 in this path
+                "chat_id": user_id,
+                "user_id": user_id,
+                "message_id": current_file.get("msg_id"),
+                "original_filename": current_file.get("name", f"file_{_job_id}{file_ext}"),
+                "file_unique_id": current_file.get("file_unique_id", ""),
+                "file_size": current_file.get("size", 0),
+                "progress_channel": f"ffmpeg:progress:{_job_id}",
+                "cleanup_input": True,
+                "type": "ffmpeg",
+                "output_ext": _out_ext,
+                "created_at": time.time(),
+            }
+
+            await enqueue_job(job)
+
+            # ── Step 4a: Write source metadata to Redis hash in a single
+            #    atomic hset call AFTER enqueue_job (no write-ordering race).
+            #    hset is additive — enqueue_job's mapping (status, progress, …)
+            #    and these metadata fields coexist in the same hash. ──
+            if _source_meta:
+                _source_meta_fields = {
+                    "source_duration": str(_source_meta.get("duration", "")),
+                    "source_fps": str(_source_meta.get("fps", "")),
+                    "source_video_codec": str(_source_meta.get("video_codec", "")),
+                    "source_audio_codec": str(_source_meta.get("audio_codec", "")),
+                    "source_width": str(_source_meta.get("width", "")),
+                    "source_height": str(_source_meta.get("height", "")),
+                    "source_video_bitrate": str(_source_meta.get("video_bitrate", "")),
+                    "source_audio_bitrate": str(_source_meta.get("audio_bitrate", "")),
+                    "source_rotation": str(_source_meta.get("rotation", "")),
+                    "source_creation_time": str(_source_meta.get("creation_time", "")),
+                    "source_language": str(_source_meta.get("language", "")),
+                    "source_chapters": str(_source_meta.get("chapters", 0)),
+                    "source_format": str(_source_meta.get("format_name", "")),
+                    "filename": current_file.get("name", ""),
+                }
+                try:
+                    from utils.job_queue import get_redis as _get_jq_redis
+                    _r = await _get_jq_redis()
+                    try:
+                        await _r.hset(f"ffmpeg:job:{_job_id}", mapping=_source_meta_fields)
+                    finally:
+                        await _r.close()
+                except Exception:
+                    logger.debug("Auto-enqueue: failed to store source metadata in Redis hash")
+            logger.info(
+                "Auto-enqueue: job %s queued for user=%s input_key=%s type=%s",
+                _job_id,
+                user_id,
+                _input_key,
+                job["type"],
+            )
+
+            # ── Step 5: Show progress message and start watcher ──
+            current_file["_pipeline_job_id"] = _job_id
+            session["current_file"] = current_file
+            with contextlib.suppress(Exception):
+                self._persist_session(user_id)
+
+            # Start background progress watcher
+            asyncio.create_task(
+                self._watch_job_progress(
+                    query=None,
+                    job_id=_job_id,
+                    progress_msg=_progress_msg,
+                )
+            )
+
+            return True
+
+        except Exception as e:
+            logger.exception("Auto-enqueue pipeline failed for user=%s: %s", user_id, e)
+            with contextlib.suppress(Exception):
+                await update.message.reply_text(
+                    f"❌ Auto-processing failed: {e}\nPlease try again with a conversion button."
+                )
+            return False
+
     async def handle_video(self, update: Update, context: ContextTypes.DEFAULT_TYPE, session: dict):
         """Handle incoming video files."""
         video = update.message.video
@@ -2410,11 +2726,19 @@ class EnhancedMediaHandler:
         # Log to MongoDB if needed
         await self.log_media_to_db(user_id, session["current_file"])
 
-        # Show main menu immediately (lazy download)
-        await update.message.reply_text(
-            f"✅ Video registered!\n📦 Size: {video.file_size // 1024 // 1024} MB\nChoose an action:",
-            reply_markup=MediaMenuBuilder.get_main_menu("video"),
+        # ── T6: Auto-enqueue immediately via pipeline ──
+        _enqueued = await self._auto_enqueue_pipeline(
+            update, context, session,
+            file_type="video",
+            file_size=video.file_size,
+            file_ext=".mp4",
         )
+        if not _enqueued:
+            # Fallback: show format menu for local-storage files or errors
+            await update.message.reply_text(
+                f"✅ Video registered!\n📦 Size: {video.file_size // 1024 // 1024} MB\nChoose an action:",
+                reply_markup=MediaMenuBuilder.get_main_menu("video"),
+            )
 
     async def handle_audio(self, update: Update, context: ContextTypes.DEFAULT_TYPE, session: dict):
         """Handle incoming audio files."""
@@ -2496,10 +2820,19 @@ class EnhancedMediaHandler:
             audio.file_size,
         )
 
-        await update.message.reply_text(
-            f"✅ Audio registered!\n🎵 {audio.title or 'Unknown title'}\nChoose an action:",
-            reply_markup=MediaMenuBuilder.get_main_menu("audio"),
+        # ── T6: Auto-enqueue immediately via pipeline ──
+        _enqueued = await self._auto_enqueue_pipeline(
+            update, context, session,
+            file_type="audio",
+            file_size=audio.file_size,
+            file_ext=".mp3",
         )
+        if not _enqueued:
+            # Fallback: show format menu for local-storage files or errors
+            await update.message.reply_text(
+                f"✅ Audio registered!\n🎵 {audio.title or 'Unknown title'}\nChoose an action:",
+                reply_markup=MediaMenuBuilder.get_main_menu("audio"),
+            )
 
     async def handle_document(self, update: Update, context: ContextTypes.DEFAULT_TYPE, session: dict):
         """Handle document files (could be video/audio)."""
@@ -2664,10 +2997,20 @@ class EnhancedMediaHandler:
             document.file_size,
         )
 
-        await update.message.reply_text(
-            f"✅ {file_type.capitalize()} registered!\n📁 {file_name}\nChoose an action:",
-            reply_markup=MediaMenuBuilder.get_main_menu(file_type),
+        # ── T6: Auto-enqueue immediately via pipeline ──
+        _ext = os.path.splitext(file_name)[1] or ".mp4"
+        _enqueued = await self._auto_enqueue_pipeline(
+            update, context, session,
+            file_type=file_type,
+            file_size=document.file_size or 0,
+            file_ext=_ext,
         )
+        if not _enqueued:
+            # Fallback: show format menu for local-storage files or errors
+            await update.message.reply_text(
+                f"✅ {file_type.capitalize()} registered!\n📁 {file_name}\nChoose an action:",
+                reply_markup=MediaMenuBuilder.get_main_menu(file_type),
+            )
 
     async def _apply_fade(
         self,
@@ -3538,15 +3881,14 @@ class EnhancedMediaHandler:
                     # before cancel_job() sets status=cancelled (eliminates race window).
                     try:
                         _r = await get_redis()
-                        await _r.hset(f"ffmpeg:job:{job_id}", "cancel_notified", "1")
                         try:
+                            await _r.hset(f"ffmpeg:job:{job_id}", "cancel_notified", "1")
+                        finally:
                             _aclose = getattr(_r, "aclose", None)
                             if _aclose is not None:
                                 await _aclose()
                             else:
                                 await _r.close()
-                        except Exception:
-                            pass
                     except Exception:
                         pass
 
@@ -3831,23 +4173,9 @@ class EnhancedMediaHandler:
                 await self.safe_edit(query, f"❌ Failed to download file: {e}")
                 return
 
-        # ── Check if BigFilePipeline already queued a job for this file ──
+        # ── Cancel generic auto-enqueued job so user's specific settings take effect ──
         if current_file and current_file.get("_pipeline_job_id"):
-            _existing_id = current_file["_pipeline_job_id"]
-            logger.info(
-                "convert_to_mp3: pipeline job %s already queued for file %s; skipping duplicate",
-                _existing_id,
-                current_file.get("id"),
-            )
-            kb = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data=f"cancel_job:{_existing_id}")]])
-            await self.safe_edit(
-                query,
-                f"🎵 File already queued via pipeline (Job: {_existing_id[:8]}...). Extraction is underway.",
-                reply_markup=kb,
-            )
-            with contextlib.suppress(RuntimeError):
-                asyncio.create_task(self._watch_job_progress(query, _existing_id))
-            return
+            await self._cancel_auto_enqueue_job(session, "convert_to_mp3")
 
         await self._run_with_concurrency_limit(user_id, "mp3_conversion", do_conversion())
 
@@ -3951,23 +4279,9 @@ class EnhancedMediaHandler:
                 await self.safe_edit(query, f"❌ Failed to download file: {e}")
                 return
 
-        # ── Check if BigFilePipeline already queued a job for this file ──
+        # ── Cancel generic auto-enqueued job so user's specific settings take effect ──
         if current_file and current_file.get("_pipeline_job_id"):
-            _existing_id = current_file["_pipeline_job_id"]
-            logger.info(
-                "compress_video: pipeline job %s already queued for file %s; skipping duplicate",
-                _existing_id,
-                current_file.get("id"),
-            )
-            kb = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data=f"cancel_job:{_existing_id}")]])
-            await self.safe_edit(
-                query,
-                f"📉 File already queued via pipeline (Job: {_existing_id[:8]}...). Compression is underway.",
-                reply_markup=kb,
-            )
-            with contextlib.suppress(RuntimeError):
-                asyncio.create_task(self._watch_job_progress(query, _existing_id))
-            return
+            await self._cancel_auto_enqueue_job(session, "compress_video")
 
         await self._run_with_concurrency_limit(user_id, "compression", do_compression())
 
@@ -4232,23 +4546,9 @@ class EnhancedMediaHandler:
                 await self.safe_edit(query, f"❌ Failed to download file: {e}")
                 return
 
-        # ── Check if BigFilePipeline already queued a job for this file ──
+        # ── Cancel generic auto-enqueued job so user's specific settings take effect ──
         if current_file and current_file.get("_pipeline_job_id"):
-            _existing_id = current_file["_pipeline_job_id"]
-            logger.info(
-                "optimize_video: pipeline job %s already queued for file %s; skipping duplicate",
-                _existing_id,
-                current_file.get("id"),
-            )
-            kb = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data=f"cancel_job:{_existing_id}")]])
-            await self.safe_edit(
-                query,
-                f"⚡ File already queued via pipeline (Job: {_existing_id[:8]}...). Optimization is underway.",
-                reply_markup=kb,
-            )
-            with contextlib.suppress(RuntimeError):
-                asyncio.create_task(self._watch_job_progress(query, _existing_id))
-            return
+            await self._cancel_auto_enqueue_job(session, "optimize_video")
 
         output_dir = getattr(config, "OUTPUT_PATH", "storage/output") if config else "storage/output"
         with contextlib.suppress(OSError):
@@ -4349,23 +4649,9 @@ class EnhancedMediaHandler:
                 await self.safe_edit(query, f"❌ Failed to download file: {e}")
                 return
 
-        # ── Check if BigFilePipeline already queued a job for this file ──
+        # ── Cancel generic auto-enqueued job so user's specific settings take effect ──
         if current_file and current_file.get("_pipeline_job_id"):
-            _existing_id = current_file["_pipeline_job_id"]
-            logger.info(
-                "repair_video: pipeline job %s already queued for file %s; skipping duplicate",
-                _existing_id,
-                current_file.get("id"),
-            )
-            kb = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data=f"cancel_job:{_existing_id}")]])
-            await self.safe_edit(
-                query,
-                f"🔧 File already queued via pipeline (Job: {_existing_id[:8]}...). Repair is underway.",
-                reply_markup=kb,
-            )
-            with contextlib.suppress(RuntimeError):
-                asyncio.create_task(self._watch_job_progress(query, _existing_id))
-            return
+            await self._cancel_auto_enqueue_job(session, "repair_video")
 
         # enqueue repair job
         job_id = str(uuid.uuid4())
@@ -4581,23 +4867,9 @@ class EnhancedMediaHandler:
                 await self.safe_edit(query, f"❌ Failed to download file: {e}")
                 return
 
-        # ── Check if BigFilePipeline already queued a job for this file ──
+        # ── Cancel generic auto-enqueued job so user's specific settings take effect ──
         if current_file and current_file.get("_pipeline_job_id"):
-            _existing_id = current_file["_pipeline_job_id"]
-            logger.info(
-                "extract_streams: pipeline job %s already queued for file %s; skipping duplicate",
-                _existing_id,
-                current_file.get("id"),
-            )
-            kb = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data=f"cancel_job:{_existing_id}")]])
-            await self.safe_edit(
-                query,
-                f"🎞️ File already queued via pipeline (Job: {_existing_id[:8]}...). Extraction is underway.",
-                reply_markup=kb,
-            )
-            with contextlib.suppress(RuntimeError):
-                asyncio.create_task(self._watch_job_progress(query, _existing_id))
-            return
+            await self._cancel_auto_enqueue_job(session, "extract_streams")
 
         await self.safe_edit(query, "🎞️ Extracting streams...")
 
@@ -4680,23 +4952,9 @@ class EnhancedMediaHandler:
                 await self.safe_edit(query, f"❌ Failed to download file: {e}")
                 return
 
-        # ── Check if BigFilePipeline already queued a job for this file ──
+        # ── Cancel generic auto-enqueued job so user's specific settings take effect ──
         if current_file and current_file.get("_pipeline_job_id"):
-            _existing_id = current_file["_pipeline_job_id"]
-            logger.info(
-                "convert_audio_format: pipeline job %s already queued for file %s; skipping duplicate",
-                _existing_id,
-                current_file.get("id"),
-            )
-            kb = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data=f"cancel_job:{_existing_id}")]])
-            await self.safe_edit(
-                query,
-                f"🔄 File already queued via pipeline (Job: {_existing_id[:8]}...). Conversion to {format_type.upper()} is underway.",
-                reply_markup=kb,
-            )
-            with contextlib.suppress(RuntimeError):
-                asyncio.create_task(self._watch_job_progress(query, _existing_id))
-            return
+            await self._cancel_auto_enqueue_job(session, "convert_audio_format")
 
         output_base = getattr(config, "OUTPUT_PATH", "storage/output") if config else "storage/output"
         with contextlib.suppress(OSError):
@@ -5069,8 +5327,11 @@ class EnhancedMediaHandler:
                     try:
                         import asyncio as _asyncio
 
-                        if _asyncio.get_event_loop().is_running():
+                        try:
+                            _asyncio.get_running_loop()
                             _asyncio.create_task(model.ensure_indexes())
+                        except RuntimeError:
+                            pass
                     except Exception:
                         logger.debug("Could not schedule async index creation for Mongo model")
 
@@ -5402,8 +5663,10 @@ class EnhancedMediaHandler:
                         except Exception:
                             logger.exception("split_video failed")
                     else:
-                        parts = int(user_input.strip())
-                        await update.message.reply_text(f"✅ Split into {parts} parts queued (placeholder).")
+                        await update.message.reply_text(
+                            "⚠️ Split-into-equal-parts is not yet implemented. "
+                            "Use a range like `00:10-00:20` (start-end in HH:MM:SS) instead."
+                        )
                 except Exception:
                     await update.message.reply_text(
                         "❌ Invalid split format. Use 'start-end' or an integer number of parts."

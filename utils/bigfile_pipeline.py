@@ -208,6 +208,33 @@ class BigFilePipeline:
                 actual_size = os.path.getsize(temp_path)
                 logger.info("BigFilePipeline: disk download complete, actual_size=%dMB", actual_size // (1024 * 1024))
 
+                # ── T4: ffprobe source analysis ──
+                _source_meta = {}
+                try:
+                    from utils.ffmpeg_runner import probe_media
+                    _source_meta = await probe_media(temp_path)
+                except Exception:
+                    logger.debug("BigFilePipeline: source ffprobe failed, continuing without metadata")
+
+                # Include source_metadata in the job payload dict for the worker
+                # (will be merged into Redis hash by enqueue_job below — single atomic hset)
+                if _source_meta:
+                    _source_meta_fields = {
+                        "source_duration": str(_source_meta.get("duration", "")),
+                        "source_fps": str(_source_meta.get("fps", "")),
+                        "source_video_codec": str(_source_meta.get("video_codec", "")),
+                        "source_audio_codec": str(_source_meta.get("audio_codec", "")),
+                        "source_width": str(_source_meta.get("width", "")),
+                        "source_height": str(_source_meta.get("height", "")),
+                        "source_video_bitrate": str(_source_meta.get("video_bitrate", "")),
+                        "source_audio_bitrate": str(_source_meta.get("audio_bitrate", "")),
+                        "source_rotation": str(_source_meta.get("rotation", "")),
+                        "source_creation_time": str(_source_meta.get("creation_time", "")),
+                        "source_language": str(_source_meta.get("language", "")),
+                        "source_chapters": str(_source_meta.get("chapters", 0)),
+                        "source_format": str(_source_meta.get("format_name", "")),
+                    }
+
                 # Cache file info in Redis
                 if self._cache and file_unique_id:
                     with contextlib.suppress(Exception):
@@ -295,7 +322,25 @@ class BigFilePipeline:
                 job["output_dir"] = _streams_dir
                 job["archive_path"] = f"{_streams_dir}.zip"
 
+            # Enqueue the job first — enqueue_job creates the Redis hash
+            # with its own mapping (status=queued, progress=0, ...).
             await enqueue_job(job)
+
+            # Write source metadata to the same Redis hash in a single atomic
+            # hset AFTER enqueue_job so there is no write-ordering race.
+            # hset is additive (does not clear other fields), so both
+            # enqueue_job's mapping and these metadata fields coexist.
+            if _source_meta_fields:
+                try:
+                    from utils.job_queue import get_redis as _get_r
+                    _r = await _get_r()
+                    try:
+                        await _r.hset(f"ffmpeg:job:{job_id}", mapping=_source_meta_fields)
+                    finally:
+                        await _r.close()
+                except Exception:
+                    logger.debug("BigFilePipeline: failed to store source metadata in Redis hash")
+
             logger.info("BigFilePipeline: job %s enqueued (input_key=%s)", job_id, s3_key)
 
             return IngestResult(ok=True, job_id=job_id, s3_key=s3_key)

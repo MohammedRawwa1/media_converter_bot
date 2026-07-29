@@ -66,6 +66,76 @@ from flask import Response, stream_with_context
 
 from utils import file_utils
 
+# ── Per-thread event loop helpers for Flask routes ──────────────────────────
+# When Flask is mounted inside FastAPI via WSGIMiddleware, each request runs
+# in a separate WSGI thread with no running event loop.  Creating a new loop
+# with asyncio.run() per request is wasteful (no connection reuse) and can
+# raise RuntimeError in some ASGI server configurations.  Instead we maintain
+# one persistent event loop per thread, created on first use, and reuse it for
+# all async calls within that thread.
+_thread_loop = threading.local()
+
+
+def _ensure_loop() -> asyncio.AbstractEventLoop:
+    """Return the current thread's persistent event loop, creating one if needed."""
+    loop = getattr(_thread_loop, "loop", None)
+    if loop is None or loop.is_closed():
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        _thread_loop.loop = loop
+    return loop
+
+
+def _run_async(coro):
+    """Run an awaitable using the current thread's persistent event loop.
+
+    Safe to call from any WSGI/Flask route handler, including when Flask is
+    mounted inside FastAPI via WSGIMiddleware.
+    """
+    return _ensure_loop().run_until_complete(coro)
+
+
+# ── Upload progress publishing helper ──────────────────────────────────────
+
+def _publish_upload_progress(
+    job_id: str,
+    pct: int,
+    message: str,
+    in_bytes: int | None = None,
+) -> None:
+    """Publish upload progress to Redis (sync, safe for background threads).
+
+    Sets the job hash fields and publishes a JSON payload to the progress
+    channel so WebSocket/SSE/polling consumers can show S3 upload progress.
+    """
+    red_url = os.environ.get("REDIS_URL")
+    if not red_url:
+        return
+    try:
+        r = redis_sync.from_url(red_url, decode_responses=True)
+        try:
+            job_key = f"ffmpeg:job:{job_id}"
+            mapping = {
+                "status": "uploading" if pct < 100 else "queued",
+                "progress": str(pct),
+                "message": message,
+                "in_bytes": str(in_bytes) if in_bytes else "0",
+            }
+            r.hset(job_key, mapping=mapping)
+            # Publish to progress channel for real-time consumers
+            channel = f"ffmpeg:progress:{job_id}"
+            payload = json.dumps({
+                "status": "uploading" if pct < 100 else "queued",
+                "progress": pct,
+                "message": message,
+                "in_bytes": in_bytes or 0,
+            })
+            r.publish(channel, payload)
+        finally:
+            r.close()
+    except Exception:
+        logger.debug("webapp: failed to publish upload progress for %s", job_id)
+
 
 @app.route("/", methods=["GET"])
 def index():
@@ -144,7 +214,7 @@ def upload():
         # HTTP 202 Accepted to indicate the request was accepted for
         # processing but is not complete yet.
         try:
-            meta = asyncio.run(load_forward_metadata(forward_hash))
+            meta = _run_async(load_forward_metadata(forward_hash))
         except Exception:
             return jsonify(
                 {"error": "failed to load forward metadata", "detail": "Check server logs for details."}
@@ -166,6 +236,9 @@ def upload():
                     logger.exception("Background poll: forward_store helpers unavailable")
                     return
 
+                # Publish initial state
+                _publish_upload_progress(j_id, 0, "Waiting for forward metadata...")
+
                 # Attempt to locate the forward metadata with exponential backoff
                 for attempt in range(attempts):
                     try:
@@ -181,6 +254,7 @@ def upload():
                             logger.exception("Background poll: userbot_downloader not available for %s", fid)
                             return
 
+                        _publish_upload_progress(j_id, 20, "Downloading forwarded media via userbot...")
                         try:
                             ok_loc = _asyncio.run(
                                 download_forward_via_userbot(
@@ -193,10 +267,12 @@ def upload():
                             )
                         except Exception:
                             logger.exception("Background userbot download failed for forward %s", m.get("chat_id"))
+                            _publish_upload_progress(j_id, 0, "Userbot download failed")
                             return
 
                         if not ok_loc or not os.path.exists(inp_path):
                             logger.error("Background userbot download did not produce file: %s", inp_path)
+                            _publish_upload_progress(j_id, 0, "Download produced no file")
                             return
 
                         # Upload to remote storage if configured, else enqueue using local path
@@ -207,9 +283,11 @@ def upload():
                         key_loc = f"uploads/{j_id}_{os.path.basename(inp_path)}" if use_remote_loc else None
                         job_loc = None
                         if use_remote_loc and key_loc:
+                            _publish_upload_progress(j_id, 50, "Uploading to S3...")
                             try:
                                 b = get_storage_backend_sync()
                                 _asyncio.run(b.upload_file(inp_path, key_loc))
+                                _publish_upload_progress(j_id, 80, "S3 upload complete")
                                 if os.environ.get("KEEP_LOCAL_UPLOADS", "").lower() not in ("1", "true", "yes"):
                                     with contextlib.suppress(Exception):
                                         os.remove(inp_path)
@@ -236,6 +314,7 @@ def upload():
                                 }
                             except Exception:
                                 logger.exception("Background upload failed for fetched forward %s", inp_path)
+                                _publish_upload_progress(j_id, 0, "S3 upload failed")
 
                         if job_loc is None:
                             job_loc = {
@@ -261,10 +340,13 @@ def upload():
                             }
 
                         job_loc["request_id"] = req_id
+                        _publish_upload_progress(j_id, 90, "Enqueuing job...")
                         try:
                             _asyncio.run(enqueue_job(job_loc))
+                            _publish_upload_progress(j_id, 100, "Job queued")
                         except Exception:
                             logger.exception("Failed to enqueue background fetched job %s", j_id)
+                            _publish_upload_progress(j_id, 0, "Enqueue failed")
 
                         # cleanup forward metadata to avoid duplicates
                         with contextlib.suppress(Exception):
@@ -273,10 +355,12 @@ def upload():
                         return
 
                     # not found yet: backoff then retry
+                    _publish_upload_progress(j_id, 5, f"Forward metadata not ready (attempt {attempt+1}/{attempts})...")
                     with contextlib.suppress(Exception):
                         time.sleep(initial_delay * (2**attempt))
 
                 logger.warning("Forward metadata still not found after %s attempts for %s", attempts, fid)
+                _publish_upload_progress(j_id, 0, "Forward metadata not found after all attempts")
 
             t = threading.Thread(
                 target=_poll_and_fetch, args=(forward_hash, input_path, job_id, request_id), daemon=True
@@ -308,6 +392,7 @@ def upload():
         def _bg_fetch_and_enqueue(meta_obj, inp_path, j_id, req_id):
             import asyncio as _asyncio
 
+            _publish_upload_progress(j_id, 10, "Downloading forwarded media via userbot...")
             try:
                 ok_loc = False
                 try:
@@ -322,10 +407,12 @@ def upload():
                     )
                 except Exception:
                     logger.exception("Background userbot download failed for forward %s", meta_obj.get("chat_id"))
+                    _publish_upload_progress(j_id, 0, "Userbot download failed")
                     return
 
                 if not ok_loc or not os.path.exists(inp_path):
                     logger.error("Background userbot download did not produce file: %s", inp_path)
+                    _publish_upload_progress(j_id, 0, "Download produced no file")
                     return
 
                 # If configured, upload the input to remote storage and enqueue
@@ -333,9 +420,11 @@ def upload():
                 use_remote_loc = backend_name_loc in ("s3", "r2") and get_storage_backend_sync is not None
                 key_loc = f"uploads/{j_id}_{os.path.basename(inp_path)}" if use_remote_loc else None
                 if use_remote_loc and key_loc:
+                    _publish_upload_progress(j_id, 50, "Uploading to S3...")
                     try:
                         b = get_storage_backend_sync()
                         _asyncio.run(b.upload_file(inp_path, key_loc))
+                        _publish_upload_progress(j_id, 80, "S3 upload complete")
                         if os.environ.get("KEEP_LOCAL_UPLOADS", "").lower() not in ("1", "true", "yes"):
                             with contextlib.suppress(Exception):
                                 os.remove(inp_path)
@@ -362,6 +451,7 @@ def upload():
                         }
                     except Exception:
                         logger.exception("Background upload failed for fetched forward %s", inp_path)
+                        _publish_upload_progress(j_id, 40, "S3 upload failed, using local fallback")
                         job_loc = {
                             "job_id": j_id,
                             "input_path": inp_path,
@@ -407,12 +497,16 @@ def upload():
                     }
 
                 job_loc["request_id"] = req_id
+                _publish_upload_progress(j_id, 90, "Enqueuing job...")
                 try:
                     _asyncio.run(enqueue_job(job_loc))
+                    _publish_upload_progress(j_id, 100, "Job queued")
                 except Exception:
                     logger.exception("Failed to enqueue background fetched job %s", j_id)
+                    _publish_upload_progress(j_id, 0, "Enqueue failed")
             except Exception:
                 logger.exception("Unexpected error in background fetch/enqueue for forward %s", meta_obj.get("chat_id"))
+                _publish_upload_progress(j_id, 0, "Background fetch/enqueue failed")
 
         t = threading.Thread(target=_bg_fetch_and_enqueue, args=(meta, input_path, job_id, request_id), daemon=True)
         t.start()
@@ -423,9 +517,9 @@ def upload():
     try:
         # Run sanitization/detection synchronously but keep it lightweight.
         if filename:
-            original_filename = asyncio.run(file_utils.sanitize_filename(filename))
+            original_filename = _run_async(file_utils.sanitize_filename(filename))
         else:
-            original_filename = asyncio.run(file_utils.detect_filename(input_path))
+            original_filename = _run_async(file_utils.detect_filename(input_path))
     except Exception:
         original_filename = os.path.basename(input_path)
 
@@ -458,8 +552,11 @@ def upload():
     # Enqueue job: do not block the request thread for uploads/enqueues.
     if enqueue_job:
 
-        def _background_upload_and_enqueue(j, key, use_remote, req_id):
+        def _background_upload_and_enqueue(j, key, use_remote, req_id, jid, inp_bytes):
             try:
+                # Publish: upload starting
+                _publish_upload_progress(jid, 10, "S3 upload started...", in_bytes=inp_bytes)
+
                 # If remote backend is enabled, upload first then set input_key
                 if use_remote and key:
                     b = get_storage_backend_sync()
@@ -467,12 +564,16 @@ def upload():
                     try:
                         import asyncio as _asyncio
 
+                        _publish_upload_progress(jid, 20, "Uploading to S3 (0-50%)...", in_bytes=inp_bytes)
                         _asyncio.run(b.upload_file(input_path, key))
+                        _publish_upload_progress(jid, 80, "S3 upload complete, cleaning up...", in_bytes=inp_bytes)
+
                         if os.environ.get("KEEP_LOCAL_UPLOADS", "").lower() not in ("1", "true", "yes"):
                             with contextlib.suppress(Exception):
                                 os.remove(input_path)
                     except Exception:
                         logger.exception("Background upload failed for %s", input_path)
+                        _publish_upload_progress(jid, 0, "S3 upload failed", in_bytes=inp_bytes)
                         # fallthrough; enqueue with local path as a fallback
                     else:
                         j["input_key"] = key
@@ -483,18 +584,30 @@ def upload():
                 except Exception:
                     j["request_id"] = None
 
+                _publish_upload_progress(jid, 90, "Enqueuing job for worker...", in_bytes=inp_bytes)
+
                 # enqueue the job (async helper run inside this thread)
                 try:
                     import asyncio as _asyncio
 
                     _asyncio.run(enqueue_job(j))
+                    _publish_upload_progress(jid, 100, "Job queued", in_bytes=inp_bytes)
                 except Exception:
                     logger.exception("Background enqueue failed for job %s", j.get("job_id"))
+                    _publish_upload_progress(jid, 0, "Enqueue failed", in_bytes=inp_bytes)
             except Exception:
                 logger.exception("Unexpected error in background upload/enqueue for job %s", j.get("job_id"))
+                with contextlib.suppress(Exception):
+                    _publish_upload_progress(jid, 0, "Upload/enqueue failed", in_bytes=inp_bytes)
+
+        # ── Initialize Redis job hash with upload-in-progress status ──
+        _local_size = os.path.getsize(input_path) if os.path.exists(input_path) else 0
+        _publish_upload_progress(job_id, 0, "Queued for S3 upload...", in_bytes=_local_size)
 
         t = threading.Thread(
-            target=_background_upload_and_enqueue, args=(job, key, use_remote_backend, request_id), daemon=True
+            target=_background_upload_and_enqueue,
+            args=(job, key, use_remote_backend, request_id, job_id, _local_size),
+            daemon=True,
         )
         t.start()
     else:
@@ -571,12 +684,11 @@ def telethon_log():
     if backend is None:
         # Try to import async factory and instantiate it via asyncio
         try:
-            import asyncio as _asyncio
 
             from utils.storage import get_storage_backend as _get_async_backend
 
             try:
-                async_backend = _asyncio.run(_get_async_backend())
+                async_backend = _run_async(_get_async_backend())
             except Exception as e:
                 logger.exception("telethon_log: failed to init async storage backend: %s", e)
                 async_backend = None
@@ -633,7 +745,6 @@ def telethon_log():
             # Try async backend via asyncio.run
             if async_backend is not None:
                 try:
-                    import asyncio as _asyncio
 
                     async def _dl(a_backend, a_key, a_dst):
                         try:
@@ -648,7 +759,7 @@ def telethon_log():
                                 return False
                         return False
 
-                    ok = _asyncio.run(_dl(async_backend, key, dst))
+                    ok = _run_async(_dl(async_backend, key, dst))
                     if ok and os.path.exists(dst):
                         return send_file(dst, mimetype="text/plain", as_attachment=False)
                 except Exception:
@@ -823,8 +934,10 @@ async def _get_job_hash(job_id: str):
         return None
     try:
         r = await get_redis()
-        data = await r.hgetall(f"ffmpeg:job:{job_id}")
-        await r.close()
+        try:
+            data = await r.hgetall(f"ffmpeg:job:{job_id}")
+        finally:
+            await r.close()
         if not data:
             return None
         decoded = {
@@ -847,7 +960,7 @@ def status(job_id):
 
     # Try to read Redis job hash
     try:
-        job_hash = asyncio.run(_get_job_hash(job_id)) if aioredis_available else None
+        job_hash = _run_async(_get_job_hash(job_id)) if aioredis_available else None
     except Exception:
         job_hash = None
 
@@ -890,7 +1003,7 @@ def status(job_id):
                 if get_storage_backend_sync is not None:
                     backend = get_storage_backend_sync()
                     try:
-                        output_url = asyncio.run(backend.generate_presigned_get(output_key))
+                        output_url = _run_async(backend.generate_presigned_get(output_key))
                     except Exception:
                         output_url = None
             except Exception:
@@ -952,7 +1065,7 @@ def download(job_id):
 
     # Check Redis for output path
     try:
-        job_hash = asyncio.run(_get_job_hash(job_id)) if aioredis_available else None
+        job_hash = _run_async(_get_job_hash(job_id)) if aioredis_available else None
     except Exception:
         job_hash = None
 
@@ -986,7 +1099,7 @@ def download(job_id):
             if output_key and get_storage_backend_sync is not None:
                 backend = get_storage_backend_sync()
                 try:
-                    url = asyncio.run(backend.generate_presigned_get(output_key))
+                    url = _run_async(backend.generate_presigned_get(output_key))
                     from flask import redirect
 
                     return redirect(url)
@@ -1030,54 +1143,104 @@ def events(job_id):
             body, status, headers = make_rate_limit_response("events", client_ip)
             return jsonify(body), status, headers
 
+    DEPRECATED: Legacy Flask SSE endpoint.
+
+    Use the FastAPI SSE endpoint at ``/events/{job_id}`` (registered via
+    ``web/ws_fastapi.sse_router``) instead. Unlike this Flask version, the
+    FastAPI endpoint uses async Redis pubsub and does NOT consume a WSGI
+    thread per connection.
+
     Server-Sent Events endpoint that streams Redis progress pubsub messages
         published on channel `ffmpeg:progress:{job_id}` to the browser.
+
+    Uses a background thread for the blocking Redis pubsub ``.listen()`` call
+    and a ``queue.Queue`` to pass messages back to the Flask generator without
+    blocking the WSGI thread pool.
     """
+    logger.warning("Flask /events/%s called — DEPRECATED. Use FastAPI /events/%s instead.", job_id, job_id)
 
     def gen():
-        pub = None
-        try:
-            # initial state
-            try:
-                job_hash = asyncio.run(_get_job_hash(job_id)) if aioredis_available else None
-            except Exception:
-                job_hash = None
+        import queue as _queue
 
-            if job_hash:
-                yield f"data: {json.dumps(job_hash)}\n\n"
+        _msg_queue: _queue.Queue = _queue.Queue()
+        _stop_event = threading.Event()
+        _bg_thread = None
+
+        try:
+            # ── Emit initial job state from Redis ──
+            try:
+                _initial = _run_async(_get_job_hash(job_id)) if aioredis_available else None
+            except Exception:
+                _initial = None
+
+            if _initial:
+                yield f"data: {json.dumps(_initial)}\n\n"
 
             red_url = os.environ.get("REDIS_URL")
             if not red_url:
-                # No Redis configured for this deployment; finish after initial state
                 return
-            r = redis_sync.from_url(red_url, decode_responses=True)
-            pub = r.pubsub(ignore_subscribe_messages=True)
-            channel = f"ffmpeg:progress:{job_id}"
-            pub.subscribe(channel)
-            for message in pub.listen():
-                if not message:
-                    continue
-                if message.get("type") != "message":
-                    continue
-                data = message.get("data")
-                # ensure string
-                if isinstance(data, bytes):
+
+            # ── Background thread: blocking Redis pubsub listener ──
+            def _redis_listener():
+                """Subscribe to ffmpeg:progress:{job_id} and push messages to queue."""
+                _r = None
+                _pub = None
+                try:
+                    _r = redis_sync.from_url(red_url, decode_responses=True)
+                    _pub = _r.pubsub(ignore_subscribe_messages=True)
+                    _pub.subscribe(f"ffmpeg:progress:{job_id}")
+
+                    while not _stop_event.is_set():
+                        _msg = _pub.get_message(timeout=0.5)
+                        if _msg is None:
+                            continue
+                        if _msg.get("type") != "message":
+                            continue
+                        _data = _msg.get("data")
+                        if isinstance(_data, bytes):
+                            try:
+                                _data = _data.decode("utf-8")
+                            except Exception:
+                                _data = str(_data)
+                        _msg_queue.put(_data)
+                except Exception:
+                    logger.debug("webapp: events background listener failed for %s", job_id)
+                finally:
                     try:
-                        data = data.decode("utf-8")
+                        if _pub is not None:
+                            _pub.close()
                     except Exception:
-                        data = str(data)
-                yield f"data: {data}\n\n"
+                        pass
+                    try:
+                        if _r is not None:
+                            _r.close()
+                    except Exception:
+                        pass
+
+            _bg_thread = threading.Thread(target=_redis_listener, daemon=True)
+            _bg_thread.start()
+
+            # ── Generator loop: poll queue with timeout, yield messages, detect disconnect ──
+            while True:
+                try:
+                    _payload = _msg_queue.get(timeout=1.0)
+                    yield f"data: {_payload}\n\n"
+                except _queue.Empty:
+                    # Check if listener thread died unexpectedly
+                    if not _bg_thread.is_alive():
+                        logger.debug("webapp: events bg thread died for %s", job_id)
+                        break
+                    continue
+
         except GeneratorExit:
-            # client disconnected
-            pass
+            logger.debug("webapp: events client disconnected for %s", job_id)
         except Exception:
             logger.debug("webapp: events listener error for %s", job_id)
         finally:
-            try:
-                if pub:
-                    pub.close()
-            except Exception:
-                logger.debug("webapp: failed to close pubsub for %s", job_id)
+            _stop_event.set()
+            # Wait briefly for the background thread to finish
+            if _bg_thread is not None and _bg_thread.is_alive():
+                _bg_thread.join(timeout=2.0)
 
     return Response(stream_with_context(gen()), content_type="text/event-stream")
 
@@ -1224,7 +1387,10 @@ def internal_diag():
 
 
 if __name__ == "__main__":
-    # Start WebSocket server for real-time updates (best-effort)
+    # Start legacy WebSocket server on a separate port for standalone Flask usage.
+    # NOTE: When running under FastAPI (production), WebSocket is handled on the
+    # same port as the main app via ``web/ws_fastapi``. The standalone ``ws_server``
+    # below is only active during local Flask ``app.run()`` for development.
     try:
         from web.ws_server import start_in_thread
 

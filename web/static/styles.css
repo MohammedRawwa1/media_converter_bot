@@ -1,5 +1,9 @@
 :root{
   --bg:#f7f8fb;--card:#ffffff;--accent:#2563eb;--muted:#6b7280;
+  --upload:#16a34a;      /* green — S3 upload phase */
+  --processing:#2563eb;  /* blue — FFmpeg conversion */
+  --done:#16a34a;        /* green — complete */
+  --error:#dc2626;       /* red — error */
 }
 *{box-sizing:border-box}
 body{font-family:Inter,system-ui,Segoe UI,Roboto,Arial;margin:0;background:var(--bg);color:#111}
@@ -9,13 +13,19 @@ form{display:flex;gap:12px;flex-wrap:wrap;align-items:center}
 .file-label{display:inline-flex;align-items:center;padding:10px 12px;background:var(--card);border-radius:8px;border:1px solid #e6e9ef}
 .file-label input{display:none}
 .file-cta{color:var(--muted)}
-.btn{background:var(--accent);color:#fff;border:none;padding:10px 14px;border-radius:8px;cursor:pointer}
+.btn{background:var(--accent);color:#fff;border:none;padding:10px 14px;border-radius:8px;cursor:pointer;transition:opacity .2s;text-decoration:none;display:inline-block}
+.btn:hover{opacity:.85}
 .jobs{margin-top:20px;display:flex;flex-direction:column;gap:12px}
-.job{background:var(--card);padding:12px;border-radius:8px;border:1px solid #e6e9ef;display:flex;flex-direction:column}
+.job{background:var(--card);padding:12px;border-radius:8px;border:1px solid #e6e9ef;display:flex;flex-direction:column;transition:border-color .3s}
+.job:hover{border-color:#cbd5e1}
 .job-row{display:flex;justify-content:space-between;align-items:center;gap:12px}
-.progress{height:10px;background:#eef2ff;border-radius:999px;overflow:hidden;margin-top:8px}
-.progress > .bar{height:100%;background:var(--accent);width:0%;display:flex;align-items:center;justify-content:center;color:#fff;font-weight:600;font-size:0.8rem;transition:width 0.35s ease}
-.progress > .bar::after{content:''}
+.progress{height:12px;background:#eef2ff;border-radius:999px;overflow:hidden;margin-top:8px;position:relative}
+.progress > .bar{height:100%;width:0%;display:flex;align-items:center;justify-content:center;color:#fff;font-weight:600;font-size:0.7rem;transition:width 0.35s ease,background 0.3s ease}
+/* Phase-specific bar colors */
+.bar-upload{background:var(--upload)}
+.bar-processing{background:var(--processing)}
+.bar-done{background:var(--done)}
+.bar-error{background:var(--error)}
 .job .size{font-size:0.85rem;color:var(--muted);margin-top:6px}
 .meta{font-size:0.9rem;color:var(--muted)}
 @media (max-width:600px){

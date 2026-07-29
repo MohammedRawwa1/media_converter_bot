@@ -185,12 +185,17 @@ async def enqueue_job(job: dict) -> None:
         mongo_uri = os.environ.get("MONGO_URI")
         if mongo_uri:
             try:
-                # ensure client available
-                loop = asyncio.get_event_loop()
-                if loop.is_running():
+                try:
+                    loop = asyncio.get_running_loop()
                     asyncio.create_task(save_job(job))
-                else:
-                    loop.run_until_complete(save_job(job))
+                except RuntimeError:
+                    # Called from sync context (e.g. background thread)
+                    loop = asyncio.new_event_loop()
+                    asyncio.set_event_loop(loop)
+                    try:
+                        loop.run_until_complete(save_job(job))
+                    finally:
+                        loop.close()
             except Exception:
                 logger.debug("job_queue: failed to persist job %s to Mongo", job.get("job_id", "?"))
     except Exception:

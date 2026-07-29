@@ -293,21 +293,25 @@ class ConversionRateLimiterRedis:
 
         try:
             r = await get_redis()
-            key = self._key(user_id)
-            now = int(time.time())
-            cutoff = now - self.window
-            with contextlib.suppress(Exception):
-                # remove old entries for accurate count
-                await r.zremrangebyscore(key, 0, cutoff)
-            cnt = await r.zcard(key)
-            await r.close()
+            try:
+                key = self._key(user_id)
+                now = int(time.time())
+                cutoff = now - self.window
+                with contextlib.suppress(Exception):
+                    # remove old entries for accurate count
+                    await r.zremrangebyscore(key, 0, cutoff)
+                cnt = await r.zcard(key)
+            finally:
+                await r.close()
             if cnt < self.conversions_per_hour:
                 return True, "Conversion allowed"
             # compute wait time until earliest entry expires
             try:
                 r = await get_redis()
-                vals = await r.zrange(key, 0, 0, withscores=True)
-                await r.close()
+                try:
+                    vals = await r.zrange(key, 0, 0, withscores=True)
+                finally:
+                    await r.close()
                 if vals and len(vals) > 0:
                     earliest_score = vals[0][1]
                     wait = max(0.0, (earliest_score + self.window) - now)

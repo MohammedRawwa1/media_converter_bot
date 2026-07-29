@@ -1,5 +1,11 @@
 #!/usr/bin/env python3
-"""Final cleanup: Redis lock, dead code removal, unused import cleanup."""
+"""
+⚠️  ALREADY APPLIED — DO NOT RE-RUN
+
+This script contains old-code replacements that were already applied to main.py.
+Running it again would corrupt the file because the old patterns no longer exist.
+Kept here as documentation of what was changed during the cleanup pass.
+"""
 
 # ===== PART 1: main.py - Add Redis lock =====
 with open("main.py", encoding="utf-8") as f:

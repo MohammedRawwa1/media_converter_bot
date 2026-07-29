@@ -406,7 +406,7 @@ async def _upload_and_enqueue(local_path: str, original_name: str, chat_id: int 
                     asyncio.create_task(save_telethon_forward(job))
                 except Exception:
                     try:
-                        loop = asyncio.get_event_loop()
+                        loop = asyncio.get_running_loop()
                         loop.create_task(save_telethon_forward(job))
                     except Exception:
                         # best-effort only

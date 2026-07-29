@@ -19,6 +19,10 @@ class CleanupManager:
         self.cleanup_interval = 3600  # 1 hour
         self.max_file_age = 24 * 3600  # 24 hours
         self.max_temp_age = 1 * 3600  # 1 hour
+        # S3 / R2 TTLs (overridable via env vars, values in seconds)
+        self.s3_input_ttl = int(os.getenv("S3_INPUT_TTL", str(24 * 3600)))
+        self.s3_upload_ttl = int(os.getenv("S3_UPLOADS_TTL", str(24 * 3600)))
+        self.s3_forward_ttl = int(os.getenv("S3_FORWARDS_TTL", str(48 * 3600)))
         self.is_running = False
 
     async def start(self):
@@ -40,13 +44,17 @@ class CleanupManager:
         logger.info("Cleanup manager stopped")
 
     async def cleanup_all(self) -> dict:
-        """Run all cleanup operations."""
+        """Run all cleanup operations (local + remote)."""
         results = {
             "input_files": await self.cleanup_input_files(),
             "output_files": await self.cleanup_output_files(),
             "temp_files": await self.cleanup_temp_files(),
             "thumbnails": await self.cleanup_thumbnails(),
             "empty_dirs": await self.cleanup_empty_directories(),
+            # ── S3 / R2 remote cleanup ──
+            "s3_inputs": await self.cleanup_s3_inputs(),
+            "s3_uploads": await self.cleanup_s3_uploads(),
+            "s3_forwards": await self.cleanup_s3_forwards(),
         }
 
         total_cleaned = sum(results.values())
@@ -132,6 +140,58 @@ class CleanupManager:
                 logger.error(f"Error cleaning empty directories in {directory}: {e}")
 
         return removed_count
+
+    # ─────────────────────────────────────────────────────────────────────
+    # S3 / R2 remote cleanup helpers
+    # ─────────────────────────────────────────────────────────────────────
+
+    async def cleanup_s3_inputs(self) -> int:
+        """Clean old input files from S3 under the ``inputs/`` prefix."""
+        return await self._cleanup_s3_prefix("inputs/", self.s3_input_ttl)
+
+    async def cleanup_s3_uploads(self) -> int:
+        """Clean old uploaded files from S3 under the ``uploads/`` prefix."""
+        return await self._cleanup_s3_prefix("uploads/", self.s3_upload_ttl)
+
+    async def cleanup_s3_forwards(self) -> int:
+        """Clean old forward metadata files from S3 under the ``forwards/`` prefix."""
+        return await self._cleanup_s3_prefix("forwards/", self.s3_forward_ttl)
+
+    async def _cleanup_s3_prefix(self, prefix: str, max_age_seconds: int) -> int:
+        """List objects under an S3 *prefix* and delete those older than *max_age_seconds*."""
+        try:
+            from utils.storage import get_storage_backend
+
+            backend = await get_storage_backend()
+
+            # Only attempt S3 / R2 cleanup when the active backend is actually remote
+            _bn = (os.getenv("STORAGE_BACKEND") or getattr(config, "STORAGE_BACKEND", "local") or "local").lower()
+            if _bn not in ("s3", "r2"):
+                return 0
+
+            objects = await backend.list_keys(prefix)
+            if not objects:
+                return 0
+
+            now = time.time()
+            to_delete = [obj["key"] for obj in objects if (now - obj["last_modified"]) > max_age_seconds]
+
+            if not to_delete:
+                return 0
+
+            deleted = await backend.delete_keys(to_delete)
+            logger.info(
+                "S3 cleanup: prefix=%s deleted=%d/%d candidates=%d (TTL=%ds)",
+                prefix,
+                deleted,
+                len(to_delete),
+                len(objects),
+                max_age_seconds,
+            )
+            return deleted
+        except Exception as e:
+            logger.error("S3 cleanup failed for prefix=%s: %s", prefix, e)
+            return 0
 
     async def force_cleanup(self, directory: str = None) -> int:
         """Force cleanup of specific directory or all."""

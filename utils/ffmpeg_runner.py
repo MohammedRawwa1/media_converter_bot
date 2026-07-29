@@ -81,6 +81,206 @@ def _parse_out_time(timestr: str) -> float:
             return 0.0
 
 
+async def probe_media(path: str) -> dict:
+    """Run comprehensive ffprobe on a media file, returning structured metadata.
+
+    Extracts all fields shown in the T4 timeline of the pipeline diagram:
+    duration, fps, bitrate (video + audio), streams (codec, language, disposition),
+    chapters, rotation, color metadata (space/primaries/transfer), SAR, DAR,
+    creation_time.
+
+    Returns a dict with all available fields; missing fields are empty strings.
+    Never raises — returns empty dict on any error.
+    """
+    result: dict[str, str | int | float] = {}
+
+    if not path or not os.path.exists(path):
+        logger.warning("probe_media: path does not exist: %s", path)
+        return result
+
+    ffprobe = getattr(config, "FFMPEG_PATH", "ffmpeg").replace("ffmpeg", "ffprobe")
+    if "ffprobe" not in ffprobe:
+        ffprobe = "ffprobe"
+
+    try:
+        from utils.process_utils import create_checked_subprocess_exec
+    except Exception:
+        create_checked_subprocess_exec = None
+
+    cmd = [
+        ffprobe,
+        "-v",
+        "quiet",
+        "-print_format",
+        "json",
+        "-show_format",
+        "-show_streams",
+        "-show_chapters",
+        path,
+    ]
+
+    try:
+        if create_checked_subprocess_exec is not None:
+            proc = await create_checked_subprocess_exec(
+                *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+            )
+        else:
+            proc = await asyncio.create_subprocess_exec(
+                *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+            )
+        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=30)
+    except Exception as e:
+        logger.debug("probe_media: ffprobe subprocess error: %s", e)
+        return result
+
+    if proc.returncode != 0:
+        logger.debug("probe_media: ffprobe returned %s", proc.returncode)
+        return result
+
+    try:
+        data = json.loads(stdout.decode("utf-8", errors="replace"))
+    except Exception as e:
+        logger.debug("probe_media: JSON parse error: %s", e)
+        return result
+
+    fmt = data.get("format") or {}
+    streams = data.get("streams") or []
+    chapters = data.get("chapters") or []
+
+    # ── Format-level metadata ──
+    dur_str = fmt.get("duration", "")
+    if dur_str:
+        with contextlib.suppress(ValueError, TypeError):
+            result["duration"] = float(dur_str)
+
+    try:
+        bitrate_str = fmt.get("bit_rate", "")
+        if bitrate_str:
+            result["format_bitrate"] = int(bitrate_str)
+    except (ValueError, TypeError):
+        pass
+
+    result["format_name"] = fmt.get("format_name", "")
+    result["size"] = int(fmt.get("size", 0)) if fmt.get("size") else 0
+
+    # ── Chapters ──
+    result["chapters"] = len(chapters) if chapters else 0
+
+    # ── Per-stream metadata ──
+    video_streams = [s for s in streams if s.get("codec_type") == "video"]
+    audio_streams = [s for s in streams if s.get("codec_type") == "audio"]
+    subtitle_streams = [s for s in streams if s.get("codec_type") == "subtitle"]
+
+    result["video_streams"] = len(video_streams)
+    result["audio_streams"] = len(audio_streams)
+    result["subtitle_streams"] = len(subtitle_streams)
+
+    # ── Primary video stream (first) ──
+    if video_streams:
+        vs = video_streams[0]
+        result["video_codec"] = vs.get("codec_name", "")
+        result["video_codec_long"] = vs.get("codec_long_name", "")
+        result["width"] = vs.get("width", 0)
+        result["height"] = vs.get("height", 0)
+        result["coded_width"] = vs.get("coded_width", 0)
+        result["coded_height"] = vs.get("coded_height", 0)
+
+        # FPS: prefer r_frame_rate, fall back to avg_frame_rate
+        for fps_key in ("r_frame_rate", "avg_frame_rate"):
+            fps_val = vs.get(fps_key, "")
+            if fps_val and "/" in fps_val:
+                try:
+                    num, den = fps_val.split("/")
+                    result["fps"] = round(float(num) / max(float(den), 1), 3)
+                    break
+                except (ValueError, ZeroDivisionError):
+                    continue
+
+        # Bitrate
+        vbr = vs.get("bit_rate", "")
+        if vbr:
+            with contextlib.suppress(ValueError, TypeError):
+                result["video_bitrate"] = int(vbr)
+
+        # Rotation
+        side_data = vs.get("side_data_list") or []
+        rotation = vs.get("rotation", 0) or 0
+        if not rotation:
+            for sd in side_data:
+                if sd.get("side_data_type") == "Display Matrix":
+                    rotation = abs(int(sd.get("rotation", 0)))
+                    break
+        result["rotation"] = rotation
+
+        # SAR / DAR
+        sar = vs.get("sample_aspect_ratio", "")
+        dar = vs.get("display_aspect_ratio", "")
+        result["sar"] = sar
+        result["dar"] = dar
+
+        # Color metadata
+        result["color_space"] = vs.get("color_space", "")
+        result["color_primaries"] = vs.get("color_primaries", "")
+        result["color_transfer"] = vs.get("color_transfer", "")
+        result["color_range"] = vs.get("color_range", "")
+        result["pix_fmt"] = vs.get("pix_fmt", "")
+
+        # Pixel format
+        result["pixel_format"] = vs.get("pix_fmt", "")
+
+        # Creation time from video stream metadata
+        result["creation_time"] = vs.get("tags", {}).get("creation_time", "")
+
+        # Video stream disposition
+        disposition = vs.get("disposition", {}) or {}
+        result["default_stream"] = disposition.get("default", 0)
+        result["forced_stream"] = disposition.get("forced", 0)
+        result["original_stream"] = disposition.get("original", 0)
+
+    # ── Primary audio stream (first) ──
+    if audio_streams:
+        audio = audio_streams[0]
+        result["audio_codec"] = audio.get("codec_name", "")
+        result["audio_codec_long"] = audio.get("codec_long_name", "")
+        abr = audio.get("bit_rate", "")
+        if abr:
+            with contextlib.suppress(ValueError, TypeError):
+                result["audio_bitrate"] = int(abr)
+        result["audio_sample_rate"] = audio.get("sample_rate", "")
+        result["audio_channels"] = audio.get("channels", 0)
+        result["audio_channel_layout"] = audio.get("channel_layout", "")
+
+        # Audio language from tags
+        audio_tags = audio.get("tags", {}) or {}
+        result["language"] = audio_tags.get("language", "")
+
+        # Audio disposition
+        audio_disposition = audio.get("disposition", {}) or {}
+        result["audio_default"] = audio_disposition.get("default", 0)
+        result["audio_forced"] = audio_disposition.get("forced", 0)
+
+    # ── Format-level creation_time ──
+    if not result.get("creation_time"):
+        fmt_tags = fmt.get("tags", {}) or {}
+        result["creation_time"] = fmt_tags.get("creation_time", "")
+
+    logger.info(
+        "probe_media: %s — dur=%s codec=%s %sx%s fps=%s rot=%s audio=%s ch=%s lang=%s chapters=%s",
+        path,
+        result.get("duration", "?"),
+        result.get("video_codec", "?"),
+        result.get("width", "?"),
+        result.get("height", "?"),
+        result.get("fps", "?"),
+        result.get("rotation", "?"),
+        result.get("audio_codec", "?"),
+        result.get("audio_channels", "?"),
+        result.get("language", "?"),
+        result.get("chapters", "?"),
+    )
+    return result
+
+
 async def run_ffmpeg(
     input_path: str,
     output_path: str,
@@ -144,8 +344,7 @@ async def run_ffmpeg(
     in_bytes = 0
     try:
         if os.path.exists(input_path):
-            loop = asyncio.get_event_loop()
-            in_bytes = await loop.run_in_executor(None, lambda p=input_path: os.path.getsize(p))
+            in_bytes = await asyncio.get_running_loop().run_in_executor(None, lambda p=input_path: os.path.getsize(p))
     except Exception:
         in_bytes = 0
 
@@ -244,9 +443,8 @@ async def run_ffmpeg(
                 # Try to read the current output file size (non-blocking)
                 out_bytes = 0
                 try:
-                    loop = asyncio.get_event_loop()
                     if os.path.exists(output_path):
-                        out_bytes = await loop.run_in_executor(None, lambda p=output_path: os.path.getsize(p))
+                        out_bytes = await asyncio.get_running_loop().run_in_executor(None, lambda p=output_path: os.path.getsize(p))
                 except Exception:
                     out_bytes = 0
 
@@ -329,9 +527,8 @@ async def run_ffmpeg(
                     # ensure final sizes are recorded
                     final_out = 0
                     try:
-                        loop = asyncio.get_event_loop()
                         if os.path.exists(output_path):
-                            final_out = await loop.run_in_executor(None, lambda p=output_path: os.path.getsize(p))
+                            final_out = await asyncio.get_running_loop().run_in_executor(None, lambda p=output_path: os.path.getsize(p))
                     except Exception:
                         final_out = 0
 

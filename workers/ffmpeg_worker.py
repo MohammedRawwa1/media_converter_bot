@@ -63,6 +63,9 @@ FORWARD_NOTIFY_EVENT: asyncio.Event | None = None
 # Redis cache instance shared between worker_loop and handle_job
 _cache = None
 LAST_FORWARD_NOTIFICATION: dict | None = None
+# Cache for output probe results to avoid double ffprobe/thumbnail generation.
+# Keyed by output file path; values are (video_meta, thumb_path).
+_output_probe_cache: dict[str, tuple[dict | None, str | None]] = {}
 
 
 async def _check_upload_cancelled(job_id: str) -> bool:
@@ -262,6 +265,10 @@ async def _probe_output_metadata(out_path: str) -> tuple[dict | None, str | None
     even if the internal probe inside Telethon/Pyrogram fails, the video still arrives
     with proper duration/timestamps and a thumbnail in the user's DM.
 
+    Results are cached in ``_output_probe_cache`` keyed by *out_path* so that
+    the Bot API delivery path (which calls this function a second time) reuses
+    the cached probe and thumbnail rather than running ffprobe and ffmpeg again.
+
     Returns:
         Tuple of (video_meta dict or None, thumb_path str or None).
         ``video_meta`` has keys ``duration`` (int), ``width`` (int), ``height`` (int).
@@ -269,6 +276,12 @@ async def _probe_output_metadata(out_path: str) -> tuple[dict | None, str | None
     """
     if not out_path or not os.path.exists(out_path):
         return None, None
+
+    # Return cached result immediately if available (avoids double ffprobe)
+    _cached = _output_probe_cache.get(out_path)
+    if _cached is not None:
+        logger.debug("Worker: _probe_output_metadata cache HIT for %s", out_path)
+        return _cached
 
     video_meta = None
     thumb_path = None
@@ -299,7 +312,7 @@ async def _probe_output_metadata(out_path: str) -> tuple[dict | None, str | None
                 "-print_format",
                 "json",
                 "-show_entries",
-                "stream=width,height,codec_type:format=duration",
+                "stream=width,height,codec_type,codec_name,bit_rate,r_frame_rate,nb_frames:format=duration,bit_rate",
                 out_path,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
@@ -319,6 +332,26 @@ async def _probe_output_metadata(out_path: str) -> tuple[dict | None, str | None
                 if fmt.get("duration"):
                     with contextlib.suppress(ValueError, TypeError):
                         meta["duration"] = int(float(fmt["duration"]))
+                # T10: Extract extended metadata from the expanded ffprobe output
+                _all_streams = data.get("streams", [])
+                for s in _all_streams:
+                    if s.get("codec_type") == "video":
+                        if s.get("codec_name"):
+                            meta["video_codec"] = s["codec_name"]
+                        if s.get("bit_rate"):
+                            meta["video_bitrate"] = int(s["bit_rate"])
+                        if s.get("r_frame_rate"):
+                            try:
+                                _parts = str(s["r_frame_rate"]).split("/")
+                                if len(_parts) == 2 and int(_parts[1]) > 0:
+                                    meta["fps"] = round(int(_parts[0]) / int(_parts[1]), 2)
+                            except (ValueError, ZeroDivisionError):
+                                pass
+                    elif s.get("codec_type") == "audio":
+                        if s.get("codec_name"):
+                            meta["audio_codec"] = s["codec_name"]
+                        if s.get("bit_rate"):
+                            meta["audio_bitrate"] = int(s["bit_rate"])
                 if meta:
                     video_meta = meta
                     # Cache the result
@@ -332,10 +365,12 @@ async def _probe_output_metadata(out_path: str) -> tuple[dict | None, str | None
         logger.debug("Worker: fallback metadata probe failed for %s", out_path)
 
     # ── ffmpeg thumbnail at 1s ──
+    # Use a flat temp file (no nested directory) so cleanup is just os.remove()
+    # and there's no temp dir leak on the success path.
+    _fd, _tp = tempfile.mkstemp(suffix=".jpg", prefix="worker_thumb_")
+    os.close(_fd)
     ffmpeg_bin = getattr(config, "FFMPEG_PATH", "ffmpeg")
     try:
-        _td = tempfile.mkdtemp(prefix="worker_thumb_")
-        _tp = os.path.join(_td, "thumb.jpg")
         proc = await asyncio.create_subprocess_exec(
             ffmpeg_bin,
             "-y",
@@ -355,11 +390,14 @@ async def _probe_output_metadata(out_path: str) -> tuple[dict | None, str | None
         if proc.returncode == 0 and os.path.exists(_tp) and os.path.getsize(_tp) > 0:
             thumb_path = _tp
         else:
-            shutil.rmtree(_td, ignore_errors=True)
+            os.remove(_tp)
     except Exception:
         logger.debug("Worker: fallback thumbnail generation failed for %s", out_path)
         with contextlib.suppress(Exception):
-            shutil.rmtree(_td, ignore_errors=True)
+            os.remove(_tp)
+
+    # Cache result before returning so subsequent calls skip ffprobe + ffmpeg
+    _output_probe_cache[out_path] = (video_meta, thumb_path)
 
     return video_meta, thumb_path
 
@@ -441,6 +479,11 @@ async def _forward_pubsub_listener(stop_event: asyncio.Event | None, event: asyn
 
 
 async def handle_job(job: dict):
+    # Clear per-job probe cache to prevent unbounded memory growth across jobs.
+    # Each job starts with a fresh cache; re-probes within the same job are still
+    # served from the cache because _probe_output_metadata is called multiple
+    # times during a single handle_job invocation (e.g. for delivery).
+    _output_probe_cache.clear()
     job_id = job.get("job_id")
     input_path = job.get("input_path")
     # Early resolve commonly-used fields so error handlers can report progress
@@ -1235,6 +1278,121 @@ async def handle_job(job: dict):
                                     mapping["output"] = get_url if get_url and send_link else dest
                                     with contextlib.suppress(Exception):
                                         mapping["out_bytes"] = str(os.path.getsize(out))
+
+                                    # ── T11: Preserve original thumbnail if available (Pillow, no ffmpeg),
+                                    #    otherwise generate new frame (ffmpeg) & upload to S3 ──
+                                    _thumb_key = None
+                                    _thumb_path = None
+                                    _probe_meta = None
+                                    try:
+                                        try:
+                                            # Check job for existing thumbnail data (thumb_key from S3 upload
+                                            # or 'thumbnail'/'thumb' from Telegram metadata). If it exists
+                                            # as a local file, use Pillow to resize/save — no ffmpeg needed.
+                                            _existing_thumb = (
+                                                job.get("thumbnail") or job.get("thumb") or job.get("thumb_key")
+                                            )
+                                            # ── T11: Keep original — if thumb is an S3 key, download it first ──
+                                            _existing_thumb_dir = None
+                                            if _existing_thumb and not os.path.exists(str(_existing_thumb)):
+                                                _td_thumb = None
+                                                try:
+                                                    from utils.storage import get_storage_backend as _gsb_thumb
+                                                    _backend_thumb = await _gsb_thumb()
+                                                    if _backend_thumb:
+                                                        _td_thumb = tempfile.mkdtemp(prefix="worker_thumb_s3_")
+                                                        _dl_thumb = os.path.join(_td_thumb, "original_thumb.jpg")
+                                                        await _backend_thumb.download_file(str(_existing_thumb), _dl_thumb)
+                                                        if os.path.exists(_dl_thumb) and os.path.getsize(_dl_thumb) > 0:
+                                                            _existing_thumb = _dl_thumb
+                                                            _existing_thumb_dir = _td_thumb
+                                                            logger.debug(
+                                                                "Worker: T11 downloaded existing thumb from S3: %s -> %s",
+                                                                job.get("thumb_key"), _dl_thumb
+                                                            )
+                                                        else:
+                                                            shutil.rmtree(_td_thumb, ignore_errors=True)
+                                                except Exception:
+                                                    _existing_thumb = None
+                                                    if _td_thumb is not None and os.path.exists(_td_thumb):
+                                                        shutil.rmtree(_td_thumb, ignore_errors=True)
+                                                    logger.debug("Worker: T11 failed to download existing thumb from S3")
+                                            if _existing_thumb and os.path.exists(str(_existing_thumb)):
+                                                # ── T11: Keep original — Pillow resize/save ──
+                                                try:
+                                                    from PIL import Image as _PILImg
+                                                    _td = tempfile.mkdtemp(prefix="worker_thumb_")
+                                                    _tp = os.path.join(_td, "thumb.jpg")
+                                                    _img = _PILImg.open(str(_existing_thumb))
+                                                    _img.thumbnail((320, 320), _PILImg.Resampling.LANCZOS)
+                                                    _img.save(_tp, "JPEG", quality=85, optimize=True)
+                                                    if os.path.exists(_tp) and os.path.getsize(_tp) > 0:
+                                                        _thumb_path = _tp
+                                                        logger.debug(
+                                                            "Worker: T11 preserved original thumbnail via Pillow -> %s", _tp
+                                                        )
+                                                except Exception:
+                                                    _thumb_path = None
+                                                    logger.debug("Worker: Pillow thumbnail preservation failed, falling back to ffmpeg")
+                                                finally:
+                                                    # Cleanup S3-downloaded thumb temp dir after Pillow is done with it
+                                                    if _existing_thumb_dir is not None and os.path.exists(_existing_thumb_dir):
+                                                        shutil.rmtree(_existing_thumb_dir, ignore_errors=True)
+                                                        _existing_thumb_dir = None
+                                        except Exception:
+                                            _thumb_path = None
+
+                                        # If no existing thumbnail, generate one via ffmpeg
+                                        if not _thumb_path:
+                                            _probe_meta, _thumb_path = await _probe_output_metadata(out)
+                                            if _thumb_path and os.path.exists(_thumb_path):
+                                                # ── T11: Pillow post-process ──
+                                                try:
+                                                    from PIL import Image as _PILImg
+                                                    _img = _PILImg.open(_thumb_path)
+                                                    _img.thumbnail((320, 320), _PILImg.Resampling.LANCZOS)
+                                                    _img.save(_thumb_path, "JPEG", quality=85, optimize=True)
+                                                except ImportError:
+                                                    pass  # Pillow not available; use ffmpeg output as-is
+                                                except Exception:
+                                                    pass  # Best-effort; keep original ffmpeg thumb
+
+                                                _thumb_s3_key = f"outputs/{job_id}/thumb.jpg"
+                                                try:
+                                                    await backend.upload_file(_thumb_path, _thumb_s3_key)
+                                                    _thumb_key = _thumb_s3_key
+                                                    mapping["thumb_key"] = _thumb_s3_key
+                                                    mapping["thumbnail"] = _thumb_s3_key
+                                                    logger.info(
+                                                        "Worker: uploaded thumbnail to S3: %s", _thumb_s3_key
+                                                    )
+                                                except Exception as _thumb_err:
+                                                    logger.warning(
+                                                        "Worker: failed to upload thumbnail to S3: %s", _thumb_err
+                                                    )
+
+                                            # ── T10: Store output ffprobe metadata in Redis for delivery ──
+                                            if _probe_meta:
+                                                if _probe_meta.get("duration"):
+                                                    mapping["output_duration"] = str(_probe_meta["duration"])
+                                                if _probe_meta.get("width"):
+                                                    mapping["output_width"] = str(_probe_meta["width"])
+                                                if _probe_meta.get("height"):
+                                                    mapping["output_height"] = str(_probe_meta["height"])
+                                                # Extended output metadata (bitrate, fps, codecs)
+                                                if _probe_meta.get("video_bitrate"):
+                                                    mapping["output_video_bitrate"] = str(_probe_meta["video_bitrate"])
+                                                if _probe_meta.get("fps"):
+                                                    mapping["output_fps"] = str(_probe_meta["fps"])
+                                                if _probe_meta.get("video_codec"):
+                                                    mapping["output_video_codec"] = _probe_meta["video_codec"]
+                                                if _probe_meta.get("audio_codec"):
+                                                    mapping["output_audio_codec"] = _probe_meta["audio_codec"]
+                                    except Exception as _thumb_gen_err:
+                                        logger.debug(
+                                            "Worker: thumbnail generation/upload failed: %s", _thumb_gen_err
+                                        )
+
                                     await r.hset(f"ffmpeg:job:{job_id}", mapping=mapping)
                                     upload_success = True
                                     await r.close()

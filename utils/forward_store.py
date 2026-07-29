@@ -53,11 +53,15 @@ def _publish_forward_notification(fid: str, extra: dict = None) -> None:
                 client = _redis.from_url(redis_url, decode_responses=True)
             else:
                 client = _redis.Redis(decode_responses=True)
-            with contextlib.suppress(Exception):
-                client.publish(forward_channel, json.dumps(payload))
-            if do_auto_fetch:
+            try:
                 with contextlib.suppress(Exception):
-                    client.publish(fetch_channel, json.dumps({"forward_hash": fid}))
+                    client.publish(forward_channel, json.dumps(payload))
+                if do_auto_fetch:
+                    with contextlib.suppress(Exception):
+                        client.publish(fetch_channel, json.dumps({"forward_hash": fid}))
+            finally:
+                with contextlib.suppress(Exception):
+                    client.close()
         except Exception:
             logger.debug("forward_store: Redis publish failed (inner)")
     except Exception:

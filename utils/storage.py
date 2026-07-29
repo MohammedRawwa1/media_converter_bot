@@ -64,6 +64,26 @@ class AsyncStorageBackend(ABC):
     async def exists(self, key: str) -> bool:
         """Return True if object `key` exists in storage, False otherwise."""
 
+    @abstractmethod
+    async def list_keys(self, prefix: str = "") -> list[dict[str, Any]]:
+        """List keys under a prefix, returning key name, last_modified, and size.
+
+        Each entry in the returned list is a dict with:
+            - "key": the full storage key
+            - "last_modified": a float UNIX timestamp (seconds since epoch)
+            - "size": file size in bytes
+        Returns an empty list when the prefix yields no objects or when the
+        backend does not support listing.
+        """
+
+    @abstractmethod
+    async def delete_keys(self, keys: list[str]) -> int:
+        """Bulk-delete the given keys. Returns the count of successfully deleted keys.
+
+        Backends that do not support bulk-delete may fall back to calling
+        `delete()` in a loop.  Returns 0 when no keys are provided.
+        """
+
 
 class LocalStorageBackend(AsyncStorageBackend):
     def __init__(self, base_path: str | None = None):
@@ -109,6 +129,46 @@ class LocalStorageBackend(AsyncStorageBackend):
             return os.path.exists(p)
         except Exception:
             return False
+
+    async def list_keys(self, prefix: str = "") -> list[dict[str, Any]]:
+        """List local files under a prefix directory.
+
+        The prefix is treated as a relative directory path.  Returns an
+        empty dict if the directory does not exist.
+        """
+        base = self._abs_path(prefix)
+        if not os.path.isdir(base):
+            return []
+        results: list[dict[str, Any]] = []
+        try:
+            for entry in os.scandir(base):
+                if entry.is_file():
+                    st = entry.stat()
+                    results.append(
+                        {
+                            "key": os.path.join(prefix, entry.name).replace("\\", "/"),
+                            "last_modified": st.st_mtime,
+                            "size": st.st_size,
+                        }
+                    )
+        except Exception:
+            pass
+        return results
+
+    async def delete_keys(self, keys: list[str]) -> int:
+        """Delete multiple local files. Calls `asyncio.to_thread` for each."""
+        if not keys:
+            return 0
+        deleted = 0
+        for key in keys:
+            try:
+                p = self._abs_path(key)
+                if os.path.exists(p):
+                    await asyncio.to_thread(os.remove, p)
+                deleted += 1
+            except Exception:
+                pass
+        return deleted
 
 
 class S3AsyncBackend(AsyncStorageBackend):
@@ -474,6 +534,102 @@ class S3AsyncBackend(AsyncStorageBackend):
                 # Use deterministic jitter (based on attempt number) to avoid S311 insecure-random warning
                 _jitter = (attempt * 9973) % 1000 / 1000  # deterministic fractional jitter
                 await asyncio.sleep(backoff + _jitter)
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Bulk key listing & deletion (used by periodic S3 cleanup tasks)
+    # ─────────────────────────────────────────────────────────────────────────
+
+    async def list_keys(self, prefix: str = "") -> list[dict[str, Any]]:
+        """List S3 keys under *prefix*, with pagination.
+
+        Returns a list of dicts with keys:
+            - "key": the full S3 object key
+            - "last_modified": UNIX timestamp (float)
+            - "size": object size in bytes
+        """
+        keys: list[dict[str, Any]] = []
+        kwargs: dict[str, Any] = {"Bucket": self.bucket, "Prefix": prefix}
+
+        if self._use_aioboto3:
+            async with self._session.client("s3", **self._client_kwargs()) as client:
+                paginator = client.get_paginator("list_objects_v2")
+                async for page in paginator.paginate(**kwargs):
+                    for obj in page.get("Contents", []):
+                        keys.append(
+                            {
+                                "key": obj["Key"],
+                                "last_modified": obj["LastModified"].timestamp(),
+                                "size": obj["Size"],
+                            }
+                        )
+        else:
+            if boto3 is None:
+                raise RuntimeError("boto3 is required for S3 operations when aioboto3 is not installed")
+
+            def _sync_list():
+                client = boto3.client("s3", **self._client_kwargs())
+                paginator = client.get_paginator("list_objects_v2")
+                out: list[dict[str, Any]] = []
+                for page in paginator.paginate(**kwargs):
+                    for obj in page.get("Contents", []):
+                        out.append(
+                            {
+                                "key": obj["Key"],
+                                "last_modified": obj["LastModified"].timestamp(),
+                                "size": obj["Size"],
+                            }
+                        )
+                return out
+
+            keys = await asyncio.to_thread(_sync_list)
+
+        return keys
+
+    async def delete_keys(self, keys: list[str]) -> int:
+        """Bulk-delete S3 keys using delete_objects (batching up to 1000)."""
+        if not keys:
+            return 0
+
+        deleted = 0
+        batch_size = 1000
+
+        for i in range(0, len(keys), batch_size):
+            batch = keys[i : i + batch_size]
+            delete_dict = {"Objects": [{"Key": k} for k in batch]}
+
+            if self._use_aioboto3:
+                async with self._session.client("s3", **self._client_kwargs()) as client:
+                    resp = await client.delete_objects(Bucket=self.bucket, Delete=delete_dict)
+                    _batch_deleted = len(resp.get("Deleted", []))
+                    _errors = resp.get("Errors", [])
+                    if _errors:
+                        logger.warning(
+                            "S3 bulk delete: %d errors in batch: %s",
+                            len(_errors),
+                            _errors[:3],
+                        )
+                    deleted += _batch_deleted
+            else:
+                if boto3 is None:
+                    raise RuntimeError("boto3 is required for S3 operations when aioboto3 is not installed")
+
+                def _sync_delete(delete_dict=delete_dict):
+                    client = boto3.client("s3", **self._client_kwargs())
+                    resp = client.delete_objects(Bucket=self.bucket, Delete=delete_dict)
+                    _batch_del = len(resp.get("Deleted", []))
+                    _errs = resp.get("Errors", [])
+                    if _errs:
+                        logger.warning(
+                            "S3 bulk delete: %d errors in batch: %s",
+                            len(_errs),
+                            _errs[:3],
+                        )
+                    return _batch_del
+
+                deleted += await asyncio.to_thread(_sync_delete)
+
+        logger.info("S3 bulk delete: requested=%d succeeded=%d/%d", len(keys), deleted, len(keys))
+        return deleted
 
 
 _STORAGE_SINGLETON: AsyncStorageBackend | None = None

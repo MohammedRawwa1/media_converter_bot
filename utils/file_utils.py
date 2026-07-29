@@ -161,8 +161,7 @@ async def cleanup_directory(dir_path: str, recursive: bool = True) -> tuple[bool
 
             return deleted
 
-        loop = asyncio.get_event_loop()
-        files_deleted = await loop.run_in_executor(None, sync_cleanup)
+        files_deleted = await asyncio.get_running_loop().run_in_executor(None, sync_cleanup)
 
         logger.info(f"Cleaned up {files_deleted} files from {dir_path}")
         return True, files_deleted

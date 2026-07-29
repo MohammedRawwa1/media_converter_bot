@@ -903,9 +903,8 @@ def setup_handlers(application: Application) -> None:
             if client is not None:
                 try:
                     try:
-                        loop = asyncio.get_event_loop()
-                        if loop.is_running():
-                            asyncio.create_task(client.disconnect())
+                        asyncio.get_running_loop()  # throws RuntimeError if no loop running
+                        asyncio.create_task(client.disconnect())
                     except RuntimeError:
                         pass
                 except Exception:
@@ -1023,12 +1022,10 @@ def setup_handlers(application: Application) -> None:
                 client = context.user_data.get("login_client")
                 if client is not None:
                     try:
-                        try:
-                            loop = asyncio.get_event_loop()
-                            if loop.is_running():
-                                asyncio.create_task(client.disconnect())
-                        except RuntimeError:
-                            pass
+                        asyncio.get_running_loop()  # throws RuntimeError if no loop running
+                        asyncio.create_task(client.disconnect())
+                    except RuntimeError:
+                        pass
                     except Exception:
                         logger.debug("main: operation failed")
             except Exception:
@@ -1762,6 +1759,7 @@ async def main(background: bool = False) -> None:
     loop = asyncio.get_running_loop()
     shutdown_event = asyncio.Event()
 
+    # ── Signal handler helpers (named functions for strong refs) ──
     def _request_shutdown(sig_name: str = None):
         logger.info(f"Shutdown requested via signal: {sig_name}")
         try:
@@ -1770,14 +1768,22 @@ async def main(background: bool = False) -> None:
             # last-resort: set result via asyncio.ensure_future
             asyncio.ensure_future(shutdown_event.set())
 
+    def _on_sigint(s, f):
+        loop.call_soon_threadsafe(shutdown_event.set)
+
+    # SIGTERM uses the same handler as SIGINT (triggers graceful shutdown)
+    _on_sigterm = _on_sigint
+
     try:
         loop.add_signal_handler(signal.SIGINT, lambda: _request_shutdown("SIGINT"))
         loop.add_signal_handler(signal.SIGTERM, lambda: _request_shutdown("SIGTERM"))
-    except NotImplementedError:
-        # Fallback for Windows or event loops that don't support add_signal_handler
-        signal.signal(signal.SIGINT, lambda s, f: loop.call_soon_threadsafe(shutdown_event.set))
+    except (NotImplementedError, RuntimeError):
+        # Fallback for Windows, non-running loops, or event loops that don't
+        # support add_signal_handler (e.g. some ASGI startup sequences).
+        # CPython's signal.signal() keeps a strong reference to the handler.
+        signal.signal(signal.SIGINT, _on_sigint)
         with contextlib.suppress(Exception):
-            signal.signal(signal.SIGTERM, lambda s, f: loop.call_soon_threadsafe(shutdown_event.set))
+            signal.signal(signal.SIGTERM, _on_sigterm)
 
     try:
         # Start the bot with PTB v20+ proper async context
@@ -2148,7 +2154,18 @@ try:
     from fastapi.responses import FileResponse, Response
     from telegram import Update as TgUpdate
 
+    from web.ws_fastapi import sse_router as _sse_router
+    from web.ws_fastapi import start_ws_listener as _start_ws_listener
+    from web.ws_fastapi import stop_ws_listener as _stop_ws_listener
+
+    # WebSocket and SSE progress endpoints (same port as main app)
+    from web.ws_fastapi import ws_router as _ws_router
+
     app = FastAPI(title="Media Conversion Bot - PTB v20+")
+
+    app.include_router(_ws_router)
+    app.include_router(_sse_router)
+    logger.info("WebSocket /ws/{job_id} and SSE /events/{job_id} endpoints registered (same port)")
 
     # Mount legacy Flask-based web UI (if present) under '/flask' so the
     # web uploader and static UI remain available when running under ASGI/uvicorn.
@@ -2793,8 +2810,9 @@ try:
     @app.get("/events/{job_id}")
     async def events_sse(job_id: str):
         """Server-Sent Events endpoint streaming real-time conversion progress from Redis."""
-        from fastapi.responses import StreamingResponse
         import json as _rj
+
+        from fastapi.responses import StreamingResponse
 
         async def _event_gen():
             # 1) Emit initial job state from Redis
@@ -2802,8 +2820,10 @@ try:
                 from utils.job_queue import get_redis as _get_redis
                 _r = await _get_redis()
                 if _r:
-                    _data = await _r.hgetall(f"ffmpeg:job:{job_id}")
-                    await _r.close()
+                    try:
+                        _data = await _r.hgetall(f"ffmpeg:job:{job_id}")
+                    finally:
+                        await _r.close()
                     if _data:
                         _decoded = {
                             _k.decode() if isinstance(_k, bytes) else _k:
@@ -2831,7 +2851,7 @@ try:
                                     _d = _d.decode(errors="ignore")
                                 if _d:
                                     yield f"data: {_d}\n\n"
-                        except asyncio.TimeoutError:
+                        except TimeoutError:
                             yield ": keepalive\n\n"
                         except Exception:
                             break
@@ -3078,6 +3098,12 @@ try:
 
     @app.on_event("startup")
     async def _start_bot_background():
+        # Start WebSocket Redis listener (same-port WebSocket for progress)
+        try:
+            _start_ws_listener(app)
+        except Exception as _ws_e:
+            logger.warning("Could not start WebSocket listener: %s", _ws_e)
+
         # Launch main() as a background task so uvicorn also serves ASGI endpoints
         try:
             task = asyncio.create_task(main(background=True))
@@ -3215,6 +3241,12 @@ try:
 
     @app.on_event("shutdown")
     async def _stop_bot_background():
+        # Stop WebSocket Redis listener and close connections (same-port WS)
+        try:
+            await _stop_ws_listener(app)
+        except Exception as _ws_e:
+            logger.warning("Error stopping WebSocket listener: %s", _ws_e)
+
         # Cancel the background bot task if present
         try:
             task = getattr(app.state, "bot_task", None)
