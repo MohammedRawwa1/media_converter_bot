@@ -1258,12 +1258,13 @@ async def _download_and_ensure_path(client, msg, dest_path, progress_callback=No
             _dl_kwargs["progress"] = progress_callback
         _dl = await _download_media_with_retry(client, msg, **_dl_kwargs)
     except Exception as exc:
-        logger.warning(
-            "userbot: download_media_with_retry failed for %s: %s",
-            dest_path,
-            exc,
-        )
-        return False
+            logger.warning(
+                "userbot: download_media_with_retry failed for %s (absolute=%s): %s",
+                dest_path,
+                os.path.abspath(dest_path) if dest_path else dest_path,
+                exc,
+            )
+            return False
 
     logger.info(
         "userbot: download_media dest_path=%s returned=%s",
@@ -1596,7 +1597,12 @@ async def _download_with_pyrogram(
         try:
             os.makedirs(_dest_dir, exist_ok=True)
         except Exception as e:
-            logger.warning("userbot: could not create dest dir %s: %s", _dest_dir, e)
+            logger.warning(
+                "userbot: could not create dest dir %s (absolute=%s): %s",
+                _dest_dir,
+                os.path.abspath(_dest_dir),
+                e,
+            )
 
     try:
         await client.start()

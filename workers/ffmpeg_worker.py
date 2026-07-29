@@ -804,7 +804,7 @@ async def handle_job(job: dict):
         if orig:
             sanitized = await file_utils.sanitize_filename(orig)
             base, ext = os.path.splitext(sanitized)
-            out_ext = (
+            out_ext = job.get("output_ext") or (
                 ".mp4"
                 if (job.get("ffmpeg_args") or job.get("type") in ("ffmpeg", None, "generate_sample"))
                 else (ext or ".mp4")

@@ -42,7 +42,21 @@ except ImportError:
 try:
     import config
 except Exception:
-    config = None
+    import os as _cfg_os
+
+    class _FallbackConfig:
+        """Minimal config with absolute paths when config.py import fails."""
+        ROOT_DIR = _cfg_os.path.dirname(_cfg_os.path.abspath(__file__))
+        STORAGE_PATH = _cfg_os.getenv("STORAGE_PATH", _cfg_os.path.join(ROOT_DIR, "storage"))
+        INPUT_PATH = _cfg_os.path.join(STORAGE_PATH, "input")
+        OUTPUT_PATH = _cfg_os.path.join(STORAGE_PATH, "output")
+        TEMP_PATH = _cfg_os.path.join(STORAGE_PATH, "temp")
+        THUMBNAIL_PATH = _cfg_os.path.join(STORAGE_PATH, "thumbnails")
+        FFMPEG_PATH = _cfg_os.getenv("FFMPEG_PATH", "ffmpeg")
+        MAX_FILE_SIZE = 4 * 1024 ** 3
+        STORAGE_BACKEND = "local"
+
+    config = _FallbackConfig()
 
 # Import ACL helper
 try:
@@ -837,7 +851,7 @@ class EnhancedMediaHandler:
         else:
             ext = os.path.splitext(name)[1] or ""
 
-        input_dir = getattr(config, "INPUT_PATH", "storage/input")
+        input_dir = getattr(config, "INPUT_PATH", os.path.join(os.path.dirname(os.path.abspath(__file__)), "storage", "input"))
         with contextlib.suppress(OSError):
             os.makedirs(input_dir, exist_ok=True)
         file_path = os.path.join(input_dir, f"{user_id}_{file_id}{ext}")
@@ -1011,6 +1025,10 @@ class EnhancedMediaHandler:
                             file_unique_id=current_file.get("file_unique_id"),
                             user_id=user_id,
                             original_filename=current_file.get("name"),
+                            ffmpeg_args=current_file.get("_pipeline_ffmpeg_args"),
+                            conversion_type=current_file.get("_pipeline_conversion_type") or "ffmpeg",
+                            output_ext=current_file.get("_pipeline_output_ext"),
+                            caption=current_file.get("_pipeline_caption"),
                             progress_callback=_pipeline_progress_cb,
                         )
                         if _ingest.ok:
@@ -1427,7 +1445,7 @@ class EnhancedMediaHandler:
                 # Prepare local paths
                 jid = str(uuid.uuid4())
 
-                input_dir = getattr(config, "INPUT_PATH", "storage/input") if config else "storage/input"
+                input_dir = getattr(config, "INPUT_PATH", os.path.join(os.path.dirname(os.path.abspath(__file__)), "storage", "input"))
                 with contextlib.suppress(OSError):
                     os.makedirs(input_dir, exist_ok=True)
 
@@ -1593,7 +1611,7 @@ class EnhancedMediaHandler:
                 # If we successfully fetched locally, enqueue the job directly
                 if fetched:
                     job_id = str(uuid.uuid4())
-                    output_dir = getattr(config, "OUTPUT_PATH", "storage/output") if config else "storage/output"
+                    output_dir = getattr(config, "OUTPUT_PATH", os.path.join(os.path.dirname(os.path.abspath(__file__)), "storage", "output"))
                     with contextlib.suppress(OSError):
                         os.makedirs(output_dir, exist_ok=True)
                     base_name = os.path.splitext(metadata.get("name") or os.path.basename(input_path))[0]
@@ -1867,6 +1885,22 @@ class EnhancedMediaHandler:
 
         await self.safe_edit(query, f"🎬 Queuing conversion to {target_format.upper()}...")
 
+        # ── Store conversion metadata so the BigFilePipeline knows what to produce ──
+        _format_ffmpeg_args = {
+            "mp4": ["-c:v", "libx264", "-c:a", "aac", "-strict", "experimental"],
+            "mkv": ["-c:v", "libx264", "-c:a", "aac"],
+            "avi": ["-c:v", "libx264", "-c:a", "mp3"],
+            "mov": ["-c:v", "libx264", "-c:a", "aac"],
+            "webm": ["-c:v", "libvpx-vp9", "-c:a", "libvorbis"],
+            "flv": ["-c:v", "libx264", "-c:a", "aac"],
+            "m4v": ["-c:v", "libx264", "-c:a", "aac", "-strict", "experimental"],
+        }
+        current_file["_pipeline_ffmpeg_args"] = _format_ffmpeg_args.get(target_format)
+        current_file["_pipeline_output_ext"] = f".{target_format}"
+        current_file["_pipeline_conversion_type"] = "format_video"
+        current_file["_pipeline_caption"] = f"Conversion to {target_format.upper()} finished"
+        session["current_file"] = current_file
+
         # Ensure file is available locally (lazy-download)
         if not current_file.get("path") or not os.path.exists(current_file.get("path") or ""):
             try:
@@ -1885,7 +1919,7 @@ class EnhancedMediaHandler:
                     )
                     await self.safe_edit(
                         query,
-                        f"🎬 Large file routed to pipeline (Job: {_existing_id[:8]}...).",
+                        f"🎬 Large file routed to pipeline (Job: {_existing_id[:8]}...) converting to {target_format.upper()}.",
                         reply_markup=kb,
                     )
                     with contextlib.suppress(RuntimeError):
@@ -3695,6 +3729,13 @@ class EnhancedMediaHandler:
                 else:
                     await self.safe_edit(query, "❌ Conversion failed.")
 
+        # ── Store conversion metadata so the BigFilePipeline knows what to produce ──
+        current_file["_pipeline_ffmpeg_args"] = ["-vn", "-acodec", "libmp3lame", "-ab", "192k"]
+        current_file["_pipeline_output_ext"] = ".mp3"
+        current_file["_pipeline_conversion_type"] = "extract_audio"
+        current_file["_pipeline_caption"] = "✅ Audio extracted"
+        session["current_file"] = current_file
+
         # Ensure file downloaded before conversion (lazy-download)
         if not current_file.get("path") or not os.path.exists(current_file.get("path") or ""):
             try:
@@ -3703,6 +3744,24 @@ class EnhancedMediaHandler:
             except Exception as e:
                 await self.safe_edit(query, f"❌ Failed to download file: {e}")
                 return
+
+        # ── Check if BigFilePipeline already queued a job for this file ──
+        if current_file and current_file.get("_pipeline_job_id"):
+            _existing_id = current_file["_pipeline_job_id"]
+            logger.info(
+                "convert_to_mp3: pipeline job %s already queued for file %s; skipping duplicate",
+                _existing_id,
+                current_file.get("id"),
+            )
+            kb = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data=f"cancel_job:{_existing_id}")]])
+            await self.safe_edit(
+                query,
+                f"🎵 File already queued via pipeline (Job: {_existing_id[:8]}...). Extraction is underway.",
+                reply_markup=kb,
+            )
+            with contextlib.suppress(RuntimeError):
+                asyncio.create_task(self._watch_job_progress(query, _existing_id))
+            return
 
         await self._run_with_concurrency_limit(user_id, "mp3_conversion", do_conversion())
 
@@ -3789,6 +3848,14 @@ class EnhancedMediaHandler:
             else:
                 await self.safe_edit(query, "❌ Compression failed.")
 
+        # ── Store conversion metadata so the BigFilePipeline knows what to produce ──
+        _crf_value = int(crf) if isinstance(crf, str) and crf.isdigit() else 28
+        current_file["_pipeline_ffmpeg_args"] = ["-c:v", "libx264", "-preset", "medium", "-crf", str(_crf_value), "-c:a", "aac", "-b:a", "128k"]
+        current_file["_pipeline_output_ext"] = ".mp4"
+        current_file["_pipeline_conversion_type"] = "compress_video"
+        current_file["_pipeline_caption"] = f"✅ Compressed (CRF {crf})"
+        session["current_file"] = current_file
+
         # Ensure file downloaded before compression (lazy-download)
         if not current_file.get("path") or not os.path.exists(current_file.get("path") or ""):
             try:
@@ -3797,6 +3864,24 @@ class EnhancedMediaHandler:
             except Exception as e:
                 await self.safe_edit(query, f"❌ Failed to download file: {e}")
                 return
+
+        # ── Check if BigFilePipeline already queued a job for this file ──
+        if current_file and current_file.get("_pipeline_job_id"):
+            _existing_id = current_file["_pipeline_job_id"]
+            logger.info(
+                "compress_video: pipeline job %s already queued for file %s; skipping duplicate",
+                _existing_id,
+                current_file.get("id"),
+            )
+            kb = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data=f"cancel_job:{_existing_id}")]])
+            await self.safe_edit(
+                query,
+                f"📉 File already queued via pipeline (Job: {_existing_id[:8]}...). Compression is underway.",
+                reply_markup=kb,
+            )
+            with contextlib.suppress(RuntimeError):
+                asyncio.create_task(self._watch_job_progress(query, _existing_id))
+            return
 
         await self._run_with_concurrency_limit(user_id, "compression", do_compression())
 
@@ -4036,6 +4121,20 @@ class EnhancedMediaHandler:
             return
 
         encoder_preset, crf, bitrate = preset_map[preset]
+        # ── Store conversion metadata so the BigFilePipeline knows what to produce ──
+        current_file["_pipeline_ffmpeg_args"] = [
+            "-c:v", "libx264",
+            "-preset", encoder_preset,
+            "-crf", str(crf),
+            "-movflags", "+faststart",
+            "-c:a", "aac",
+            "-b:a", bitrate,
+        ]
+        current_file["_pipeline_output_ext"] = ".mp4"
+        current_file["_pipeline_conversion_type"] = "optimize_video"
+        current_file["_pipeline_caption"] = f"⚡ Optimized for {preset}"
+        session["current_file"] = current_file
+
         await self.safe_edit(query, f"⚡ Optimizing for {preset}...")
 
         # Ensure file downloaded (lazy-download)
@@ -4380,6 +4479,13 @@ class EnhancedMediaHandler:
         if not await self._check_conversion_quota(update, context):
             return
 
+        # ── Store conversion metadata so the BigFilePipeline knows what to produce ──
+        current_file["_pipeline_ffmpeg_args"] = None
+        current_file["_pipeline_output_ext"] = ".zip"
+        current_file["_pipeline_conversion_type"] = "extract_streams"
+        current_file["_pipeline_caption"] = "🎞️ Streams extracted"
+        session["current_file"] = current_file
+
         # Ensure file downloaded (lazy-download)
         if not current_file.get("path") or not os.path.exists(current_file.get("path") or ""):
             try:
@@ -4464,6 +4570,19 @@ class EnhancedMediaHandler:
         if not await self._check_conversion_quota(update, context):
             return
 
+        # ── Store conversion metadata so the BigFilePipeline knows what to produce ──
+        _format_ffmpeg_args = {
+            "mp3": ["-c:a", "libmp3lame", "-q:a", "2"],
+            "wav": ["-c:a", "pcm_s16le"],
+            "aac": ["-c:a", "aac", "-b:a", "128k"],
+            "opus": ["-c:a", "libopus", "-b:a", "96k"],
+        }
+        current_file["_pipeline_ffmpeg_args"] = _format_ffmpeg_args.get(format_type, ["-c:a", "copy"])
+        current_file["_pipeline_output_ext"] = f".{format_type}"
+        current_file["_pipeline_conversion_type"] = "format_audio"
+        current_file["_pipeline_caption"] = f"✅ Converted to {format_type.upper()}"
+        session["current_file"] = current_file
+
         await self.safe_edit(query, f"🔄 Converting to {format_type.upper()}...")
 
         # Ensure file downloaded (lazy-download)
@@ -4474,6 +4593,24 @@ class EnhancedMediaHandler:
             except Exception as e:
                 await self.safe_edit(query, f"❌ Failed to download file: {e}")
                 return
+
+        # ── Check if BigFilePipeline already queued a job for this file ──
+        if current_file and current_file.get("_pipeline_job_id"):
+            _existing_id = current_file["_pipeline_job_id"]
+            logger.info(
+                "convert_audio_format: pipeline job %s already queued for file %s; skipping duplicate",
+                _existing_id,
+                current_file.get("id"),
+            )
+            kb = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data=f"cancel_job:{_existing_id}")]])
+            await self.safe_edit(
+                query,
+                f"🔄 File already queued via pipeline (Job: {_existing_id[:8]}...). Conversion to {format_type.upper()} is underway.",
+                reply_markup=kb,
+            )
+            with contextlib.suppress(RuntimeError):
+                asyncio.create_task(self._watch_job_progress(query, _existing_id))
+            return
 
         output_base = getattr(config, "OUTPUT_PATH", "storage/output") if config else "storage/output"
         with contextlib.suppress(OSError):

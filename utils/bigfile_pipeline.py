@@ -29,6 +29,8 @@ import uuid
 from collections.abc import Callable
 from dataclasses import dataclass
 
+import config
+
 logger = logging.getLogger(__name__)
 
 # Default thresholds
@@ -94,6 +96,8 @@ class BigFilePipeline:
         original_filename: str | None = None,
         ffmpeg_args: list | None = None,
         conversion_type: str | None = None,
+        output_ext: str | None = None,
+        caption: str | None = None,
         progress_callback: Callable[[int, int], None] | None = None,
     ) -> IngestResult:
         """Download a large file via Pyrogram userbot, upload to S3, enqueue a processing job.
@@ -112,6 +116,8 @@ class BigFilePipeline:
             original_filename: Original filename if known.
             ffmpeg_args: Custom FFmpeg arguments for processing.
             conversion_type: Type of conversion (e.g., "ffmpeg", "compress", "to_mp3").
+            output_ext: Output file extension (e.g., ".mp4", ".mkv") when different from original.
+            caption: Caption text for the output message.
             progress_callback: Optional callable(current_bytes, total_bytes) for download progress.
 
         Returns:
@@ -246,6 +252,14 @@ class BigFilePipeline:
         try:
             from utils.job_queue import enqueue_job
 
+            # Determine output extension: prefer caller-supplied output_ext,
+            # otherwise fall back to original filename extension or .mp4
+            _out_ext = output_ext or ".mp4"
+            if not output_ext and original_filename:
+                _, _orig_ext = os.path.splitext(original_filename)
+                if _orig_ext:
+                    _out_ext = _orig_ext
+
             # Build the job payload
             job = {
                 "job_id": job_id,
@@ -265,8 +279,21 @@ class BigFilePipeline:
                 "type": conversion_type or "ffmpeg",
                 "created_at": time.time(),
             }
+            # Include conversion-specific metadata when provided by the caller
             if ffmpeg_args:
                 job["ffmpeg_args"] = ffmpeg_args
+            if caption:
+                job["caption"] = caption
+            # Include output_ext so the worker knows what format extension to use
+            job["output_ext"] = _out_ext
+
+            # For extract_streams, include output_dir and archive_path so the
+            # worker's extract_streams branch can place extracted files and create the zip.
+            if conversion_type == "extract_streams":
+                _out_base = getattr(config, "OUTPUT_PATH", "storage/output")
+                _streams_dir = os.path.join(_out_base, f"{job_id}_streams")
+                job["output_dir"] = _streams_dir
+                job["archive_path"] = f"{_streams_dir}.zip"
 
             await enqueue_job(job)
             logger.info("BigFilePipeline: job %s enqueued (input_key=%s)", job_id, s3_key)
