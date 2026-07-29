@@ -924,8 +924,8 @@ class EnhancedMediaHandler:
         except Exception:
             pass
 
-    async def _cancel_auto_enqueue_job(self, session: dict, handler_name: str) -> bool:
-        """Cancel the generic auto-enqueued job (if any) so user's specific settings take effect.
+    async def _cancel_stale_pipeline_job(self, session: dict, handler_name: str) -> bool:
+        """Cancel any stale pipeline job that may have been started, so the user's specific settings take effect.
 
         Returns True if a job was cancelled, False otherwise.
         """
@@ -943,7 +943,7 @@ class EnhancedMediaHandler:
             try:
                 await _r_cancel.hset(f"ffmpeg:job:{_existing_id}", "cancel", "1")
                 logger.info(
-                    "%s: cancelled generic auto-enqueue job %s to apply specific settings",
+                    "%s: cancelled stale pipeline job %s to apply specific settings",
                     handler_name,
                     _existing_id,
                 )
@@ -951,7 +951,7 @@ class EnhancedMediaHandler:
                 with contextlib.suppress(Exception):
                     await _r_cancel.close()
         except Exception:
-            logger.debug("%s: failed to cancel auto-enqueue job %s", handler_name, _existing_id)
+            logger.debug("%s: failed to cancel stale pipeline job %s", handler_name, _existing_id)
 
         current_file.pop("_pipeline_job_id", None)
         session["current_file"] = current_file
@@ -1675,9 +1675,8 @@ class EnhancedMediaHandler:
             _input_key = f"inputs/{_job_id}/source{ext}"
             await _backend.upload_file(_temp_path, _input_key)
 
-            # ── Source metadata stored on current_file; enqueue_job in
-            #    _auto_enqueue_pipeline will write it to Redis in a single
-            #    atomic hset call — avoids a separate hset race here. ──
+            # ── Source metadata stored on current_file; the callback handler
+            #    will write it to Redis when the user picks an action. ──
 
             # Clean up temp file
             try:
@@ -2202,9 +2201,9 @@ class EnhancedMediaHandler:
         if not await self._check_conversion_quota(update, context):
             return
 
-        # ── Cancel generic auto-enqueued job so user's specific settings take effect ──
+        # ── Cancel any stale pipeline job so user's specific settings take effect ──
         if current_file.get("_pipeline_job_id"):
-            await self._cancel_auto_enqueue_job(session, "convert_video_format")
+            await self._cancel_stale_pipeline_job(session, "convert_video_format")
 
         await self.safe_edit(query, f"🎬 Queuing conversion to {target_format.upper()}...")
 
@@ -2231,7 +2230,7 @@ class EnhancedMediaHandler:
                 current_file = session.get("current_file")
                 # Re-check after download — cancel if pipeline queued during download
                 if current_file and current_file.get("_pipeline_job_id"):
-                    await self._cancel_auto_enqueue_job(session, "convert_video_format")
+                    await self._cancel_stale_pipeline_job(session, "convert_video_format")
             except Exception as e:
                 await self.safe_edit(query, f"❌ Failed to download file: {e}")
                 return
@@ -2575,171 +2574,6 @@ class EnhancedMediaHandler:
                 "Please send a video, audio, or document file. You can also paste one or more URLs (http/https) to enqueue conversions."
             )
 
-    async def _auto_enqueue_pipeline(
-        self,
-        update: Update,
-        context: ContextTypes.DEFAULT_TYPE,
-        session: dict,
-        file_type: str,
-        file_size: int,
-        file_ext: str = ".mp4",
-    ) -> bool:
-        """Auto-enqueue a file immediately after registration (T6 in diagram).
-
-        Flows through:
-          1. Call _ensure_current_file_downloaded() (triggers T3→T4→T5: Bot API download,
-             ffprobe source analysis, S3 upload with inputs/{job_id}/source.ext)
-          2. Build a processing job payload matching the BigFilePipeline format
-          3. Enqueue via enqueue_job() so the worker handles conversion
-          4. Show a progress message with Cancel button and start _watch_job_progress
-
-        Returns True if enqueued successfully, False on failure.
-        """
-        user_id = update.effective_user.id if update and update.effective_user else None
-        if not user_id:
-            return False
-
-        try:
-            # ── Step 1: Ensure file is downloaded → ffprobed → S3 uploaded ──
-            _progress_msg = await update.message.reply_text(
-                f"⬇️ Processing {file_type} ({file_size // (1024 * 1024)} MB)..."
-            )
-
-            await self._ensure_current_file_downloaded(update, context, session)
-            current_file = session.get("current_file")
-            if not current_file:
-                await _progress_msg.edit_text("❌ Session lost during download.")
-                return False
-
-            # ── Step 2: Check if S3 pipeline ran (got _source_job_id) or if
-            #    BigFilePipeline already queued a job (_pipeline_job_id) ──
-            _job_id = current_file.get("_source_job_id")
-            _input_key = current_file.get("input_key")
-            _pipeline_job_id = current_file.get("_pipeline_job_id")
-
-            if not _job_id or not _input_key:
-                if _pipeline_job_id:
-                    # BigFilePipeline already queued this job (file >20MB).
-                    # Start progress watcher on the existing job instead of
-                    # showing the fallback menu.
-                    logger.info(
-                        "Auto-enqueue: BigFilePipeline already queued job %s for user=%s; starting watcher",
-                        _pipeline_job_id,
-                        user_id,
-                    )
-                    asyncio.create_task(
-                        self._watch_job_progress(
-                            query=None,
-                            job_id=_pipeline_job_id,
-                            progress_msg=_progress_msg,
-                        )
-                    )
-                    return True
-
-                # Pipeline didn't run (local storage or error) — fall back to old inline flow
-                logger.info(
-                    "Auto-enqueue: S3 pipeline did not produce a job_id for user=%s file=%s; falling back",
-                    user_id,
-                    current_file.get("id"),
-                )
-                await _progress_msg.edit_text(
-                    f"✅ {file_type.capitalize()} registered!\nChoose an action:",
-                    reply_markup=MediaMenuBuilder.get_main_menu(file_type),
-                )
-                return False
-
-            # ── Step 3: Build job payload (mirrors BigFilePipeline format) ──
-            _source_meta = current_file.get("_source_metadata", {})
-            _out_ext = file_ext  # Preserve original extension by default
-            # For audio, use .mp3; for video, keep .mp4 or original
-            if file_type == "audio":
-                _out_ext = ".mp3"
-            elif file_type == "video":
-                _out_ext = ".mp4"
-
-            job = {
-                "job_id": _job_id,
-                "input_key": _input_key,
-                "input_path": None,  # Always S3 in this path
-                "chat_id": user_id,
-                "user_id": user_id,
-                "message_id": current_file.get("msg_id"),
-                "original_filename": current_file.get("name", f"file_{_job_id}{file_ext}"),
-                "file_unique_id": current_file.get("file_unique_id", ""),
-                "file_size": current_file.get("size", 0),
-                "progress_channel": f"ffmpeg:progress:{_job_id}",
-                "cleanup_input": True,
-                "type": "ffmpeg",
-                "output_ext": _out_ext,
-                "created_at": time.time(),
-            }
-
-            await enqueue_job(job)
-
-            # ── Step 4a: Write source metadata to Redis hash in a single
-            #    atomic hset call AFTER enqueue_job (no write-ordering race).
-            #    hset is additive — enqueue_job's mapping (status, progress, …)
-            #    and these metadata fields coexist in the same hash. ──
-            if _source_meta:
-                _source_meta_fields = {
-                    "source_duration": str(_source_meta.get("duration", "")),
-                    "source_fps": str(_source_meta.get("fps", "")),
-                    "source_video_codec": str(_source_meta.get("video_codec", "")),
-                    "source_audio_codec": str(_source_meta.get("audio_codec", "")),
-                    "source_width": str(_source_meta.get("width", "")),
-                    "source_height": str(_source_meta.get("height", "")),
-                    "source_video_bitrate": str(_source_meta.get("video_bitrate", "")),
-                    "source_audio_bitrate": str(_source_meta.get("audio_bitrate", "")),
-                    "source_rotation": str(_source_meta.get("rotation", "")),
-                    "source_creation_time": str(_source_meta.get("creation_time", "")),
-                    "source_language": str(_source_meta.get("language", "")),
-                    "source_chapters": str(_source_meta.get("chapters", 0)),
-                    "source_format": str(_source_meta.get("format_name", "")),
-                    "filename": current_file.get("name", ""),
-                }
-                try:
-                    from utils.job_queue import get_redis as _get_jq_redis
-
-                    _r = await _get_jq_redis()
-                    try:
-                        await _r.hset(f"ffmpeg:job:{_job_id}", mapping=_source_meta_fields)
-                    finally:
-                        await _r.close()
-                except Exception:
-                    logger.debug("Auto-enqueue: failed to store source metadata in Redis hash")
-            logger.info(
-                "Auto-enqueue: job %s queued for user=%s input_key=%s type=%s",
-                _job_id,
-                user_id,
-                _input_key,
-                job["type"],
-            )
-
-            # ── Step 5: Show progress message and start watcher ──
-            current_file["_pipeline_job_id"] = _job_id
-            session["current_file"] = current_file
-            with contextlib.suppress(Exception):
-                self._persist_session(user_id)
-
-            # Start background progress watcher
-            asyncio.create_task(
-                self._watch_job_progress(
-                    query=None,
-                    job_id=_job_id,
-                    progress_msg=_progress_msg,
-                )
-            )
-
-            return True
-
-        except Exception as e:
-            logger.exception("Auto-enqueue pipeline failed for user=%s: %s", user_id, e)
-            with contextlib.suppress(Exception):
-                await update.message.reply_text(
-                    f"❌ Auto-processing failed: {e}\nPlease try again with a conversion button."
-                )
-            return False
-
     async def handle_video(self, update: Update, context: ContextTypes.DEFAULT_TYPE, session: dict):
         """Handle incoming video files."""
         video = update.message.video
@@ -2825,21 +2659,11 @@ class EnhancedMediaHandler:
         # Log to MongoDB if needed
         await self.log_media_to_db(user_id, session["current_file"])
 
-        # ── T6: Auto-enqueue immediately via pipeline ──
-        _enqueued = await self._auto_enqueue_pipeline(
-            update,
-            context,
-            session,
-            file_type="video",
-            file_size=video.file_size,
-            file_ext=".mp4",
+        # ── Show action menu — let user choose what to do with the video ──
+        await update.message.reply_text(
+            f"✅ Video registered!\n📦 Size: {video.file_size // 1024 // 1024} MB\nChoose an action:",
+            reply_markup=MediaMenuBuilder.get_main_menu("video"),
         )
-        if not _enqueued:
-            # Fallback: show format menu for local-storage files or errors
-            await update.message.reply_text(
-                f"✅ Video registered!\n📦 Size: {video.file_size // 1024 // 1024} MB\nChoose an action:",
-                reply_markup=MediaMenuBuilder.get_main_menu("video"),
-            )
 
     async def handle_audio(self, update: Update, context: ContextTypes.DEFAULT_TYPE, session: dict):
         """Handle incoming audio files."""
@@ -2921,21 +2745,11 @@ class EnhancedMediaHandler:
             audio.file_size,
         )
 
-        # ── T6: Auto-enqueue immediately via pipeline ──
-        _enqueued = await self._auto_enqueue_pipeline(
-            update,
-            context,
-            session,
-            file_type="audio",
-            file_size=audio.file_size,
-            file_ext=".mp3",
+        # ── Show action menu — let user choose what to do with the audio ──
+        await update.message.reply_text(
+            f"✅ Audio registered!\n🎵 {audio.title or 'Unknown title'}\nChoose an action:",
+            reply_markup=MediaMenuBuilder.get_main_menu("audio"),
         )
-        if not _enqueued:
-            # Fallback: show format menu for local-storage files or errors
-            await update.message.reply_text(
-                f"✅ Audio registered!\n🎵 {audio.title or 'Unknown title'}\nChoose an action:",
-                reply_markup=MediaMenuBuilder.get_main_menu("audio"),
-            )
 
     async def handle_document(self, update: Update, context: ContextTypes.DEFAULT_TYPE, session: dict):
         """Handle document files (could be video/audio)."""
@@ -3100,22 +2914,11 @@ class EnhancedMediaHandler:
             document.file_size,
         )
 
-        # ── T6: Auto-enqueue immediately via pipeline ──
-        _ext = os.path.splitext(file_name)[1] or ".mp4"
-        _enqueued = await self._auto_enqueue_pipeline(
-            update,
-            context,
-            session,
-            file_type=file_type,
-            file_size=document.file_size or 0,
-            file_ext=_ext,
+        # ── Show action menu — let user choose what to do with the file ──
+        await update.message.reply_text(
+            f"✅ {file_type.capitalize()} registered!\n📁 {file_name}\nChoose an action:",
+            reply_markup=MediaMenuBuilder.get_main_menu(file_type),
         )
-        if not _enqueued:
-            # Fallback: show format menu for local-storage files or errors
-            await update.message.reply_text(
-                f"✅ {file_type.capitalize()} registered!\n📁 {file_name}\nChoose an action:",
-                reply_markup=MediaMenuBuilder.get_main_menu(file_type),
-            )
 
     async def _apply_fade(
         self,
@@ -4268,9 +4071,9 @@ class EnhancedMediaHandler:
                 await self.safe_edit(query, f"❌ Failed to download file: {e}")
                 return
 
-        # ── Cancel generic auto-enqueued job so user's specific settings take effect ──
+        # ── Cancel any stale pipeline job so user's specific settings take effect ──
         if current_file and current_file.get("_pipeline_job_id"):
-            await self._cancel_auto_enqueue_job(session, "convert_to_mp3")
+            await self._cancel_stale_pipeline_job(session, "convert_to_mp3")
 
         await self._run_with_concurrency_limit(user_id, "mp3_conversion", do_conversion())
 
@@ -4385,9 +4188,9 @@ class EnhancedMediaHandler:
                 await self.safe_edit(query, f"❌ Failed to download file: {e}")
                 return
 
-        # ── Cancel generic auto-enqueued job so user's specific settings take effect ──
+        # ── Cancel any stale pipeline job so user's specific settings take effect ──
         if current_file and current_file.get("_pipeline_job_id"):
-            await self._cancel_auto_enqueue_job(session, "compress_video")
+            await self._cancel_stale_pipeline_job(session, "compress_video")
 
         await self._run_with_concurrency_limit(user_id, "compression", do_compression())
 
@@ -4658,9 +4461,9 @@ class EnhancedMediaHandler:
                 await self.safe_edit(query, f"❌ Failed to download file: {e}")
                 return
 
-        # ── Cancel generic auto-enqueued job so user's specific settings take effect ──
+        # ── Cancel any stale pipeline job so user's specific settings take effect ──
         if current_file and current_file.get("_pipeline_job_id"):
-            await self._cancel_auto_enqueue_job(session, "optimize_video")
+            await self._cancel_stale_pipeline_job(session, "optimize_video")
 
         output_dir = getattr(config, "OUTPUT_PATH", "storage/output") if config else "storage/output"
         with contextlib.suppress(OSError):
@@ -4761,9 +4564,9 @@ class EnhancedMediaHandler:
                 await self.safe_edit(query, f"❌ Failed to download file: {e}")
                 return
 
-        # ── Cancel generic auto-enqueued job so user's specific settings take effect ──
+        # ── Cancel any stale pipeline job so user's specific settings take effect ──
         if current_file and current_file.get("_pipeline_job_id"):
-            await self._cancel_auto_enqueue_job(session, "repair_video")
+            await self._cancel_stale_pipeline_job(session, "repair_video")
 
         # enqueue repair job
         job_id = str(uuid.uuid4())
@@ -4979,9 +4782,9 @@ class EnhancedMediaHandler:
                 await self.safe_edit(query, f"❌ Failed to download file: {e}")
                 return
 
-        # ── Cancel generic auto-enqueued job so user's specific settings take effect ──
+        # ── Cancel any stale pipeline job so user's specific settings take effect ──
         if current_file and current_file.get("_pipeline_job_id"):
-            await self._cancel_auto_enqueue_job(session, "extract_streams")
+            await self._cancel_stale_pipeline_job(session, "extract_streams")
 
         await self.safe_edit(query, "🎞️ Extracting streams...")
 
@@ -5064,9 +4867,9 @@ class EnhancedMediaHandler:
                 await self.safe_edit(query, f"❌ Failed to download file: {e}")
                 return
 
-        # ── Cancel generic auto-enqueued job so user's specific settings take effect ──
+        # ── Cancel any stale pipeline job so user's specific settings take effect ──
         if current_file and current_file.get("_pipeline_job_id"):
-            await self._cancel_auto_enqueue_job(session, "convert_audio_format")
+            await self._cancel_stale_pipeline_job(session, "convert_audio_format")
 
         output_base = getattr(config, "OUTPUT_PATH", "storage/output") if config else "storage/output"
         with contextlib.suppress(OSError):
