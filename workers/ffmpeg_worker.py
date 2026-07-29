@@ -1391,9 +1391,10 @@ async def handle_job(job: dict):
                                     _up_cb = _make_upload_progress_callback(job_id, progress_channel)
                                     _relay_chat = config.RELAY_CHAT_ID
                                     if _relay_chat and bot_token:
-                                        # ── Relay+copy: Telethon uploads to relay, then Bot API delivers to
-                                        #    user's DM via sendVideo(file_id, supports_streaming=True).
-                                        #    Final message appears from the bot with full timestamps. ──
+                                        # ── Relay+copy: Telethon uploads to relay, then Bot API copy_message delivers
+                                        #    to user's DM with full metadata preserved (duration, dimensions,
+                                        #    thumbnail). The final message appears from the bot with full playback
+                                        #    controls (timeline/timestamps). ──
                                         _relay_id = int(_relay_chat)
                                         _pre_vm, _pre_tp = await _probe_output_metadata(out)
                                         try:
@@ -1412,48 +1413,16 @@ async def handle_job(job: dict):
                                                     shutil.rmtree(os.path.dirname(_pre_tp), ignore_errors=True)
                                         if relay_msg_id is not None:
                                             async with Bot(token=bot_token) as _bot:
-                                                # Forward within relay to extract video.file_id
-                                                # without flashing a "Forwarded from" message to the user.
-                                                # Then sendVideo directly with supports_streaming=True and all metadata.
-                                                _fwd = await _bot.forward_message(
-                                                    chat_id=_relay_id,
+                                                # Use copy_message to deliver with full metadata preserved.
+                                                # copy_message copies the video including all metadata/duration/
+                                                # dimensions/thumbnail from the relay group message to the user's DM.
+                                                await _bot.copy_message(
+                                                    chat_id=chat_id,
                                                     from_chat_id=_relay_id,
                                                     message_id=relay_msg_id,
+                                                    caption=caption or "",
                                                 )
-                                                if _fwd and _fwd.video:
-                                                    _file_id = _fwd.video.file_id
-                                                    with contextlib.suppress(Exception):
-                                                        await _bot.delete_message(
-                                                            chat_id=_relay_id,
-                                                            message_id=_fwd.message_id,
-                                                        )
-                                                    _send_kwargs = {
-                                                        "chat_id": chat_id,
-                                                        "video": _file_id,
-                                                        "caption": caption or "",
-                                                        "supports_streaming": True,
-                                                    }
-                                                    if _pre_vm and _pre_vm.get("duration"):
-                                                        _send_kwargs["duration"] = _pre_vm["duration"]
-                                                    if _pre_vm and _pre_vm.get("width"):
-                                                        _send_kwargs["width"] = _pre_vm["width"]
-                                                    if _pre_vm and _pre_vm.get("height"):
-                                                        _send_kwargs["height"] = _pre_vm["height"]
-                                                    if _pre_tp and os.path.exists(_pre_tp):
-                                                        with open(_pre_tp, "rb") as _tf:
-                                                            _send_kwargs["thumbnail"] = _tf
-                                                            await _bot.send_video(**_send_kwargs)
-                                                    else:
-                                                        await _bot.send_video(**_send_kwargs)
-                                                else:
-                                                    # Fallback: copy_message if forward didn't yield a video
-                                                    await _bot.copy_message(
-                                                        chat_id=chat_id,
-                                                        from_chat_id=_relay_id,
-                                                        message_id=relay_msg_id,
-                                                        caption=caption,
-                                                    )
-                                                # Delete relay message only after successful delivery
+                                                # Delete relay message after successful delivery
                                                 with contextlib.suppress(Exception):
                                                     await _bot.delete_message(
                                                         chat_id=_relay_id,
@@ -1836,7 +1805,7 @@ async def handle_job(job: dict):
                                     _up_cb = _make_upload_progress_callback(job_id, progress_channel)
                                     _relay_chat = config.RELAY_CHAT_ID
                                     if _relay_chat and bot_token:
-                                        # ── Relay+copy (fallback) ──
+                                        # ── Relay+copy (fallback): copy_message delivers with full metadata ──
                                         _relay_id = int(_relay_chat)
                                         _pre_vm, _pre_tp = await _probe_output_metadata(out)
                                         try:
@@ -1855,48 +1824,14 @@ async def handle_job(job: dict):
                                                     shutil.rmtree(os.path.dirname(_pre_tp), ignore_errors=True)
                                         if relay_msg_id is not None:
                                             async with Bot(token=bot_token) as _bot:
-                                                # Forward within relay to extract video.file_id
-                                                # without flashing a "Forwarded from" message to the user.
-                                                # Then sendVideo directly with supports_streaming=True and all metadata.
-                                                _fwd = await _bot.forward_message(
-                                                    chat_id=_relay_id,
+                                                # Use copy_message to deliver with full metadata preserved.
+                                                await _bot.copy_message(
+                                                    chat_id=chat_id,
                                                     from_chat_id=_relay_id,
                                                     message_id=relay_msg_id,
+                                                    caption=caption or "",
                                                 )
-                                                if _fwd and _fwd.video:
-                                                    _file_id = _fwd.video.file_id
-                                                    with contextlib.suppress(Exception):
-                                                        await _bot.delete_message(
-                                                            chat_id=_relay_id,
-                                                            message_id=_fwd.message_id,
-                                                        )
-                                                    _send_kwargs = {
-                                                        "chat_id": chat_id,
-                                                        "video": _file_id,
-                                                        "caption": caption or "",
-                                                        "supports_streaming": True,
-                                                    }
-                                                    if _pre_vm and _pre_vm.get("duration"):
-                                                        _send_kwargs["duration"] = _pre_vm["duration"]
-                                                    if _pre_vm and _pre_vm.get("width"):
-                                                        _send_kwargs["width"] = _pre_vm["width"]
-                                                    if _pre_vm and _pre_vm.get("height"):
-                                                        _send_kwargs["height"] = _pre_vm["height"]
-                                                    if _pre_tp and os.path.exists(_pre_tp):
-                                                        with open(_pre_tp, "rb") as _tf:
-                                                            _send_kwargs["thumbnail"] = _tf
-                                                            await _bot.send_video(**_send_kwargs)
-                                                    else:
-                                                        await _bot.send_video(**_send_kwargs)
-                                                else:
-                                                    # Fallback: copy_message if forward didn't yield a video
-                                                    await _bot.copy_message(
-                                                        chat_id=chat_id,
-                                                        from_chat_id=_relay_id,
-                                                        message_id=relay_msg_id,
-                                                        caption=caption,
-                                                    )
-                                                # Delete relay message only after successful delivery
+                                                # Delete relay message after successful delivery
                                                 with contextlib.suppress(Exception):
                                                     await _bot.delete_message(
                                                         chat_id=_relay_id,
