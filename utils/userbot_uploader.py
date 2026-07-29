@@ -39,17 +39,24 @@ async def _send_with_telethon(
     file_path: str,
     caption: str | None = None,
     progress_callback: Callable[[int, int], None] | None = None,
+    video_meta: dict | None = None,
+    thumb_path: str | None = None,
 ) -> int | None:
     """Send a file using Telethon.
 
-    Telethon auto-detects the file type and all metadata
-    (duration/width/height/thumbnail) — no explicit probing needed.
+    When ``video_meta`` is provided (e.g. from a pre-probe in the worker), the
+    internal ffprobe+thumbnail generation is skipped entirely and the supplied
+    metadata is used directly. This ensures the video always arrives with
+    duration/timestamps even if ffprobe would fail in an isolated environment.
 
     Args:
         chat_id: Target chat ID or username.
         file_path: Path to the file to send.
         caption: Optional caption text.
         progress_callback: Optional callable(sent_bytes, total_bytes) for upload progress.
+        video_meta: Pre-probed metadata dict with keys ``duration``, ``width``, ``height``.
+                    If provided, skips internal ffprobe.
+        thumb_path: Pre-generated thumbnail path. If provided, skips internal thumbnail generation.
 
     Returns:
         The sent message ID on success, or None on failure.
@@ -59,38 +66,79 @@ async def _send_with_telethon(
 
     from utils.telethon_session import build_telethon_client, get_userbot_credentials, has_usable_telethon_session
 
+    # Fail fast if no usable Telethon session is available — avoids
+    # client.start() prompting for a phone number on stdin (EOFError).
     if not has_usable_telethon_session():
         logger.info("userbot: Telethon session not configured; skipping Telethon upload")
         return None
 
     api_id, api_hash = get_userbot_credentials()
 
+    # Pre-fetch video metadata and thumbnail before connecting.
+    # Gracefully fall back to a generic send if ffprobe isn't available.
+    # If video_meta/thumb_path were provided externally (pre-probed in the
+    # worker), skip the internal probe entirely.
+    _temp_cleanup = None
+    if video_meta is None:
+        try:
+            video_meta = await _probe_video_metadata(file_path) or {}
+        except Exception:
+            video_meta = {}
+    if thumb_path is None:
+        try:
+            thumb_path = await _generate_video_thumbnail(file_path)
+        except Exception:
+            thumb_path = None
+    if thumb_path:
+        _temp_cleanup = os.path.dirname(thumb_path)
+
     client = build_telethon_client(api_id, api_hash)
     try:
-
+        # Pass a phone callback that raises instead of prompting stdin.
         async def _no_phone():
             raise RuntimeError("Telethon phone prompt unexpectedly triggered")
 
         await client.start(phone=_no_phone)
         target = await _normalize_target(chat_id, client)
 
-        # Telethon auto-detects file type and all metadata (duration, width,
-        # height, thumbnail) — no explicit probe or kwargs needed.
-        kwargs: dict = {"file": file_path, "caption": caption or "", "supports_streaming": True}
-        if progress_callback is not None:
-            kwargs["progress_callback"] = progress_callback
-        msg = await client.send_file(target, **kwargs)
-        logger.info(
-            "userbot: Telethon sent file %s to %s (msg_id=%s)",
-            file_path,
-            target,
-            getattr(msg, "id", None),
-        )
+        # If we detected video metadata, send as video with full metadata
+        if video_meta.get("duration"):
+            kwargs = {
+                "caption": caption or "",
+                "supports_streaming": True,
+                "duration": video_meta.get("duration"),
+                "width": video_meta.get("width", 0),
+                "height": video_meta.get("height", 0),
+            }
+            if thumb_path is not None:
+                kwargs["thumb"] = thumb_path
+            if progress_callback is not None:
+                kwargs["progress_callback"] = progress_callback
+            msg = await client.send_file(target, file_path, **kwargs)
+            logger.info(
+                "userbot: Telethon sent video %s to %s (meta=%s, thumb=%s, msg_id=%s)",
+                file_path,
+                target,
+                video_meta,
+                bool(thumb_path),
+                getattr(msg, "id", None),
+            )
+        else:
+            # Fallback: generic file send
+            kwargs = {"file": file_path, "caption": caption}
+            if progress_callback is not None:
+                kwargs["progress_callback"] = progress_callback
+            msg = await client.send_file(target, **kwargs)
+            logger.info("userbot: Telethon sent file %s to %s (msg_id=%s)", file_path, target, getattr(msg, "id", None))
         return getattr(msg, "id", None)
     except Exception:
         logger.exception("userbot: Telethon failed to send file %s", file_path)
         return None
     finally:
+        # Clean up temp thumbnail directory
+        if _temp_cleanup:
+            with contextlib.suppress(Exception):
+                shutil.rmtree(_temp_cleanup, ignore_errors=True)
         with contextlib.suppress(Exception):
             await client.disconnect()
 
@@ -182,12 +230,18 @@ async def _send_with_pyrogram(
     file_path: str,
     caption: str | None = None,
     progress_callback: Callable[[int, int], None] | None = None,
+    video_meta: dict | None = None,
+    thumb_path: str | None = None,
 ) -> int | None:
     """Send a file using Pyrogram (session string fallback).
 
     Probes the video for duration / dimensions and extracts a thumbnail
-    frame so the resulting Telegram message shows proper metadata
-    (duration/width/height/thumbnail).
+    frame so the resulting Telegram message shows proper metadata instead
+    of a "violet" unknown-video placeholder.
+
+    When ``video_meta`` is provided (e.g. from a pre-probe in the worker),
+    the internal ffprobe+thumbnail generation is skipped and the supplied
+    metadata is used directly.
 
     Args:
         chat_id: Target chat ID or username.
@@ -195,6 +249,8 @@ async def _send_with_pyrogram(
         caption: Optional caption text.
         progress_callback: Optional callable(current, total) for upload progress.
                            Pyrogram progress callback is synchronous.
+        video_meta: Pre-probed metadata dict with keys ``duration``, ``width``, ``height``.
+        thumb_path: Pre-generated thumbnail path.
 
     Returns:
         The sent message ID on success, or None on failure.
@@ -210,14 +266,19 @@ async def _send_with_pyrogram(
     if client is None:
         return None
 
-    # Probe metadata and generate thumbnail before connecting.
+    # Pre-fetch video metadata and thumbnail before connecting to Telegram.
+    # If video_meta/thumb_path were provided externally, skip internal probe.
     _temp_cleanup = None
-    video_meta = {}
-    with contextlib.suppress(Exception):
-        video_meta = await _probe_video_metadata(file_path) or {}
-    thumb_path = None
-    with contextlib.suppress(Exception):
-        thumb_path = await _generate_video_thumbnail(file_path)
+    if video_meta is None:
+        try:
+            video_meta = await _probe_video_metadata(file_path) or {}
+        except Exception:
+            video_meta = {}
+    if thumb_path is None:
+        try:
+            thumb_path = await _generate_video_thumbnail(file_path)
+        except Exception:
+            thumb_path = None
     if thumb_path:
         _temp_cleanup = os.path.dirname(thumb_path)
 
@@ -231,6 +292,7 @@ async def _send_with_pyrogram(
         if progress_callback is not None:
             kwargs["progress"] = progress_callback
 
+        # Pass probed metadata so Telegram displays proper video info
         if "duration" in video_meta:
             kwargs["duration"] = video_meta["duration"]
         if "width" in video_meta:
@@ -254,6 +316,7 @@ async def _send_with_pyrogram(
         logger.exception("userbot: Pyrogram failed to send file %s", file_path)
         return None
     finally:
+        # Clean up temp thumbnail directory
         if _temp_cleanup:
             with contextlib.suppress(Exception):
                 shutil.rmtree(_temp_cleanup, ignore_errors=True)
@@ -266,6 +329,8 @@ async def send_file_via_userbot(
     file_path: str,
     caption: str | None = None,
     progress_callback: Callable[[int, int], None] | None = None,
+    video_meta: dict | None = None,
+    thumb_path: str | None = None,
 ) -> int | None:
     """Send a file using a user account.
 
@@ -273,8 +338,10 @@ async def send_file_via_userbot(
     Pyrogram if a session string is configured. Fails fast without connecting
     to Telegram when no session is configured.
 
-    Telethon auto-detects file type and all metadata (duration/width/height/
-    thumbnail) — no explicit probing needed. Pyrogram uses internal ffprobe.
+    When ``video_meta`` is provided (e.g. pre-probed in the worker), the
+    internal ffprobe is skipped and the supplied metadata is used, ensuring
+    the video always arrives with duration/timestamps even if ffprobe would
+    fail in an isolated environment.
 
     Args:
         chat_id: Target chat ID or username.
@@ -282,6 +349,8 @@ async def send_file_via_userbot(
         caption: Optional caption text.
         progress_callback: Optional callable(sent_bytes, total_bytes) for upload progress.
                            Both Telethon and Pyrogram callbacks follow this signature.
+        video_meta: Pre-probed metadata dict with keys ``duration``, ``width``, ``height``.
+        thumb_path: Pre-generated thumbnail path.
 
     Returns:
         The sent message ID on success, or None on failure.
@@ -295,6 +364,7 @@ async def send_file_via_userbot(
 
     from utils.telethon_session import has_usable_telethon_session
 
+    # Try Telethon first only when a usable session exists.
     if TelegramClient is not None and has_usable_telethon_session():
         try:
             msg_id = await _send_with_telethon(
@@ -302,6 +372,8 @@ async def send_file_via_userbot(
                 file_path,
                 caption,
                 progress_callback=progress_callback,
+                video_meta=video_meta,
+                thumb_path=thumb_path,
             )
             if msg_id is not None:
                 return msg_id
@@ -311,12 +383,15 @@ async def send_file_via_userbot(
     elif TelegramClient is not None:
         logger.info("userbot: Telethon session not configured; skipping Telethon upload")
 
+    # Fall back to Pyrogram (requires PYROGRAM_SESSION env var)
     if PyrogramClient is not None:
         msg_id = await _send_with_pyrogram(
             chat_id,
             file_path,
             caption,
             progress_callback=progress_callback,
+            video_meta=video_meta,
+            thumb_path=thumb_path,
         )
         if msg_id is not None:
             return msg_id
