@@ -76,6 +76,17 @@ PRESIGN_EXPIRES = int(os.getenv("PRESIGN_EXPIRES", "3600"))
 MAX_FILE_SIZE = int(os.getenv("MAX_FILE_SIZE", "4")) * 1024 * 1024 * 1024
 MAX_CONCURRENT_TASKS = int(os.getenv("MAX_CONCURRENT_TASKS", "5"))
 
+# Maximum file size (in MB) that the Telegram Bot API can handle.
+# Files larger than this go through the BigFilePipeline (Pyrogram -> S3 -> Worker).
+BOT_API_MAX_MB = int(os.getenv("BOT_API_MAX_MB", "50"))
+BOT_API_MAX_BYTES = BOT_API_MAX_MB * 1024 * 1024
+
+# Enable userbot (Pyrogram/Telethon) for large file downloads and uploads
+ENABLE_USERBOT = os.getenv("ENABLE_USERBOT", "").lower() in ("1", "true", "yes")
+
+# Enable sending presigned links instead of uploading files directly
+ENABLE_LINK_SEND = os.getenv("ENABLE_LINK_SEND", "").lower() in ("1", "true", "yes")
+
 # Telethon / Pyrogram userbot session string (alternative to /login flow)
 # Set PYROGRAM_SESSION to a Pyrogram session string to bypass the Telethon
 # login flow entirely. Generate one with: python scripts/create_pyrogram_session.py

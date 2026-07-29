@@ -10,6 +10,15 @@ from collections.abc import Callable
 from datetime import datetime
 
 try:
+    import config
+except Exception:
+
+    class _FallbackConfig:
+        RELAY_CHAT_ID = ""
+
+    config = _FallbackConfig()
+
+try:
     from telethon import TelegramClient
     from telethon.sessions import StringSession
 except Exception:  # pragma: no cover - optional dependency
@@ -1108,7 +1117,7 @@ async def _download_with_telethon(
             except Exception:
                 logger.debug("userbot: recent scan iteration failed for %s", target)
 
-        relay_chat_id = os.getenv("RELAY_CHAT_ID")
+        relay_chat_id = config.RELAY_CHAT_ID
         if relay_chat_id:
             logger.info(
                 "userbot: Telethon direct resolution failed; trying relay fallback for %s/%s",
@@ -1868,7 +1877,7 @@ async def _download_with_pyrogram(
             )
 
         _abs_dest = os.path.abspath(dest_path)
-        relay_chat_id = os.getenv("RELAY_CHAT_ID")
+        relay_chat_id = config.RELAY_CHAT_ID
         if not os.path.exists(_abs_dest) or os.path.getsize(_abs_dest) == 0:
             if relay_chat_id:
                 logger.info(

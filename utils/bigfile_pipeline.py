@@ -33,9 +33,9 @@ import config
 
 logger = logging.getLogger(__name__)
 
-# Default thresholds
-DEFAULT_BOT_API_MAX_MB = int(os.getenv("BOT_API_MAX_MB", "20"))
-DEFAULT_BOT_API_MAX_BYTES = DEFAULT_BOT_API_MAX_MB * 1024 * 1024
+# Default thresholds — use config.BOT_API_MAX_MB as the single source of truth.
+DEFAULT_BOT_API_MAX_MB = config.BOT_API_MAX_MB
+DEFAULT_BOT_API_MAX_BYTES = config.BOT_API_MAX_BYTES
 
 # Files up to this size (200MB) get streamed through memory instead of temp disk
 # Imports — all guarded for optional dependencies

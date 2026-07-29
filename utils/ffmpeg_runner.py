@@ -607,3 +607,113 @@ async def run_ffmpeg(
                     logger.debug("ffmpeg_runner: failed to close Redis client")
         except Exception:
             logger.debug("ffmpeg_runner: error in finally block for job %s", job_id)
+
+
+async def probe_video_for_delivery(file_path: str) -> tuple[dict | None, str | None]:
+    """Probe a video file for metadata and generate a thumbnail for Telegram delivery.
+
+    Shared utility used by both the bot handler (_send_video_result) and the
+    worker (_probe_output_metadata) to avoid duplicating ffprobe + ffmpeg
+    thumbnail logic.
+
+    Extracts ALL metadata in a single ffprobe call: dimensions, duration,
+    codec names, bitrates, and FPS — so callers don't need a second probe.
+
+    Returns:
+        Tuple of (video_meta dict or None, thumb_path str or None).
+        ``video_meta`` has keys ``duration`` (int), ``width`` (int), ``height`` (int),
+        plus optional ``video_codec``, ``video_bitrate``, ``fps``,
+        ``audio_codec``, ``audio_bitrate``.
+        ``thumb_path`` is a path to a JPEG thumbnail file (caller cleans up).
+    """
+    if not file_path or not os.path.exists(file_path):
+        return None, None
+
+    video_meta = None
+    thumb_path = None
+
+    # ── ffprobe: dimensions, duration, codec, bitrate, fps (single call) ──
+    ffprobe_bin = getattr(config, "FFMPEG_PATH", "ffmpeg").replace("ffmpeg", "ffprobe")
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            ffprobe_bin,
+            "-v",
+            "quiet",
+            "-print_format",
+            "json",
+            "-show_streams",
+            "-show_format",
+            file_path,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=15)
+        if proc.returncode == 0:
+            data = json.loads(stdout.decode() or "{}")
+            meta = {}
+            for s in data.get("streams", []):
+                if s.get("codec_type") == "video":
+                    if "width" in s:
+                        meta["width"] = s["width"]
+                    if "height" in s:
+                        meta["height"] = s["height"]
+                    if s.get("codec_name"):
+                        meta["video_codec"] = s["codec_name"]
+                    if s.get("bit_rate"):
+                        with contextlib.suppress(ValueError, TypeError):
+                            meta["video_bitrate"] = int(s["bit_rate"])
+                    if s.get("r_frame_rate"):
+                        try:
+                            _parts = str(s["r_frame_rate"]).split("/")
+                            if len(_parts) == 2 and int(_parts[1]) > 0:
+                                meta["fps"] = round(int(_parts[0]) / int(_parts[1]), 2)
+                        except (ValueError, ZeroDivisionError):
+                            pass
+                elif s.get("codec_type") == "audio":
+                    if s.get("codec_name"):
+                        meta["audio_codec"] = s["codec_name"]
+                    if s.get("bit_rate"):
+                        with contextlib.suppress(ValueError, TypeError):
+                            meta["audio_bitrate"] = int(s["bit_rate"])
+            fmt = data.get("format", {})
+            if fmt.get("duration"):
+                with contextlib.suppress(ValueError, TypeError):
+                    meta["duration"] = int(float(fmt["duration"]))
+            if meta:
+                video_meta = meta
+    except Exception:
+        logger.debug("probe_video_for_delivery: ffprobe failed for %s", file_path)
+
+    # ── ffmpeg thumbnail at 1s ──
+    import tempfile as _tf
+
+    _fd, _tp = _tf.mkstemp(suffix=".jpg", prefix="delivery_thumb_")
+    os.close(_fd)
+    ffmpeg_bin = getattr(config, "FFMPEG_PATH", "ffmpeg")
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            ffmpeg_bin,
+            "-y",
+            "-ss",
+            "00:00:01",
+            "-i",
+            file_path,
+            "-vframes",
+            "1",
+            "-q:v",
+            "2",
+            _tp,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        await asyncio.wait_for(proc.communicate(), timeout=30)
+        if proc.returncode == 0 and os.path.exists(_tp) and os.path.getsize(_tp) > 0:
+            thumb_path = _tp
+        else:
+            os.remove(_tp)
+    except Exception:
+        logger.debug("probe_video_for_delivery: thumbnail generation failed for %s", file_path)
+        with contextlib.suppress(Exception):
+            os.remove(_tp)
+
+    return video_meta, thumb_path

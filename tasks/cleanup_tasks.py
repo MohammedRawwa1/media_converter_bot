@@ -23,12 +23,23 @@ class CleanupManager:
         self.s3_input_ttl = int(os.getenv("S3_INPUT_TTL", str(24 * 3600)))
         self.s3_upload_ttl = int(os.getenv("S3_UPLOADS_TTL", str(24 * 3600)))
         self.s3_forward_ttl = int(os.getenv("S3_FORWARDS_TTL", str(48 * 3600)))
+        # Redis job hash cleanup interval (30 minutes)
+        self.redis_cleanup_interval = int(os.getenv("REDIS_CLEANUP_INTERVAL", str(30 * 60)))
+        # Stale Redis job hash max age (24 hours)
+        self.redis_job_max_age = int(os.getenv("REDIS_JOB_MAX_AGE", str(24 * 3600)))
         self.is_running = False
+        self._redis_cleanup_task = None
 
     async def start(self):
-        """Start periodic cleanup tasks."""
+        """Start periodic cleanup tasks (hourly file cleanup + 30-min Redis cleanup)."""
         self.is_running = True
-        logger.info("Cleanup manager started")
+        # Start the Redis cleanup loop as a separate background task
+        self._redis_cleanup_task = asyncio.create_task(self._redis_cleanup_loop())
+        logger.info(
+            "Cleanup manager started (file cleanup every %ds, Redis cleanup every %ds)",
+            self.cleanup_interval,
+            self.redis_cleanup_interval,
+        )
 
         while self.is_running:
             try:
@@ -41,6 +52,8 @@ class CleanupManager:
     def stop(self):
         """Stop cleanup tasks."""
         self.is_running = False
+        if self._redis_cleanup_task and not self._redis_cleanup_task.done():
+            self._redis_cleanup_task.cancel()
         logger.info("Cleanup manager stopped")
 
     async def cleanup_all(self) -> dict:
@@ -50,6 +63,8 @@ class CleanupManager:
             "output_files": await self.cleanup_output_files(),
             "temp_files": await self.cleanup_temp_files(),
             "thumbnails": await self.cleanup_thumbnails(),
+            "redis_jobs": await self.cleanup_stale_redis_jobs(),
+            "redis_dedup_keys": await self.cleanup_stale_dedup_keys(),
             "empty_dirs": await self.cleanup_empty_directories(),
             # ── S3 / R2 remote cleanup ──
             "s3_inputs": await self.cleanup_s3_inputs(),
@@ -165,11 +180,7 @@ class CleanupManager:
             backend = await get_storage_backend()
 
             # Only attempt S3 / R2 cleanup when the active backend is actually remote
-            _bn = (
-                config.get_storage_backend_name()
-                if config and hasattr(config, "get_storage_backend_name")
-                else (os.getenv("STORAGE_BACKEND") or "local").lower()
-            )
+            _bn = config.get_storage_backend_name() if config else (os.getenv("STORAGE_BACKEND") or "local").lower()
             if _bn not in ("s3", "r2"):
                 return 0
 
@@ -196,6 +207,262 @@ class CleanupManager:
         except Exception as e:
             logger.error("S3 cleanup failed for prefix=%s: %s", prefix, e)
             return 0
+
+    # ─────────────────────────────────────────────────────────────────────
+    # Redis job hash cleanup
+    # ─────────────────────────────────────────────────────────────────────
+
+    async def cleanup_stale_dedup_keys(self) -> int:
+        """Delete stale pipeline dedup keys (``ffmpeg:pipeline_dedup:*``).
+
+        A dedup key is stale if its value is "pending" (failed ingest) or
+        references a job that is no longer active (done/error/cancelled/missing).
+        Keys with an active job are preserved.
+
+        Returns the number of keys deleted.
+        """
+        try:
+            from utils.job_queue import get_redis
+
+            r = await get_redis()
+        except Exception as e:
+            logger.debug("redis_dedup_cleanup: cannot connect to Redis: %s", e)
+            return 0
+
+        deleted = 0
+        try:
+            cursor = 0
+            while True:
+                try:
+                    cursor, keys = await r.scan(cursor, match="ffmpeg:pipeline_dedup:*", count=100)
+                except Exception:
+                    break
+
+                for key in keys:
+                    try:
+                        key_str = key.decode() if isinstance(key, bytes) else key
+                        val = await r.get(key)
+                        if not val:
+                            # Already expired or empty — delete
+                            await r.delete(key)
+                            deleted += 1
+                            continue
+
+                        val_str = val.decode() if isinstance(val, bytes) else str(val)
+
+                        # "pending" placeholder from a failed ingest — stale
+                        if val_str == "pending":
+                            await r.delete(key)
+                            deleted += 1
+                            logger.debug("redis_dedup_cleanup: deleted pending key %s", key_str)
+                            continue
+
+                        # Check if the referenced job is still active
+                        job_hash = await r.hgetall(f"ffmpeg:job:{val_str}")
+                        if not job_hash:
+                            # Job hash doesn't exist — stale
+                            await r.delete(key)
+                            deleted += 1
+                            logger.debug("redis_dedup_cleanup: deleted orphaned key %s (job %s gone)", key_str, val_str)
+                            continue
+
+                        status = job_hash.get(b"status") or job_hash.get("status")
+                        if status:
+                            status = status.decode() if isinstance(status, bytes) else str(status)
+                        else:
+                            status = ""
+
+                        if status in ("done", "error", "cancelled", ""):
+                            await r.delete(key)
+                            deleted += 1
+                            logger.debug("redis_dedup_cleanup: deleted key %s (job %s status=%s)", key_str, val_str, status)
+
+                    except Exception as e:
+                        logger.debug("redis_dedup_cleanup: error processing key %s: %s", key, e)
+
+                if cursor == 0:
+                    break
+
+            if deleted > 0:
+                logger.info("redis_dedup_cleanup: deleted %d stale dedup keys", deleted)
+        except Exception as e:
+            logger.error("redis_dedup_cleanup: unexpected error: %s", e)
+        finally:
+            try:
+                aclose = getattr(r, "aclose", None)
+                if aclose is not None:
+                    await aclose()
+                else:
+                    await r.close()
+            except Exception:
+                pass
+
+        return deleted
+
+    async def cleanup_stale_redis_jobs(self) -> int:
+        """Delete Redis job hashes for completed/errored/cancelled jobs older than max age.
+
+        Scans all ``ffmpeg:job:*`` keys, checks their ``status`` and
+        ``finished_at`` (or ``started_at``) timestamp, and removes hashes
+        that are older than ``self.redis_job_max_age`` (default 24 hours).
+
+        Returns the number of hashes deleted.
+        """
+        try:
+            from utils.job_queue import get_redis
+
+            r = await get_redis()
+        except Exception as e:
+            logger.debug("redis_job_cleanup: cannot connect to Redis: %s", e)
+            return 0
+
+        deleted = 0
+        now = time.time()
+        try:
+            # Scan for all job hash keys
+            cursor = 0
+            while True:
+                try:
+                    cursor, keys = await r.scan(cursor, match="ffmpeg:job:*", count=100)
+                except Exception:
+                    break
+
+                for key in keys:
+                    try:
+                        key_str = key.decode() if isinstance(key, bytes) else key
+                        # Only delete job hashes (not dedup keys, progress keys, etc.)
+                        job_id = key_str.replace("ffmpeg:job:", "")
+                        if not job_id or len(job_id) < 8:
+                            continue
+
+                        data = await r.hgetall(key)
+                        if not data:
+                            # Empty hash — safe to delete
+                            await r.delete(key)
+                            deleted += 1
+                            continue
+
+                        status = data.get(b"status") or data.get("status")
+                        if status:
+                            status = status.decode() if isinstance(status, bytes) else str(status)
+                        else:
+                            status = ""
+
+                        # Only clean up terminal states
+                        if status not in ("done", "error", "cancelled"):
+                            continue
+
+                        # Check timestamp: prefer finished_at, fallback to started_at
+                        ts_raw = data.get(b"finished_at") or data.get("finished_at")
+                        if not ts_raw:
+                            ts_raw = data.get(b"started_at") or data.get("started_at")
+                        if not ts_raw:
+                            # No timestamp — if status is terminal, delete it
+                            await r.delete(key)
+                            deleted += 1
+                            continue
+
+                        try:
+                            ts = float(ts_raw.decode() if isinstance(ts_raw, bytes) else ts_raw)
+                        except (ValueError, TypeError):
+                            await r.delete(key)
+                            deleted += 1
+                            continue
+
+                        age = now - ts
+                        if age > self.redis_job_max_age:
+                            await r.delete(key)
+                            deleted += 1
+                            logger.debug(
+                                "redis_job_cleanup: deleted %s (status=%s, age=%.0fs)",
+                                key_str,
+                                status,
+                                age,
+                            )
+                    except Exception as e:
+                        logger.debug("redis_job_cleanup: error processing key %s: %s", key, e)
+
+                if cursor == 0:
+                    break
+
+            if deleted > 0:
+                logger.info(
+                    "redis_job_cleanup: deleted %d stale job hashes (max_age=%ds)",
+                    deleted,
+                    self.redis_job_max_age,
+                )
+        except Exception as e:
+            logger.error("redis_job_cleanup: unexpected error: %s", e)
+        finally:
+            try:
+                aclose = getattr(r, "aclose", None)
+                if aclose is not None:
+                    await aclose()
+                else:
+                    await r.close()
+            except Exception:
+                pass
+
+        return deleted
+
+    async def _redis_cleanup_loop(self):
+        """Periodic loop that runs Redis job hash cleanup every 30 minutes."""
+        # Wait a bit before first run to avoid startup thundering herd
+        await asyncio.sleep(60)
+        while self.is_running:
+            try:
+                deleted = await self.cleanup_stale_redis_jobs()
+                if deleted > 0:
+                    logger.info("Redis cleanup loop: removed %d stale job hashes", deleted)
+            except Exception as e:
+                logger.error("Redis cleanup loop error: %s", e)
+            await asyncio.sleep(self.redis_cleanup_interval)
+
+    async def startup_temp_cleanup(self, max_age: int = 1800) -> int:
+        """Clean stale temp files on startup (default: files older than 30 minutes).
+
+        This prevents stale files from previous runs (e.g. crashed workers) from
+        being picked up by the pipeline or consuming disk space.
+        """
+        temp_dir = getattr(config, "TEMP_PATH", "storage/temp") if config else "storage/temp"
+        if not os.path.exists(temp_dir):
+            logger.info("startup_temp_cleanup: temp dir %s does not exist; skipping", temp_dir)
+            return 0
+
+        current_time = time.time()
+        files_removed = 0
+        bytes_freed = 0
+
+        for item in os.listdir(temp_dir):
+            item_path = os.path.join(temp_dir, item)
+            if os.path.isfile(item_path):
+                try:
+                    file_age = current_time - os.path.getmtime(item_path)
+                    if file_age > max_age:
+                        file_size = os.path.getsize(item_path)
+                        os.remove(item_path)
+                        files_removed += 1
+                        bytes_freed += file_size
+                        logger.info(
+                            "startup_temp_cleanup: removed stale file %s (age=%.0fs, size=%dMB)",
+                            item,
+                            file_age,
+                            file_size // (1024 * 1024),
+                        )
+                except Exception as e:
+                    logger.warning("startup_temp_cleanup: failed to remove %s: %s", item_path, e)
+
+        if files_removed > 0:
+            logger.info(
+                "startup_temp_cleanup: removed %d stale files (%dMB freed) from %s",
+                files_removed,
+                bytes_freed // (1024 * 1024),
+                temp_dir,
+            )
+        else:
+            logger.info("startup_temp_cleanup: no stale files found in %s", temp_dir)
+
+        return files_removed
 
     async def force_cleanup(self, directory: str = None) -> int:
         """Force cleanup of specific directory or all."""

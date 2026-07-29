@@ -56,10 +56,15 @@ except Exception:
         FFMPEG_PATH = _cfg_os.getenv("FFMPEG_PATH", "ffmpeg")
         MAX_FILE_SIZE = 4 * 1024**3
         STORAGE_BACKEND = "local"
+        BOT_API_MAX_MB = 50
+        BOT_API_MAX_BYTES = BOT_API_MAX_MB * 1024 * 1024
+        ENABLE_USERBOT = _cfg_os.getenv("ENABLE_USERBOT", "").lower() in ("1", "true", "yes")
+        ENABLE_LINK_SEND = _cfg_os.getenv("ENABLE_LINK_SEND", "").lower() in ("1", "true", "yes")
+        RELAY_CHAT_ID = _cfg_os.getenv("RELAY_CHAT_ID", "")
 
         @staticmethod
         def get_storage_backend_name() -> str:
-            return (os.getenv("STORAGE_BACKEND") or "local").lower()
+            return (_cfg_os.getenv("STORAGE_BACKEND") or "local").lower()
 
     config = _FallbackConfig()
 
@@ -342,11 +347,33 @@ class EnhancedMediaHandler:
                 _pubsub_obj = None
                 logger.debug("_watch_job_progress: pubsub unavailable for %s, using polling", job_id)
 
+            _last_edit_time = [0.0]
+            _min_edit_interval = 2.0  # Minimum seconds between Telegram edits
+
             async def _edit(text, **kwargs):
-                """Edit either progress_msg or the callback query message."""
+                """Edit either progress_msg or the callback query message.
+
+                Throttled to avoid hitting Telegram's429 rate limit.
+                Handles RetryAfter (429), BadRequest, and network errors.
+                """
+                from telegram.error import RetryAfter as _RetryAfter
+
+                now = time.time()
+                if (now - _last_edit_time[0]) < _min_edit_interval:
+                    return  # Skip this edit to avoid429
+                _last_edit_time[0] = now
                 if progress_msg:
-                    with contextlib.suppress(BadRequest):
+                    try:
                         await progress_msg.edit_text(text, **kwargs)
+                    except _RetryAfter as e:
+                        _wait = getattr(e, "retry_after", None) or 5
+                        logger.warning("_edit:429 on progress_msg, waiting %ss", _wait)
+                        await asyncio.sleep(_wait + 0.5)
+                        _last_edit_time[0] = time.time()  # reset throttle after wait
+                    except BadRequest:
+                        pass  # Message not modified etc.
+                    except Exception:
+                        logger.debug("_edit: progress_msg edit failed")
                 else:
                     await self.safe_edit(query, text, **kwargs)
 
@@ -451,7 +478,7 @@ class EnhancedMediaHandler:
                     display_output = output
                     try:
                         # Only generate and display a presigned URL if explicit link delivery is enabled.
-                        send_link = os.environ.get("ENABLE_LINK_SEND", "").lower() in ("1", "true", "yes")
+                        send_link = config.ENABLE_LINK_SEND
                         if send_link and not (str(output).startswith("http://") or str(output).startswith("https://")):
                             try:
                                 from utils.storage import get_storage_backend
@@ -736,46 +763,73 @@ class EnhancedMediaHandler:
         return self.active_conversions.copy()
 
     async def safe_edit(self, query, text, **kwargs):
-        """Safely edit a callback-query message, ignoring 'Message is not modified'.
+        """Safely edit a callback-query message, ignoring 'Message is not modified'
+        and handling Telegram429 rate limits with exponential backoff.
 
         Returns the API result or None if the edit was a no-op.
         """
-        try:
-            return await query.edit_message_text(text, **kwargs)
-        except BadRequest as e:
-            msg = str(e)
-            # Log full BadRequest details for debugging
-            try:
-                msg_obj = getattr(query, "message", None)
-                chat_obj = getattr(msg_obj, "chat", None) if msg_obj else None
-                chat_id = getattr(chat_obj, "id", None) if chat_obj else None
+        from telegram.error import NetworkError, RetryAfter, TimedOut
 
-                await self._log_bad_callback(
-                    "BadRequest_edit",
-                    {
-                        "error": msg,
-                        "callback_data": getattr(query, "data", None),
-                    },
-                    getattr(getattr(query, "from_user", None), "id", None),
-                    chat_id,
-                    getattr(msg_obj, "message_id", None),
+        _max_retries = 3
+        for _attempt in range(_max_retries):
+            try:
+                return await query.edit_message_text(text, **kwargs)
+            except RetryAfter as e:
+                # Telegram429 — respect the retry-after delay
+                _wait = getattr(e, "retry_after", None) or 5
+                logger.warning(
+                    "safe_edit: Telegram rate limit (429), waiting %ss before retry (attempt %d/%d)",
+                    _wait,
+                    _attempt + 1,
+                    _max_retries,
                 )
-            except Exception:
-                logger.exception("Failed to log BadRequest in safe_edit")
+                await asyncio.sleep(_wait + 0.5)  # small buffer
+                continue
+            except BadRequest as e:
+                msg = str(e)
+                # Log full BadRequest details for debugging
+                try:
+                    msg_obj = getattr(query, "message", None)
+                    chat_obj = getattr(msg_obj, "chat", None) if msg_obj else None
+                    chat_id = getattr(chat_obj, "id", None) if chat_obj else None
 
-            if "Message is not modified" in msg or "specified new message content" in msg:
-                logger.debug("Ignored MessageNotModified error during edit")
-                return None
+                    await self._log_bad_callback(
+                        "BadRequest_edit",
+                        {
+                            "error": msg,
+                            "callback_data": getattr(query, "data", None),
+                        },
+                        getattr(getattr(query, "from_user", None), "id", None),
+                        chat_id,
+                        getattr(msg_obj, "message_id", None),
+                    )
+                except Exception:
+                    logger.exception("Failed to log BadRequest in safe_edit")
 
-            # Fall back to sending a new message if editing fails for other reasons
-            try:
-                if getattr(query, "message", None):
-                    return await query.message.reply_text(text, **kwargs)
-            except Exception:
-                logger.exception("Fallback reply_text failed after edit BadRequest")
+                if "Message is not modified" in msg or "specified new message content" in msg:
+                    logger.debug("Ignored MessageNotModified error during edit")
+                    return None
 
-            # If fallback not possible, re-raise the original exception
-            raise
+                # Fall back to sending a new message if editing fails for other reasons
+                try:
+                    if getattr(query, "message", None):
+                        return await query.message.reply_text(text, **kwargs)
+                except Exception:
+                    logger.exception("Fallback reply_text failed after edit BadRequest")
+
+                # If fallback not possible, re-raise the original exception
+                raise
+            except (TimedOut, NetworkError) as e:
+                if _attempt < _max_retries - 1:
+                    _wait = 2 ** (_attempt + 1)
+                    logger.warning("safe_edit: network error, retrying in %ss: %s", _wait, e)
+                    await asyncio.sleep(_wait)
+                    continue
+                raise
+
+        # All retries exhausted
+        logger.debug("safe_edit: all %d retries exhausted", _max_retries)
+        return None
 
     async def _require_callback(self, update) -> bool:
         """Ensure the update contains a callback_query. Return True if present."""
@@ -850,6 +904,26 @@ class EnhancedMediaHandler:
             logger.debug("Conversion quota check failed, allowing conversion")
         return True
 
+    async def _cleanup_dedup_key(self, dedup_key: str | None) -> None:
+        """Delete a pipeline dedup key from Redis (best-effort, fire-and-forget).
+
+        Used to clean up the "pending" placeholder when ingest fails so future
+        retries aren't blocked.
+        """
+        if not dedup_key:
+            return
+        try:
+            from utils.job_queue import get_redis as _get_dedup_redis
+
+            _r = await _get_dedup_redis()
+            try:
+                await _r.delete(dedup_key)
+            finally:
+                with contextlib.suppress(Exception):
+                    await _r.close()
+        except Exception:
+            pass
+
     async def _cancel_auto_enqueue_job(self, session: dict, handler_name: str) -> bool:
         """Cancel the generic auto-enqueued job (if any) so user's specific settings take effect.
 
@@ -894,81 +968,34 @@ class EnhancedMediaHandler:
     ) -> None:
         """Send a video file with probed metadata (duration, width, height, thumbnail).
 
-        Probes the file with ffprobe to extract video metadata, generates a
-        thumbnail if none provided, then calls send_video with all available
-        info so Telegram shows the video's duration, dimensions, and thumbnail.
+        Uses the shared ``probe_video_for_delivery`` utility to extract video
+        metadata and generate a thumbnail, then calls send_video with all
+        available info so Telegram shows the video's duration, dimensions,
+        and thumbnail.
         """
-        import json as _json
-        import subprocess as _sp
-        import tempfile as _tf
-
         _vid_duration = None
         _vid_width = None
         _vid_height = None
         _thumb_path = thumb_path
         _cleanup_thumb = False
 
-        # ── Probe video metadata with ffprobe ──
+        # ── Use shared probe+thumbnail utility ──
         try:
-            _ffprobe_bin = getattr(config, "FFMPEG_PATH", "ffmpeg").replace("ffmpeg", "ffprobe")
-            _p = await asyncio.to_thread(
-                lambda: _sp.run(  # noqa: S603
-                    [_ffprobe_bin, "-v", "quiet", "-print_format", "json", "-show_streams", "-show_format", file_path],
-                    capture_output=True,
-                    timeout=15,
-                )
-            )
-            if _p.returncode == 0:
-                _probe = _json.loads(_p.stdout.decode() or "{}")
-                _streams = _probe.get("streams", [])
-                for s in _streams:
-                    if s.get("codec_type") == "video":
-                        if "width" in s:
-                            _vid_width = s["width"]
-                        if "height" in s:
-                            _vid_height = s["height"]
-                        break
-                _fmt = _probe.get("format", {})
-                if _fmt.get("duration"):
-                    with contextlib.suppress(ValueError, TypeError):
-                        _vid_duration = int(float(_fmt["duration"]))
+            from utils.ffmpeg_runner import probe_video_for_delivery
+
+            _meta, _auto_thumb = await probe_video_for_delivery(file_path)
+            if _meta:
+                _vid_duration = _meta.get("duration")
+                _vid_width = _meta.get("width")
+                _vid_height = _meta.get("height")
+            if not _thumb_path and _auto_thumb and os.path.exists(_auto_thumb):
+                _thumb_path = _auto_thumb
+                _cleanup_thumb = True
+            elif _auto_thumb and os.path.exists(_auto_thumb):
+                with contextlib.suppress(Exception):
+                    os.remove(_auto_thumb)
         except Exception:
-            pass
-
-        # ── Auto-generate thumbnail if none provided ──
-        if not _thumb_path and os.path.exists(file_path):
-            try:
-                _tmpdir = _tf.mkdtemp(prefix="auto_thumb_")
-                _gen_thumb = os.path.join(_tmpdir, "thumb.jpg")
-                _ffmpeg_bin = getattr(config, "FFMPEG_PATH", "ffmpeg")
-                _tp = await asyncio.create_subprocess_exec(
-                    _ffmpeg_bin,
-                    "-y",
-                    "-ss",
-                    "00:00:01",
-                    "-i",
-                    file_path,
-                    "-vframes",
-                    "1",
-                    "-q:v",
-                    "2",
-                    _gen_thumb,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE,
-                )
-                await asyncio.wait_for(_tp.communicate(), timeout=30)
-                if _tp.returncode == 0 and os.path.exists(_gen_thumb) and os.path.getsize(_gen_thumb) > 0:
-                    _thumb_path = _gen_thumb
-                    _cleanup_thumb = True
-                else:
-                    try:
-                        import shutil as _shutil
-
-                        _shutil.rmtree(_tmpdir, ignore_errors=True)
-                    except Exception:
-                        pass
-            except Exception:
-                pass
+            logger.debug("handlers: probe_video_for_delivery failed")
 
         # ── Send with all available metadata ──
         try:
@@ -995,13 +1022,9 @@ class EnhancedMediaHandler:
                 else:
                     await bot.send_video(**_send_kwargs)
         finally:
-            if _cleanup_thumb and _thumb_path:
-                try:
-                    import shutil as _shutil
-
-                    _shutil.rmtree(os.path.dirname(_thumb_path), ignore_errors=True)
-                except Exception:
-                    pass
+            if _cleanup_thumb and _thumb_path and os.path.exists(_thumb_path):
+                with contextlib.suppress(Exception):
+                    os.remove(_thumb_path)
 
     async def _ensure_current_file_downloaded(self, update: Update, context: ContextTypes.DEFAULT_TYPE, session: dict):
         """Ensure the session's current_file is downloaded locally. Raises Exception on failure."""
@@ -1022,11 +1045,7 @@ class EnhancedMediaHandler:
             try:
                 from utils.storage import get_storage_backend as _gsb
 
-                _bn = (
-                    config.get_storage_backend_name()
-                    if hasattr(config, "get_storage_backend_name")
-                    else (os.getenv("STORAGE_BACKEND") or "local").lower()
-                )
+                _bn = config.get_storage_backend_name()
                 if _bn in ("s3", "r2") and _gsb is not None:
                     _backend_check = await _gsb()
                     _exists = await _backend_check.exists(input_key)
@@ -1103,7 +1122,7 @@ class EnhancedMediaHandler:
         # configured via env (`ENABLE_USERBOT` + API_ID/API_HASH).
         try:
             # -- Big files pipeline: route files > BOT_API_MAX_MB through Pyrogram->S3->Worker
-            bot_api_max_mb = int(os.environ.get("BOT_API_MAX_MB", "20"))
+            bot_api_max_mb = config.BOT_API_MAX_MB
             file_size = current_file.get("size") or 0
             if file_size and file_size > bot_api_max_mb * 1024 * 1024 and _bigfile_pipeline is not None:
                 _bot_chat, _bot_msg = _extract_large_file_source(current_file)
@@ -1116,6 +1135,10 @@ class EnhancedMediaHandler:
                     _file_uid = current_file.get("file_unique_id")
                     if user_id and _file_uid:
                         _dedup_key = f"ffmpeg:pipeline_dedup:{user_id}:{_file_uid}"
+                        # ── Atomic dedup: use SET NX to claim the dedup key.
+                        #    If the key already exists AND the job is active, skip.
+                        #    If the key exists but the job is stale, overwrite it.
+                        #    If the key doesn't exist, claim it atomically. ──
                         try:
                             from utils.job_queue import get_redis
 
@@ -1124,28 +1147,30 @@ class EnhancedMediaHandler:
                                 _already = await _r_dedup.get(_dedup_key)
                                 if _already:
                                     _stored_job_id = _already.decode() if isinstance(_already, bytes) else _already
-                                    # ── Active-job guard: only skip if the old job is still
-                                    #    actively processing.  After a redeploy the job hash
-                                    #    may be gone or the job already completed — in either
-                                    #    case clear the dedup flag and re-process so the user
-                                    #    actually gets the video, not a stale "done" message. ──
+                                    # ── Active-job guard: skip if the old job is still
+                                    #    actively processing or if another request is
+                                    #    currently claiming the key ("pending" placeholder). ──
                                     _active = False
-                                    try:
-                                        _old_hash = await _r_dedup.hgetall(f"ffmpeg:job:{_stored_job_id}")
-                                        if _old_hash:
-                                            _status = _old_hash.get(b"status") or _old_hash.get("status")
-                                            if _status:
-                                                _s = _status.decode() if isinstance(_status, bytes) else str(_status)
-                                                _active = _s in (
-                                                    "processing",
-                                                    "queued",
-                                                    "waiting",
-                                                    "started",
-                                                    "uploading",
-                                                    "sending",
-                                                )
-                                    except Exception:
-                                        _active = False
+                                    if _stored_job_id == "pending":
+                                        # Another concurrent request is mid-ingest — skip
+                                        _active = True
+                                    else:
+                                        try:
+                                            _old_hash = await _r_dedup.hgetall(f"ffmpeg:job:{_stored_job_id}")
+                                            if _old_hash:
+                                                _status = _old_hash.get(b"status") or _old_hash.get("status")
+                                                if _status:
+                                                    _s = _status.decode() if isinstance(_status, bytes) else str(_status)
+                                                    _active = _s in (
+                                                        "processing",
+                                                        "queued",
+                                                        "waiting",
+                                                        "started",
+                                                        "uploading",
+                                                        "sending",
+                                                    )
+                                        except Exception:
+                                            _active = False
 
                                     if _active:
                                         logger.info(
@@ -1170,6 +1195,22 @@ class EnhancedMediaHandler:
                                         )
                                         await _r_dedup.delete(_dedup_key)
                                         # Do NOT return — fall through to normal pipeline processing
+                                # ── Try to claim the dedup key atomically (SET NX). ──
+                                #    We'll set the value to a placeholder "pending" and
+                                #    overwrite it with the real job_id after ingest succeeds.
+                                #    If another concurrent call already claimed it, skip. ──
+                                _claimed = await _r_dedup.set(
+                                    _dedup_key, "pending", nx=True, ex=86400
+                                )
+                                if not _claimed:
+                                    # Another concurrent call claimed it — skip
+                                    logger.info(
+                                        "Pipeline dedup: concurrent claim for file %s by "
+                                        "another request; skipping for user %s",
+                                        _file_uid,
+                                        user_id,
+                                    )
+                                    return
                             finally:
                                 with contextlib.suppress(Exception):
                                     await _r_dedup.close()
@@ -1180,7 +1221,7 @@ class EnhancedMediaHandler:
                     #    forward the message there first so the userbot can download it.
                     _pipeline_chat = _bot_chat
                     _pipeline_msg = _bot_msg
-                    _relay_chat_id = os.environ.get("RELAY_CHAT_ID", "")
+                    _relay_chat_id = config.RELAY_CHAT_ID
                     if _relay_chat_id:
                         try:
                             _rid = int(_relay_chat_id)
@@ -1344,6 +1385,8 @@ class EnhancedMediaHandler:
                                 _pipeline_chat,
                                 _pipeline_msg,
                             )
+                            # ── Clean up the "pending" dedup key so future retries aren't blocked ──
+                            await self._cleanup_dedup_key(_dedup_key)
                     except Exception as pipeline_exc:
                         logger.warning(
                             "Big files pipeline error: %s (chat=%s msg=%s); falling back to Bot API",
@@ -1351,10 +1394,12 @@ class EnhancedMediaHandler:
                             _pipeline_chat,
                             _pipeline_msg,
                         )
+                        # ── Clean up the "pending" dedup key so future retries aren't blocked ──
+                        await self._cleanup_dedup_key(_dedup_key)
 
             # ── Clean early error: file > Bot API download limit but no fallback available ──
             if file_size and file_size > bot_api_max_mb * 1024 * 1024 and _bigfile_pipeline is None:
-                _userbot_enabled = os.environ.get("ENABLE_USERBOT", "").lower() in ("1", "true", "yes")
+                _userbot_enabled = config.ENABLE_USERBOT
                 if not _userbot_enabled:
                     _upload_url_early = (
                         os.environ.get("WEB_UPLOAD_URL") or os.environ.get("WEBAPP_URL") or "<your-server>/upload"
@@ -1378,7 +1423,7 @@ class EnhancedMediaHandler:
             logger.exception("get_file failed for %s: %s", file_id, e)
             err_text = str(e) or ""
             upload_url = os.environ.get("WEB_UPLOAD_URL") or os.environ.get("WEBAPP_URL") or "<your-server>/upload"
-            enable_userbot = os.environ.get("ENABLE_USERBOT", "").lower() in ("1", "true", "yes")
+            enable_userbot = config.ENABLE_USERBOT
 
             async def _try_userbot_download(chat_id, message_id, reason):
                 if not enable_userbot or not chat_id or not message_id:
@@ -1524,7 +1569,7 @@ class EnhancedMediaHandler:
                 # where the userbot account has access, then download from there.
                 # Guard: skip if the bigfile pipeline already forwarded to the relay group
                 # for this file (prevents double forwarding).
-                _relay_chat_id = os.environ.get("RELAY_CHAT_ID", "")
+                _relay_chat_id = config.RELAY_CHAT_ID
                 if _relay_chat_id and bot_chat and bot_msg and not _relay_already_done:
                     try:
                         _relay_chat_id = int(_relay_chat_id)
@@ -1599,11 +1644,7 @@ class EnhancedMediaHandler:
         try:
             from utils.storage import get_storage_backend as _gsb
 
-            _bn = (
-                config.get_storage_backend_name()
-                if hasattr(config, "get_storage_backend_name")
-                else (os.getenv("STORAGE_BACKEND") or "local").lower()
-            )
+            _bn = config.get_storage_backend_name()
             if _bn in ("s3", "r2") and _gsb is not None:
                 _backend = await _gsb()
                 _use_remote = True
@@ -1717,7 +1758,7 @@ class EnhancedMediaHandler:
 
             # Extra debug: record which fetch paths we will try
             try:
-                enable_userbot_env = os.environ.get("ENABLE_USERBOT", "").lower() in ("1", "true", "yes")
+                enable_userbot_env = config.ENABLE_USERBOT
                 logger.info(
                     "_handle_large_forward debug: fh=%s enable_userbot_env=%s AUTO_FETCH_FORWARDS=%s PREFER_USERBOT=%s",
                     fh,
@@ -1744,7 +1785,7 @@ class EnhancedMediaHandler:
                 fetched = False
 
                 # Try local userbot downloader first when enabled
-                enable_userbot = os.environ.get("ENABLE_USERBOT", "").lower() in ("1", "true", "yes")
+                enable_userbot = config.ENABLE_USERBOT
                 logger.info("_handle_large_forward: enable_userbot=%s for fh=%s", enable_userbot, fh)
 
                 if enable_userbot:
@@ -2208,7 +2249,8 @@ class EnhancedMediaHandler:
             "input_path": input_path,
             "input_key": current_file.get("input_key"),
             "output_path": output_path,
-            "ffmpeg_args": None,  # let worker infer from extension or use default
+            "ffmpeg_args": current_file.get("_pipeline_ffmpeg_args") or _format_ffmpeg_args.get(target_format),
+            "output_ext": f".{target_format}",
             "progress_channel": f"ffmpeg:progress:{job_id}",
             "chat_id": update.effective_chat.id if update and update.effective_chat else None,
             "thumbnail": current_file.get("thumbnail"),
@@ -2242,6 +2284,30 @@ class EnhancedMediaHandler:
 
     async def handle_media_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Main entry point for media messages."""
+        # ── Bot-self detection: skip messages sent by the bot's own Telethon userbot ──
+        #    When the userbot sends output to the relay group, the bot would otherwise
+        #    pick it up as a new input file, creating an infinite processing loop.
+        try:
+            _msg_obj = getattr(update, "message", None)
+            _from_user = getattr(_msg_obj, "from_user", None) if _msg_obj else None
+            _sender_id = getattr(_from_user, "id", None) if _from_user else None
+            if _sender_id is not None:
+                try:
+                    from utils.userbot_downloader import _get_bot_user_id
+
+                    _bot_id = _get_bot_user_id()
+                    if _bot_id is not None and _sender_id == _bot_id:
+                        logger.info(
+                            "handle_media_message: skipping message from bot itself (sender=%s == bot_id=%s) to prevent processing loop",
+                            _sender_id,
+                            _bot_id,
+                        )
+                        return
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
         # Log incoming update for debugging dispatch issues
         try:
             user_id = update.effective_user.id
@@ -3766,8 +3832,17 @@ class EnhancedMediaHandler:
                             job = {
                                 "job_id": job_id,
                                 "input_path": f.get("path"),
+                                "input_key": f.get("input_key"),
                                 "output_path": out_path,
-                                "ffmpeg_args": None,
+                                "ffmpeg_args": [
+                                    "-c:v",
+                                    "libx264",
+                                    "-c:a",
+                                    "aac",
+                                    "-strict",
+                                    "experimental",
+                                ],
+                                "output_ext": ".mp4",
                                 "progress_channel": f"ffmpeg:progress:{job_id}",
                                 "chat_id": update.effective_chat.id
                                 if update and getattr(update, "effective_chat", None)
@@ -4129,46 +4204,7 @@ class EnhancedMediaHandler:
 
                     if success and os.path.exists(output_path):
                         file_size = os.path.getsize(output_path)
-                        if file_size > 50 * 1024 * 1024:  # 50MB Telegram limit
-                            try:
-                                bot_api_max_mb = int(os.environ.get("BOT_API_MAX_MB", "50"))
-                            except Exception:
-                                bot_api_max_mb = 50
-                            if file_size > bot_api_max_mb * 1024 * 1024:
-                                await self.safe_edit(
-                                    query,
-                                    f"❌ File too large ({file_size // 1024 // 1024}MB).\nTry compression first.",
-                                )
-                                os.remove(output_path)
-                            else:
-                                with open(output_path, "rb") as audio_file:
-                                    await context.bot.send_audio(
-                                        chat_id=update.effective_chat.id,
-                                        audio=audio_file,
-                                        caption="✅ Converted to MP3",
-                                        title=current_file.get("name", "file").replace(".mp4", ".mp3"),
-                                        performer="Media Bot",
-                                    )
-
-                            os.remove(output_path)
-                    else:
-                        await self.safe_edit(query, "❌ Conversion failed.")
-
-                await AsyncFileLock.release(path)
-            else:
-                # Fallback without locking
-                success = await self.converter.extract_audio_from_video(
-                    current_file["path"], output_path, "mp3", "192k"
-                )
-
-                if success and os.path.exists(output_path):
-                    file_size = os.path.getsize(output_path)
-                    if file_size > 50 * 1024 * 1024:  # 50MB Telegram limit
-                        try:
-                            bot_api_max_mb = int(os.environ.get("BOT_API_MAX_MB", "50"))
-                        except Exception:
-                            bot_api_max_mb = 50
-                        if file_size > bot_api_max_mb * 1024 * 1024:
+                        if file_size > config.BOT_API_MAX_BYTES:
                             await self.safe_edit(
                                 query,
                                 f"❌ File too large ({file_size // 1024 // 1024}MB).\nTry compression first.",
@@ -4183,13 +4219,33 @@ class EnhancedMediaHandler:
                                     title=current_file.get("name", "file").replace(".mp4", ".mp3"),
                                     performer="Media Bot",
                                 )
+
+                            os.remove(output_path)
+                    else:
+                        await self.safe_edit(query, "❌ Conversion failed.")
+
+                await AsyncFileLock.release(path)
+            else:
+                # Fallback without locking
+                success = await self.converter.extract_audio_from_video(
+                    current_file["path"], output_path, "mp3", "192k"
+                )
+
+                if success and os.path.exists(output_path):
+                    file_size = os.path.getsize(output_path)
+                    if file_size > config.BOT_API_MAX_BYTES:
+                        await self.safe_edit(
+                            query,
+                            f"❌ File too large ({file_size // 1024 // 1024}MB).\nTry compression first.",
+                        )
+                        os.remove(output_path)
                     else:
                         with open(output_path, "rb") as audio_file:
                             await context.bot.send_audio(
                                 chat_id=update.effective_chat.id,
                                 audio=audio_file,
                                 caption="✅ Converted to MP3",
-                                title=current_file["name"].replace(".mp4", ".mp3"),
+                                title=current_file.get("name", "file").replace(".mp4", ".mp3"),
                                 performer="Media Bot",
                             )
                         os.remove(output_path)

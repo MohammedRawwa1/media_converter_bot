@@ -259,19 +259,19 @@ async def _send_video_result(
 
 
 async def _probe_output_metadata(out_path: str) -> tuple[dict | None, str | None]:
-    """Probe a video file for metadata (duration, width, height) and generate a thumbnail.
+    """Probe a video file for metadata and generate a thumbnail.
 
-    This is used as a fallback probe before calling ``send_file_via_userbot`` so that
-    even if the internal probe inside Telethon/Pyrogram fails, the video still arrives
-    with proper duration/timestamps and a thumbnail in the user's DM.
+    Delegates to the shared ``probe_video_for_delivery`` utility which
+    extracts all metadata (dimensions, duration, codec, bitrate, fps) and
+    generates a thumbnail in a single ffprobe + ffmpeg call.
 
-    Results are cached in ``_output_probe_cache`` keyed by *out_path* so that
-    the Bot API delivery path (which calls this function a second time) reuses
-    the cached probe and thumbnail rather than running ffprobe and ffmpeg again.
+    Adds caching layers: in-memory ``_output_probe_cache`` and Redis.
 
     Returns:
         Tuple of (video_meta dict or None, thumb_path str or None).
-        ``video_meta`` has keys ``duration`` (int), ``width`` (int), ``height`` (int).
+        ``video_meta`` has keys ``duration`` (int), ``width`` (int), ``height`` (int)
+        plus optional ``video_codec``, ``video_bitrate``, ``fps``, ``audio_codec``,
+        ``audio_bitrate``.
         ``thumb_path`` is a path to a JPEG thumbnail file (caller cleans up via os.remove).
     """
     if not out_path or not os.path.exists(out_path):
@@ -283,121 +283,19 @@ async def _probe_output_metadata(out_path: str) -> tuple[dict | None, str | None
         logger.debug("Worker: _probe_output_metadata cache HIT for %s", out_path)
         return _cached
 
-    video_meta = None
-    thumb_path = None
+    # ── Delegate to shared utility (single ffprobe + thumbnail call) ──
+    from utils.ffmpeg_runner import probe_video_for_delivery
 
-    # ── ffprobe for duration / dimensions (with Redis caching) ──
-    ffprobe_bin = getattr(config, "FFPROBE_PATH", None) or getattr(config, "FFMPEG_PATH", "ffmpeg").replace(
-        "ffmpeg", "ffprobe"
-    )
-    try:
-        # Try cache first
-        _cached = None
-        _fhash = None
-        try:
-            if _cache and out_path and os.path.exists(out_path):
-                _fhash = hashlib.sha256(f"{out_path}:{os.path.getsize(out_path)}".encode()).hexdigest()[:16]
-                _cached = await _cache.get(f"cache:probe_meta:{_fhash}")
-                if _cached:
-                    video_meta = _cached
-                    logger.debug("Worker: ffprobe cache HIT for %s", out_path)
-        except Exception:
-            logger.debug("Worker: ffprobe cache lookup failed for %s", out_path)
+    video_meta, thumb_path = await probe_video_for_delivery(out_path)
 
-        if _cached is None:  # cache miss — run ffprobe
-            proc = await asyncio.create_subprocess_exec(
-                ffprobe_bin,
-                "-v",
-                "quiet",
-                "-print_format",
-                "json",
-                "-show_entries",
-                "stream=width,height,codec_type,codec_name,bit_rate,r_frame_rate,nb_frames:format=duration,bit_rate",
-                out_path,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=15)
-            if proc.returncode == 0:
-                data = json.loads(stdout.decode())
-                meta = {}
-                for s in data.get("streams", []):
-                    if s.get("codec_type") == "video":
-                        if "width" in s:
-                            meta["width"] = s["width"]
-                        if "height" in s:
-                            meta["height"] = s["height"]
-                        break
-                fmt = data.get("format", {})
-                if fmt.get("duration"):
-                    with contextlib.suppress(ValueError, TypeError):
-                        meta["duration"] = int(float(fmt["duration"]))
-                # T10: Extract extended metadata from the expanded ffprobe output
-                _all_streams = data.get("streams", [])
-                for s in _all_streams:
-                    if s.get("codec_type") == "video":
-                        if s.get("codec_name"):
-                            meta["video_codec"] = s["codec_name"]
-                        if s.get("bit_rate"):
-                            meta["video_bitrate"] = int(s["bit_rate"])
-                        if s.get("r_frame_rate"):
-                            try:
-                                _parts = str(s["r_frame_rate"]).split("/")
-                                if len(_parts) == 2 and int(_parts[1]) > 0:
-                                    meta["fps"] = round(int(_parts[0]) / int(_parts[1]), 2)
-                            except (ValueError, ZeroDivisionError):
-                                pass
-                    elif s.get("codec_type") == "audio":
-                        if s.get("codec_name"):
-                            meta["audio_codec"] = s["codec_name"]
-                        if s.get("bit_rate"):
-                            meta["audio_bitrate"] = int(s["bit_rate"])
-                if meta:
-                    video_meta = meta
-                    # Cache the result
-                    try:
-                        if _cache:
-                            await _cache.set(f"cache:probe_meta:{_fhash}", video_meta, ttl=86400)
-                            logger.debug("Worker: cached ffprobe result for %s", out_path)
-                    except Exception:
-                        logger.debug("Worker: failed to cache ffprobe result for %s", out_path)
-    except Exception:
-        logger.debug("Worker: fallback metadata probe failed for %s", out_path)
-
-    # ── ffmpeg thumbnail at 1s ──
-    # Use a flat temp file (no nested directory) so cleanup is just os.remove()
-    # and there's no temp dir leak on the success path.
-    _fd, _tp = tempfile.mkstemp(suffix=".jpg", prefix="worker_thumb_")
-    os.close(_fd)
-    ffmpeg_bin = getattr(config, "FFMPEG_PATH", "ffmpeg")
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            ffmpeg_bin,
-            "-y",
-            "-ss",
-            "00:00:01",
-            "-i",
-            out_path,
-            "-vframes",
-            "1",
-            "-q:v",
-            "2",
-            _tp,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        await asyncio.wait_for(proc.communicate(), timeout=30)
-        if proc.returncode == 0 and os.path.exists(_tp) and os.path.getsize(_tp) > 0:
-            thumb_path = _tp
-        else:
-            os.remove(_tp)
-    except Exception:
-        logger.debug("Worker: fallback thumbnail generation failed for %s", out_path)
-        with contextlib.suppress(Exception):
-            os.remove(_tp)
-
-    # Cache result before returning so subsequent calls skip ffprobe + ffmpeg
+    # ── Cache result ──
     _output_probe_cache[out_path] = (video_meta, thumb_path)
+    try:
+        if _cache and video_meta:
+            _fhash = hashlib.sha256(f"{out_path}:{os.path.getsize(out_path)}".encode()).hexdigest()[:16]
+            await _cache.set(f"cache:probe_meta:{_fhash}", video_meta, ttl=86400)
+    except Exception:
+        logger.debug("Worker: failed to cache probe result for %s", out_path)
 
     return video_meta, thumb_path
 
@@ -1270,7 +1168,7 @@ async def handle_job(job: dict):
 
                                 # Update Redis job hash with output metadata for the web UI
                                 try:
-                                    send_link = os.environ.get("ENABLE_LINK_SEND", "").lower() in ("1", "true", "yes")
+                                    send_link = config.ENABLE_LINK_SEND
                                     r = await get_redis()
                                     mapping = {"output_key": dest}
                                     if get_url:
@@ -1447,7 +1345,7 @@ async def handle_job(job: dict):
                         chat_id = job.get("chat_id")
                         caption = job.get("caption")
                         sent = False
-                        enable_userbot = os.environ.get("ENABLE_USERBOT", "").lower() in ("1", "true", "yes")
+                        enable_userbot = config.ENABLE_USERBOT
                         bot_token = getattr(config, "BOT_TOKEN", None)
 
                         # Determine file size and Bot API threshold (MB)
@@ -1458,10 +1356,9 @@ async def handle_job(job: dict):
                         except Exception:
                             file_size = 0
 
-                        bot_api_max_mb = int(os.environ.get("BOT_API_MAX_SIZE_MB", "50"))
-                        bot_api_max_bytes = bot_api_max_mb * 1024 * 1024
+                        bot_api_max_bytes = config.BOT_API_MAX_BYTES
 
-                        send_link = os.environ.get("ENABLE_LINK_SEND", "").lower() in ("1", "true", "yes")
+                        send_link = config.ENABLE_LINK_SEND
                         # If we uploaded the output and generated a presigned GET URL, only send it if
                         # explicit link delivery is enabled. Otherwise keep delivery inside Telegram.
                         if send_link and upload_success and get_url and chat_id and bot_token:
@@ -1492,7 +1389,7 @@ async def handle_job(job: dict):
                                     from utils.userbot_uploader import send_file_via_userbot
 
                                     _up_cb = _make_upload_progress_callback(job_id, progress_channel)
-                                    _relay_chat = os.environ.get("RELAY_CHAT_ID", "")
+                                    _relay_chat = config.RELAY_CHAT_ID
                                     if _relay_chat and bot_token:
                                         # ── Relay+copy: Telethon uploads to relay, then Bot API delivers to
                                         #    user's DM via sendVideo(file_id, supports_streaming=True).
@@ -1937,7 +1834,7 @@ async def handle_job(job: dict):
                                     from utils.userbot_uploader import send_file_via_userbot
 
                                     _up_cb = _make_upload_progress_callback(job_id, progress_channel)
-                                    _relay_chat = os.environ.get("RELAY_CHAT_ID", "")
+                                    _relay_chat = config.RELAY_CHAT_ID
                                     if _relay_chat and bot_token:
                                         # ── Relay+copy (fallback) ──
                                         _relay_id = int(_relay_chat)

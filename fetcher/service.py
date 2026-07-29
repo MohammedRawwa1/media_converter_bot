@@ -87,11 +87,7 @@ async def process_forward_hash(forward_hash: str):
     # Optionally upload the fetched input to remote storage (S3/R2/MinIO)
     input_key = None
     try:
-        backend_name = (
-            config.get_storage_backend_name()
-            if hasattr(config, "get_storage_backend_name")
-            else (os.getenv("STORAGE_BACKEND") or "local").lower()
-        )
+        backend_name = config.get_storage_backend_name()
         if backend_name in ("s3", "r2") and get_storage_backend is not None:
             try:
                 backend = await get_storage_backend()

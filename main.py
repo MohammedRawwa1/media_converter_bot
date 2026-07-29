@@ -596,7 +596,7 @@ def setup_handlers(application: Application) -> None:
             or os.getenv("api_hash")
             or os.getenv("userbot_api_hash")
         )
-        userbot_enabled = os.environ.get("ENABLE_USERBOT", "").lower() in ("1", "true", "yes")
+        userbot_enabled = cfg.ENABLE_USERBOT
 
         # ── Active login flow context ──
         data = context.user_data
@@ -1640,6 +1640,18 @@ async def main(background: bool = False) -> None:
         logger.info("Cleanup manager started")
     except Exception as e:
         logger.error(f"Failed to start cleanup manager: {e}")
+
+    # ── Startup stale-temp cleanup: remove temp files older than 30 minutes ──
+    #    This prevents stale files from previous runs (e.g. crashed workers) from
+    #    being picked up by the pipeline or consuming disk space.
+    try:
+        from tasks.cleanup_tasks import cleanup_manager as _cleanup_mgr
+
+        _cleaned = await _cleanup_mgr.startup_temp_cleanup(max_age=1800)  # 30 minutes
+        if _cleaned > 0:
+            logger.info("Startup temp cleanup: removed %d stale files", _cleaned)
+    except Exception as _cleanup_exc:
+        logger.warning("Startup temp cleanup failed (non-fatal): %s", _cleanup_exc)
 
     # Start session healthcheck (with MongoDB persistence for session strings)
     try:

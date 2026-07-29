@@ -196,11 +196,7 @@ def upload():
         # If configured with remote storage (S3/R2/MinIO), we'll upload the input
         # in a background thread and enqueue the job after upload completes.
         input_key = None
-        backend_name = (
-            config.get_storage_backend_name()
-            if hasattr(config, "get_storage_backend_name")
-            else (os.getenv("STORAGE_BACKEND") or "local").lower()
-        )
+        backend_name = config.get_storage_backend_name()
         use_remote_backend = backend_name in ("s3", "r2") and get_storage_backend_sync is not None
         key = f"uploads/{job_id}_{os.path.basename(input_path)}" if use_remote_backend else None
     else:
@@ -283,11 +279,7 @@ def upload():
                             return
 
                         # Upload to remote storage if configured, else enqueue using local path
-                        backend_name_loc = (
-                            config.get_storage_backend_name()
-                            if hasattr(config, "get_storage_backend_name")
-                            else (os.getenv("STORAGE_BACKEND") or "local")
-                        ).lower()
+                        backend_name_loc = config.get_storage_backend_name()
                         use_remote_loc = backend_name_loc in ("s3", "r2") and get_storage_backend_sync is not None
                         key_loc = f"uploads/{j_id}_{os.path.basename(inp_path)}" if use_remote_loc else None
                         job_loc = None
@@ -427,11 +419,7 @@ def upload():
                     return
 
                 # If configured, upload the input to remote storage and enqueue
-                backend_name_loc = (
-                    config.get_storage_backend_name()
-                    if hasattr(config, "get_storage_backend_name")
-                    else (os.getenv("STORAGE_BACKEND") or "local")
-                ).lower()
+                backend_name_loc = config.get_storage_backend_name()
                 use_remote_loc = backend_name_loc in ("s3", "r2") and get_storage_backend_sync is not None
                 key_loc = f"uploads/{j_id}_{os.path.basename(inp_path)}" if use_remote_loc else None
                 if use_remote_loc and key_loc:
