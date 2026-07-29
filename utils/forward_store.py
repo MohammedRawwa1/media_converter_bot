@@ -99,7 +99,7 @@ async def save_forward_metadata(metadata: dict) -> str:
     data = dict(metadata)
     data.setdefault("created_at", datetime.utcnow().isoformat())
 
-    backend_name = (os.getenv("STORAGE_BACKEND") or (config.STORAGE_BACKEND if config else "local")).lower()
+    backend_name = config.get_storage_backend_name() if config else (os.getenv("STORAGE_BACKEND") or "local").lower()
     key = f"forwards/{fid}.json"
 
     if backend_name in ("s3", "r2"):
@@ -161,7 +161,7 @@ async def load_forward_metadata(fid: str) -> dict | None:
     Async callers should use ``await load_forward_metadata(fid)``;
     sync callers should wrap with ``asyncio.run(load_forward_metadata(fid))``.
     """
-    backend_name = (os.getenv("STORAGE_BACKEND") or (config.STORAGE_BACKEND if config else "local")).lower()
+    backend_name = config.get_storage_backend_name() if config else (os.getenv("STORAGE_BACKEND") or "local").lower()
     key = f"forwards/{fid}.json"
 
     if backend_name in ("s3", "r2"):
@@ -245,7 +245,7 @@ async def delete_forward_metadata(fid: str) -> bool:
     except Exception:
         logger.debug("forward_store: failed to capture caller stack for %s", fid)
 
-    backend_name = (os.getenv("STORAGE_BACKEND") or (config.STORAGE_BACKEND if config else "local")).lower()
+    backend_name = config.get_storage_backend_name() if config else (os.getenv("STORAGE_BACKEND") or "local").lower()
     key = f"forwards/{fid}.json"
 
     # Optional archival/move behavior: if `FORWARDS_ARCHIVE_PREFIX` is set

@@ -165,7 +165,11 @@ class CleanupManager:
             backend = await get_storage_backend()
 
             # Only attempt S3 / R2 cleanup when the active backend is actually remote
-            _bn = (os.getenv("STORAGE_BACKEND") or getattr(config, "STORAGE_BACKEND", "local") or "local").lower()
+            _bn = (
+                config.get_storage_backend_name()
+                if config and hasattr(config, "get_storage_backend_name")
+                else (os.getenv("STORAGE_BACKEND") or "local").lower()
+            )
             if _bn not in ("s3", "r2"):
                 return 0
 

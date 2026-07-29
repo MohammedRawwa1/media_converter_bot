@@ -1281,7 +1281,6 @@ async def handle_job(job: dict):
 
                                     # ── T11: Preserve original thumbnail if available (Pillow, no ffmpeg),
                                     #    otherwise generate new frame (ffmpeg) & upload to S3 ──
-                                    _thumb_key = None
                                     _thumb_path = None
                                     _probe_meta = None
                                     try:
@@ -1298,17 +1297,21 @@ async def handle_job(job: dict):
                                                 _td_thumb = None
                                                 try:
                                                     from utils.storage import get_storage_backend as _gsb_thumb
+
                                                     _backend_thumb = await _gsb_thumb()
                                                     if _backend_thumb:
                                                         _td_thumb = tempfile.mkdtemp(prefix="worker_thumb_s3_")
                                                         _dl_thumb = os.path.join(_td_thumb, "original_thumb.jpg")
-                                                        await _backend_thumb.download_file(str(_existing_thumb), _dl_thumb)
+                                                        await _backend_thumb.download_file(
+                                                            str(_existing_thumb), _dl_thumb
+                                                        )
                                                         if os.path.exists(_dl_thumb) and os.path.getsize(_dl_thumb) > 0:
                                                             _existing_thumb = _dl_thumb
                                                             _existing_thumb_dir = _td_thumb
                                                             logger.debug(
                                                                 "Worker: T11 downloaded existing thumb from S3: %s -> %s",
-                                                                job.get("thumb_key"), _dl_thumb
+                                                                job.get("thumb_key"),
+                                                                _dl_thumb,
                                                             )
                                                         else:
                                                             shutil.rmtree(_td_thumb, ignore_errors=True)
@@ -1316,11 +1319,14 @@ async def handle_job(job: dict):
                                                     _existing_thumb = None
                                                     if _td_thumb is not None and os.path.exists(_td_thumb):
                                                         shutil.rmtree(_td_thumb, ignore_errors=True)
-                                                    logger.debug("Worker: T11 failed to download existing thumb from S3")
+                                                    logger.debug(
+                                                        "Worker: T11 failed to download existing thumb from S3"
+                                                    )
                                             if _existing_thumb and os.path.exists(str(_existing_thumb)):
                                                 # ── T11: Keep original — Pillow resize/save ──
                                                 try:
                                                     from PIL import Image as _PILImg
+
                                                     _td = tempfile.mkdtemp(prefix="worker_thumb_")
                                                     _tp = os.path.join(_td, "thumb.jpg")
                                                     _img = _PILImg.open(str(_existing_thumb))
@@ -1329,14 +1335,19 @@ async def handle_job(job: dict):
                                                     if os.path.exists(_tp) and os.path.getsize(_tp) > 0:
                                                         _thumb_path = _tp
                                                         logger.debug(
-                                                            "Worker: T11 preserved original thumbnail via Pillow -> %s", _tp
+                                                            "Worker: T11 preserved original thumbnail via Pillow -> %s",
+                                                            _tp,
                                                         )
                                                 except Exception:
                                                     _thumb_path = None
-                                                    logger.debug("Worker: Pillow thumbnail preservation failed, falling back to ffmpeg")
+                                                    logger.debug(
+                                                        "Worker: Pillow thumbnail preservation failed, falling back to ffmpeg"
+                                                    )
                                                 finally:
                                                     # Cleanup S3-downloaded thumb temp dir after Pillow is done with it
-                                                    if _existing_thumb_dir is not None and os.path.exists(_existing_thumb_dir):
+                                                    if _existing_thumb_dir is not None and os.path.exists(
+                                                        _existing_thumb_dir
+                                                    ):
                                                         shutil.rmtree(_existing_thumb_dir, ignore_errors=True)
                                                         _existing_thumb_dir = None
                                         except Exception:
@@ -1349,6 +1360,7 @@ async def handle_job(job: dict):
                                                 # ── T11: Pillow post-process ──
                                                 try:
                                                     from PIL import Image as _PILImg
+
                                                     _img = _PILImg.open(_thumb_path)
                                                     _img.thumbnail((320, 320), _PILImg.Resampling.LANCZOS)
                                                     _img.save(_thumb_path, "JPEG", quality=85, optimize=True)
@@ -1360,12 +1372,9 @@ async def handle_job(job: dict):
                                                 _thumb_s3_key = f"outputs/{job_id}/thumb.jpg"
                                                 try:
                                                     await backend.upload_file(_thumb_path, _thumb_s3_key)
-                                                    _thumb_key = _thumb_s3_key
                                                     mapping["thumb_key"] = _thumb_s3_key
                                                     mapping["thumbnail"] = _thumb_s3_key
-                                                    logger.info(
-                                                        "Worker: uploaded thumbnail to S3: %s", _thumb_s3_key
-                                                    )
+                                                    logger.info("Worker: uploaded thumbnail to S3: %s", _thumb_s3_key)
                                                 except Exception as _thumb_err:
                                                     logger.warning(
                                                         "Worker: failed to upload thumbnail to S3: %s", _thumb_err
@@ -1389,9 +1398,7 @@ async def handle_job(job: dict):
                                                 if _probe_meta.get("audio_codec"):
                                                     mapping["output_audio_codec"] = _probe_meta["audio_codec"]
                                     except Exception as _thumb_gen_err:
-                                        logger.debug(
-                                            "Worker: thumbnail generation/upload failed: %s", _thumb_gen_err
-                                        )
+                                        logger.debug("Worker: thumbnail generation/upload failed: %s", _thumb_gen_err)
 
                                     await r.hset(f"ffmpeg:job:{job_id}", mapping=mapping)
                                     upload_success = True
@@ -2549,7 +2556,6 @@ def create_worker_task(stop_event: asyncio.Event | None = None) -> asyncio.Task:
         logger.debug("ffmpeg worker: Initialize job store if MONGO_URI is configured")
 
     # Initialize cache if helper available
-    global _cache
     try:
         if get_cache is not None:
             loop = asyncio.get_running_loop()

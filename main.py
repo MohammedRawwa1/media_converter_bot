@@ -1644,7 +1644,7 @@ async def main(background: bool = False) -> None:
     # Start session healthcheck (with MongoDB persistence for session strings)
     try:
         _shc_db_model = application.bot_data.get("db_model")
-        _shc_task = start_session_healthcheck(
+        start_session_healthcheck(
             admin_user_id=ADMIN_USER_ID,
             bot_app=application,
             db_model=_shc_db_model,
@@ -1926,7 +1926,6 @@ async def main(background: bool = False) -> None:
                                     await _longpoll_redis_lock.renew()
 
                 try:
-                    global LONG_POLLER_STARTED
                     can_start = True
                     if _longpoll_redis_lock is not None:
                         can_start = await _longpoll_redis_lock.acquire()
@@ -2799,6 +2798,7 @@ try:
         if "text/html" in accept or "application/xhtml" in accept:
             try:
                 from fastapi.responses import RedirectResponse
+
                 return RedirectResponse(url="/flask/")
             except Exception:
                 pass
@@ -2818,6 +2818,7 @@ try:
             # 1) Emit initial job state from Redis
             try:
                 from utils.job_queue import get_redis as _get_redis
+
                 _r = await _get_redis()
                 if _r:
                     try:
@@ -2826,8 +2827,7 @@ try:
                         await _r.close()
                     if _data:
                         _decoded = {
-                            _k.decode() if isinstance(_k, bytes) else _k:
-                            _v.decode() if isinstance(_v, bytes) else _v
+                            _k.decode() if isinstance(_k, bytes) else _k: _v.decode() if isinstance(_v, bytes) else _v
                             for _k, _v in _data.items()
                         }
                         yield f"data: {_rj.dumps(_decoded)}\n\n"
@@ -2839,6 +2839,7 @@ try:
             if _red_url:
                 try:
                     from utils.job_queue import get_redis as _get_redis2
+
                     _r2 = await _get_redis2()
                     _pub = _r2.pubsub()
                     await _pub.subscribe(f"ffmpeg:progress:{job_id}")
@@ -2867,9 +2868,11 @@ try:
         """Redirect to Flask's /flask/download endpoint for file downloads."""
         try:
             from fastapi.responses import RedirectResponse
+
             return RedirectResponse(url=f"/flask/download/{job_id}")
         except Exception:
             from fastapi.responses import JSONResponse
+
             return JSONResponse(status_code=500, content={"error": "Download endpoint unavailable"})
 
     @app.head("/telegram/webhook")
@@ -3225,7 +3228,6 @@ try:
                             logger.exception("ASGI long-poller fatal error")
 
                     try:
-                        global LONG_POLLER_STARTED
                         if not globals().get("LONG_POLLER_STARTED", False):
                             globals()["LONG_POLLER_STARTED"] = True
                             app.state.longpoll = asyncio.create_task(_asgi_longpoll_loop())

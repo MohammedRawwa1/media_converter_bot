@@ -1265,13 +1265,13 @@ async def _download_and_ensure_path(client, msg, dest_path, progress_callback=No
             _dl_kwargs["progress"] = progress_callback
         _dl = await _download_media_with_retry(client, msg, **_dl_kwargs)
     except Exception as exc:
-            logger.warning(
-                "userbot: download_media_with_retry failed for %s (absolute=%s): %s",
-                dest_path,
-                _abs_dest,
-                exc,
-            )
-            return False
+        logger.warning(
+            "userbot: download_media_with_retry failed for %s (absolute=%s): %s",
+            dest_path,
+            _abs_dest,
+            exc,
+        )
+        return False
 
     logger.info(
         "userbot: download_media dest_path=%s returned=%s",

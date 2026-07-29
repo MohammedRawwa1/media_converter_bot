@@ -5,7 +5,11 @@ logger = logging.getLogger(__name__)
 
 
 def _parse_out_time(timestr: str) -> float:
-    # timestr like 00:01:23.456789
+    """Parse ffmpeg out_time string like ``00:01:23.456789`` into seconds (float).
+
+    Canonical implementation lives in ``utils.ffmpeg_runner._parse_out_time``.
+    This copy exists to keep the web worker free of async-module dependencies.
+    """
     try:
         parts = timestr.split(":")
         h = int(parts[0])
@@ -13,7 +17,10 @@ def _parse_out_time(timestr: str) -> float:
         s = float(parts[2])
         return h * 3600 + m * 60 + s
     except Exception:
-        return 0.0
+        try:
+            return float(timestr)
+        except Exception:
+            return 0.0
 
 
 def get_duration(path: str) -> float:

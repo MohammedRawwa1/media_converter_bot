@@ -218,6 +218,21 @@ if _canonical_mongo:
 MONGO_URI = os.getenv("MONGO_URI", "")
 
 
+def get_storage_backend_name() -> str:
+    """Return normalized storage backend name.
+
+    Returns one of ``"local"``, ``"s3"``, or ``"r2"`` based on the
+    ``STORAGE_BACKEND`` environment variable or module-level constant.
+    Falls back to ``"local"`` when unconfigured.
+    This is the single canonical resolver — all modules should call this
+    instead of repeating the same ``os.getenv()`` + fallback chain.
+    """
+    try:
+        return (os.getenv("STORAGE_BACKEND") or STORAGE_BACKEND or "local").lower()
+    except (NameError, AttributeError):
+        return (os.getenv("STORAGE_BACKEND") or "local").lower()
+
+
 def validate_env() -> None:
     """Validate critical environment variables without printing secrets.
 
@@ -231,11 +246,7 @@ def validate_env() -> None:
         missing.append("BOT_TOKEN")
 
     # Storage backend requirements
-    backend = (
-        os.getenv("STORAGE_BACKEND", STORAGE_BACKEND).lower()
-        if "STORAGE_BACKEND" in globals()
-        else os.getenv("STORAGE_BACKEND", "local")
-    )
+    backend = get_storage_backend_name()
     if backend in ("s3", "r2") and (not os.getenv("S3_BUCKET") or not os.getenv("S3_ENDPOINT")):
         missing.append("S3_BUCKET/S3_ENDPOINT")
 

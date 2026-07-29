@@ -3,15 +3,8 @@ import asyncio
 import logging
 import os
 import tempfile
-import zipfile
 
 import config
-
-# Optional imports
-try:
-    import aiofiles
-except ImportError:
-    aiofiles = None
 
 try:
     import ffmpeg
@@ -105,9 +98,14 @@ class ExtendedMediaConverter:
             return False
 
     async def change_resolution(self, input_path: str, output_path: str, width: int, height: int) -> bool:
-        """Change video resolution."""
-        cmd = ["-filter:v", f"scale={width}:{height}", "-c:a", "copy"]
-        return (await self.execute_ffmpeg(cmd, input_path, output_path))[0]
+        """Change video resolution.
+
+        Delegates to the canonical implementation in ``tasks.conversion_tasks``.
+        """
+        from tasks.conversion_tasks import change_resolution as _change_res
+
+        success, _ = await _change_res(input_path, output_path, width, height)
+        return success
 
     async def change_framerate(self, input_path: str, output_path: str, fps: float) -> bool:
         """Change video framerate."""
@@ -115,44 +113,36 @@ class ExtendedMediaConverter:
         return (await self.execute_ffmpeg(cmd, input_path, output_path))[0]
 
     async def adjust_bitrate(self, input_path: str, output_path: str, video_bitrate: str, audio_bitrate: str) -> bool:
-        """Adjust video and audio bitrate."""
-        cmd = ["-b:v", video_bitrate, "-b:a", audio_bitrate, "-c:v", "libx264", "-c:a", "aac"]
-        return (await self.execute_ffmpeg(cmd, input_path, output_path))[0]
+        """Adjust video and audio bitrate.
+
+        Delegates to the canonical implementation in ``tasks.conversion_tasks``.
+        """
+        from tasks.conversion_tasks import adjust_bitrate as _adj_bitrate
+
+        success, _ = await _adj_bitrate(input_path, output_path, video_bitrate, audio_bitrate)
+        return success
 
     async def optimize_video(self, input_path: str, output_path: str, preset: str = "slow", crf: int = 23) -> bool:
-        """Optimize video for web/streaming."""
-        cmd = [
-            "-c:v",
-            "libx264",
-            "-preset",
-            preset,
-            "-crf",
-            str(crf),
-            "-movflags",
-            "+faststart",
-            "-c:a",
-            "aac",
-            "-b:a",
-            "128k",
-        ]
-        return (await self.execute_ffmpeg(cmd, input_path, output_path))[0]
+        """Optimize video for web/streaming.
+
+        Delegates to the canonical implementation in ``tasks.conversion_tasks``.
+        """
+        from tasks.conversion_tasks import optimize_video as _opt_video
+
+        success, _ = await _opt_video(input_path, output_path, preset=preset, crf=crf)
+        return success
 
     async def extract_audio_from_video(
         self, input_path: str, output_path: str, fmt: str = "mp3", bitrate: str = "192k"
     ) -> bool:
-        """Extract audio from video."""
-        cmd = [
-            "-vn",  # No video
-            "-acodec",
-            "libmp3lame" if fmt == "mp3" else "copy",
-            "-ab",
-            bitrate,
-            "-ar",
-            "48000",
-            "-ac",
-            "2",
-        ]
-        return (await self.execute_ffmpeg(cmd, input_path, output_path))[0]
+        """Extract audio from video.
+
+        Delegates to the canonical implementation in ``tasks.conversion_tasks.extract_audio``.
+        """
+        from tasks.conversion_tasks import extract_audio as _extract_audio
+
+        success, _ = await _extract_audio(input_path, output_path, format=fmt, bitrate=bitrate)
+        return success
 
     async def remove_audio(self, input_path: str, output_path: str) -> bool:
         """Remove audio from video."""
@@ -178,36 +168,24 @@ class ExtendedMediaConverter:
         return (await self.execute_ffmpeg(cmd, None, output_path))[0]
 
     async def merge_videos(self, video_paths: list[str], output_path: str) -> bool:
-        """Merge multiple videos into one."""
-        # Create concat file
-        concat_content = "\n".join([f"file '{path}'" for path in video_paths])
-        with tempfile.NamedTemporaryFile(mode="w", delete=False, suffix=".txt") as concat_file:
-            concat_file.write(concat_content)
-        concat_file.close()
+        """Merge multiple videos into one.
 
-        try:
-            cmd = ["-f", "concat", "-safe", "0", "-i", concat_file.name, "-c", "copy"]
-            success = (await self.execute_ffmpeg(cmd, None, output_path))[0]
-            os.unlink(concat_file.name)
-            return success
-        except Exception:
-            os.unlink(concat_file.name)
-            return False
+        Delegates to the canonical implementation in ``tasks.conversion_tasks``.
+        """
+        from tasks.conversion_tasks import merge_videos as _merge_vids
+
+        success, _ = await _merge_vids(video_paths, output_path)
+        return success
 
     async def merge_audios(self, audio_paths: list[str], output_path: str) -> bool:
-        """Merge multiple audio files."""
-        # Create input string
-        inputs = []
-        filter_complex = ""
+        """Merge multiple audio files.
 
-        for i, path in enumerate(audio_paths):
-            inputs.extend(["-i", path])
-            filter_complex += f"[{i}:a]"
+        Delegates to the canonical implementation in ``tasks.conversion_tasks``.
+        """
+        from tasks.conversion_tasks import merge_audios as _merge_auds
 
-        filter_complex += f"concat=n={len(audio_paths)}:v=0:a=1[out]"
-
-        cmd = inputs + ["-filter_complex", filter_complex, "-map", "[out]", "-c:a", "libmp3lame", "-q:a", "2"]
-        return (await self.execute_ffmpeg(cmd, None, output_path))[0]
+        success, _ = await _merge_auds(audio_paths, output_path)
+        return success
 
     async def split_video(self, input_path: str, output_pattern: str, segment_time: str = "01:00:00") -> list[str]:
         """Split video into segments."""
@@ -240,38 +218,12 @@ class ExtendedMediaConverter:
     async def trim_video(self, input_path: str, output_path: str, start_time: str, end_time: str) -> bool:
         """Trim a segment from input between `start_time` and `end_time`.
 
-        Time strings should be in HH:MM:SS(.xxx) or MM:SS(.xxx) or seconds format.
+        Delegates to the canonical implementation in ``tasks.conversion_tasks.trim_media``.
         """
-        try:
-            # Parse times into seconds
-            def _to_seconds(tstr: str) -> float:
-                parts = tstr.split(":")
-                if len(parts) == 3:
-                    h = int(parts[0])
-                    m = int(parts[1])
-                    s = float(parts[2])
-                    return h * 3600 + m * 60 + s
-                elif len(parts) == 2:
-                    m = int(parts[0])
-                    s = float(parts[1])
-                    return m * 60 + s
-                else:
-                    return float(parts[0])
+        from tasks.conversion_tasks import trim_media as _trim
 
-            start_s = _to_seconds(start_time)
-            end_s = _to_seconds(end_time)
-            if end_s <= start_s:
-                logger.error("trim_video: end_time must be greater than start_time")
-                return False
-
-            duration = end_s - start_s
-
-            # Use copy where possible for speed; rely on execute_ffmpeg to build command
-            cmd = ["-ss", str(start_time), "-t", str(duration), "-c", "copy"]
-            return (await self.execute_ffmpeg(cmd, input_path, output_path))[0]
-        except Exception as e:
-            logger.exception("trim_video failed: %s", e)
-            return False
+        success, _ = await _trim(input_path, output_path, start_time, end_time)
+        return success
 
     async def burn_subtitles(self, input_path: str, subtitle_path: str, output_path: str) -> bool:
         """Hardcode (burn) subtitles into the video using ffmpeg subtitles filter.
@@ -288,9 +240,14 @@ class ExtendedMediaConverter:
             return False
 
     async def extract_subtitles(self, input_path: str, output_path: str) -> bool:
-        """Extract subtitles from video."""
-        cmd = ["-map", "0:s:0", "-c:s", "mov_text"]  # or 'copy' for original format
-        return (await self.execute_ffmpeg(cmd, input_path, output_path))[0]
+        """Extract subtitles from video.
+
+        Delegates to the canonical implementation in ``tasks.conversion_tasks``.
+        """
+        from tasks.conversion_tasks import extract_subtitles as _extract_subs
+
+        success, _ = await _extract_subs(input_path, output_path)
+        return success
 
     async def add_subtitles(self, video_path: str, subtitle_path: str, output_path: str) -> bool:
         """Add subtitles to video."""
@@ -311,50 +268,34 @@ class ExtendedMediaConverter:
         return (await self.execute_ffmpeg(cmd, None, output_path))[0]
 
     async def extract_streams(self, input_path: str, output_dir: str) -> dict[str, str]:
-        """Extract all streams (video, audio, subtitles)."""
-        # Validate input and probe safely
-        try:
-            if not input_path or not os.path.exists(input_path):
-                logger.error("extract_streams: input file missing: %s", input_path)
-                return {}
-            probe = ffmpeg.probe(input_path)
-        except Exception as e:
-            logger.error("extract_streams: probe failed for %s: %s", input_path, e)
-            return {}
-        streams = probe.get("streams", [])
+        """Extract all streams (video, audio, subtitles).
 
-        extracted = {}
+        Delegates to the canonical implementation in ``tasks.conversion_tasks``.
+        """
+        from tasks.conversion_tasks import extract_streams as _extract_streams
 
-        for i, stream in enumerate(streams):
-            codec_type = stream.get("codec_type", "unknown")
-
-            if codec_type == "video":
-                output = os.path.join(output_dir, f"stream_video_{i}.h264")
-                cmd = ["-map", f"0:v:{i}", "-c:v", "copy", "-an"]
-            elif codec_type == "audio":
-                output = os.path.join(output_dir, f"stream_audio_{i}.aac")
-                cmd = ["-map", f"0:a:{i}", "-c:a", "copy", "-vn"]
-            elif codec_type == "subtitle":
-                output = os.path.join(output_dir, f"stream_subtitle_{i}.srt")
-                cmd = ["-map", f"0:s:{i}", "-c:s", "srt"]
-            else:
-                continue
-
-            success = (await self.execute_ffmpeg(cmd, input_path, output))[0]
-            if success:
-                extracted[f"{codec_type}_{i}"] = output
-
+        _, extracted = await _extract_streams(input_path, output_dir)
         return extracted
 
     async def repair_video(self, input_path: str, output_path: str) -> bool:
-        """Attempt to repair corrupted video."""
-        cmd = ["-c", "copy"]
-        return (await self.execute_ffmpeg(cmd, input_path, output_path))[0]
+        """Attempt to repair corrupted video.
+
+        Delegates to the canonical implementation in ``tasks.conversion_tasks``.
+        """
+        from tasks.conversion_tasks import repair_video as _repair
+
+        success, _ = await _repair(input_path, output_path)
+        return success
 
     async def take_screenshot_at_time(self, input_path: str, output_path: str, time: str = "00:00:01") -> bool:
-        """Take screenshot at specific time."""
-        cmd = ["-ss", time, "-vframes", "1", "-q:v", "2"]
-        return (await self.execute_ffmpeg(cmd, input_path, output_path))[0]
+        """Take screenshot at specific time.
+
+        Delegates to the canonical implementation in ``tasks.conversion_tasks``.
+        """
+        from tasks.conversion_tasks import take_screenshot as _screenshot
+
+        success, _ = await _screenshot(input_path, output_path, time=time)
+        return success
 
     async def take_screenshot_grid(self, input_path: str, output_dir: str, count: int = 9) -> list[str]:
         """Take multiple screenshots at intervals."""
@@ -377,75 +318,63 @@ class ExtendedMediaConverter:
         return screenshots
 
     async def generate_sample(self, input_path: str, output_path: str, duration: int = 30) -> bool:
-        """Generate sample/preview of video."""
-        # Prefer re-encoding to an H.264/AAC MP4 with faststart for Telegram
-        # when the requested output is MP4; otherwise try to copy streams.
-        try:
-            if output_path.lower().endswith(".mp4"):
-                cmd = [
-                    "-t",
-                    str(duration),
-                    "-c:v",
-                    "libx264",
-                    "-preset",
-                    "veryfast",
-                    "-crf",
-                    "28",
-                    "-c:a",
-                    "aac",
-                    "-b:a",
-                    "96k",
-                    "-movflags",
-                    "+faststart",
-                ]
-            else:
-                cmd = ["-t", str(duration), "-c", "copy"]
+        """Generate sample/preview of video.
 
-            return (await self.execute_ffmpeg(cmd, input_path, output_path))[0]
-        except Exception as e:
-            logger.exception("generate_sample failed: %s", e)
-            # Fallback to copying a range
-            cmd = ["-t", str(duration), "-c", "copy"]
-            return (await self.execute_ffmpeg(cmd, input_path, output_path))[0]
+        Delegates to the canonical implementation in ``tasks.conversion_tasks``.
+        """
+        from tasks.conversion_tasks import generate_sample as _gen_sample
+
+        success, _ = await _gen_sample(input_path, output_path, duration)
+        return success
 
     async def create_archive(self, file_paths: list[str], output_path: str) -> bool:
-        """Create ZIP archive of files."""
-        try:
-            with zipfile.ZipFile(output_path, "w", zipfile.ZIP_DEFLATED) as zipf:
-                for file_path in file_paths:
-                    arcname = os.path.basename(file_path)
-                    zipf.write(file_path, arcname)
-            return True
-        except Exception as e:
-            logger.error(f"Archive creation failed: {e}")
-            return False
+        """Create ZIP archive of files.
+
+        Delegates to the canonical implementation in ``tasks.conversion_tasks``.
+        """
+        from tasks.conversion_tasks import create_archive as _create_archive
+
+        success, _ = await _create_archive(file_paths, output_path)
+        return success
 
     async def edit_metadata(self, input_path: str, output_path: str, metadata: dict[str, str]) -> bool:
-        """Edit video metadata."""
-        cmd = ["-c", "copy", "-map_metadata", "-1"]  # Remove all metadata
+        """Edit video metadata.
 
-        # Add new metadata
-        for key, value in metadata.items():
-            cmd.extend(["-metadata", f"{key}={value}"])
+        Delegates to the canonical implementation in ``tasks.conversion_tasks``
+        so there is a single source of truth for this operation.
+        """
+        from tasks.conversion_tasks import edit_metadata as _edit_meta
 
-        return (await self.execute_ffmpeg(cmd, input_path, output_path))[0]
+        success, _ = await _edit_meta(input_path, output_path, metadata)
+        return success
 
     async def convert_audio_format(
         self, input_path: str, output_path: str, target_format: str = "mp3", quality: int = 2
     ) -> bool:
-        """Convert audio between formats."""
-        if target_format == "mp3":
-            cmd = ["-c:a", "libmp3lame", "-q:a", str(quality)]
-        elif target_format == "wav":
-            cmd = ["-c:a", "pcm_s16le"]
-        elif target_format == "aac":
-            cmd = ["-c:a", "aac", "-b:a", "128k"]
-        elif target_format == "opus":
-            cmd = ["-c:a", "libopus", "-b:a", "96k"]
-        else:
-            cmd = ["-c:a", "copy"]
+        """Convert audio between formats.
 
-        return (await self.execute_ffmpeg(cmd, input_path, output_path))[0]
+        Delegates to the canonical implementation in ``tasks.conversion_tasks``.
+        Maps the ``quality`` parameter to an approximate CBR bitrate.
+        """
+        from tasks.conversion_tasks import convert_audio_format as _convert_audio
+
+        # Map VBR quality (0-9, where 0=best) to approximate CBR bitrate
+        _bitrate_map = {
+            0: "320k",
+            1: "256k",
+            2: "192k",
+            3: "160k",
+            4: "128k",
+            5: "96k",
+            6: "80k",
+            7: "64k",
+            8: "48k",
+            9: "32k",
+        }
+        bitrate = _bitrate_map.get(quality, "192k")
+
+        success, _ = await _convert_audio(input_path, output_path, target_format=target_format, bitrate=bitrate)
+        return success
 
     async def screen_record(
         self, output_path: str, duration: int = 10, resolution: str = "1280x720", fps: int = 30

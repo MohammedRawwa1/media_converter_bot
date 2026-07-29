@@ -128,8 +128,7 @@ async def sse_events(job_id: str):
                 _initial = await r.hgetall(f"ffmpeg:job:{job_id}")
                 if _initial:
                     _decoded = {
-                        k.decode() if isinstance(k, bytes) else k:
-                        v.decode() if isinstance(v, bytes) else v
+                        k.decode() if isinstance(k, bytes) else k: v.decode() if isinstance(v, bytes) else v
                         for k, v in _initial.items()
                     }
                     yield f"data: {json.dumps(_decoded)}\n\n"

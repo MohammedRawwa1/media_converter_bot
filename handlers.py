@@ -46,6 +46,7 @@ except Exception:
 
     class _FallbackConfig:
         """Minimal config with absolute paths when config.py import fails."""
+
         ROOT_DIR = _cfg_os.path.dirname(_cfg_os.path.abspath(__file__))
         STORAGE_PATH = _cfg_os.getenv("STORAGE_PATH", _cfg_os.path.join(ROOT_DIR, "storage"))
         INPUT_PATH = _cfg_os.path.join(STORAGE_PATH, "input")
@@ -53,8 +54,12 @@ except Exception:
         TEMP_PATH = _cfg_os.path.join(STORAGE_PATH, "temp")
         THUMBNAIL_PATH = _cfg_os.path.join(STORAGE_PATH, "thumbnails")
         FFMPEG_PATH = _cfg_os.getenv("FFMPEG_PATH", "ffmpeg")
-        MAX_FILE_SIZE = 4 * 1024 ** 3
+        MAX_FILE_SIZE = 4 * 1024**3
         STORAGE_BACKEND = "local"
+
+        @staticmethod
+        def get_storage_backend_name() -> str:
+            return (os.getenv("STORAGE_BACKEND") or "local").lower()
 
     config = _FallbackConfig()
 
@@ -535,8 +540,16 @@ class EnhancedMediaHandler:
                                 _ffprobe_bin = getattr(config, "FFMPEG_PATH", "ffmpeg").replace("ffmpeg", "ffprobe")
                                 _rp = await asyncio.to_thread(
                                     lambda: _rsp.run(  # noqa: S603
-                                        [_ffprobe_bin, "-v", "quiet", "-print_format", "json",
-                                         "-show_streams", "-show_format", str(output)],
+                                        [
+                                            _ffprobe_bin,
+                                            "-v",
+                                            "quiet",
+                                            "-print_format",
+                                            "json",
+                                            "-show_streams",
+                                            "-show_format",
+                                            str(output),
+                                        ],
                                         capture_output=True,
                                         timeout=15,
                                     )
@@ -851,12 +864,14 @@ class EnhancedMediaHandler:
 
         try:
             from utils.job_queue import get_redis as _cancel_r
+
             _r_cancel = await _cancel_r()
             try:
                 await _r_cancel.hset(f"ffmpeg:job:{_existing_id}", "cancel", "1")
                 logger.info(
                     "%s: cancelled generic auto-enqueue job %s to apply specific settings",
-                    handler_name, _existing_id,
+                    handler_name,
+                    _existing_id,
                 )
             finally:
                 with contextlib.suppress(Exception):
@@ -946,7 +961,6 @@ class EnhancedMediaHandler:
                     _thumb_path = _gen_thumb
                     _cleanup_thumb = True
                 else:
-                    _sp_run = None
                     try:
                         import shutil as _shutil
 
@@ -1007,7 +1021,12 @@ class EnhancedMediaHandler:
         if input_key and current_file.get("_pipeline_job_id"):
             try:
                 from utils.storage import get_storage_backend as _gsb
-                _bn = (os.getenv("STORAGE_BACKEND") or getattr(config, "STORAGE_BACKEND", "local") or "local").lower()
+
+                _bn = (
+                    config.get_storage_backend_name()
+                    if hasattr(config, "get_storage_backend_name")
+                    else (os.getenv("STORAGE_BACKEND") or "local").lower()
+                )
                 if _bn in ("s3", "r2") and _gsb is not None:
                     _backend_check = await _gsb()
                     _exists = await _backend_check.exists(input_key)
@@ -1068,7 +1087,9 @@ class EnhancedMediaHandler:
         else:
             ext = os.path.splitext(name)[1] or ""
 
-        input_dir = getattr(config, "INPUT_PATH", os.path.join(os.path.dirname(os.path.abspath(__file__)), "storage", "input"))
+        input_dir = getattr(
+            config, "INPUT_PATH", os.path.join(os.path.dirname(os.path.abspath(__file__)), "storage", "input")
+        )
         with contextlib.suppress(OSError):
             os.makedirs(input_dir, exist_ok=True)
         file_path = os.path.join(input_dir, f"{user_id}_{file_id}{ext}")
@@ -1578,7 +1599,11 @@ class EnhancedMediaHandler:
         try:
             from utils.storage import get_storage_backend as _gsb
 
-            _bn = (os.getenv("STORAGE_BACKEND") or getattr(config, "STORAGE_BACKEND", "local") or "local").lower()
+            _bn = (
+                config.get_storage_backend_name()
+                if hasattr(config, "get_storage_backend_name")
+                else (os.getenv("STORAGE_BACKEND") or "local").lower()
+            )
             if _bn in ("s3", "r2") and _gsb is not None:
                 _backend = await _gsb()
                 _use_remote = True
@@ -1600,6 +1625,7 @@ class EnhancedMediaHandler:
             _source_meta = {}
             try:
                 from utils.ffmpeg_runner import probe_media as _probe_media
+
                 _source_meta = await _probe_media(_temp_path)
             except Exception:
                 logger.debug("handlers: source ffprobe failed for %s", file_id)
@@ -1706,7 +1732,9 @@ class EnhancedMediaHandler:
                 # Prepare local paths
                 jid = str(uuid.uuid4())
 
-                input_dir = getattr(config, "INPUT_PATH", os.path.join(os.path.dirname(os.path.abspath(__file__)), "storage", "input"))
+                input_dir = getattr(
+                    config, "INPUT_PATH", os.path.join(os.path.dirname(os.path.abspath(__file__)), "storage", "input")
+                )
                 with contextlib.suppress(OSError):
                     os.makedirs(input_dir, exist_ok=True)
 
@@ -1872,7 +1900,11 @@ class EnhancedMediaHandler:
                 # If we successfully fetched locally, enqueue the job directly
                 if fetched:
                     job_id = str(uuid.uuid4())
-                    output_dir = getattr(config, "OUTPUT_PATH", os.path.join(os.path.dirname(os.path.abspath(__file__)), "storage", "output"))
+                    output_dir = getattr(
+                        config,
+                        "OUTPUT_PATH",
+                        os.path.join(os.path.dirname(os.path.abspath(__file__)), "storage", "output"),
+                    )
                     with contextlib.suppress(OSError):
                         os.makedirs(output_dir, exist_ok=True)
                     base_name = os.path.splitext(metadata.get("name") or os.path.basename(input_path))[0]
@@ -2601,6 +2633,7 @@ class EnhancedMediaHandler:
                 }
                 try:
                     from utils.job_queue import get_redis as _get_jq_redis
+
                     _r = await _get_jq_redis()
                     try:
                         await _r.hset(f"ffmpeg:job:{_job_id}", mapping=_source_meta_fields)
@@ -2728,7 +2761,9 @@ class EnhancedMediaHandler:
 
         # ── T6: Auto-enqueue immediately via pipeline ──
         _enqueued = await self._auto_enqueue_pipeline(
-            update, context, session,
+            update,
+            context,
+            session,
             file_type="video",
             file_size=video.file_size,
             file_ext=".mp4",
@@ -2822,7 +2857,9 @@ class EnhancedMediaHandler:
 
         # ── T6: Auto-enqueue immediately via pipeline ──
         _enqueued = await self._auto_enqueue_pipeline(
-            update, context, session,
+            update,
+            context,
+            session,
             file_type="audio",
             file_size=audio.file_size,
             file_ext=".mp3",
@@ -3000,7 +3037,9 @@ class EnhancedMediaHandler:
         # ── T6: Auto-enqueue immediately via pipeline ──
         _ext = os.path.splitext(file_name)[1] or ".mp4"
         _enqueued = await self._auto_enqueue_pipeline(
-            update, context, session,
+            update,
+            context,
+            session,
             file_type=file_type,
             file_size=document.file_size or 0,
             file_ext=_ext,
@@ -4264,7 +4303,18 @@ class EnhancedMediaHandler:
 
         # ── Store conversion metadata so the BigFilePipeline knows what to produce ──
         _crf_value = int(crf) if isinstance(crf, str) and crf.isdigit() else 28
-        current_file["_pipeline_ffmpeg_args"] = ["-c:v", "libx264", "-preset", "medium", "-crf", str(_crf_value), "-c:a", "aac", "-b:a", "128k"]
+        current_file["_pipeline_ffmpeg_args"] = [
+            "-c:v",
+            "libx264",
+            "-preset",
+            "medium",
+            "-crf",
+            str(_crf_value),
+            "-c:a",
+            "aac",
+            "-b:a",
+            "128k",
+        ]
         current_file["_pipeline_output_ext"] = ".mp4"
         current_file["_pipeline_conversion_type"] = "compress_video"
         current_file["_pipeline_caption"] = f"✅ Compressed (CRF {crf})"
@@ -4523,12 +4573,18 @@ class EnhancedMediaHandler:
         encoder_preset, crf, bitrate = preset_map[preset]
         # ── Store conversion metadata so the BigFilePipeline knows what to produce ──
         current_file["_pipeline_ffmpeg_args"] = [
-            "-c:v", "libx264",
-            "-preset", encoder_preset,
-            "-crf", str(crf),
-            "-movflags", "+faststart",
-            "-c:a", "aac",
-            "-b:a", bitrate,
+            "-c:v",
+            "libx264",
+            "-preset",
+            encoder_preset,
+            "-crf",
+            str(crf),
+            "-movflags",
+            "+faststart",
+            "-c:a",
+            "aac",
+            "-b:a",
+            bitrate,
         ]
         current_file["_pipeline_output_ext"] = ".mp4"
         current_file["_pipeline_conversion_type"] = "optimize_video"

@@ -315,20 +315,24 @@ async def run_ffmpeg(
     if _maxrate.lower() not in ("0", "unlimited", "", "none"):
         _bitrate_caps.extend(["-maxrate", _maxrate, "-bufsize", _bufsize])
 
-    ffmpeg_args = ffmpeg_args or [
-        "-c:v",
-        "libx264",
-        "-preset",
-        "veryfast",
-        "-crf",
-        "23",
-        "-c:a",
-        "aac",
-        "-b:a",
-        "128k",
-        "-movflags",
-        "+faststart",
-    ] + _bitrate_caps
+    ffmpeg_args = (
+        ffmpeg_args
+        or [
+            "-c:v",
+            "libx264",
+            "-preset",
+            "veryfast",
+            "-crf",
+            "23",
+            "-c:a",
+            "aac",
+            "-b:a",
+            "128k",
+            "-movflags",
+            "+faststart",
+        ]
+        + _bitrate_caps
+    )
 
     # Validate input path before probing/starting ffmpeg
     if not input_path:
@@ -444,7 +448,9 @@ async def run_ffmpeg(
                 out_bytes = 0
                 try:
                     if os.path.exists(output_path):
-                        out_bytes = await asyncio.get_running_loop().run_in_executor(None, lambda p=output_path: os.path.getsize(p))
+                        out_bytes = await asyncio.get_running_loop().run_in_executor(
+                            None, lambda p=output_path: os.path.getsize(p)
+                        )
                 except Exception:
                     out_bytes = 0
 
@@ -528,7 +534,9 @@ async def run_ffmpeg(
                     final_out = 0
                     try:
                         if os.path.exists(output_path):
-                            final_out = await asyncio.get_running_loop().run_in_executor(None, lambda p=output_path: os.path.getsize(p))
+                            final_out = await asyncio.get_running_loop().run_in_executor(
+                                None, lambda p=output_path: os.path.getsize(p)
+                            )
                     except Exception:
                         final_out = 0
 

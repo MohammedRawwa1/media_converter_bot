@@ -97,6 +97,7 @@ def _run_async(coro):
 
 # ── Upload progress publishing helper ──────────────────────────────────────
 
+
 def _publish_upload_progress(
     job_id: str,
     pct: int,
@@ -124,12 +125,14 @@ def _publish_upload_progress(
             r.hset(job_key, mapping=mapping)
             # Publish to progress channel for real-time consumers
             channel = f"ffmpeg:progress:{job_id}"
-            payload = json.dumps({
-                "status": "uploading" if pct < 100 else "queued",
-                "progress": pct,
-                "message": message,
-                "in_bytes": in_bytes or 0,
-            })
+            payload = json.dumps(
+                {
+                    "status": "uploading" if pct < 100 else "queued",
+                    "progress": pct,
+                    "message": message,
+                    "in_bytes": in_bytes or 0,
+                }
+            )
             r.publish(channel, payload)
         finally:
             r.close()
@@ -193,7 +196,11 @@ def upload():
         # If configured with remote storage (S3/R2/MinIO), we'll upload the input
         # in a background thread and enqueue the job after upload completes.
         input_key = None
-        backend_name = (os.getenv("STORAGE_BACKEND") or getattr(config, "STORAGE_BACKEND", "local")).lower()
+        backend_name = (
+            config.get_storage_backend_name()
+            if hasattr(config, "get_storage_backend_name")
+            else (os.getenv("STORAGE_BACKEND") or "local").lower()
+        )
         use_remote_backend = backend_name in ("s3", "r2") and get_storage_backend_sync is not None
         key = f"uploads/{job_id}_{os.path.basename(input_path)}" if use_remote_backend else None
     else:
@@ -277,7 +284,9 @@ def upload():
 
                         # Upload to remote storage if configured, else enqueue using local path
                         backend_name_loc = (
-                            os.getenv("STORAGE_BACKEND") or getattr(config, "STORAGE_BACKEND", "local")
+                            config.get_storage_backend_name()
+                            if hasattr(config, "get_storage_backend_name")
+                            else (os.getenv("STORAGE_BACKEND") or "local")
                         ).lower()
                         use_remote_loc = backend_name_loc in ("s3", "r2") and get_storage_backend_sync is not None
                         key_loc = f"uploads/{j_id}_{os.path.basename(inp_path)}" if use_remote_loc else None
@@ -355,7 +364,9 @@ def upload():
                         return
 
                     # not found yet: backoff then retry
-                    _publish_upload_progress(j_id, 5, f"Forward metadata not ready (attempt {attempt+1}/{attempts})...")
+                    _publish_upload_progress(
+                        j_id, 5, f"Forward metadata not ready (attempt {attempt + 1}/{attempts})..."
+                    )
                     with contextlib.suppress(Exception):
                         time.sleep(initial_delay * (2**attempt))
 
@@ -416,7 +427,11 @@ def upload():
                     return
 
                 # If configured, upload the input to remote storage and enqueue
-                backend_name_loc = (os.getenv("STORAGE_BACKEND") or getattr(config, "STORAGE_BACKEND", "local")).lower()
+                backend_name_loc = (
+                    config.get_storage_backend_name()
+                    if hasattr(config, "get_storage_backend_name")
+                    else (os.getenv("STORAGE_BACKEND") or "local")
+                ).lower()
                 use_remote_loc = backend_name_loc in ("s3", "r2") and get_storage_backend_sync is not None
                 key_loc = f"uploads/{j_id}_{os.path.basename(inp_path)}" if use_remote_loc else None
                 if use_remote_loc and key_loc:
@@ -684,7 +699,6 @@ def telethon_log():
     if backend is None:
         # Try to import async factory and instantiate it via asyncio
         try:
-
             from utils.storage import get_storage_backend as _get_async_backend
 
             try:
