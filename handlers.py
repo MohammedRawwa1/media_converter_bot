@@ -435,7 +435,85 @@ class EnhancedMediaHandler:
                                     logger.debug("handlers: operation failed")
                     except Exception:
                         logger.debug("handlers: operation failed")
-                    await _edit(f"✅ Job {job_id} finished. Output: {display_output}")
+
+                    # ── Build a rich result message with video metadata ──
+                    _result_parts = [f"✅ **Conversion complete!**"]
+
+                    # Try to extract metadata from the Redis job hash first
+                    _in_bytes = info.get("in_bytes")
+                    _out_bytes = info.get("out_bytes")
+
+                    if _in_bytes:
+                        try:
+                            _in_mb = int(_in_bytes) / (1024 * 1024)
+                            _result_parts.append(f"📥 Input: `{_in_mb:.1f} MB`")
+                        except (ValueError, TypeError):
+                            pass
+                    if _out_bytes:
+                        try:
+                            _out_mb = int(_out_bytes) / (1024 * 1024)
+                            _result_parts.append(f"📤 Output: `{_out_mb:.1f} MB`")
+                            # Show size ratio if both sizes are available
+                            if _in_bytes:
+                                try:
+                                    _ratio = int(_out_bytes) / max(int(_in_bytes), 1)
+                                    _result_parts.append(f"📊 Ratio: `{_ratio:.2f}x`")
+                                except (ValueError, TypeError, ZeroDivisionError):
+                                    pass
+                        except (ValueError, TypeError):
+                            pass
+
+                    # ── ffprobe the output file for rich metadata ──
+                    # Only probe if output is a local path (not a URL)
+                    if not str(display_output).startswith("http") and os.path.exists(str(output)):
+                        try:
+                            import json as _rj
+                            import subprocess as _rsp
+
+                            _ffprobe_bin = getattr(config, "FFMPEG_PATH", "ffmpeg").replace("ffmpeg", "ffprobe")
+                            _rp = await asyncio.to_thread(
+                                lambda: _rsp.run(
+                                    [_ffprobe_bin, "-v", "quiet", "-print_format", "json",
+                                     "-show_streams", "-show_format", str(output)],
+                                    capture_output=True,
+                                    timeout=15,
+                                )
+                            )
+                            if _rp.returncode == 0:
+                                _probe = _rj.loads(_rp.stdout.decode() or "{}")
+                                _streams = _probe.get("streams", [])
+                                _vcodec = None
+                                _acodec = None
+                                _width = None
+                                _height = None
+                                _duration = None
+                                for s in _streams:
+                                    if s.get("codec_type") == "video":
+                                        _vcodec = s.get("codec_name", "unknown")
+                                        _width = s.get("width")
+                                        _height = s.get("height")
+                                    elif s.get("codec_type") == "audio":
+                                        _acodec = s.get("codec_name", "unknown")
+                                _fmt = _probe.get("format", {})
+                                if _fmt.get("duration"):
+                                    with contextlib.suppress(ValueError, TypeError):
+                                        _duration = float(_fmt["duration"])
+
+                                if _width and _height:
+                                    _result_parts.append(f"🖥️ Resolution: `{_width}×{_height}`")
+                                if _duration:
+                                    _dur_str = _format_seconds_to_hhmmss(_duration)
+                                    _result_parts.append(f"⏱️ Duration: `{_dur_str}`")
+                                if _vcodec:
+                                    _result_parts.append(f"🎞️ Video: `{_vcodec}`")
+                                if _acodec:
+                                    _result_parts.append(f"🔊 Audio: `{_acodec}`")
+                        except Exception:
+                            logger.debug("handlers: ffprobe metadata extraction failed for result")
+
+                    _result_parts.append(f"📎 Job: `{job_id[:12]}...`")
+                    _result_text = "\n".join(_result_parts)
+                    await _edit(_result_text)
                 elif status == "cancelled":
                     # If cancel_notified flag is set, the cancel button handler
                     # already edited the message — skip to avoid overwriting.
@@ -1633,6 +1711,10 @@ class EnhancedMediaHandler:
                             "aac",
                             "-b:a",
                             "128k",
+                            "-maxrate",
+                            "2M",
+                            "-bufsize",
+                            "4M",
                         ],
                         "progress_channel": f"ffmpeg:progress:{job_id}",
                         "chat_id": update.effective_chat.id
@@ -2216,6 +2298,10 @@ class EnhancedMediaHandler:
                             "aac",
                             "-b:a",
                             "128k",
+                            "-maxrate",
+                            "2M",
+                            "-bufsize",
+                            "4M",
                         ],
                         "progress_channel": f"ffmpeg:progress:{job_id}",
                         "chat_id": update.effective_chat.id if update and update.effective_chat else None,

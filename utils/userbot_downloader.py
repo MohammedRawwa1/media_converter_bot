@@ -1252,8 +1252,15 @@ async def _download_and_ensure_path(client, msg, dest_path, progress_callback=No
 
     Returns ``True`` on success, ``False`` otherwise.
     """
+    # ── CRITICAL: Convert relative path to absolute before passing to Pyrogram.
+    #    Pyrogram 2.0.106's ``download_media`` resolves relative ``file_name``
+    #    against its own ``PARENT_DIR`` (which is the Python install directory,
+    #    e.g. ``/usr/local/bin/``), NOT the process current working directory.
+    #    This causes ``[Errno 13] Permission denied: '/usr/local/bin/storage'``
+    #    when it tries to create subdirectories there. ──
+    _abs_dest = os.path.abspath(dest_path) if dest_path else dest_path
     try:
-        _dl_kwargs = {"file_name": dest_path}
+        _dl_kwargs = {"file_name": _abs_dest}
         if progress_callback is not None:
             _dl_kwargs["progress"] = progress_callback
         _dl = await _download_media_with_retry(client, msg, **_dl_kwargs)
@@ -1261,14 +1268,14 @@ async def _download_and_ensure_path(client, msg, dest_path, progress_callback=No
             logger.warning(
                 "userbot: download_media_with_retry failed for %s (absolute=%s): %s",
                 dest_path,
-                os.path.abspath(dest_path) if dest_path else dest_path,
+                _abs_dest,
                 exc,
             )
             return False
 
     logger.info(
         "userbot: download_media dest_path=%s returned=%s",
-        dest_path,
+        _abs_dest,
         _dl,
     )
     if not _dl:
@@ -1276,10 +1283,9 @@ async def _download_and_ensure_path(client, msg, dest_path, progress_callback=No
         return False
 
     # Reconcile Pyrogram's download path to the expected destination
-    _reconcile_download_path(_dl, dest_path)
+    _reconcile_download_path(_dl, _abs_dest)
 
     # Check at the absolute destination path (where the file should be)
-    _abs_dest = os.path.abspath(dest_path)
     if os.path.exists(_abs_dest) and os.path.getsize(_abs_dest) > 0:
         ok = await _ffprobe_ok(_abs_dest)
         if ok:

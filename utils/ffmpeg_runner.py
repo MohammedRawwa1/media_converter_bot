@@ -100,6 +100,21 @@ async def run_ffmpeg(
     # Use veryfast preset to reduce memory usage on memory-constrained hosts.
     # The -preset fast default was consuming too much RAM alongside multiple uvicorn workers.
     # veryfast uses ~30% less memory at the cost of slightly larger output files.
+    #
+    # ── Bitrate caps ─────────────────────────────────────────────────────
+    # CRF 23 without a maximum bitrate can cause massive file size inflation
+    # for certain content (e.g. 27 MB input → 165 MB output was observed).
+    # The env vars below let operators tune the video bitrate cap.  The
+    # defaults (2 Mbps video + 128 Kbps audio ≈ 2.15 Mbps total) prevent
+    # outrageous bloat while preserving good visual quality for most content.
+    # Set FFMPEG_MAXRATE to "0" or "unlimited" to disable the cap entirely.
+    # ─────────────────────────────────────────────────────────────────────
+    _maxrate = os.getenv("FFMPEG_MAXRATE", "2M")
+    _bufsize = os.getenv("FFMPEG_BUFSIZE", "4M")
+    _bitrate_caps = []
+    if _maxrate.lower() not in ("0", "unlimited", "", "none"):
+        _bitrate_caps.extend(["-maxrate", _maxrate, "-bufsize", _bufsize])
+
     ffmpeg_args = ffmpeg_args or [
         "-c:v",
         "libx264",
@@ -113,7 +128,7 @@ async def run_ffmpeg(
         "128k",
         "-movflags",
         "+faststart",
-    ]
+    ] + _bitrate_caps
 
     # Validate input path before probing/starting ffmpeg
     if not input_path:

@@ -2163,7 +2163,7 @@ try:
 
         # Provide a compatibility redirect so requests to /upload still work.
         # Accept both GET (browser navigation) and POST (internal server fetch from handlers.py).
-        @app.route("/upload", methods=["GET", "POST"])
+        @app.api_route("/upload", methods=["GET", "POST"])
         async def _upload_redirect():
             return RedirectResponse(url="/flask/upload")
 
@@ -2776,12 +2776,81 @@ try:
         }
 
     @app.get("/")
-    async def root_index():
-        """Root endpoint for platform health checks."""
+    async def root_index(request: Request):
+        """Root endpoint: redirects browsers to the web UI, returns health JSON for API clients."""
+        accept = request.headers.get("accept", "")
+        if "text/html" in accept or "application/xhtml" in accept:
+            try:
+                from fastapi.responses import RedirectResponse
+                return RedirectResponse(url="/flask/")
+            except Exception:
+                pass
         try:
             return {"status": "ok", "bot_ready": bool(BOT_READY.is_set())}
         except Exception:
             return {"status": "ok"}
+
+    @app.get("/events/{job_id}")
+    async def events_sse(job_id: str):
+        """Server-Sent Events endpoint streaming real-time conversion progress from Redis."""
+        from fastapi.responses import StreamingResponse
+        import json as _rj
+
+        async def _event_gen():
+            # 1) Emit initial job state from Redis
+            try:
+                from utils.job_queue import get_redis as _get_redis
+                _r = await _get_redis()
+                if _r:
+                    _data = await _r.hgetall(f"ffmpeg:job:{job_id}")
+                    await _r.close()
+                    if _data:
+                        _decoded = {
+                            _k.decode() if isinstance(_k, bytes) else _k:
+                            _v.decode() if isinstance(_v, bytes) else _v
+                            for _k, _v in _data.items()
+                        }
+                        yield f"data: {_rj.dumps(_decoded)}\n\n"
+            except Exception:
+                pass
+
+            # 2) Subscribe to Redis pub/sub for live updates
+            _red_url = os.environ.get("REDIS_URL")
+            if _red_url:
+                try:
+                    from utils.job_queue import get_redis as _get_redis2
+                    _r2 = await _get_redis2()
+                    _pub = _r2.pubsub()
+                    await _pub.subscribe(f"ffmpeg:progress:{job_id}")
+                    while True:
+                        try:
+                            _msg = await _pub.get_message(ignore_subscribe_messages=True, timeout=1.0)
+                            if _msg:
+                                _d = _msg.get("data")
+                                if isinstance(_d, (bytes, bytearray)):
+                                    _d = _d.decode(errors="ignore")
+                                if _d:
+                                    yield f"data: {_d}\n\n"
+                        except asyncio.TimeoutError:
+                            yield ": keepalive\n\n"
+                        except Exception:
+                            break
+                    await _pub.close()
+                    await _r2.close()
+                except Exception:
+                    pass
+
+        return StreamingResponse(_event_gen(), media_type="text/event-stream")
+
+    @app.get("/download/{job_id}")
+    async def download_redirect(job_id: str):
+        """Redirect to Flask's /flask/download endpoint for file downloads."""
+        try:
+            from fastapi.responses import RedirectResponse
+            return RedirectResponse(url=f"/flask/download/{job_id}")
+        except Exception:
+            from fastapi.responses import JSONResponse
+            return JSONResponse(status_code=500, content={"error": "Download endpoint unavailable"})
 
     @app.head("/telegram/webhook")
     async def telegram_webhook_head(request: Request):
