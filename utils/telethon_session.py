@@ -378,16 +378,7 @@ async def _load_session_string_from_file_async(client_type: str = "telethon", us
 
 
 def _get_configured_session_string(user_id: int | None = None) -> str | None:
-    """Return a Telethon session string from any available source.
-
-    Resolution order:
-    1. Environment variable (``TELETHON_SESSION`` / ``API_SESSION`` etc.)
-    2. Per-user JSON file (when ``user_id`` is provided)
-    3. Legacy global JSON file (ONLY when ``user_id`` is ``None``)
-
-    When called with a ``user_id`` the global JSON is intentionally skipped
-    to prevent user A's session from leaking to user B.
-    """
+    """Return a Telethon session string from env var or per-user JSON."""
     # 1. Check env vars first (highest priority)
     env_str = _get_env_value(
         "API_SESSION",
@@ -406,13 +397,6 @@ def _get_configured_session_string(user_id: int | None = None) -> str | None:
         file_str = _load_session_string_from_file(client_type="telethon", user_id=user_id)
         if file_str:
             return file_str
-        # user_id provided but per-user file empty — STOP here, don't leak from global
-        return None
-
-    # 3. Fall back to the legacy global JSON file (only when no user_id)
-    file_str = _load_session_string_from_file(client_type="telethon")
-    if file_str:
-        return file_str
 
     return None
 
@@ -616,19 +600,7 @@ def build_telethon_client(api_id: int, api_hash: str, session_str: str | None = 
 
 
 def get_pyrogram_session_string(user_id: int | None = None) -> str | None:
-    """Return a Pyrogram session string from env vars, JSON file, or in-memory cache (sync).
-
-    Resolution order:
-    1. Environment variable (``PYROGRAM_SESSION`` etc.)
-    2. Per-user JSON file (when ``user_id`` is provided)
-    3. Legacy global JSON file (ONLY when ``user_id`` is ``None``)
-    4. In-memory cache (ONLY when ``user_id`` is ``None``)
-
-    When called with a ``user_id`` the global JSON and cache are intentionally
-    skipped to prevent user A's session from leaking to user B.
-
-    For a direct MongoDB read, use ``get_pyrogram_session_string_for_user()`` (async).
-    """
+    """Return a Pyrogram session string from env var, per-user JSON, or in-memory cache."""
     # 1. Check env vars first (highest priority)
     env_str = _get_env_value(
         "PYROGRAM_SESSION",
@@ -644,15 +616,9 @@ def get_pyrogram_session_string(user_id: int | None = None) -> str | None:
         file_str = _load_session_string_from_file(client_type="pyrogram", user_id=user_id)
         if file_str:
             return file_str
-        # user_id provided but per-user file empty — STOP here, don't leak from global/cache
         return None
 
-    # 3. Fall back to the legacy global JSON file (only when no user_id)
-    file_str = _load_session_string_from_file(client_type="pyrogram")
-    if file_str:
-        return file_str
-
-    # 4. Fall back to the in-memory cache (only when no user_id)
+    # 3. Fall back to the in-memory cache (only when no user_id)
     mongo_str = _get_pyrogram_mongo_cache()
     if mongo_str:
         return mongo_str
@@ -859,22 +825,16 @@ def has_usable_telethon_session(user_id: int | None = None) -> bool:
     if session_str:
         return True
 
-    # 2. Check persisted JSON file (per-user first, then global)
+    # 2. Check per-user JSON file (when user_id is known)
     if user_id is not None:
         file_str = _load_session_string_from_file(client_type="telethon", user_id=user_id)
         if file_str:
             return True
-        # user_id provided but per-user file empty — don't leak from global
         # Still check per-user .session file
         per_user_path = get_telethon_session_path() + f".{user_id}.session"
         return bool(os.path.exists(per_user_path))
 
-    # 3. Check legacy global JSON file (only when no user_id)
-    file_str = _load_session_string_from_file(client_type="telethon")
-    if file_str:
-        return True
-
-    # 4. Check file-based .session files on disk (only when no user_id)
+    # 3. Check file-based .session files on disk (only when no user_id)
     session_path = get_telethon_session_path()
     return os.path.exists(session_path) or os.path.exists(session_path + ".session")
 
