@@ -333,6 +333,94 @@ async def _send_with_pyrogram(
             await client.stop()
 
 
+async def _send_with_pyrogram_bot(
+    chat_id: int | str,
+    file_path: str,
+    caption: str | None = None,
+    progress_callback: Callable[[int, int], None] | None = None,
+    video_meta: dict | None = None,
+    thumb_path: str | None = None,
+) -> int | None:
+    """Send a video using Pyrogram authenticated as the bot (bot token).
+
+    The video appears as sent by the bot (not a user account), with full
+    metadata (duration, width, height, supports_streaming, thumbnail).
+    Sends via MTProto directly — no Bot API 50MB limit.
+
+    Returns:
+        The sent message ID on success, or None on failure/missing BOT_TOKEN.
+    """
+    if PyrogramClient is None:
+        return None
+
+    bot_token = os.environ.get("BOT_TOKEN")
+    if not bot_token:
+        logger.info("userbot: BOT_TOKEN not set; skipping Pyrogram (bot) send")
+        return None
+
+    # Pre-fetch video metadata and thumbnail before connecting.
+    _temp_cleanup = None
+    if video_meta is None:
+        try:
+            video_meta = await _probe_video_metadata(file_path) or {}
+        except Exception:
+            video_meta = {}
+    if thumb_path is None:
+        try:
+            thumb_path = await _generate_video_thumbnail(file_path)
+        except Exception:
+            thumb_path = None
+    if thumb_path:
+        _temp_cleanup = os.path.dirname(thumb_path)
+
+    bot = None
+    try:
+        bot = PyrogramClient(
+            "bot_sender",
+            bot_token=bot_token,
+            in_memory=True,
+        )
+        await bot.start()
+        target = await _normalize_target(chat_id)
+
+        kwargs = {
+            "caption": caption or "",
+            "supports_streaming": True,
+        }
+        if progress_callback is not None:
+            kwargs["progress"] = progress_callback
+        if "duration" in video_meta:
+            kwargs["duration"] = video_meta["duration"]
+        if "width" in video_meta:
+            kwargs["width"] = video_meta["width"]
+        if "height" in video_meta:
+            kwargs["height"] = video_meta["height"]
+        if thumb_path is not None:
+            kwargs["thumb"] = thumb_path
+
+        msg = await bot.send_video(target, file_path, **kwargs)
+        logger.info(
+            "userbot: Pyrogram (bot) sent video %s to %s (meta=%s, thumb=%s, msg_id=%s)",
+            file_path,
+            target,
+            video_meta,
+            bool(thumb_path),
+            getattr(msg, "id", None),
+        )
+        return getattr(msg, "id", None)
+    except Exception:
+        logger.exception("userbot: Pyrogram (bot) failed to send file %s", file_path)
+        return None
+    finally:
+        # Clean up temp thumbnail directory
+        if _temp_cleanup:
+            with contextlib.suppress(Exception):
+                shutil.rmtree(_temp_cleanup, ignore_errors=True)
+        if bot is not None:
+            with contextlib.suppress(Exception):
+                await bot.stop()
+
+
 async def send_file_via_userbot(
     chat_id: int | str,
     file_path: str,
@@ -341,11 +429,12 @@ async def send_file_via_userbot(
     video_meta: dict | None = None,
     thumb_path: str | None = None,
 ) -> int | None:
-    """Send a file using a user account.
+    """Send a file using a user account or bot.
 
-    Tries Telethon first (when a session is available), then falls back to
-    Pyrogram if a session string is configured. Fails fast without connecting
-    to Telegram when no session is configured.
+    Priority order:
+    1. Pyrogram with bot token — video appears as sent by the bot (preferred)
+    2. Telethon user account — appears as sent by the Telethon phone number
+    3. Pyrogram user account — appears as sent by the Pyrogram phone number
 
     When ``video_meta`` is provided (e.g. pre-probed in the worker), the
     internal ffprobe is skipped and the supplied metadata is used, ensuring
@@ -371,9 +460,26 @@ async def send_file_via_userbot(
             "Install at least one: pip install telethon or pip install pyrogram"
         )
 
+    # ── Priority 1: Pyrogram with bot token (video appears as sent by bot) ──
+    if PyrogramClient is not None and os.environ.get("BOT_TOKEN"):
+        try:
+            msg_id = await _send_with_pyrogram_bot(
+                chat_id,
+                file_path,
+                caption,
+                progress_callback=progress_callback,
+                video_meta=video_meta,
+                thumb_path=thumb_path,
+            )
+            if msg_id is not None:
+                return msg_id
+            logger.info("userbot: Pyrogram bot send failed; trying Telethon fallback")
+        except Exception as e:
+            logger.warning("userbot: Pyrogram bot error (%s); trying Telethon fallback", e)
+
+    # ── Priority 2: Telethon user account ──
     from utils.telethon_session import has_usable_telethon_session
 
-    # Try Telethon first only when a usable session exists.
     if TelegramClient is not None and has_usable_telethon_session():
         try:
             msg_id = await _send_with_telethon(
@@ -392,7 +498,7 @@ async def send_file_via_userbot(
     elif TelegramClient is not None:
         logger.info("userbot: Telethon session not configured; skipping Telethon upload")
 
-    # Fall back to Pyrogram (requires PYROGRAM_SESSION env var)
+    # ── Priority 3: Pyrogram user account (session string) ──
     if PyrogramClient is not None:
         msg_id = await _send_with_pyrogram(
             chat_id,
