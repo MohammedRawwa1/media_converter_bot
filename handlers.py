@@ -1177,17 +1177,27 @@ class EnhancedMediaHandler:
                                         try:
                                             _old_hash = await _r_dedup.hgetall(f"ffmpeg:job:{_stored_job_id}")
                                             if _old_hash:
-                                                _status = _old_hash.get(b"status") or _old_hash.get("status")
-                                                if _status:
-                                                    _s = _status.decode() if isinstance(_status, bytes) else str(_status)
-                                                    _active = _s in (
-                                                        "processing",
-                                                        "queued",
-                                                        "waiting",
-                                                        "started",
-                                                        "uploading",
-                                                        "sending",
-                                                    )
+                                                # If the job has cancel=1 set (even if status still
+                                                # shows "queued"/"waiting"), treat it as inactive so
+                                                # the user can reprocess the same file immediately.
+                                                _cancel_val = _old_hash.get(b"cancel") or _old_hash.get("cancel")
+                                                _is_cancelled = False
+                                                if _cancel_val:
+                                                    _cv = _cancel_val.decode() if isinstance(_cancel_val, bytes) else str(_cancel_val)
+                                                    _is_cancelled = (_cv == "1")
+                                                if not _is_cancelled:
+                                                    _status = _old_hash.get(b"status") or _old_hash.get("status")
+                                                    if _status:
+                                                        _s = _status.decode() if isinstance(_status, bytes) else str(_status)
+                                                        _active = _s in (
+                                                            "processing",
+                                                            "queued",
+                                                            "waiting",
+                                                            "started",
+                                                            "uploading",
+                                                            "sending",
+                                                        )
+                                                # else: _active stays False (cancelled)
                                         except Exception:
                                             _active = False
 
