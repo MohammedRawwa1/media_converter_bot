@@ -1539,6 +1539,7 @@ class EnhancedMediaHandler:
                         or current_file.get("registered_at"),
                         file_unique_id=current_file.get("file_unique_id"),
                         progress_callback=_dl_progress_cb,
+                        user_id=update.effective_user.id,
                     )
                     logger.info(
                         "Userbot download fallback (%s) result for %s/%s: ok=%s exists=%s",
@@ -1898,6 +1899,7 @@ class EnhancedMediaHandler:
                                 msg_date=metadata.get("registered_at") or metadata.get("created_at"),
                                 file_unique_id=metadata.get("file_unique_id"),
                                 progress_callback=_dl_progress_cb,
+                                user_id=update.effective_user.id,
                             )
                             logger.info(
                                 "userbot download result for fh=%s: ok=%s exists=%s",

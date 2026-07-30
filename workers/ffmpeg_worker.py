@@ -1410,6 +1410,7 @@ async def handle_job(job: dict):
                                             progress_callback=_up_cb,
                                             video_meta=_pre_vm,
                                             thumb_path=_pre_tp,
+                                            user_id=job.get("user_id"),
                                         )
                                     finally:
                                         if _pre_tp:
@@ -1781,6 +1782,7 @@ async def handle_job(job: dict):
                                             progress_callback=_up_cb,
                                             video_meta=_pre_vm,
                                             thumb_path=_pre_tp,
+                                            user_id=job.get("user_id"),
                                         )
                                     finally:
                                         if _pre_tp:
@@ -2051,6 +2053,7 @@ async def handle_job(job: dict):
                                                         input_path,
                                                         msg_date=meta.get("registered_at") or meta.get("created_at"),
                                                         file_unique_id=meta.get("file_unique_id"),
+                                                        user_id=job.get("user_id"),
                                                     )
                                                 except Exception:
                                                     ok = False
@@ -2066,7 +2069,10 @@ async def handle_job(job: dict):
 
                                         tried = True
                                         ok = await download_forward_via_userbot(
-                                            job.get("chat_id"), job.get("message_id") or job.get("msg_id"), input_path
+                                            job.get("chat_id"),
+                                            job.get("message_id") or job.get("msg_id"),
+                                            input_path,
+                                            user_id=job.get("user_id"),
                                         )
                                     except Exception:
                                         ok = False

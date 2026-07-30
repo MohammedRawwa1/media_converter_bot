@@ -163,9 +163,13 @@ class MediaConversionModel(FillableModel):
             with contextlib.suppress(Exception):
                 await self._stats_coll.create_index("date", unique=True)
 
-            # Sessions: index by user_id for fast lookup
+            # Sessions: non-unique index on user_id to allow multiple docs per user (per-phone)
             with contextlib.suppress(Exception):
-                await self._sessions_coll.create_index("user_id", unique=True)
+                await self._sessions_coll.create_index("user_id")
+
+            # Compound index {user_id, phone} for fast per-phone session lookups
+            with contextlib.suppress(Exception):
+                await self._sessions_coll.create_index([("user_id", 1), ("phone", 1)])
 
             # Schedules: index by run_at and status for efficient queries
             with contextlib.suppress(Exception):
@@ -347,13 +351,22 @@ class MediaConversionModel(FillableModel):
             return []
 
     # -------- Session helpers --------
-    async def save_session(self, user_id: int, session_data: dict[str, Any]) -> bool:
+    async def save_session(self, user_id: int, session_data: dict[str, Any], phone: str | None = None) -> bool:
         """Save a minimal session document for quick recovery across restarts.
 
         Uses individual ``session.<key>`` paths in ``$set`` so multiple callers
         can update distinct keys within the ``session`` sub-document without
         clobbering each other — critical when saves run in parallel (e.g.
         the healthchecker checks both Telethon and Pyrogram concurrently).
+
+        When ``phone`` is provided, the document is keyed by the compound
+        ``{user_id, phone}``, enabling per-phone-number session isolation.
+        Multiple phone numbers under the same ``user_id`` each get their own
+        document and will not overwrite each other.
+
+        When ``phone`` is ``None`` (default), the document is keyed by
+        ``{user_id}`` only — backward-compatible with existing single-phone
+        deployments.
         """
         try:
             set_fields = {"updated_at": datetime.utcnow()}
@@ -364,6 +377,10 @@ class MediaConversionModel(FillableModel):
                 query["bot_id"] = self.bot_id
                 set_fields["bot_id"] = self.bot_id
             set_fields["user_id"] = user_id
+            # Per-phone compound key: add phone to query + stored fields
+            if phone is not None:
+                query["phone"] = phone
+                set_fields["phone"] = phone
             await self.sessions.update(query, {"$set": set_fields}, upsert=True)
             return True
         except Exception as e:
@@ -380,13 +397,29 @@ class MediaConversionModel(FillableModel):
                 logger.error("Error saving session for %s: %s", user_id, e, exc_info=True)
             return False
 
-    async def load_session(self, user_id: int) -> dict[str, Any] | None:
-        """Load a previously saved session for a user_id."""
+    async def load_session(self, user_id: int, phone: str | None = None) -> dict[str, Any] | None:
+        """Load a previously saved session for a user_id.
+
+        When ``phone`` is provided, only sessions for that specific phone
+        number are returned (compound ``{user_id, phone}`` key).
+
+        When ``phone`` is ``None``, returns the most recently saved session
+        across all phone numbers for this user — backward-compatible with
+        existing single-phone deployments.
+        """
         try:
             query = {"user_id": user_id}
             if self.bot_id is not None:
                 query["bot_id"] = self.bot_id
-            doc = await self.sessions.select(filters=query, projection={"_id": 0, "session": 1}).first()
+            if phone is not None:
+                query["phone"] = phone
+            # If no phone specified, return the most recently updated doc
+            # (handles multi-phone scenario gracefully)
+            doc = await (
+                self.sessions.select(filters=query, projection={"_id": 0, "session": 1})
+                .sort(("updated_at", -1))
+                .first()
+            )
             if doc:
                 return doc.get("session")
             return None
@@ -394,12 +427,19 @@ class MediaConversionModel(FillableModel):
             logger.error("Error loading session for %s: %s", user_id, e)
             return None
 
-    async def delete_session(self, user_id: int) -> bool:
-        """Delete a persisted session for a user."""
+    async def delete_session(self, user_id: int, phone: str | None = None) -> bool:
+        """Delete a persisted session for a user.
+
+        When ``phone`` is provided, only the session for that specific phone
+        number is deleted. When ``phone`` is ``None``, ALL sessions for the
+        ``user_id`` are deleted (backward-compatible).
+        """
         try:
             query = {"user_id": user_id}
             if self.bot_id is not None:
                 query["bot_id"] = self.bot_id
+            if phone is not None:
+                query["phone"] = phone
             await self.sessions.delete(query)
             return True
         except Exception as e:

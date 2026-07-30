@@ -198,6 +198,7 @@ class BigFilePipeline:
                     message_id,
                     temp_path,
                     progress_callback=progress_callback,
+                    user_id=user_id,
                 )
                 if not download_ok or not os.path.exists(temp_path) or os.path.getsize(temp_path) == 0:
                     return IngestResult(
@@ -357,6 +358,7 @@ class BigFilePipeline:
         message_id: int,
         dest_path: str,
         progress_callback: Callable[[int, int], None] | None = None,
+        user_id: int | None = None,
     ) -> bool:
         """Download a message using Pyrogram userbot.
 
@@ -365,6 +367,7 @@ class BigFilePipeline:
             message_id: Telegram message ID of the file.
             dest_path: Local path to save the downloaded file.
             progress_callback: Optional callable(current_bytes, total_bytes) for progress.
+            user_id: Optional Telegram user ID for per-user session resolution.
 
         Returns True on success, False on failure.
         """
@@ -376,6 +379,7 @@ class BigFilePipeline:
                 message_id=message_id,
                 dest_path=dest_path,
                 progress_callback=progress_callback,
+                user_id=user_id,
             )
             return ok
         except Exception as e:

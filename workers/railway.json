@@ -4,7 +4,6 @@
     "builder": "DOCKERFILE",
     "dockerfilePath": "./Dockerfile",
     "watchPatterns": [
-      ".github/**",
       "**/*.py",
       "requirements.txt",
       "Dockerfile",

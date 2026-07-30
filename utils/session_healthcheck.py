@@ -395,11 +395,18 @@ class SessionHealthChecker:
         if env_str:
             session_str = env_str
         else:
-            # Read the persisted JSON file
+            # Read per-user JSON first, then fall back to global
             try:
-                session_str = await _load_session_string_from_file_async(client_type="pyrogram")
+                session_str = await _load_session_string_from_file_async(
+                    client_type="pyrogram", user_id=self.admin_user_id
+                )
             except Exception:
                 session_str = None
+            if not session_str:
+                try:
+                    session_str = await _load_session_string_from_file_async(client_type="pyrogram")
+                except Exception:
+                    session_str = None
 
         # If still nothing, check MongoDB (for sessions saved by /loginpyro)
         if not session_str and self.db_model is not None and self.admin_user_id is not None:
@@ -484,12 +491,21 @@ class SessionHealthChecker:
             "telethon_session",
         )
         if not session_str:
-            # Read the persisted JSON file async to avoid blocking the event loop
+            # Read the persisted global JSON file
             try:
                 session_str = await _load_session_string_from_file_async(client_type="telethon")
             except Exception as exc:
                 h.error = f"config check failed: {exc}"
                 return h
+
+        # 2. Check per-user JSON file if admin_user_id is available
+        if not session_str and self.admin_user_id is not None:
+            try:
+                session_str = await _load_session_string_from_file_async(
+                    client_type="telethon", user_id=self.admin_user_id
+                )
+            except Exception as exc:
+                logger.debug("SessionHealthChecker: per-user Telethon check failed: %s", exc)
 
         if not session_str:
             # Fall back to checking for a file-based .session on disk
@@ -562,7 +578,9 @@ class SessionHealthChecker:
             try:
                 from utils.telethon_session import save_session_string_to_file_async
 
-                saved_file = await save_session_string_to_file_async(session_str, client_type="telethon")
+                saved_file = await save_session_string_to_file_async(
+                    session_str, client_type="telethon", user_id=self.admin_user_id
+                )
             except Exception:
                 logger.debug("SessionHealthChecker: failed to save Telethon session to file")
 
@@ -620,7 +638,9 @@ class SessionHealthChecker:
             try:
                 from utils.telethon_session import save_session_string_to_file_async
 
-                saved_file = await save_session_string_to_file_async(session_str, client_type="pyrogram")
+                saved_file = await save_session_string_to_file_async(
+                    session_str, client_type="pyrogram", user_id=self.admin_user_id
+                )
             except Exception:
                 logger.debug("SessionHealthChecker: failed to save Pyrogram session to file")
 

@@ -863,11 +863,13 @@ async def _download_with_telethon(
     msg_date: str | None = None,
     file_unique_id: str | None = None,
     progress_callback=None,
+    user_id: int | None = None,
 ) -> bool:
     """Download using Telethon client.
 
     Args:
         progress_callback: Optional ``(current, total)`` callback for download progress.
+        user_id: Optional Telegram user ID for per-user session resolution.
     """
     if TelegramClient is None:
         logger.debug("Telethon not installed; skipping Telethon download")
@@ -884,7 +886,7 @@ async def _download_with_telethon(
 
     session_str = None
     try:
-        session_str = await get_telethon_session_string_for_user(user_id=None, db_model=None)
+        session_str = await get_telethon_session_string_for_user(user_id=user_id, db_model=None)
     except Exception:
         session_str = None
 
@@ -1315,6 +1317,7 @@ async def _download_bytes_with_pyrogram(
     chat_id: int | str,
     message_id: int,
     progress_callback: Callable[[int, int], None] | None = None,
+    user_id: int | None = None,
 ) -> bytes | None:
     """Download a message's media into memory (bytes) using Pyrogram.
 
@@ -1327,16 +1330,23 @@ async def _download_bytes_with_pyrogram(
 
     If ``progress_callback`` is provided, it will be called with
     ``(current_bytes, total_bytes)`` during download.
+
+    Args:
+        user_id: Optional Telegram user ID for per-user session resolution.
     """
     if PyrogramClient is None:
         logger.info("userbot: Pyrogram not installed; cannot do in-memory download")
         return None
 
-    from utils.telethon_session import build_pyrogram_client, get_userbot_credentials
+    from utils.telethon_session import (
+        build_pyrogram_client,
+        get_pyrogram_session_string,
+        get_userbot_credentials,
+    )
 
     api_id, api_hash = get_userbot_credentials()
-
-    client = build_pyrogram_client(api_id, api_hash)
+    pyro_session = get_pyrogram_session_string(user_id=user_id)
+    client = build_pyrogram_client(api_id, api_hash, session_str=pyro_session)
     if client is None:
         logger.info("userbot: Pyrogram session string not configured; cannot do in-memory download")
         return None
@@ -1584,6 +1594,7 @@ async def _download_with_pyrogram(
     message_id: int,
     dest_path: str,
     progress_callback=None,
+    user_id: int | None = None,
 ) -> bool:
     """Download using Pyrogram client (session string fallback).
 
@@ -1592,16 +1603,21 @@ async def _download_with_pyrogram(
         message_id: Message ID in that chat.
         dest_path: Destination file path.
         progress_callback: Optional ``(current, total)`` callback for download progress.
+        user_id: Optional Telegram user ID for per-user session resolution.
     """
     if PyrogramClient is None:
         logger.info("userbot: Pyrogram not installed; skipping")
         return False
 
-    from utils.telethon_session import build_pyrogram_client, get_userbot_credentials
+    from utils.telethon_session import (
+        build_pyrogram_client,
+        get_pyrogram_session_string,
+        get_userbot_credentials,
+    )
 
     api_id, api_hash = get_userbot_credentials()
-
-    client = build_pyrogram_client(api_id, api_hash)
+    pyro_session = get_pyrogram_session_string(user_id=user_id)
+    client = build_pyrogram_client(api_id, api_hash, session_str=pyro_session)
     if client is None:
         logger.info("userbot: Pyrogram session string not configured")
         return False
@@ -1938,6 +1954,7 @@ async def download_forward_via_userbot(
     msg_date: str | None = None,
     file_unique_id: str | None = None,
     progress_callback=None,
+    user_id: int | None = None,
 ) -> bool:
     """Download a message media using a user account.
 
@@ -1951,6 +1968,7 @@ async def download_forward_via_userbot(
       msg_date: ISO datetime string of the original message (optional)
       file_unique_id: Telegram Bot API file_unique_id (optional)
       progress_callback: Optional ``(current, total)`` callback for download progress.
+      user_id: Optional Telegram user ID for per-user session resolution.
 
     Returns True on success, False on failure. Raises RuntimeError for missing config.
     """
@@ -1965,13 +1983,15 @@ async def download_forward_via_userbot(
         has_usable_telethon_session,
     )
 
-    pyrogram_session_configured = bool(get_pyrogram_session_string())
+    pyrogram_session_configured = bool(get_pyrogram_session_string(user_id=user_id))
 
     # Prefer a pre-configured Pyrogram session when available; it avoids
     # interactive Telethon login prompts on server environments.
     if PyrogramClient is not None and pyrogram_session_configured:
         try:
-            result = await _download_with_pyrogram(chat_id, message_id, dest_path, progress_callback=progress_callback)
+            result = await _download_with_pyrogram(
+                chat_id, message_id, dest_path, progress_callback=progress_callback, user_id=user_id
+            )
             if result:
                 return True
             logger.info("userbot: Pyrogram download failed; trying Telethon fallback")
@@ -1979,10 +1999,16 @@ async def download_forward_via_userbot(
             logger.warning("userbot: Pyrogram download error (%s); trying Telethon fallback", e)
 
     # Try Telethon only when a usable session exists.
-    if TelegramClient is not None and has_usable_telethon_session():
+    if TelegramClient is not None and has_usable_telethon_session(user_id=user_id):
         try:
             result = await _download_with_telethon(
-                chat_id, message_id, dest_path, msg_date, file_unique_id, progress_callback=progress_callback
+                chat_id,
+                message_id,
+                dest_path,
+                msg_date,
+                file_unique_id,
+                progress_callback=progress_callback,
+                user_id=user_id,
             )
             if result:
                 return True
@@ -2005,6 +2031,7 @@ async def download_bytes_via_userbot(
     chat_id: int | str,
     message_id: int,
     progress_callback: Callable[[int, int], None] | None = None,
+    user_id: int | None = None,
 ) -> bytes | None:
     """Download a message media into memory (bytes) using userbot.
 
@@ -2015,6 +2042,9 @@ async def download_bytes_via_userbot(
     ``(current_bytes, total_bytes)`` during download.
 
     Returns the file contents as ``bytes`` on success, or ``None`` on failure.
+
+    Args:
+        user_id: Optional Telegram user ID for per-user session resolution.
     """
     if TelegramClient is None and PyrogramClient is None:
         raise RuntimeError(
@@ -2027,12 +2057,14 @@ async def download_bytes_via_userbot(
         has_usable_telethon_session,
     )
 
-    pyrogram_session_configured = bool(get_pyrogram_session_string())
+    pyrogram_session_configured = bool(get_pyrogram_session_string(user_id=user_id))
 
     # Try Pyrogram in-memory first
     if PyrogramClient is not None and pyrogram_session_configured:
         try:
-            data = await _download_bytes_with_pyrogram(chat_id, message_id, progress_callback=progress_callback)
+            data = await _download_bytes_with_pyrogram(
+                chat_id, message_id, progress_callback=progress_callback, user_id=user_id
+            )
             if data is not None:
                 logger.info(
                     "userbot: in-memory download via Pyrogram succeeded: %d bytes",
@@ -2047,7 +2079,7 @@ async def download_bytes_via_userbot(
             )
 
     # Try Telethon with BytesIO as fallback
-    if TelegramClient is not None and has_usable_telethon_session():
+    if TelegramClient is not None and has_usable_telethon_session(user_id=user_id):
         try:
             from utils.telethon_session import build_telethon_client
             from utils.telethon_session import get_userbot_credentials as _get_creds

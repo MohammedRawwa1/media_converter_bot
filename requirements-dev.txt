@@ -1,0 +1,5 @@
+# ── Development & CI dependencies ──
+# Installed only in CI pipelines and local dev, never in production Docker image.
+bandit>=1.9.0
+ruff>=0.7.0
+pip-audit>=2.0.0

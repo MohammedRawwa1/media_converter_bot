@@ -83,12 +83,29 @@ _TELETHON_CACHE_LOCK: asyncio.Lock | None = None
 _TELETHON_CACHED_CLIENT: tuple | None = None  # (client, api_id, api_hash)
 
 
-async def _get_cached_telethon_client(api_id: int, api_hash: str):
-    """Return a cached Telethon client, creating or reconnecting if needed."""
+async def _get_cached_telethon_client(api_id: int, api_hash: str, session_str: str | None = None):
+    """Return a cached Telethon client, creating or reconnecting if needed.
+
+    When ``session_str`` is provided (per-user session), a fresh non-cached
+    client is created and returned.  When ``session_str`` is ``None`` (default),
+    the global cached client is reused, avoiding reconnect overhead.
+    """
     from utils.telethon_session import build_telethon_client
 
     global _TELETHON_CACHE_LOCK, _TELETHON_CACHED_CLIENT
 
+    # ── Per-user session: create a fresh client, no caching ──
+    if session_str is not None:
+        client = build_telethon_client(api_id, api_hash, session_str=session_str)
+
+        async def _no_phone_explicit():
+            raise RuntimeError("Telethon phone prompt unexpectedly triggered")
+
+        await client.start(phone=_no_phone_explicit)
+        logger.info("userbot: Created new Telethon client for per-user session")
+        return client
+
+    # ── Global session: use cached client ──
     if _TELETHON_CACHE_LOCK is None:
         _TELETHON_CACHE_LOCK = asyncio.Lock()
 
@@ -131,12 +148,27 @@ _PYRO_USER_CACHE_LOCK: asyncio.Lock | None = None
 _PYRO_USER_CACHED_CLIENT: tuple | None = None  # (client, api_id, api_hash)
 
 
-async def _get_cached_pyrogram_user_client(api_id: int, api_hash: str):
-    """Return a cached Pyrogram user client, creating or reconnecting if needed."""
+async def _get_cached_pyrogram_user_client(api_id: int, api_hash: str, session_str: str | None = None):
+    """Return a cached Pyrogram user client, creating or reconnecting if needed.
+
+    When ``session_str`` is provided (per-user session), a fresh non-cached
+    client is created and returned.  When ``session_str`` is ``None`` (default),
+    the global cached client is reused, avoiding reconnect overhead.
+    """
     from utils.telethon_session import build_pyrogram_client
 
     global _PYRO_USER_CACHE_LOCK, _PYRO_USER_CACHED_CLIENT
 
+    # ── Per-user session: create a fresh client, no caching ──
+    if session_str is not None:
+        client = build_pyrogram_client(api_id, api_hash, session_str=session_str)
+        if client is None:
+            return None
+        await client.start()
+        logger.info("userbot: Created new Pyrogram client for per-user session")
+        return client
+
+    # ── Global session: use cached client ──
     if _PYRO_USER_CACHE_LOCK is None:
         _PYRO_USER_CACHE_LOCK = asyncio.Lock()
 
@@ -422,6 +454,7 @@ async def _send_with_telethon(
     progress_callback: Callable[[int, int], None] | None = None,
     video_meta: dict | None = None,
     thumb_path: str | None = None,
+    user_id: int | None = None,
 ) -> int | None:
     """Send a file using Telethon.
 
@@ -438,6 +471,7 @@ async def _send_with_telethon(
         video_meta: Pre-probed metadata dict with keys ``duration``, ``width``, ``height``.
                     If provided, skips internal ffprobe.
         thumb_path: Pre-generated thumbnail path. If provided, skips internal thumbnail generation.
+        user_id: Optional Telegram user ID for per-user session resolution.
 
     Returns:
         The sent message ID on success, or None on failure.
@@ -445,15 +479,27 @@ async def _send_with_telethon(
     if TelegramClient is None:
         return None
 
-    from utils.telethon_session import get_userbot_credentials, has_usable_telethon_session
+    from utils.telethon_session import (
+        get_telethon_session_string_for_user,
+        get_userbot_credentials,
+        has_usable_telethon_session,
+    )
 
     # Fail fast if no usable Telethon session is available — avoids
     # client.start() prompting for a phone number on stdin (EOFError).
-    if not has_usable_telethon_session():
+    if not has_usable_telethon_session(user_id=user_id):
         logger.info("userbot: Telethon session not configured; skipping Telethon upload")
         return None
 
     api_id, api_hash = get_userbot_credentials()
+
+    # Resolve per-user session string if user_id is provided
+    session_str = None
+    if user_id is not None:
+        try:
+            session_str = await get_telethon_session_string_for_user(user_id=user_id, db_model=None)
+        except Exception:
+            session_str = None
 
     # Pre-fetch video metadata and thumbnail before connecting.
     # Gracefully fall back to a generic send if ffprobe isn't available.
@@ -483,7 +529,7 @@ async def _send_with_telethon(
     # worker) owns it and will clean it up after ALL send methods have been
     # tried.  Cleaning it up early would break fallback send methods.
 
-    client = await _get_cached_telethon_client(api_id, api_hash)
+    client = await _get_cached_telethon_client(api_id, api_hash, session_str=session_str)
     if client is None:
         return None
     try:
@@ -633,6 +679,87 @@ async def _generate_video_thumbnail(path: str) -> str | None:
         return None
 
 
+async def _send_video_raw(
+    client,  # pyrogram.Client — noqa: F821
+    target: int | str,
+    file_path: str,
+    uploaded_file,  # raw.types.InputFile or InputFileBig
+    caption: str = "",
+    video_meta: dict | None = None,
+    thumb_path: str | None = None,
+) -> int | None:
+    """Send a pre-uploaded video via raw Telegram API.
+
+    Pyrogram's ``send_video()`` has no code path for pre-uploaded
+    ``raw.types.InputFile`` / ``InputFileBig`` objects — it always calls
+    ``save_file()`` which only accepts file paths or binary streams and
+    raises ``ValueError`` for TL types.
+
+    This helper builds the raw ``messages.SendMedia`` call directly with
+    the already-uploaded file, avoiding a redundant re-upload.
+    """
+    from pyrogram import raw
+
+    video_meta = video_meta or {}
+
+    attributes = [
+        raw.types.DocumentAttributeVideo(
+            supports_streaming=True,
+            duration=int(video_meta.get("duration", 0)),
+            w=int(video_meta.get("width", 0)),
+            h=int(video_meta.get("height", 0)),
+        ),
+        raw.types.DocumentAttributeFilename(file_name=os.path.basename(file_path)),
+    ]
+
+    thumb = None
+    if thumb_path:
+        try:
+            thumb = await client.save_file(thumb_path)
+        except Exception:
+            logger.warning("userbot: failed to upload thumbnail %s", thumb_path)
+
+    media = raw.types.InputMediaUploadedDocument(
+        mime_type=client.guess_mime_type(file_path) or "video/mp4",
+        file=uploaded_file,
+        thumb=thumb,
+        attributes=attributes,
+    )
+
+    try:
+        r = await client.invoke(
+            raw.functions.messages.SendMedia(
+                peer=await client.resolve_peer(target),
+                media=media,
+                message=caption or "",
+                random_id=client.rnd_id(),
+            )
+        )
+        for update in r.updates:
+            if isinstance(
+                update,
+                (
+                    raw.types.UpdateNewMessage,
+                    raw.types.UpdateNewChannelMessage,
+                    raw.types.UpdateNewScheduledMessage,
+                ),
+            ):
+                from pyrogram import types as pyro_types
+
+                msg = await pyro_types.Message._parse(
+                    client,
+                    update.message,
+                    {i.id: i for i in r.users},
+                    {i.id: i for i in r.chats},
+                    is_scheduled=isinstance(update, raw.types.UpdateNewScheduledMessage),
+                )
+                return getattr(msg, "id", None)
+        return None
+    except Exception:
+        logger.exception("userbot: raw API send failed for %s", file_path)
+        return None
+
+
 async def _send_with_pyrogram(
     chat_id: int | str,
     file_path: str,
@@ -640,6 +767,7 @@ async def _send_with_pyrogram(
     progress_callback: Callable[[int, int], None] | None = None,
     video_meta: dict | None = None,
     thumb_path: str | None = None,
+    user_id: int | None = None,
 ) -> int | None:
     """Send a file using Pyrogram (session string fallback).
 
@@ -659,6 +787,7 @@ async def _send_with_pyrogram(
                            Pyrogram progress callback is synchronous.
         video_meta: Pre-probed metadata dict with keys ``duration``, ``width``, ``height``.
         thumb_path: Pre-generated thumbnail path.
+        user_id: Optional Telegram user ID for per-user session resolution.
 
     Returns:
         The sent message ID on success, or None on failure.
@@ -666,11 +795,19 @@ async def _send_with_pyrogram(
     if PyrogramClient is None:
         return None
 
-    from utils.telethon_session import get_userbot_credentials
+    from utils.telethon_session import get_pyrogram_session_string, get_userbot_credentials
 
     api_id, api_hash = get_userbot_credentials()
 
-    client = await _get_cached_pyrogram_user_client(api_id, api_hash)
+    # Resolve per-user session string if user_id is provided
+    session_str = None
+    if user_id is not None:
+        session_str = get_pyrogram_session_string(user_id=user_id)
+        if not session_str:
+            logger.info("userbot: Pyrogram session not configured for user %s; skipping Pyrogram upload", user_id)
+            return None
+
+    client = await _get_cached_pyrogram_user_client(api_id, api_hash, session_str=session_str)
     if client is None:
         return None
 
@@ -696,14 +833,48 @@ async def _send_with_pyrogram(
 
     try:
         target = await _normalize_target(chat_id)
+
+        # ── Parallel upload then send ──
+        # Pyrogram's send_video() does NOT accept pre-uploaded InputFile
+        # objects (it calls save_file() which only handles strings/IO).
+        # When parallel upload succeeds, we use the raw API instead.
+        file_size = os.path.getsize(file_path)
+        uploaded_file = await _parallel_upload_file_pyrogram(
+            client,
+            file_path,
+            file_size,
+            progress_callback=progress_callback,
+        )
+        if uploaded_file is not None:
+            msg_id = await _send_video_raw(
+                client,
+                target,
+                file_path,
+                uploaded_file,
+                caption=caption or "",
+                video_meta=video_meta,
+                thumb_path=thumb_path,
+            )
+            if msg_id is not None:
+                logger.info(
+                    "userbot: Pyrogram sent video %s to %s (meta=%s, thumb=%s, msg_id=%s)",
+                    file_path,
+                    target,
+                    video_meta,
+                    bool(thumb_path),
+                    msg_id,
+                )
+                return msg_id
+            logger.warning("userbot: Pyrogram raw API send returned None; falling back")
+
+        # Fallback: let Pyrogram handle upload + send via send_video
+        logger.info("userbot: Pyrogram falling back to send_video for %s", file_path)
         kwargs = {
             "caption": caption or "",
             "supports_streaming": True,
         }
         if progress_callback is not None:
             kwargs["progress"] = progress_callback
-
-        # Pass probed metadata so Telegram displays proper video info
         if "duration" in video_meta:
             kwargs["duration"] = video_meta["duration"]
         if "width" in video_meta:
@@ -713,22 +884,7 @@ async def _send_with_pyrogram(
         if thumb_path is not None:
             kwargs["thumb"] = thumb_path
 
-        # ── Parallel upload then send ──
-        file_size = os.path.getsize(file_path)
-        uploaded_file = await _parallel_upload_file_pyrogram(
-            client,
-            file_path,
-            file_size,
-            progress_callback=progress_callback,
-        )
-        # If parallel upload returned None (memory guard), remove progress
-        # so Pyrogram uses file_path and reports progress itself.
-        if uploaded_file is None:
-            logger.info("userbot: Pyrogram falling back to sequential upload for %s", file_path)
-        else:
-            kwargs.pop("progress", None)  # parallel upload already handled progress
-        _file_arg = uploaded_file if uploaded_file is not None else file_path
-        msg = await client.send_video(target, _file_arg, **kwargs)
+        msg = await client.send_video(target, file_path, **kwargs)
         logger.info(
             "userbot: Pyrogram sent video %s to %s (meta=%s, thumb=%s, msg_id=%s)",
             file_path,
@@ -809,6 +965,41 @@ async def _send_with_pyrogram_bot(
     try:
         target = await _normalize_target(chat_id)
 
+        # ── Parallel upload then send ──
+        # Pyrogram's send_video() does NOT accept pre-uploaded InputFile
+        # objects (it calls save_file() which only handles strings/IO).
+        # When parallel upload succeeds, we use the raw API instead.
+        file_size = os.path.getsize(file_path)
+        uploaded_file = await _parallel_upload_file_pyrogram(
+            bot,
+            file_path,
+            file_size,
+            progress_callback=progress_callback,
+        )
+        if uploaded_file is not None:
+            msg_id = await _send_video_raw(
+                bot,
+                target,
+                file_path,
+                uploaded_file,
+                caption=caption or "",
+                video_meta=video_meta,
+                thumb_path=thumb_path,
+            )
+            if msg_id is not None:
+                logger.info(
+                    "userbot: Pyrogram (bot) sent video %s to %s (meta=%s, thumb=%s, msg_id=%s)",
+                    file_path,
+                    target,
+                    video_meta,
+                    bool(thumb_path),
+                    msg_id,
+                )
+                return msg_id
+            logger.warning("userbot: Pyrogram (bot) raw API send failed; falling back")
+
+        # Fallback: let Pyrogram handle upload + send via send_video
+        logger.info("userbot: Pyrogram (bot) falling back to send_video for %s", file_path)
         kwargs = {
             "caption": caption or "",
             "supports_streaming": True,
@@ -824,22 +1015,7 @@ async def _send_with_pyrogram_bot(
         if thumb_path is not None:
             kwargs["thumb"] = thumb_path
 
-        # ── Parallel upload then send ──
-        file_size = os.path.getsize(file_path)
-        uploaded_file = await _parallel_upload_file_pyrogram(
-            bot,
-            file_path,
-            file_size,
-            progress_callback=progress_callback,
-        )
-        # If parallel upload returned None (memory guard), remove progress
-        # so Pyrogram uses file_path and reports progress itself.
-        if uploaded_file is None:
-            logger.info("userbot: Pyrogram (bot) falling back to sequential upload for %s", file_path)
-        else:
-            kwargs.pop("progress", None)  # parallel upload already handled progress
-        _file_arg = uploaded_file if uploaded_file is not None else file_path
-        msg = await bot.send_video(target, _file_arg, **kwargs)
+        msg = await bot.send_video(target, file_path, **kwargs)
         logger.info(
             "userbot: Pyrogram (bot) sent video %s to %s (meta=%s, thumb=%s, msg_id=%s)",
             file_path,
@@ -869,6 +1045,7 @@ async def send_file_via_userbot(
     progress_callback: Callable[[int, int], None] | None = None,
     video_meta: dict | None = None,
     thumb_path: str | None = None,
+    user_id: int | None = None,
 ) -> int | None:
     """Send a file using a user account or bot.
 
@@ -890,6 +1067,7 @@ async def send_file_via_userbot(
                            Both Telethon and Pyrogram callbacks follow this signature.
         video_meta: Pre-probed metadata dict with keys ``duration``, ``width``, ``height``.
         thumb_path: Pre-generated thumbnail path.
+        user_id: Optional Telegram user ID for per-user session resolution.
 
     Returns:
         The sent message ID on success, or None on failure.
@@ -921,7 +1099,7 @@ async def send_file_via_userbot(
     # ── Priority 2: Telethon user account ──
     from utils.telethon_session import has_usable_telethon_session
 
-    if TelegramClient is not None and has_usable_telethon_session():
+    if TelegramClient is not None and has_usable_telethon_session(user_id=user_id):
         try:
             msg_id = await _send_with_telethon(
                 chat_id,
@@ -930,6 +1108,7 @@ async def send_file_via_userbot(
                 progress_callback=progress_callback,
                 video_meta=video_meta,
                 thumb_path=thumb_path,
+                user_id=user_id,
             )
             if msg_id is not None:
                 return msg_id
@@ -948,6 +1127,7 @@ async def send_file_via_userbot(
             progress_callback=progress_callback,
             video_meta=video_meta,
             thumb_path=thumb_path,
+            user_id=user_id,
         )
         if msg_id is not None:
             return msg_id

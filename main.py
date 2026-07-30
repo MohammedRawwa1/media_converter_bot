@@ -259,11 +259,11 @@ Available slash commands (exact):
 /settings - Open your user settings (aliases: /usettings, /usersettings)
 /bulkmenu - Open bulk/URL tools
 /cancel - Cancel current operation
-/canceljob <job_id> - Request cancellation for a queued/running job (admin only)
+/canceljob <job_id> - Request cancellation for a queued/running job
 /admin add|remove|list <user_id> - Manage allowed users (admin only)
 /addthumb - Add default thumbnail (if enabled)
 /delthumb - Remove default thumbnail (if enabled)
-/loginstatus - Live session health check (Telethon + Pyrogram) (admin only)
+/loginstatus - Live session health check (Telethon + Pyrogram)
 
 Send me a file to get started! 🚀
 """
@@ -535,21 +535,12 @@ def setup_handlers(application: Application) -> None:
     application.add_handler(CommandHandler("cancel", latency_wrapper(cancel_command, "cancel_command")))
 
     async def loginstatus_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        """Admin-only: run a **live** session health check.
+        """Live session health check.
 
         Connects to Telegram and verifies each configured session is actually
         authorized, showing phone/DC/latency for working sessions or the
         real error for broken ones.
         """
-        try:
-            admin_id = update.effective_user.id
-        except Exception:
-            await update.message.reply_text("Could not determine user id")
-            return
-        if admin_id != ADMIN_USER_ID:
-            await update.message.reply_text("Unauthorized")
-            return
-
         await update.message.reply_text("🩺 Testing sessions live — connecting to Telegram...")
 
         # ── Run live health check via the healthchecker ──
@@ -732,9 +723,6 @@ def setup_handlers(application: Application) -> None:
 
     async def logout_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_id = update.effective_user.id
-        if ADMIN_USER_ID and user_id != ADMIN_USER_ID:
-            await update.message.reply_text("Unauthorized: admin only")
-            return
 
         # ── Clean up any active login flow before logging out ──
         futures_map = context.application.bot_data.get("login_futures", {})
@@ -789,9 +777,6 @@ def setup_handlers(application: Application) -> None:
 
     async def logoutpyro_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_id = update.effective_user.id
-        if ADMIN_USER_ID and user_id != ADMIN_USER_ID:
-            await update.message.reply_text("Unauthorized: admin only")
-            return
 
         # ── Clean up any active login flow before logging out ──
         futures_map = context.application.bot_data.get("login_futures", {})
@@ -806,14 +791,20 @@ def setup_handlers(application: Application) -> None:
         try:
             removed = []
 
-            # 1. Clear Pyrogram session from JSON file
+            # 1. Clear Pyrogram session from JSON file (per-user, then global)
             try:
                 from utils.telethon_session import save_session_string_to_file_async
 
-                if await save_session_string_to_file_async("", client_type="pyrogram"):
+                if await save_session_string_to_file_async("", client_type="pyrogram", user_id=user_id):
                     removed.append("JSON file (pyrogram_session cleared)")
             except Exception as exc:
-                logger.debug("logoutpyro: JSON clear failed: %s", exc)
+                logger.debug("logoutpyro: JSON per-user clear failed: %s", exc)
+            # Also clear the legacy global JSON file for completeness
+            try:
+                if await save_session_string_to_file_async("", client_type="pyrogram"):
+                    removed.append("Global JSON file (pyrogram_session cleared)")
+            except Exception as exc:
+                logger.debug("logoutpyro: JSON global clear failed: %s", exc)
 
             # 2. Clear Pyrogram session from MongoDB (saves "" for pyrogram_session,
             #    preserving telethon_session and string_session keys)
@@ -838,12 +829,6 @@ def setup_handlers(application: Application) -> None:
     application.add_handler(CommandHandler("logoutpyro", latency_wrapper(logoutpyro_command, "logoutpyro_command")))
 
     async def canceljob_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-        user_id = update.effective_user.id
-        # restrict to admin or allowed users
-        if ADMIN_USER_ID and user_id != ADMIN_USER_ID:
-            await update.message.reply_text("Unauthorized: admin only")
-            return
-
         args = context.args if hasattr(context, "args") else []
         if not args:
             await update.message.reply_text("Usage: /canceljob <job_id>")
@@ -1172,8 +1157,8 @@ async def main(background: bool = False) -> None:
                     db_model=_mongo_db,
                 )
                 if _mongo_pyro:
-                    await save_session_string_to_file_async(_mongo_pyro, client_type="pyrogram")
-                    logger.info("Startup: persisted Pyrogram session from MongoDB to JSON file")
+                    await save_session_string_to_file_async(_mongo_pyro, client_type="pyrogram", user_id=ADMIN_USER_ID)
+                    logger.info("Startup: persisted Pyrogram session from MongoDB to per-user JSON file")
     except Exception as exc:
         logger.debug("Startup MongoDB->JSON Pyrogram persistence skipped: %s", exc)
 
@@ -1765,12 +1750,25 @@ try:
 
                 result = {"env": {}, "redis": {}, "logs": {}, "ps": None}
                 # Minimal masked env snapshot
-                for k in ("REDIS_URL", "WEB_UPLOAD_URL", "UPLOAD_SECRET", "S3_BUCKET", "AWS_ACCESS_KEY_ID"):
+                for k in (
+                    "REDIS_URL",
+                    "WEB_UPLOAD_URL",
+                    "UPLOAD_SECRET",
+                    "S3_BUCKET",
+                    "AWS_ACCESS_KEY_ID",
+                    "MONGO_URI",
+                    "MONGODB_URL",
+                    "MONGODB_URI",
+                    "MONGO_URL",
+                ):
                     v = os.environ.get(k)
                     if k == "REDIS_URL" and v:
                         result["env"][k] = re.sub(r"(redis://[^:]*:)[^@]+@", r"\1****@", v)
                     elif k == "UPLOAD_SECRET":
                         result["env"][k] = "****" if v else None
+                    elif k in ("MONGO_URI", "MONGODB_URL", "MONGODB_URI", "MONGO_URL") and v:
+                        # Mask password in mongodb://user:pass@host or mongodb+srv://user:pass@host
+                        result["env"][k] = re.sub(r"(mongodb(?:\+srv)?://[^:]*:)[^@]+@", r"\1****@", v)
                     else:
                         result["env"][k] = v
 

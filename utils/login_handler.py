@@ -180,19 +180,6 @@ def register_login_handlers(application):
     # checks bot_data["login_futures"] for an active background task.
 
 
-# ── Permission check ────────────────────────────────────────────────────
-
-
-async def _check_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
-    admin_id = context.application.bot_data.get("admin_user_id")
-    if admin_id is not None:
-        uid = update.effective_user.id
-        if uid != admin_id:
-            await update.message.reply_text("Unauthorized: admin only")
-            return False
-    return True
-
-
 # ── Login state helpers ─────────────────────────────────────────────────
 
 
@@ -209,7 +196,7 @@ def _get_futures(context: ContextTypes.DEFAULT_TYPE, user_id: int, create: bool 
         fm[user_id] = {
             "phone": None,  # asyncio.Future or None
             "code": None,  # asyncio.Future or None
-            "password": None,  # asyncio.Future or None
+            "password": None,  # nosec - asyncio.Future or placeholder
             "cancel": asyncio.Event(),
             "task": None,  # asyncio.Task or None
             "client": None,  # TelegramClient or None
@@ -229,9 +216,6 @@ def _get_futures(context: ContextTypes.DEFAULT_TYPE, user_id: int, create: bool 
 
 async def _login_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """``/login [phone]`` — start the Telethon login flow."""
-    if not await _check_admin(update, context):
-        return
-
     creds = _get_api_credentials()
     if isinstance(creds, tuple) and len(creds) == 1:
         await update.message.reply_text(str(creds[0]))
@@ -324,6 +308,10 @@ async def _load_any_session(context: ContextTypes.DEFAULT_TYPE, user_id: int) ->
     try:
         from utils.telethon_session import _load_session_string_from_file_async
 
+        # Try per-user JSON first, then legacy global JSON
+        saved = await _load_session_string_from_file_async(client_type="telethon", user_id=user_id)
+        if saved:
+            return saved
         saved = await _load_session_string_from_file_async(client_type="telethon")
         if saved:
             return saved
@@ -660,7 +648,7 @@ async def _run_login_task(
                 pwd_info = await client(functions.account.GetPasswordRequest())
                 pwd_hint = str(getattr(pwd_info, "hint", "") or "")
             except Exception:
-                pwd_hint = ""
+                pwd_hint = ""  # nosec - fallback when hint is unavailable
 
             msg_text = "🔐 Two-step verification is enabled. Please enter your account password:"
             if pwd_hint:
@@ -714,6 +702,7 @@ async def _run_login_task(
                         "telethon_session": session_str,
                         "string_session": session_str,
                     },
+                    phone=phone,
                 )
                 saved_to.append("MongoDB")
         except Exception as exc:
@@ -721,7 +710,7 @@ async def _run_login_task(
         try:
             from utils.telethon_session import save_session_string_to_file_async  # noqa: PLC0415
 
-            if await save_session_string_to_file_async(session_str, client_type="telethon"):
+            if await save_session_string_to_file_async(session_str, client_type="telethon", user_id=user_id):
                 saved_to.append("JSON file")
         except Exception as exc:
             logger.warning("login: JSON save failed: %s", exc)
@@ -804,9 +793,6 @@ async def _pyro_login_command(update: Update, context: ContextTypes.DEFAULT_TYPE
     which handles 2FA reliably from cloud servers (unlike Telethon which
     has PhoneCodeExpiredError issues on Railway for 2FA accounts).
     """
-    if not await _check_admin(update, context):
-        return
-
     creds = _get_api_credentials()
     if isinstance(creds, tuple) and len(creds) == 1:
         await update.message.reply_text(str(creds[0]))
@@ -1051,7 +1037,7 @@ async def _run_pyro_login_task(
             try:
                 pwd_hint = await client.get_password_hint()
             except Exception:
-                pwd_hint = ""
+                pwd_hint = ""  # nosec - fallback when hint is unavailable
 
             msg_text = "🔐 Two-step verification is enabled. Please enter your account password:"
             if pwd_hint:
@@ -1104,6 +1090,7 @@ async def _run_pyro_login_task(
                     {
                         "pyrogram_session": session_str,
                     },
+                    phone=phone,
                 )
                 saved_to.append("MongoDB")
         except Exception as exc:
@@ -1111,7 +1098,7 @@ async def _run_pyro_login_task(
         try:
             from utils.telethon_session import save_session_string_to_file_async  # noqa: PLC0415
 
-            if await save_session_string_to_file_async(session_str, client_type="pyrogram"):
+            if await save_session_string_to_file_async(session_str, client_type="pyrogram", user_id=user_id):
                 saved_to.append("JSON file")
         except Exception as exc:
             logger.warning("login: JSON Pyrogram save failed: %s", exc)

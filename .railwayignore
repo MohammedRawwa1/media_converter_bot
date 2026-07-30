@@ -36,9 +36,9 @@ env.bak/
 *.session.lock
 *.session.json
 
-# ── Runtime data directories (created on startup) ──
-storage/
-logs/
+# ── Runtime data directories ──
+# storage/ and logs/ are NOT excluded — they're created on startup
+# and need README.md placeholders carried over from the build context.
 *.log
 
 # ── Tool caches ──
@@ -79,5 +79,5 @@ validation_results.txt
 docker-compose*.yml
 docker-compose*.yaml
 
-# ── Documentation (READMEs inside storage/ are excluded via storage/ rule) ──
+# ── Documentation ──
 # Keep root README.md and DEPLOY.md — they're small and useful

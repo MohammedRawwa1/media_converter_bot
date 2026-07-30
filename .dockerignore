@@ -35,9 +35,9 @@ ENV/
 *.session.lock
 *.session.json
 
-# ── Runtime data directories (created on container startup) ──
-storage/
-logs/
+# ── Runtime data directories ──
+# storage/ and logs/ are NOT excluded — they're created on startup
+# and need README.md placeholders carried over from the build context.
 *.log
 
 # ── Python & tool caches ──
@@ -78,6 +78,4 @@ validation_results.txt
 docker-compose*.yml
 docker-compose*.yaml
 
-# ── Utility scripts (local dev only) ──
-scripts/
 
