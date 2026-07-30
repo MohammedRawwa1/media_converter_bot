@@ -72,7 +72,7 @@ from utils.error_handler import (
 )
 from utils.job_queue import cancel_job
 from utils.rate_limiter import ConversionRateLimiter, ConversionRateLimiterRedis, TelegramAPIRateLimiter
-from utils.login_handler import create_login_conversation_handler
+from utils.login_handler import cleanup_login_flow, create_login_conversation_handler
 from utils.session_healthcheck import (
     get_session_healthchecker,
     start_session_healthcheck,
@@ -329,6 +329,25 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Cancel current operation."""
+    # Defense-in-depth: if there's an active login flow, clean it up
+    # (normally the ConversationHandler intercepts /cancel first, but
+    # this ensures cleanup even if the ordering ever breaks).
+    if context.user_data.get("login_client") is not None:
+        user_id = update.effective_user.id
+        logger.info("cancel: cleaning up active login flow for user %s (defensive)", user_id)
+        await cleanup_login_flow(context)
+        try:
+            conv_data = context.application.conversation_data
+            if conv_data is not None:
+                handler_states = conv_data.get("userbot_login_flow", {})
+                key = (user_id, update.effective_chat.id)
+                if key in handler_states:
+                    del handler_states[key]
+        except Exception:
+            logger.debug("cancel: failed to end conversation state", exc_info=True)
+        await update.message.reply_text("❌ Login cancelled.")
+        return
+
     await update.message.reply_text(
         "❌ Operation cancelled.\n\nSend /start to see available options.",
     )
@@ -793,6 +812,21 @@ def setup_handlers(application: Application) -> None:
         if ADMIN_USER_ID and user_id != ADMIN_USER_ID:
             await update.message.reply_text("Unauthorized: admin only")
             return
+
+        # ── Clean up any active login flow before logging out ──
+        if context.user_data.get("login_client") is not None:
+            logger.info("logout: cleaning up active login flow for user %s", user_id)
+            await cleanup_login_flow(context)
+            # End the conversation in the ConversationHandler state
+            try:
+                conv_data = context.application.conversation_data
+                if conv_data is not None:
+                    handler_states = conv_data.get("userbot_login_flow", {})
+                    key = (user_id, update.effective_chat.id)
+                    if key in handler_states:
+                        del handler_states[key]
+            except Exception:
+                logger.debug("logout: failed to end conversation state", exc_info=True)
 
         try:
             from utils.telethon_session import get_telethon_session_path

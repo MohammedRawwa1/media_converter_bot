@@ -174,8 +174,16 @@ async def _check_admin(update: "Update", context: "ContextTypes.DEFAULT_TYPE") -
 # ── Client cleanup helper ──────────────────────────────────────────
 
 
-async def _cleanup_client(context: "ContextTypes.DEFAULT_TYPE"):
-    """Disconnect and remove the Telethon client from ``user_data``."""
+async def cleanup_login_flow(context: "ContextTypes.DEFAULT_TYPE"):
+    """Disconnect the Telethon client and remove all login-related keys from ``user_data``.
+
+    This is the public version of ``_cleanup_client`` intended for external
+    callers (e.g. ``logout_command`` in main.py) that need to clean up an
+    active login flow without returning a conversation state.
+
+    The caller is responsible for ending the ConversationHandler conversation
+    state in ``application.conversation_data`` if needed.
+    """
     client = context.user_data.pop("login_client", None)
     if client is not None:
         try:
@@ -194,6 +202,11 @@ async def _cleanup_client(context: "ContextTypes.DEFAULT_TYPE"):
         "_chat_id",
     ):
         context.user_data.pop(key, None)
+
+
+async def _cleanup_client(context: "ContextTypes.DEFAULT_TYPE"):
+    """Disconnect and remove the Telethon client from ``user_data``."""
+    await cleanup_login_flow(context)
 
 
 async def _timeout_handler(
