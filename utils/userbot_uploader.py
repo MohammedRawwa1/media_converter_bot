@@ -314,16 +314,20 @@ async def _send_with_telethon(
     if thumb_path is None:
         try:
             thumb_path = await _generate_video_thumbnail(file_path)
+            if thumb_path:
+                # Track the containing directory explicitly (not dirname(), which
+                # could resolve to /tmp if the file is placed directly in the system
+                # temp directory).  _generate_video_thumbnail and
+                # probe_video_for_delivery both create a mkdtemp subdirectory, so
+                # dirname() will return the private subdirectory — but this explicit
+                # tracking is more robust against future changes.
+                _thumb_dir = os.path.dirname(thumb_path)
         except Exception:
             thumb_path = None
-    if thumb_path:
-        # Track the containing directory explicitly (not dirname(), which
-        # could resolve to /tmp if the file is placed directly in the system
-        # temp directory).  _generate_video_thumbnail and
-        # probe_video_for_delivery both create a mkdtemp subdirectory, so
-        # dirname() will return the private subdirectory — but this explicit
-        # tracking is more robust against future changes.
-        _thumb_dir = os.path.dirname(thumb_path)
+    # NOTE: if thumb_path was provided externally (by the worker), we do NOT
+    # track it for cleanup here — the caller (send_file_via_userbot or the
+    # worker) owns it and will clean it up after ALL send methods have been
+    # tried.  Cleaning it up early would break fallback send methods.
 
     client = build_telethon_client(api_id, api_hash)
     try:
@@ -530,10 +534,14 @@ async def _send_with_pyrogram(
     if thumb_path is None:
         try:
             thumb_path = await _generate_video_thumbnail(file_path)
+            if thumb_path:
+                _thumb_dir = os.path.dirname(thumb_path)
         except Exception:
             thumb_path = None
-    if thumb_path:
-        _thumb_dir = os.path.dirname(thumb_path)
+    # NOTE: if thumb_path was provided externally (by the worker), we do NOT
+    # track it for cleanup here — the caller (send_file_via_userbot or the
+    # worker) owns it and will clean it up after ALL send methods have been
+    # tried.  Cleaning it up early would break fallback send methods.
 
     try:
         await client.start()
@@ -617,6 +625,17 @@ async def _send_with_pyrogram_bot(
         logger.info("userbot: BOT_TOKEN not set; skipping Pyrogram (bot) send")
         return None
 
+    from utils.telethon_session import get_userbot_credentials
+
+    try:
+        api_id, api_hash = get_userbot_credentials()
+    except RuntimeError:
+        logger.info(
+            "userbot: API_ID/API_HASH not set; skipping Pyrogram (bot) send "
+            "(bot accounts still need API credentials for MTProto connection)"
+        )
+        return None
+
     # Pre-fetch video metadata and thumbnail before connecting.
     _thumb_dir = None
     if video_meta is None:
@@ -627,15 +646,21 @@ async def _send_with_pyrogram_bot(
     if thumb_path is None:
         try:
             thumb_path = await _generate_video_thumbnail(file_path)
+            if thumb_path:
+                _thumb_dir = os.path.dirname(thumb_path)
         except Exception:
             thumb_path = None
-    if thumb_path:
-        _thumb_dir = os.path.dirname(thumb_path)
+    # NOTE: if thumb_path was provided externally (by the worker), we do NOT
+    # track it for cleanup here — the caller (send_file_via_userbot or the
+    # worker) owns it and will clean it up after ALL send methods have been
+    # tried.  Cleaning it up early would break fallback send methods.
 
     bot = None
     try:
         bot = PyrogramClient(
             "bot_sender",
+            api_id=api_id,
+            api_hash=api_hash,
             bot_token=bot_token,
             in_memory=True,
         )

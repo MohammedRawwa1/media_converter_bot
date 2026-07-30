@@ -1754,8 +1754,12 @@ async def handle_job(job: dict):
                                     logger.warning("Bot init failed for job %s: %s", job_id, e)
                                     sent = False
 
-                        # Fallback: if not sent and Telethon userbot is enabled, attempt userbot
-                        if not sent and chat_id and enable_userbot:
+                        # Fallback: if not sent and userbot is enabled, attempt userbot.
+                        # Only runs when the preferred userbot path above did NOT already run
+                        # (i.e. for files small enough for Bot API).  Without this guard the
+                        # fallback would re-call send_file_via_userbot after the preferred path
+                        # already tried all 3 methods — causing a duplicate full upload.
+                        if not sent and chat_id and enable_userbot and file_size <= bot_api_max_bytes:
                             if await _check_upload_cancelled(job_id):
                                 logger.info(
                                     "Upload cancelled by user — skipping fallback userbot send for job %s", job_id
