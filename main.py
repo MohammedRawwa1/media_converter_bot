@@ -264,7 +264,7 @@ Available slash commands (exact):
 /admin add|remove|list <user_id> - Manage allowed users (admin only)
 /addthumb - Add default thumbnail (if enabled)
 /delthumb - Remove default thumbnail (if enabled)
-/sessionstatus - Show userbot session health (admin only)
+/loginstatus - Live session health check (Telethon + Pyrogram) (admin only)
 
 Send me a file to get started! 🚀
 """
@@ -536,22 +536,39 @@ def setup_handlers(application: Application) -> None:
     application.add_handler(CommandHandler("cancel", latency_wrapper(cancel_command, "cancel_command")))
 
     async def loginstatus_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        """Admin-only diagnostic: show userbot session configuration status (Telethon + Pyrogram)."""
+        """Admin-only: run a **live** session health check.
+
+        Connects to Telegram and verifies each configured session is actually
+        authorized, showing phone/DC/latency for working sessions or the
+        real error for broken ones.
+        """
         try:
-            user_id = update.effective_user.id
+            admin_id = update.effective_user.id
         except Exception:
             await update.message.reply_text("Could not determine user id")
             return
-        if user_id != ADMIN_USER_ID:
+        if admin_id != ADMIN_USER_ID:
             await update.message.reply_text("Unauthorized")
             return
 
-        # ── Persisted JSON file check (async, non-blocking) ──
+        await update.message.reply_text("🩺 Testing sessions live — connecting to Telegram...")
+
+        # ── Run live health check via the healthchecker ──
+        try:
+            checker = get_session_healthchecker()
+            health = await checker.run_once()
+        except Exception as exc:
+            logger.exception("loginstatus: health check failed: %s", exc)
+            health = {}
+
+        pyro = health.get("pyrogram", {})
+        tele = health.get("telethon", {})
+
+        # ── Persisted JSON file info ──
         json_session = None
         json_file_exists = False
         try:
             from utils.telethon_session import _get_persisted_session_path, _load_all_sessions_from_file_async
-
             _p = _get_persisted_session_path()
             json_file_exists = os.path.exists(_p)
             json_session = await _load_all_sessions_from_file_async()
@@ -560,38 +577,6 @@ def setup_handlers(application: Application) -> None:
 
         tele_from_json = bool(json_session and json_session.get("telethon_session")) if json_session else False
         pyro_from_json = bool(json_session and json_session.get("pyrogram_session")) if json_session else False
-
-        # ── Telethon session availability ──
-        telethon_ready = False
-        telethon_status = {
-            "ready": False,
-            "source": "missing",
-            "details": "No Telethon session configured or persisted",
-        }
-        try:
-            from utils.telethon_session import get_telethon_session_status
-
-            telethon_status = await get_telethon_session_status(
-                user_id=user_id,
-                db_model=context.application.bot_data.get("db_model"),
-            )
-            telethon_ready = bool(telethon_status.get("ready", False))
-        except Exception:
-            try:
-                from utils.telethon_session import has_usable_telethon_session
-
-                telethon_ready = has_usable_telethon_session()
-            except Exception:
-                logger.debug("main: operation failed")
-
-        # ── Pyrogram session string ──
-        pyrogram_ready = False
-        try:
-            from utils.telethon_session import get_pyrogram_session_string
-
-            pyrogram_ready = bool(get_pyrogram_session_string())
-        except Exception:
-            logger.debug("main: ── Pyrogram session string ──")
 
         # ── Credentials check ──
         has_api_id = bool(
@@ -605,89 +590,44 @@ def setup_handlers(application: Application) -> None:
         )
         userbot_enabled = cfg.ENABLE_USERBOT
 
-        # ── Active login flow context (ConversationHandler-based) ──
-        data = context.user_data
-        login_phone = data.get("login_phone")
-        has_client = bool(data.get("login_client"))
-        phone_code_hash = data.get("phone_code_hash")
-        code_sent_at = data.get("code_sent_at")
+        # ── Format live check results ──
+        def _session_line(name: str, result: dict) -> str:
+            if not result:
+                return f"❌ **{name}** — Check failed (no result)"
+            alive = result.get("alive", False)
+            if alive:
+                phone = result.get("phone") or "?"
+                dc = result.get("dc_id") or "?"
+                latency = result.get("latency_ms") or "?"
+                return (
+                    f"✅ **{name}** — Working\n"
+                    f"   Phone: `{phone}`\n"
+                    f"   DC: `{dc}` | Latency: `{latency}ms`"
+                )
+            else:
+                err = result.get("error") or "Not configured"
+                return f"❌ **{name}** — `{err}`"
 
-        # Determine conversation state from keys present in user_data
-        if login_phone and has_client and phone_code_hash:
-            # Client exists + code hash present = at CODE or TWO_FA state
-            conv_state = "awaiting code or 2FA password"
-        elif login_phone and has_client:
-            # Client exists but no code hash yet = PHONE state (just created client)
-            conv_state = "awaiting phone number / client created"
-        elif has_client:
-            conv_state = "client active, no phone yet"
-        else:
-            conv_state = "no active login flow"
-
-        # Try to get ConversationHandler state directly from application.conversation_data
-        try:
-            conv_data = context.application.conversation_data
-            if conv_data is not None:
-                handler_name = "userbot_login_flow"
-                user_id = update.effective_user.id
-                chat_id = update.effective_chat.id
-                # PTB v20+ stores conversation state as {(handler_name): {(user_id, chat_id): state}}
-                handler_states = conv_data.get(handler_name, {})
-                # Conversation state key might be stored as (user_id, chat_id) or (user_id,)
-                raw_state = handler_states.get((user_id, chat_id)) or handler_states.get(user_id)
-                if raw_state is not None:
-                    state_names = {0: "PHONE", 1: "CODE", 2: "TWO_FA"}
-                    conv_state = state_names.get(raw_state, f"state_{raw_state}")
-        except Exception:
-            pass
-
-        # Format code_sent_at as human-readable age
-        sent_age = ""
-        if code_sent_at:
-            try:
-                elapsed = int(time.time() - code_sent_at)
-                if elapsed < 60:
-                    sent_age = f"{elapsed}s ago"
-                elif elapsed < 3600:
-                    sent_age = f"{elapsed // 60}m{elapsed % 60}s ago"
-                else:
-                    sent_age = f"{elapsed // 3600}h ago"
-            except Exception:
-                sent_age = str(code_sent_at)
-
-        # Mask phone_code_hash for display
-        masked_hash = None
-        try:
-            if phone_code_hash:
-                s = str(phone_code_hash)
-                masked_hash = s[:8] + "..."
-        except Exception:
-            masked_hash = None
+        # Get healthcheck interval from the checker
+        check_interval = getattr(checker, 'check_interval', 3600)
+        admin_alerts = "Enabled" if getattr(checker, 'admin_user_id', None) else "Disabled"
 
         lines = [
-            "\U0001f510 **Login Status**",
+            "\U0001f510 **Live Session Status**",
             "",
             "**Userbot enabled:** " + ("✅ Yes" if userbot_enabled else "❌ No"),
             "**API credentials:** " + ("✅ Set" if has_api_id and has_api_hash else "⚠️ Missing API_ID/API_HASH"),
             "",
-            "**Telethon session:** "
-            + (
-                "✅ Available (" + (telethon_status.get("source", "unknown") if telethon_ready else "") + ")"
-                if telethon_ready
-                else "❌ Not configured"
-            ),
-            "**Pyrogram session:** " + ("✅ Available" if pyrogram_ready else "❌ Not configured"),
+            _session_line("Telethon", tele),
+            "",
+            _session_line("Pyrogram", pyro),
             "",
             "**Persisted JSON file:** " + ("✅ Exists" if json_file_exists else "❌ Not found"),
             f"  Telethon in JSON: {'✅' if tele_from_json else '❌'}",
             f"  Pyrogram in JSON: {'✅' if pyro_from_json else '❌'}",
             "",
-            "**Active login flow:**",
-            f"  State: `{conv_state}`",
-            f"  Phone: {f'`{login_phone}`' if login_phone else '—'}",
-            f"  Client connected: {'✅' if has_client else '❌'}",
-            f"  Code sent: {f'`{sent_age}`' if sent_age else '—'}",
-            f"  Code hash: {f'`{masked_hash}`' if masked_hash else '—'}",
+            f"🔔 Admin alerts: `{admin_alerts}`",
+            f"🔄 Background check: every `{check_interval}s`",
         ]
         await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
@@ -896,29 +836,6 @@ def setup_handlers(application: Application) -> None:
             await update.message.reply_text("⚠️ Failed to open bulk menu.")
 
     application.add_handler(CommandHandler("bulkmenu", latency_wrapper(bulk_menu_command, "bulk_menu_command")))
-
-    async def sessionstatus_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        """Admin-only: show current session health status."""
-        try:
-            user_id = update.effective_user.id
-        except Exception:
-            await update.message.reply_text("Could not determine user id")
-            return
-        if ADMIN_USER_ID and user_id != ADMIN_USER_ID:
-            await update.message.reply_text("Unauthorized")
-            return
-
-        try:
-            checker = get_session_healthchecker()
-            if not checker.last_health:
-                await update.message.reply_text("🩺 Running session health check... (please wait a moment)")
-                await checker.run_once()
-            text = checker.format_status_text()
-            await update.message.reply_text(text, parse_mode="Markdown")
-        except Exception as e:
-            logger.exception("/sessionstatus failed: %s", e)
-            await update.message.reply_text(f"❌ Failed to check session health: {e}")
-    application.add_handler(CommandHandler("sessionstatus", latency_wrapper(sessionstatus_command, "sessionstatus_command")))
 
     # Store handler manager in bot_data for access in other handlers
     application.bot_data["handler_manager"] = handler_manager
