@@ -13,8 +13,15 @@ Key improvements over the old design
    ``sign_in(phone, code)`` and ``sign_in(password=password)``.  This avoids
    Telethon's internal ``_phone_code_hash`` cache and gives us full control
    over code-expiration retries.
-3. **Fresh code on expiry** – ``PhoneCodeExpiredError`` triggers a fresh
-   ``send_code_request()`` which returns a new ``phone_code_hash``.
+3. **Fresh code on expiry (max 2 resends)** – ``PhoneCodeExpiredError`` triggers
+   a fresh ``send_code_request()`` with a new ``phone_code_hash`` (up to 2
+   resends). After 3 expired codes the flow aborts with a diagnostic message.
+4. **2FA detection** – after sending the code, ``account.GetPasswordRequest``
+   is called to detect two-step verification. If 2FA is found a fresh
+   Telethon client is created for each code resend to avoid hash staleness.
+5. **Built-in timeout** – ``conversation_timeout=300`` auto-cancels stale flows.
+6. **No race conditions** – ``per_user=True, per_chat=True`` ensures messages
+   from different users don't interfere.
 4. **Built-in timeout** – ``conversation_timeout=300`` auto-cancels stale flows.
 5. **No race conditions** – ``per_user=True, per_chat=True`` ensures messages
    from different users don't interfere.
@@ -193,6 +200,9 @@ async def cleanup_login_flow(context: "ContextTypes.DEFAULT_TYPE"):
         "phone_code_hash",
         "code_sent_at",
         "_chat_id",
+        "code_retry_count",
+        "has_2fa",
+        "password_hint",
     ):
         context.user_data.pop(key, None)
 
@@ -243,11 +253,21 @@ async def _login_start(
     # Store chat_id so the timeout handler can notify the user
     context.user_data["_chat_id"] = update.effective_chat.id
 
+    # ── Proactive warning about potential Pyrogram session conflict ──
+    _pyro_warn = ""
+    if os.getenv("PYROGRAM_SESSION"):
+        _pyro_warn = (
+            "\n\n⚠️ An existing Pyrogram session (`PYROGRAM_SESSION`) is configured.\n"
+            "If it uses the same phone number, verification codes may be consumed\n"
+            "by that session. Run /logout first if the login keeps failing."
+        )
+
     await update.message.reply_text(
         "📱 Please send the phone number in international format,\n"
         "e.g. ``+1234567890``\n\n"
         "⏳ Your login flow will expire after **5 minutes** of inactivity.\n"
-        "Type /cancel to abort the login flow at any time.",
+        "Type /cancel to abort the login flow at any time."
+        + _pyro_warn,
         parse_mode="Markdown",
     )
     return PHONE
@@ -368,13 +388,41 @@ async def _receive_phone(
         await _cleanup_client(context)
         return ConversationHandler.END  # type: ignore[return-value]
 
+    # ── Detect 2FA (Two-Step Verification) ──────────────────────────
+    # account.GetPasswordRequest works without full auth — it returns
+    # password settings if 2FA is enabled on the account.
+    _has_2fa = False
+    _pwd_hint = ""
+    try:
+        from telethon import functions  # noqa: PLC0415
+
+        _pwd_info = await client(functions.account.GetPasswordRequest())
+        _has_2fa = bool(getattr(_pwd_info, "has_password", False))
+        _pwd_hint = str(getattr(_pwd_info, "hint", "") or "")
+    except Exception:
+        # GetPasswordRequest may fail without full auth — best-effort
+        pass
+
+    if _has_2fa:
+        context.user_data["has_2fa"] = True
+        context.user_data["password_hint"] = _pwd_hint
+        logger.info("login: 2FA detected for %s (hint: %s)", phone, _pwd_hint or "none")
+
     logger.info("login: code sent to %s (hash=%s...)",
                 phone, str(sent.phone_code_hash)[:8])
-    await update.message.reply_text(
-        "✅ Verification code sent to your Telegram app!\n"
-        "Please enter the code you received (digits only).\n"
-        "Type /cancel to abort."
-    )
+
+    # ── Build initial response message ──────────────────────────────
+    _msg = "✅ Verification code sent to your Telegram app!"
+    if _has_2fa:
+        _msg += "\n\n🔐 **Two-step verification (2FA) is enabled** on this account."
+        _msg += "\nAfter entering the code, you'll need to enter your password."
+        if _pwd_hint:
+            _msg += f"\nPassword hint: `{_pwd_hint}`"
+        _msg += "\n\n⚠️ If the code expires too fast, enter it quickly"
+        _msg += " — 2FA accounts sometimes need a fresh code on each attempt."
+    _msg += "\n\nPlease enter the code (digits only).\nType /cancel to abort."
+
+    await update.message.reply_text(_msg, parse_mode="Markdown")
     return CODE
 
 
@@ -416,14 +464,81 @@ async def _receive_code(
             return TWO_FA
 
         if "PhoneCodeExpiredError" in exc_name:
-            # Code expired – request a fresh one with a new phone_code_hash
-            logger.warning("login: code expired for %s, requesting new one", phone)
+            _has_2fa = context.user_data.get("has_2fa", False)
+
+            # ── Retry limit guard: prevent infinite loop ──────────
+            retry_count = context.user_data.get("code_retry_count", 0) + 1
+            context.user_data["code_retry_count"] = retry_count
+
+            if retry_count >= 3:
+                logger.warning(
+                    "login: code expired for %s after %d retries, giving up",
+                    phone, retry_count,
+                )
+                if _has_2fa:
+                    msg = (
+                        "❌ The verification codes keep expiring before they can be used.\n"
+                        "\n**Two-step verification (2FA)** is enabled on this account.\n"
+                        "The code is likely being consumed by the 2FA handshake.\n"
+                        "Try using /logout first, then /login again, and enter the\n"
+                        "code + password as quickly as possible."
+                    )
+                else:
+                    msg = (
+                        "❌ The verification codes keep expiring before they can be used.\n"
+                        "\nThis usually happens when:\n"
+                        "1. **Another session** (like the Pyrogram userbot in\n"
+                        "   PYROGRAM_SESSION) is already logged into this number.\n"
+                        "2. **Two-step verification (2FA)** is enabled.\n"
+                    )
+                msg += "\nPlease run /logout first, then try /login again."
+                await update.message.reply_text(msg, parse_mode="Markdown")
+                await _cleanup_client(context)
+                return ConversationHandler.END  # type: ignore[return-value]
+
+            # ── 2FA-aware resend: use a fresh client to avoid stale hash ──
+
+
+            logger.warning(
+                "login: code expired for %s (attempt %d/3)%s",
+                phone, retry_count,
+                ", 2FA enabled" if _has_2fa else "",
+            )
+
             try:
-                sent = await client.send_code_request(phone)
+                if _has_2fa:
+                    # 2FA can invalidate the hash. Create a FRESH client
+                    # with a new StringSession to guarantee a valid connection.
+                    logger.info("login: 2FA detected, creating fresh Telethon client")
+                    try:
+                        await client.disconnect()
+                    except Exception:
+                        pass
+
+                    from telethon import TelegramClient  # noqa: PLC0415
+                    from telethon.sessions import StringSession  # noqa: PLC0415
+
+                    api_id = context.user_data.get("login_api_id")
+                    api_hash = context.user_data.get("login_api_hash")
+                    if not api_id or not api_hash:
+                        raise ValueError("Login API credentials missing from session")
+                    new_client = TelegramClient(
+                        StringSession(), api_id, api_hash
+                    )
+                    await new_client.connect()
+                    sent = await new_client.send_code_request(phone)
+                    context.user_data["login_client"] = new_client
+                else:
+                    # No 2FA — existing client is fine
+                    sent = await client.send_code_request(phone)
+
                 context.user_data["phone_code_hash"] = sent.phone_code_hash
                 context.user_data["code_sent_at"] = time.time()
-                logger.info("login: resent code for %s after expiry (new hash=%s...)",
-                            phone, str(sent.phone_code_hash)[:8])
+                logger.info(
+                    "login: resent code for %s after expiry (new hash=%s...)",
+                    phone,
+                    str(sent.phone_code_hash)[:8],
+                )
             except Exception as send_exc:
                 logger.error("login: resend after expiry failed: %s", send_exc)
                 await update.message.reply_text(
@@ -433,9 +548,21 @@ async def _receive_code(
                 await _cleanup_client(context)
                 return ConversationHandler.END  # type: ignore[return-value]
 
+            # ── Build resend message ─────────────────────────────────
+            _resend_msg = "⏰ The previous code expired. A new one has been sent!"
+            if _has_2fa:
+                _hint = context.user_data.get("password_hint", "")
+                _resend_msg += (
+                    "\n\n🔐 **2FA is enabled** — the code may expire if the"
+                    " password handshake interrupts it."
+                )
+                if _hint:
+                    _resend_msg += f"\nPassword hint: `{_hint}`"
+            _resend_msg += f"\n\n*Resend #{retry_count}*\n"
+            _resend_msg += "Please enter the new code:"
+
             await update.message.reply_text(
-                "⏰ The previous code expired. A new one has been sent!\n"
-                "Please enter the new code:"
+                _resend_msg, parse_mode="Markdown"
             )
             return CODE  # Stay in CODE state
 
