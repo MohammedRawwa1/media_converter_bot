@@ -1181,7 +1181,7 @@ def setup_handlers(application: Application) -> None:
                 # that the PTB message handler resolves with the user's input.
 
                 async def _do_start():
-                    from telethon.errors import FloodWaitError, PhoneCodeExpiredError, SessionPasswordNeededError
+                    from telethon.errors import FloodWaitError, PhoneCodeExpiredError
 
                     try:
                         loop = asyncio.get_running_loop()
@@ -1259,6 +1259,7 @@ def setup_handlers(application: Application) -> None:
                                 await client.start(
                                     phone=phone,
                                     code_callback=_code_callback,
+                                    password=_password_callback,
                                 )
                                 logger.info("Login successful for %s via client.start()", phone)
                                 # Store phone_code_hash for /loginstatus diagnostics
@@ -1271,11 +1272,6 @@ def setup_handlers(application: Application) -> None:
                                 # invalidate the pending code and issue a fresh one.
                                 await asyncio.sleep(5)
                                 continue
-                            except SessionPasswordNeededError:
-                                # 2FA required - prompt for password and complete sign_in
-                                _password = await _password_callback()
-                                await client.sign_in(password=_password)
-                                break  # 2FA handled
 
                         if await client.is_user_authorized():
                             # Save session string to MongoDB and JSON file for persistence

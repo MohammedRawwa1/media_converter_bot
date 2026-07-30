@@ -22,6 +22,156 @@ from utils.file_utils import safe_rmtree
 
 logger = logging.getLogger(__name__)
 
+# ── Cached Pyrogram bot client (reused across sends to avoid reconnect overhead) ──
+_BOT_CACHE_LOCK: asyncio.Lock | None = None
+_BOT_CACHED_CLIENT: tuple | None = None  # (client, api_id, api_hash, bot_token)
+
+
+async def _get_cached_bot_client(api_id: int, api_hash: str, bot_token: str):
+    """Return a cached Pyrogram bot client, creating or reconnecting if needed.
+
+    The client is created once and reused for all subsequent ``_send_with_pyrogram_bot``
+    calls, avoiding the ~5s connection/auth overhead per file.
+
+    Thread-safe via ``_BOT_CACHE_LOCK`` (``asyncio.Lock``).
+    """
+    global _BOT_CACHE_LOCK, _BOT_CACHED_CLIENT
+
+    # Lazily initialise the lock on first call (module import may not have a running loop)
+    if _BOT_CACHE_LOCK is None:
+        _BOT_CACHE_LOCK = asyncio.Lock()
+
+    # Fast path: cached client is still connected
+    cached = _BOT_CACHED_CLIENT
+    if cached is not None:
+        client, c_id, c_hash, c_token = cached
+        if c_id == api_id and c_hash == api_hash and c_token == bot_token:
+            if client.is_connected:
+                return client
+            logger.info("userbot: Pyrogram bot client disconnected; recreating")
+
+    # Slow path: create a new client under the lock
+    async with _BOT_CACHE_LOCK:
+        # Double-check after acquiring lock
+        cached = _BOT_CACHED_CLIENT
+        if cached is not None:
+            client, c_id, c_hash, c_token = cached
+            if c_id == api_id and c_hash == api_hash and c_token == bot_token and client.is_connected:
+                return client
+
+        # Stop any previous orphaned client before replacing it
+        if _BOT_CACHED_CLIENT is not None:
+            old_client = _BOT_CACHED_CLIENT[0]
+            with contextlib.suppress(Exception):
+                await old_client.stop()
+
+        client = PyrogramClient(
+            "bot_sender",
+            api_id=api_id,
+            api_hash=api_hash,
+            bot_token=bot_token,
+            in_memory=True,
+        )
+        await client.start()
+        _BOT_CACHED_CLIENT = (client, api_id, api_hash, bot_token)
+        logger.info("userbot: Created new cached Pyrogram bot client")
+        return client
+
+
+# ── Cached Telethon client (reused across sends) ──
+_TELETHON_CACHE_LOCK: asyncio.Lock | None = None
+_TELETHON_CACHED_CLIENT: tuple | None = None  # (client, api_id, api_hash)
+
+
+async def _get_cached_telethon_client(api_id: int, api_hash: str):
+    """Return a cached Telethon client, creating or reconnecting if needed."""
+    from utils.telethon_session import build_telethon_client
+
+    global _TELETHON_CACHE_LOCK, _TELETHON_CACHED_CLIENT
+
+    if _TELETHON_CACHE_LOCK is None:
+        _TELETHON_CACHE_LOCK = asyncio.Lock()
+
+    # Fast path: cached client still connected
+    cached = _TELETHON_CACHED_CLIENT
+    if cached is not None:
+        client, c_id, c_hash = cached
+        if c_id == api_id and c_hash == api_hash:
+            if client.is_connected():
+                return client
+            logger.info("userbot: Telethon client disconnected; recreating")
+
+    # Slow path: create new client under lock
+    async with _TELETHON_CACHE_LOCK:
+        cached = _TELETHON_CACHED_CLIENT
+        if cached is not None:
+            client, c_id, c_hash = cached
+            if c_id == api_id and c_hash == api_hash and client.is_connected():
+                return client
+
+        # Stop old orphaned client before replacing
+        if _TELETHON_CACHED_CLIENT is not None:
+            old = _TELETHON_CACHED_CLIENT[0]
+            with contextlib.suppress(Exception):
+                await old.disconnect()
+
+        client = build_telethon_client(api_id, api_hash)
+
+        async def _no_phone():
+            raise RuntimeError("Telethon phone prompt unexpectedly triggered")
+
+        await client.start(phone=_no_phone)
+        _TELETHON_CACHED_CLIENT = (client, api_id, api_hash)
+        logger.info("userbot: Created new cached Telethon client")
+        return client
+
+
+# ── Cached Pyrogram user client (reused across sends) ──
+_PYRO_USER_CACHE_LOCK: asyncio.Lock | None = None
+_PYRO_USER_CACHED_CLIENT: tuple | None = None  # (client, api_id, api_hash)
+
+
+async def _get_cached_pyrogram_user_client(api_id: int, api_hash: str):
+    """Return a cached Pyrogram user client, creating or reconnecting if needed."""
+    from utils.telethon_session import build_pyrogram_client
+
+    global _PYRO_USER_CACHE_LOCK, _PYRO_USER_CACHED_CLIENT
+
+    if _PYRO_USER_CACHE_LOCK is None:
+        _PYRO_USER_CACHE_LOCK = asyncio.Lock()
+
+    # Fast path: cached client still connected
+    cached = _PYRO_USER_CACHED_CLIENT
+    if cached is not None:
+        client, c_id, c_hash = cached
+        if c_id == api_id and c_hash == api_hash:
+            if client.is_connected:
+                return client
+            logger.info("userbot: Pyrogram user client disconnected; recreating")
+
+    # Slow path: create new client under lock
+    async with _PYRO_USER_CACHE_LOCK:
+        cached = _PYRO_USER_CACHED_CLIENT
+        if cached is not None:
+            client, c_id, c_hash = cached
+            if c_id == api_id and c_hash == api_hash and client.is_connected:
+                return client
+
+        # Stop old orphaned client before replacing
+        if _PYRO_USER_CACHED_CLIENT is not None:
+            old = _PYRO_USER_CACHED_CLIENT[0]
+            with contextlib.suppress(Exception):
+                await old.stop()
+
+        client = build_pyrogram_client(api_id, api_hash)
+        if client is None:
+            return None
+        await client.start()
+        _PYRO_USER_CACHED_CLIENT = (client, api_id, api_hash)
+        logger.info("userbot: Created new cached Pyrogram user client")
+        return client
+
+
 # ── Parallel upload constants (FastTelethon-style) ──
 # Part size for Telegram file uploads: 512 KB (standard for big files)
 _PARALLEL_PART_SIZE: int = 512 * 1024
@@ -291,7 +441,7 @@ async def _send_with_telethon(
     if TelegramClient is None:
         return None
 
-    from utils.telethon_session import build_telethon_client, get_userbot_credentials, has_usable_telethon_session
+    from utils.telethon_session import get_userbot_credentials, has_usable_telethon_session
 
     # Fail fast if no usable Telethon session is available — avoids
     # client.start() prompting for a phone number on stdin (EOFError).
@@ -329,13 +479,10 @@ async def _send_with_telethon(
     # worker) owns it and will clean it up after ALL send methods have been
     # tried.  Cleaning it up early would break fallback send methods.
 
-    client = build_telethon_client(api_id, api_hash)
+    client = await _get_cached_telethon_client(api_id, api_hash)
+    if client is None:
+        return None
     try:
-        # Pass a phone callback that raises instead of prompting stdin.
-        async def _no_phone():
-            raise RuntimeError("Telethon phone prompt unexpectedly triggered")
-
-        await client.start(phone=_no_phone)
         target = await _normalize_target(chat_id, client)
 
         # ── Upload file data using parallel chunked transfer (FastTelethon-style) ──
@@ -396,8 +543,8 @@ async def _send_with_telethon(
         if _thumb_dir:
             with contextlib.suppress(Exception):
                 safe_rmtree(_thumb_dir)
-        with contextlib.suppress(Exception):
-            await client.disconnect()
+        # NOTE: the Telethon client is cached and NOT disconnected here.
+        # _get_cached_telethon_client() recycles it for the next send.
 
 
 async def _probe_video_metadata(path: str) -> dict:
@@ -515,11 +662,11 @@ async def _send_with_pyrogram(
     if PyrogramClient is None:
         return None
 
-    from utils.telethon_session import build_pyrogram_client, get_userbot_credentials
+    from utils.telethon_session import get_userbot_credentials
 
     api_id, api_hash = get_userbot_credentials()
 
-    client = build_pyrogram_client(api_id, api_hash)
+    client = await _get_cached_pyrogram_user_client(api_id, api_hash)
     if client is None:
         return None
 
@@ -544,7 +691,6 @@ async def _send_with_pyrogram(
     # tried.  Cleaning it up early would break fallback send methods.
 
     try:
-        await client.start()
         target = await _normalize_target(chat_id)
         kwargs = {
             "caption": caption or "",
@@ -596,8 +742,8 @@ async def _send_with_pyrogram(
         if _thumb_dir:
             with contextlib.suppress(Exception):
                 safe_rmtree(_thumb_dir)
-        with contextlib.suppress(Exception):
-            await client.stop()
+        # NOTE: the Pyrogram user client is cached and NOT stopped here.
+        # _get_cached_pyrogram_user_client() recycles it for the next send.
 
 
 async def _send_with_pyrogram_bot(
@@ -655,16 +801,8 @@ async def _send_with_pyrogram_bot(
     # worker) owns it and will clean it up after ALL send methods have been
     # tried.  Cleaning it up early would break fallback send methods.
 
-    bot = None
+    bot = await _get_cached_bot_client(api_id, api_hash, bot_token)
     try:
-        bot = PyrogramClient(
-            "bot_sender",
-            api_id=api_id,
-            api_hash=api_hash,
-            bot_token=bot_token,
-            in_memory=True,
-        )
-        await bot.start()
         target = await _normalize_target(chat_id)
 
         kwargs = {
@@ -715,9 +853,9 @@ async def _send_with_pyrogram_bot(
         if _thumb_dir:
             with contextlib.suppress(Exception):
                 safe_rmtree(_thumb_dir)
-        if bot is not None:
-            with contextlib.suppress(Exception):
-                await bot.stop()
+        # NOTE: the bot client is cached and NOT stopped here.
+        # _get_cached_bot_client() recycles it for the next send.
+        # If the connection drops, the next call automatically creates a fresh one.
 
 
 async def send_file_via_userbot(
