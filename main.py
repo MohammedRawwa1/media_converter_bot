@@ -72,7 +72,7 @@ from utils.error_handler import (
 )
 from utils.job_queue import cancel_job
 from utils.rate_limiter import ConversionRateLimiter, ConversionRateLimiterRedis, TelegramAPIRateLimiter
-from utils.login_handler import cleanup_login_flow, create_login_conversation_handler
+from utils.login_handler import cleanup_login_flow, register_login_handlers
 from utils.session_healthcheck import (
     get_session_healthchecker,
     start_session_healthcheck,
@@ -329,22 +329,12 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Cancel current operation."""
-    # Defense-in-depth: if there's an active login flow, clean it up
-    # (normally the ConversationHandler intercepts /cancel first, but
-    # this ensures cleanup even if the ordering ever breaks).
-    if context.user_data.get("login_client") is not None:
-        user_id = update.effective_user.id
-        logger.info("cancel: cleaning up active login flow for user %s (defensive)", user_id)
-        await cleanup_login_flow(context)
-        try:
-            conv_data = context.application.conversation_data
-            if conv_data is not None:
-                handler_states = conv_data.get("userbot_login_flow", {})
-                key = (user_id, update.effective_chat.id)
-                if key in handler_states:
-                    del handler_states[key]
-        except Exception:
-            logger.debug("cancel: failed to end conversation state", exc_info=True)
+    uid = update.effective_user.id
+    # If there's an active login flow (background-task pattern), clean it up
+    futures_map = context.application.bot_data.get("login_futures", {})
+    if uid in futures_map and futures_map[uid].get("task") is not None and not futures_map[uid]["task"].done():
+        logger.info("cancel: cleaning up active login flow for user %s", uid)
+        await cleanup_login_flow(context, uid)
         await update.message.reply_text("❌ Login cancelled.")
         return
 
@@ -532,14 +522,10 @@ def setup_handlers(application: Application) -> None:
     except Exception:
         logger.debug("MONGO_URI check skipped")
 
-    # ── Register the login ConversationHandler FIRST so its state handlers
-    #     (including /cancel inside the login flow) take priority over
-    #     the global /cancel command.  PTB v20+ iterates handlers in
-    #     registration order and stops at the first match.
-    # Admin authorisation is handled via application.bot_data["admin_user_id"]
-    # (set in main() before setup_handlers runs).  No parameter needed.
-    login_conv_handler = create_login_conversation_handler()
-    application.add_handler(login_conv_handler)
+    # ── Register the login background-task handlers (no ConversationHandler)
+    #     ``register_login_handlers`` adds ``/login`` + a high-priority text
+    #     handler that intercepts phone/code/password input during login.
+    register_login_handlers(application)
 
     # Command handlers (wrapped for latency tracing)
     application.add_handler(CommandHandler("start", latency_wrapper(start_command, "start_command")))
@@ -816,19 +802,10 @@ def setup_handlers(application: Application) -> None:
             return
 
         # ── Clean up any active login flow before logging out ──
-        if context.user_data.get("login_client") is not None:
+        futures_map = context.application.bot_data.get("login_futures", {})
+        if user_id in futures_map and futures_map[user_id].get("task") is not None and not futures_map[user_id]["task"].done():
             logger.info("logout: cleaning up active login flow for user %s", user_id)
-            await cleanup_login_flow(context)
-            # End the conversation in the ConversationHandler state
-            try:
-                conv_data = context.application.conversation_data
-                if conv_data is not None:
-                    handler_states = conv_data.get("userbot_login_flow", {})
-                    key = (user_id, update.effective_chat.id)
-                    if key in handler_states:
-                        del handler_states[key]
-            except Exception:
-                logger.debug("logout: failed to end conversation state", exc_info=True)
+            await cleanup_login_flow(context, user_id)
 
         try:
             from utils.telethon_session import get_telethon_session_path
@@ -941,10 +918,7 @@ def setup_handlers(application: Application) -> None:
         except Exception as e:
             logger.exception("/sessionstatus failed: %s", e)
             await update.message.reply_text(f"❌ Failed to check session health: {e}")
-
-    application.add_handler(
-        CommandHandler("sessionstatus", latency_wrapper(sessionstatus_command, "sessionstatus_command"))
-    )
+    application.add_handler(CommandHandler("sessionstatus", latency_wrapper(sessionstatus_command, "sessionstatus_command")))
 
     # Store handler manager in bot_data for access in other handlers
     application.bot_data["handler_manager"] = handler_manager
