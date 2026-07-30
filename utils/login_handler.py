@@ -30,6 +30,7 @@ Usage in main.py::
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import os
 import time
@@ -42,16 +43,31 @@ logger = logging.getLogger(__name__)
 
 # ── Helpers ────────────────────────────────────────────────────────────
 
+
 def _normalize_code(text: str) -> str:
     """Normalize Unicode digits to ASCII and strip non-digit chars."""
     trans = str.maketrans(
         {
-            "\u0660": "0", "\u0661": "1", "\u0662": "2", "\u0663": "3",
-            "\u0664": "4", "\u0665": "5", "\u0666": "6", "\u0667": "7",
-            "\u0668": "8", "\u0669": "9",
-            "\u06f0": "0", "\u06f1": "1", "\u06f2": "2", "\u06f3": "3",
-            "\u06f4": "4", "\u06f5": "5", "\u06f6": "6", "\u06f7": "7",
-            "\u06f8": "8", "\u06f9": "9",
+            "\u0660": "0",
+            "\u0661": "1",
+            "\u0662": "2",
+            "\u0663": "3",
+            "\u0664": "4",
+            "\u0665": "5",
+            "\u0666": "6",
+            "\u0667": "7",
+            "\u0668": "8",
+            "\u0669": "9",
+            "\u06f0": "0",
+            "\u06f1": "1",
+            "\u06f2": "2",
+            "\u06f3": "3",
+            "\u06f4": "4",
+            "\u06f5": "5",
+            "\u06f6": "6",
+            "\u06f7": "7",
+            "\u06f8": "8",
+            "\u06f9": "9",
         }
     )
     return "".join(c for c in text.translate(trans) if c.isdigit())
@@ -78,6 +94,7 @@ def _parse_proxy_config():
         return None
     try:
         from urllib.parse import urlparse
+
         parsed = urlparse(raw)
         if parsed.scheme not in ("socks5", "socks4"):
             logger.warning("proxy: only socks5/socks4 supported by Telethon, got '%s'", parsed.scheme)
@@ -97,14 +114,14 @@ def _get_api_credentials() -> tuple:
     api_id_str = (
         os.getenv("API_ID")
         or os.getenv("USERBOT_API_ID")
-        or os.getenv("api_id")
-        or os.getenv("userbot_api_id")
+        or os.getenv("api_id")  # noqa: SIM112
+        or os.getenv("userbot_api_id")  # noqa: SIM112
     )
     api_hash = (
         os.getenv("API_HASH")
         or os.getenv("USERBOT_API_HASH")
-        or os.getenv("api_hash")
-        or os.getenv("userbot_api_hash")
+        or os.getenv("api_hash")  # noqa: SIM112
+        or os.getenv("userbot_api_hash")  # noqa: SIM112
     )
     if not api_id_str or not api_hash:
         return ("Missing Telethon credentials. Set API_ID and API_HASH.",)
@@ -116,6 +133,7 @@ def _get_api_credentials() -> tuple:
 
 
 # ── Public helpers ──────────────────────────────────────────────────────
+
 
 async def cleanup_login_flow(context: ContextTypes.DEFAULT_TYPE, user_id: int | None = None):
     """Cancel any active login flow for *user_id* (or the calling user).
@@ -135,16 +153,12 @@ async def cleanup_login_flow(context: ContextTypes.DEFAULT_TYPE, user_id: int | 
     # Disconnect client (Telethon or Pyrogram)
     client = entry.get("client")
     if client is not None:
-        try:
+        with contextlib.suppress(Exception):
             await client.disconnect()
-        except Exception:
-            pass
     pyro_client = entry.get("pyro_client")
     if pyro_client is not None:
-        try:
+        with contextlib.suppress(Exception):
             await pyro_client.stop()
-        except Exception:
-            pass
 
 
 def register_login_handlers(application):
@@ -168,6 +182,7 @@ def register_login_handlers(application):
 
 # ── Permission check ────────────────────────────────────────────────────
 
+
 async def _check_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
     admin_id = context.application.bot_data.get("admin_user_id")
     if admin_id is not None:
@@ -180,6 +195,7 @@ async def _check_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bo
 
 # ── Login state helpers ─────────────────────────────────────────────────
 
+
 def _get_futures(context: ContextTypes.DEFAULT_TYPE, user_id: int, create: bool = False) -> dict | None:
     """Get the login futures dict for *user_id*, optionally creating it."""
     if "login_futures" not in context.application.bot_data:
@@ -191,14 +207,14 @@ def _get_futures(context: ContextTypes.DEFAULT_TYPE, user_id: int, create: bool 
         if not create:
             return None
         fm[user_id] = {
-            "phone": None,          # asyncio.Future or None
-            "code": None,           # asyncio.Future or None
-            "password": None,       # asyncio.Future or None
+            "phone": None,  # asyncio.Future or None
+            "code": None,  # asyncio.Future or None
+            "password": None,  # asyncio.Future or None
             "cancel": asyncio.Event(),
-            "task": None,           # asyncio.Task or None
-            "client": None,         # TelegramClient or None
-            "chat_id": None,        # set by caller after creation
-            "phone_number": None,   # str or None
+            "task": None,  # asyncio.Task or None
+            "client": None,  # TelegramClient or None
+            "chat_id": None,  # set by caller after creation
+            "phone_number": None,  # str or None
             "phone_code_hash": None,
             "api_id": None,
             "api_hash": None,
@@ -209,6 +225,7 @@ def _get_futures(context: ContextTypes.DEFAULT_TYPE, user_id: int, create: bool 
 # ══════════════════════════════════════════════════════════════════════════
 # /login command
 # ══════════════════════════════════════════════════════════════════════════
+
 
 async def _login_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """``/login [phone]`` — start the Telethon login flow."""
@@ -227,9 +244,7 @@ async def _login_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     # Check for existing active flow
     existing = _get_futures(context, uid)
     if existing and existing.get("task") is not None and not existing["task"].done():
-        await update.message.reply_text(
-            "⏳ You already have an active login flow. Use /cancel to abort it first."
-        )
+        await update.message.reply_text("⏳ You already have an active login flow. Use /cancel to abort it first.")
         return
 
     # Check for already-authorised session
@@ -240,7 +255,9 @@ async def _login_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         saved_session = await _load_any_session(context, uid)
         if saved_session:
             test_client = TelegramClient(
-                StringSession(saved_session), api_id, api_hash,
+                StringSession(saved_session),
+                api_id,
+                api_hash,
                 proxy=_parse_proxy_config(),
             )
             try:
@@ -276,16 +293,12 @@ async def _login_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         warn = _pyrogram_warning_text()
 
         msg = await update.message.reply_text(
-            f"📱 Phone: `{phone}`\n"
-            "⏳ Connecting to Telegram and requesting verification code..."
-            + warn,
+            f"📱 Phone: `{phone}`\n⏳ Connecting to Telegram and requesting verification code..." + warn,
             parse_mode="Markdown",
         )
 
         # Start background task
-        entry["task"] = asyncio.create_task(
-            _run_login_task(uid, phone, api_id, api_hash, entry, context, msg)
-        )
+        entry["task"] = asyncio.create_task(_run_login_task(uid, phone, api_id, api_hash, entry, context, msg))
     else:
         # No phone — ask for it, set up phone Future
         entry = _get_futures(context, uid, create=True)
@@ -301,8 +314,7 @@ async def _login_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             "📱 Please send the phone number in international format,\n"
             "e.g. ``+1234567890``\n\n"
             "⏳ Your login flow will expire after **5 minutes** of inactivity.\n"
-            "Type /cancel to abort."
-            + warn,
+            "Type /cancel to abort." + warn,
             parse_mode="Markdown",
         )
 
@@ -311,6 +323,7 @@ async def _load_any_session(context: ContextTypes.DEFAULT_TYPE, user_id: int) ->
     """Try to load a saved Telethon session from JSON or MongoDB."""
     try:
         from utils.telethon_session import _load_session_string_from_file_async
+
         saved = await _load_session_string_from_file_async(client_type="telethon")
         if saved:
             return saved
@@ -330,6 +343,7 @@ async def _load_any_session(context: ContextTypes.DEFAULT_TYPE, user_id: int) ->
 # ══════════════════════════════════════════════════════════════════════════
 # Text message handler (resolves Futures)
 # ══════════════════════════════════════════════════════════════════════════
+
 
 async def _handle_login_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Intercept text messages that may be login input (phone / code / password).
@@ -365,27 +379,34 @@ async def _handle_login_text(update: Update, context: ContextTypes.DEFAULT_TYPE)
         if client_type == "pyrogram":
             msg = await update.message.reply_text(
                 f"📱 Phone: `{text}`\n"
-                "⏳ Connecting to Telegram via Pyrogram and requesting verification code..."
-                + warn,
+                "⏳ Connecting to Telegram via Pyrogram and requesting verification code..." + warn,
                 parse_mode="Markdown",
             )
             entry["task"] = asyncio.create_task(
                 _run_pyro_login_task(
-                    uid, text, entry["api_id"], entry["api_hash"],
-                    entry, context, msg,
+                    uid,
+                    text,
+                    entry["api_id"],
+                    entry["api_hash"],
+                    entry,
+                    context,
+                    msg,
                 )
             )
         else:
             msg = await update.message.reply_text(
-                f"📱 Phone: `{text}`\n"
-                "⏳ Connecting to Telegram and requesting verification code..."
-                + warn,
+                f"📱 Phone: `{text}`\n⏳ Connecting to Telegram and requesting verification code..." + warn,
                 parse_mode="Markdown",
             )
             entry["task"] = asyncio.create_task(
                 _run_login_task(
-                    uid, text, entry["api_id"], entry["api_hash"],
-                    entry, context, msg,
+                    uid,
+                    text,
+                    entry["api_id"],
+                    entry["api_hash"],
+                    entry,
+                    context,
+                    msg,
                 )
             )
         return  # consumed
@@ -395,9 +416,7 @@ async def _handle_login_text(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if code_fut is not None and not code_fut.done():
         code = _normalize_code(text)
         if not code:
-            await update.message.reply_text(
-                "❌ No digits found. Please enter the code you received (digits only):"
-            )
+            await update.message.reply_text("❌ No digits found. Please enter the code you received (digits only):")
             return
         code_fut.set_result(code)
         return  # consumed
@@ -463,10 +482,14 @@ async def _run_login_task(
         phone_code_hash = str(sent.phone_code_hash)
         entry["phone_code_hash"] = phone_code_hash
         code_type = type(sent).__name__
-        sent_timeout = getattr(sent, 'timeout', None)
+        sent_timeout = getattr(sent, "timeout", None)
         logger.info(
             "login [%s]: code sent to %s (hash=%s..., type=%s, timeout=%s)",
-            elapsed(), phone, phone_code_hash[:8], code_type, sent_timeout,
+            elapsed(),
+            phone,
+            phone_code_hash[:8],
+            code_type,
+            sent_timeout,
         )
 
         # NOTE: We deliberately do NOT call GetPasswordRequest here.
@@ -488,7 +511,7 @@ async def _run_login_task(
 
         try:
             code = await asyncio.wait_for(entry["code"], timeout=TIMEOUT_SECONDS)
-        except asyncio.TimeoutError:
+        except TimeoutError:
             await _login_fail(bot, chat_id, status_msg, "⏰ Login timed out (no code received within 5 minutes).")
             return
 
@@ -496,7 +519,8 @@ async def _run_login_task(
         code_delay = code_received_at - t0
         logger.info(
             "login [%s]: code received from user (total elapsed=%.1fs)",
-            elapsed(), code_delay,
+            elapsed(),
+            code_delay,
         )
 
         if entry["cancel"].is_set():
@@ -511,7 +535,9 @@ async def _run_login_task(
                 sign_in_t0 = time.monotonic()
                 logger.debug(
                     "login [%s]: calling sign_in(phone=%s, hash=%s...)",
-                    elapsed(), phone, entry["phone_code_hash"][:8],
+                    elapsed(),
+                    phone,
+                    entry["phone_code_hash"][:8],
                 )
                 # Pass phone_code_hash explicitly to bypass any internal cache issues
                 await client.sign_in(
@@ -524,12 +550,19 @@ async def _run_login_task(
                 break  # success
             except Exception as exc:
                 exc_name = type(exc).__name__
-                exc_x = getattr(exc, 'x', None)
-                exc_code = getattr(exc, 'code', None)
-                exc_type_attr = getattr(exc, 'type', None) or getattr(exc, 'type_name', None) or getattr(exc, 'error_code', None)
+                exc_x = getattr(exc, "x", None)
+                exc_code = getattr(exc, "code", None)
+                exc_type_attr = (
+                    getattr(exc, "type", None) or getattr(exc, "type_name", None) or getattr(exc, "error_code", None)
+                )
                 logger.warning(
                     "login [%s]: sign_in FAILED — name=%s, code=%s, type=%s, raw=%s, exc=%s",
-                    elapsed(), exc_name, exc_code, exc_type_attr, exc_x, exc,
+                    elapsed(),
+                    exc_name,
+                    exc_code,
+                    exc_type_attr,
+                    exc_x,
+                    exc,
                 )
 
                 if "SessionPasswordNeededError" in exc_name:
@@ -541,14 +574,18 @@ async def _run_login_task(
                     retry_count += 1
                     logger.warning(
                         "login [%s]: code expired for %s (attempt %d/3)",
-                        elapsed(), phone, retry_count,
+                        elapsed(),
+                        phone,
+                        retry_count,
                     )
                     if retry_count >= 3:
                         await _login_fail(
-                            bot, chat_id, status_msg,
+                            bot,
+                            chat_id,
+                            status_msg,
                             "❌ The verification codes keep expiring before they can be used.\n"
                             "This usually happens when two bots share API_ID/API_HASH with 2FA enabled.\n"
-                            "Try using /logout first, then /login again."
+                            "Try using /logout first, then /login again.",
                         )
                         return
                     # Wait before resending — gives Telegram's backend time to
@@ -560,7 +597,12 @@ async def _run_login_task(
                     sent = await client.send_code_request(phone)
                     phone_code_hash = str(sent.phone_code_hash)
                     entry["phone_code_hash"] = phone_code_hash
-                    logger.info("login [%s]: resent code (attempt %d/3, new hash=%s...)", elapsed(), retry_count, phone_code_hash[:8])
+                    logger.info(
+                        "login [%s]: resent code (attempt %d/3, new hash=%s...)",
+                        elapsed(),
+                        retry_count,
+                        phone_code_hash[:8],
+                    )
                     # Set up new code future
                     entry["code"] = asyncio.get_running_loop().create_future()
                     try:
@@ -575,7 +617,7 @@ async def _run_login_task(
                         pass
                     try:
                         code = await asyncio.wait_for(entry["code"], timeout=TIMEOUT_SECONDS)
-                    except asyncio.TimeoutError:
+                    except TimeoutError:
                         await _login_fail(bot, chat_id, status_msg, "⏰ Login timed out.")
                         return
                     continue  # retry sign_in with new code
@@ -590,7 +632,7 @@ async def _run_login_task(
                         await bot.send_message(chat_id, "❌ Invalid code. Please try again:")
                     try:
                         code = await asyncio.wait_for(entry["code"], timeout=TIMEOUT_SECONDS)
-                    except asyncio.TimeoutError:
+                    except TimeoutError:
                         await _login_fail(bot, chat_id, status_msg, "⏰ Login timed out.")
                         return
                     continue
@@ -598,8 +640,10 @@ async def _run_login_task(
                 if "FloodWaitError" in exc_name:
                     wait = getattr(exc, "seconds", None) or getattr(exc, "timeout", None) or 60
                     await _login_fail(
-                        bot, chat_id, status_msg,
-                        f"⏳ Too many attempts. Please wait {int(wait)} seconds before trying /login again."
+                        bot,
+                        chat_id,
+                        status_msg,
+                        f"⏳ Too many attempts. Please wait {int(wait)} seconds before trying /login again.",
                     )
                     return
 
@@ -612,6 +656,7 @@ async def _run_login_task(
             # Fetch 2FA password info NOW (after sign_in with code has confirmed 2FA is needed)
             try:
                 from telethon import functions  # noqa: PLC0415
+
                 pwd_info = await client(functions.account.GetPasswordRequest())
                 pwd_hint = str(getattr(pwd_info, "hint", "") or "")
             except Exception:
@@ -628,8 +673,10 @@ async def _run_login_task(
             entry["password"] = asyncio.get_running_loop().create_future()
             try:
                 password = await asyncio.wait_for(entry["password"], timeout=TIMEOUT_SECONDS)
-            except asyncio.TimeoutError:
-                await _login_fail(bot, chat_id, status_msg, "⏰ Login timed out (no password received within 5 minutes).")
+            except TimeoutError:
+                await _login_fail(
+                    bot, chat_id, status_msg, "⏰ Login timed out (no password received within 5 minutes)."
+                )
                 return
 
             if entry["cancel"].is_set():
@@ -647,7 +694,7 @@ async def _run_login_task(
                         await bot.send_message(chat_id, "❌ Incorrect password. Please try again:")
                     try:
                         password = await asyncio.wait_for(entry["password"], timeout=TIMEOUT_SECONDS)
-                    except asyncio.TimeoutError:
+                    except TimeoutError:
                         await _login_fail(bot, chat_id, status_msg, "⏰ Login timed out.")
                         return
                     # Retry with new password
@@ -661,15 +708,19 @@ async def _run_login_task(
         try:
             db_model = context.application.bot_data.get("db_model")
             if db_model is not None:
-                await db_model.save_session(user_id, {
-                    "telethon_session": session_str,
-                    "string_session": session_str,
-                })
+                await db_model.save_session(
+                    user_id,
+                    {
+                        "telethon_session": session_str,
+                        "string_session": session_str,
+                    },
+                )
                 saved_to.append("MongoDB")
         except Exception as exc:
             logger.warning("login: MongoDB save failed: %s", exc)
         try:
             from utils.telethon_session import save_session_string_to_file_async  # noqa: PLC0415
+
             if await save_session_string_to_file_async(session_str, client_type="telethon"):
                 saved_to.append("JSON file")
         except Exception as exc:
@@ -703,18 +754,14 @@ async def _run_login_task(
         logger.info("login: task cancelled for %s", phone)
     except Exception as exc:
         logger.exception("login: unexpected error: %s", exc)
-        try:
+        with contextlib.suppress(Exception):
             await bot.send_message(chat_id, f"❌ Login failed unexpectedly: {exc}")
-        except Exception:
-            pass
     finally:
         # Clean up
         client = entry.get("client")
         if client is not None:
-            try:
+            with contextlib.suppress(Exception):
                 await client.disconnect()
-            except Exception:
-                pass
         # Remove from futures map
         futures_map = context.application.bot_data.get("login_futures", {})
         if user_id in futures_map:
@@ -729,15 +776,14 @@ async def _login_fail(bot, chat_id, status_msg, text: str):
         else:
             await bot.send_message(chat_id, text, parse_mode="Markdown")
     except Exception:
-        try:
+        with contextlib.suppress(Exception):
             await bot.send_message(chat_id, text, parse_mode="Markdown")
-        except Exception:
-            pass
 
 
 # ══════════════════════════════════════════════════════════════════════════
 # Cancel handler
 # ══════════════════════════════════════════════════════════════════════════
+
 
 async def cancel_login_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """``/cancel`` inside a login flow — abort and clean up the background task."""
@@ -749,6 +795,7 @@ async def cancel_login_command(update: Update, context: ContextTypes.DEFAULT_TYP
 # ══════════════════════════════════════════════════════════════════════════
 # /loginpyro command (Pyrogram-based login)
 # ══════════════════════════════════════════════════════════════════════════
+
 
 async def _pyro_login_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """``/loginpyro [phone]`` — start the Pyrogram login flow.
@@ -792,14 +839,10 @@ async def _pyro_login_command(update: Update, context: ContextTypes.DEFAULT_TYPE
         entry["phone_number"] = phone
         warn = _pyrogram_warning_text()
         msg = await update.message.reply_text(
-            f"📱 Phone: `{phone}`\n"
-            "⏳ Connecting to Telegram via Pyrogram and requesting verification code..."
-            + warn,
+            f"📱 Phone: `{phone}`\n⏳ Connecting to Telegram via Pyrogram and requesting verification code..." + warn,
             parse_mode="Markdown",
         )
-        entry["task"] = asyncio.create_task(
-            _run_pyro_login_task(uid, phone, api_id, api_hash, entry, context, msg)
-        )
+        entry["task"] = asyncio.create_task(_run_pyro_login_task(uid, phone, api_id, api_hash, entry, context, msg))
     else:
         entry["phone"] = asyncio.get_running_loop().create_future()
         warn = _pyrogram_warning_text()
@@ -808,8 +851,7 @@ async def _pyro_login_command(update: Update, context: ContextTypes.DEFAULT_TYPE
             "e.g. ``+1234567890``\n\n"
             "This will use **Pyrogram** login (handles 2FA reliably).\n"
             "⏳ Your login flow will expire after **5 minutes** of inactivity.\n"
-            "Type /cancel to abort."
-            + warn,
+            "Type /cancel to abort." + warn,
             parse_mode="Markdown",
         )
 
@@ -817,6 +859,7 @@ async def _pyro_login_command(update: Update, context: ContextTypes.DEFAULT_TYPE
 # ══════════════════════════════════════════════════════════════════════════
 # Pyrogram background login task
 # ══════════════════════════════════════════════════════════════════════════
+
 
 async def _run_pyro_login_task(
     user_id: int,
@@ -847,7 +890,8 @@ async def _run_pyro_login_task(
         return f"+{time.monotonic() - t0:.1f}s"
 
     try:
-        from pyrogram import Client as PyrogramClient, errors as pyro_errors  # noqa: PLC0415
+        from pyrogram import Client as PyrogramClient  # noqa: PLC0415
+        from pyrogram import errors as pyro_errors
 
         logger.debug("login [%s]: building Pyrogram client (in-memory)...", elapsed())
 
@@ -869,9 +913,11 @@ async def _run_pyro_login_task(
         entry["phone_code_hash"] = phone_code_hash
         logger.info(
             "login [%s]: code sent to %s (hash=%s..., type=%s, timeout=%s)",
-            elapsed(), phone, phone_code_hash[:8],
-            getattr(sent_code, 'type', None),
-            getattr(sent_code, 'timeout', None),
+            elapsed(),
+            phone,
+            phone_code_hash[:8],
+            getattr(sent_code, "type", None),
+            getattr(sent_code, "timeout", None),
         )
 
         # Notify user
@@ -885,7 +931,7 @@ async def _run_pyro_login_task(
         entry["code"] = asyncio.get_running_loop().create_future()
         try:
             code = await asyncio.wait_for(entry["code"], timeout=TIMEOUT_SECONDS)
-        except asyncio.TimeoutError:
+        except TimeoutError:
             await _login_fail(bot, chat_id, status_msg, "⏰ Login timed out (no code received within 5 minutes).")
             return
 
@@ -893,7 +939,8 @@ async def _run_pyro_login_task(
         code_delay = code_received_at - t0
         logger.info(
             "login [%s]: code received from user (total elapsed=%.1fs)",
-            elapsed(), code_delay,
+            elapsed(),
+            code_delay,
         )
 
         if entry["cancel"].is_set():
@@ -908,9 +955,11 @@ async def _run_pyro_login_task(
                 sign_in_t0 = time.monotonic()
                 logger.debug(
                     "login [%s]: calling sign_in(phone=%s, hash=%s...)",
-                    elapsed(), phone, phone_code_hash[:8],
+                    elapsed(),
+                    phone,
+                    phone_code_hash[:8],
                 )
-                result = await client.sign_in(phone, phone_code_hash, code)
+                await client.sign_in(phone, phone_code_hash, code)
                 sign_in_duration = time.monotonic() - sign_in_t0
                 logger.info("login [%s]: sign_in SUCCEEDED in %.2fs", elapsed(), sign_in_duration)
                 break  # success
@@ -922,12 +971,16 @@ async def _run_pyro_login_task(
                 retry_count += 1
                 logger.warning(
                     "login [%s]: code expired for %s (attempt %d/3)",
-                    elapsed(), phone, retry_count,
+                    elapsed(),
+                    phone,
+                    retry_count,
                 )
                 if retry_count >= 3:
                     await _login_fail(
-                        bot, chat_id, status_msg,
-                        "❌ The verification codes keep expiring. Try /login instead or check your network."
+                        bot,
+                        chat_id,
+                        status_msg,
+                        "❌ The verification codes keep expiring. Try /login instead or check your network.",
                     )
                     return
                 # Wait and resend
@@ -937,7 +990,9 @@ async def _run_pyro_login_task(
                 entry["phone_code_hash"] = phone_code_hash
                 logger.info(
                     "login [%s]: resent code via Pyrogram (attempt %d/3, new hash=%s...)",
-                    elapsed(), retry_count, phone_code_hash[:8],
+                    elapsed(),
+                    retry_count,
+                    phone_code_hash[:8],
                 )
                 entry["code"] = asyncio.get_running_loop().create_future()
                 try:
@@ -952,7 +1007,7 @@ async def _run_pyro_login_task(
                     pass
                 try:
                     code = await asyncio.wait_for(entry["code"], timeout=TIMEOUT_SECONDS)
-                except asyncio.TimeoutError:
+                except TimeoutError:
                     await _login_fail(bot, chat_id, status_msg, "⏰ Login timed out.")
                     return
                 continue
@@ -965,23 +1020,28 @@ async def _run_pyro_login_task(
                     await bot.send_message(chat_id, "❌ Invalid code. Please try again:")
                 try:
                     code = await asyncio.wait_for(entry["code"], timeout=TIMEOUT_SECONDS)
-                except asyncio.TimeoutError:
+                except TimeoutError:
                     await _login_fail(bot, chat_id, status_msg, "⏰ Login timed out.")
                     return
                 continue
             except pyro_errors.FloodWait as e:
-                wait = getattr(e, 'x', None) or getattr(e, 'value', None) or 60
+                wait = getattr(e, "x", None) or getattr(e, "value", None) or 60
                 await _login_fail(
-                    bot, chat_id, status_msg,
-                    f"⏳ Too many attempts. Please wait {int(wait)} seconds before trying /loginpyro again."
+                    bot,
+                    chat_id,
+                    status_msg,
+                    f"⏳ Too many attempts. Please wait {int(wait)} seconds before trying /loginpyro again.",
                 )
                 return
             except Exception as exc:
                 exc_name = type(exc).__name__
-                exc_x = getattr(exc, 'x', None)
+                exc_x = getattr(exc, "x", None)
                 logger.warning(
                     "login [%s]: sign_in FAILED — name=%s, raw=%s, exc=%s",
-                    elapsed(), exc_name, exc_x, exc,
+                    elapsed(),
+                    exc_name,
+                    exc_x,
+                    exc,
                 )
                 await _login_fail(bot, chat_id, status_msg, f"❌ Login failed: {exc}")
                 return
@@ -1004,8 +1064,10 @@ async def _run_pyro_login_task(
             entry["password"] = asyncio.get_running_loop().create_future()
             try:
                 password = await asyncio.wait_for(entry["password"], timeout=TIMEOUT_SECONDS)
-            except asyncio.TimeoutError:
-                await _login_fail(bot, chat_id, status_msg, "⏰ Login timed out (no password received within 5 minutes).")
+            except TimeoutError:
+                await _login_fail(
+                    bot, chat_id, status_msg, "⏰ Login timed out (no password received within 5 minutes)."
+                )
                 return
 
             if entry["cancel"].is_set():
@@ -1022,7 +1084,7 @@ async def _run_pyro_login_task(
                     await bot.send_message(chat_id, "❌ Incorrect password. Please try again:")
                 try:
                     password = await asyncio.wait_for(entry["password"], timeout=TIMEOUT_SECONDS)
-                except asyncio.TimeoutError:
+                except TimeoutError:
                     await _login_fail(bot, chat_id, status_msg, "⏰ Login timed out.")
                     return
                 await client.check_password(password)
@@ -1037,14 +1099,18 @@ async def _run_pyro_login_task(
         try:
             db_model = context.application.bot_data.get("db_model")
             if db_model is not None:
-                await db_model.save_session(user_id, {
-                    "pyrogram_session": session_str,
-                })
+                await db_model.save_session(
+                    user_id,
+                    {
+                        "pyrogram_session": session_str,
+                    },
+                )
                 saved_to.append("MongoDB")
         except Exception as exc:
             logger.warning("login: MongoDB Pyrogram save failed: %s", exc)
         try:
             from utils.telethon_session import save_session_string_to_file_async  # noqa: PLC0415
+
             if await save_session_string_to_file_async(session_str, client_type="pyrogram"):
                 saved_to.append("JSON file")
         except Exception as exc:
@@ -1078,18 +1144,14 @@ async def _run_pyro_login_task(
         logger.info("login: Pyrogram task cancelled for %s", phone)
     except Exception as exc:
         logger.exception("login: Pyrogram unexpected error: %s", exc)
-        try:
+        with contextlib.suppress(Exception):
             await bot.send_message(chat_id, f"❌ Pyrogram login failed unexpectedly: {exc}")
-        except Exception:
-            pass
     finally:
         # Clean up Pyrogram client
         pyro_client = entry.get("pyro_client")
         if pyro_client is not None:
-            try:
+            with contextlib.suppress(Exception):
                 await pyro_client.stop()
-            except Exception:
-                pass
         # Remove from futures map
         futures_map = context.application.bot_data.get("login_futures", {})
         if user_id in futures_map:

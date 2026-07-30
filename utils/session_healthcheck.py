@@ -321,7 +321,8 @@ class SessionHealthChecker:
 
             # Resolve session from env → JSON → MongoDB (includes /loginpyro sessions)
             client = await build_pyrogram_client_async(
-                api_id, api_hash,
+                api_id,
+                api_hash,
                 user_id=self.admin_user_id,
                 db_model=self.db_model,
             )
@@ -397,13 +398,14 @@ class SessionHealthChecker:
             # Read the persisted JSON file
             try:
                 session_str = await _load_session_string_from_file_async(client_type="pyrogram")
-            except Exception as exc:
+            except Exception:
                 session_str = None
 
         # If still nothing, check MongoDB (for sessions saved by /loginpyro)
         if not session_str and self.db_model is not None and self.admin_user_id is not None:
             try:
                 from utils.telethon_session import get_pyrogram_session_string_for_user
+
                 session_str = await get_pyrogram_session_string_for_user(
                     user_id=self.admin_user_id, db_model=self.db_model
                 )

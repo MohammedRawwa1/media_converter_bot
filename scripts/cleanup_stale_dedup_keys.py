@@ -23,14 +23,16 @@ if repo_root not in sys.path:
 import redis
 
 # Active statuses — copied from the dedup check in ``_ensure_current_file_downloaded``
-_ACTIVE_STATUSES = frozenset({
-    "processing",
-    "queued",
-    "waiting",
-    "started",
-    "uploading",
-    "sending",
-})
+_ACTIVE_STATUSES = frozenset(
+    {
+        "processing",
+        "queued",
+        "waiting",
+        "started",
+        "uploading",
+        "sending",
+    }
+)
 
 _DEDUP_PREFIX = "ffmpeg:pipeline_dedup:"
 
@@ -124,14 +126,14 @@ def main():
             break
 
     # Summary
-    print(f"\n{'='*50}")
+    print(f"\n{'=' * 50}")
     print(f"Scanned:     {total_scanned} dedup keys")
     print(f"Active:      {active_count}")
     print(f"Stale:       {stale_count}")
     print(f"Deleted:     {deleted_count}")
     print(f"Errors:      {error_count}")
     print(f"Mode:        {'DRY-RUN (no deletions)' if dry_run else 'APPLY (deletions performed)'}")
-    print(f"{'='*50}")
+    print(f"{'=' * 50}")
 
     if dry_run and stale_count > 0:
         print(f"\n💡 Run with --apply to delete {stale_count} stale keys.")

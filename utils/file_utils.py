@@ -368,9 +368,7 @@ def safe_rmtree(path: str) -> None:
     resolved = os.path.realpath(path)
     protected = {"/", "/tmp", os.path.realpath(tempfile.gettempdir())}  # noqa: S108  # nosec  # deliberate safety guard, not insecure usage
     if resolved in protected:
-        raise RuntimeError(
-            f"safe_rmtree: refusing to delete system directory {resolved!r}"
-        )
+        raise RuntimeError(f"safe_rmtree: refusing to delete system directory {resolved!r}")
     shutil.rmtree(resolved, ignore_errors=True)
 
 

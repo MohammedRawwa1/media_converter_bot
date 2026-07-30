@@ -42,7 +42,6 @@ from telegram.ext import (
     CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
-    ConversationHandler,
     MessageHandler,
     filters,
 )
@@ -71,8 +70,8 @@ from utils.error_handler import (
     setup_comprehensive_logging,
 )
 from utils.job_queue import cancel_job
-from utils.rate_limiter import ConversionRateLimiter, ConversionRateLimiterRedis, TelegramAPIRateLimiter
 from utils.login_handler import cleanup_login_flow, register_login_handlers
+from utils.rate_limiter import ConversionRateLimiter, ConversionRateLimiterRedis, TelegramAPIRateLimiter
 from utils.session_healthcheck import (
     get_session_healthchecker,
     start_session_healthcheck,
@@ -569,6 +568,7 @@ def setup_handlers(application: Application) -> None:
         json_file_exists = False
         try:
             from utils.telethon_session import _get_persisted_session_path, _load_all_sessions_from_file_async
+
             _p = _get_persisted_session_path()
             json_file_exists = os.path.exists(_p)
             json_session = await _load_all_sessions_from_file_async()
@@ -599,18 +599,14 @@ def setup_handlers(application: Application) -> None:
                 phone = result.get("phone") or "?"
                 dc = result.get("dc_id") or "?"
                 latency = result.get("latency_ms") or "?"
-                return (
-                    f"✅ **{name}** — Working\n"
-                    f"   Phone: `{phone}`\n"
-                    f"   DC: `{dc}` | Latency: `{latency}ms`"
-                )
+                return f"✅ **{name}** — Working\n   Phone: `{phone}`\n   DC: `{dc}` | Latency: `{latency}ms`"
             else:
                 err = result.get("error") or "Not configured"
                 return f"❌ **{name}** — `{err}`"
 
         # Get healthcheck interval from the checker
-        check_interval = getattr(checker, 'check_interval', 3600)
-        admin_alerts = "Enabled" if getattr(checker, 'admin_user_id', None) else "Disabled"
+        check_interval = getattr(checker, "check_interval", 3600)
+        admin_alerts = "Enabled" if getattr(checker, "admin_user_id", None) else "Disabled"
 
         lines = [
             "\U0001f510 **Live Session Status**",
@@ -734,7 +730,6 @@ def setup_handlers(application: Application) -> None:
 
     application.add_handler(CommandHandler("admin", latency_wrapper(admin_command, "admin_command")))
 
-
     async def logout_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_id = update.effective_user.id
         if ADMIN_USER_ID and user_id != ADMIN_USER_ID:
@@ -743,7 +738,11 @@ def setup_handlers(application: Application) -> None:
 
         # ── Clean up any active login flow before logging out ──
         futures_map = context.application.bot_data.get("login_futures", {})
-        if user_id in futures_map and futures_map[user_id].get("task") is not None and not futures_map[user_id]["task"].done():
+        if (
+            user_id in futures_map
+            and futures_map[user_id].get("task") is not None
+            and not futures_map[user_id]["task"].done()
+        ):
             logger.info("logout: cleaning up active login flow for user %s", user_id)
             await cleanup_login_flow(context, user_id)
 
@@ -796,7 +795,11 @@ def setup_handlers(application: Application) -> None:
 
         # ── Clean up any active login flow before logging out ──
         futures_map = context.application.bot_data.get("login_futures", {})
-        if user_id in futures_map and futures_map[user_id].get("task") is not None and not futures_map[user_id]["task"].done():
+        if (
+            user_id in futures_map
+            and futures_map[user_id].get("task") is not None
+            and not futures_map[user_id]["task"].done()
+        ):
             logger.info("logoutpyro: cleaning up active login flow for user %s", user_id)
             await cleanup_login_flow(context, user_id)
 
@@ -806,6 +809,7 @@ def setup_handlers(application: Application) -> None:
             # 1. Clear Pyrogram session from JSON file
             try:
                 from utils.telethon_session import save_session_string_to_file_async
+
                 if await save_session_string_to_file_async("", client_type="pyrogram"):
                     removed.append("JSON file (pyrogram_session cleared)")
             except Exception as exc:
@@ -1160,10 +1164,12 @@ async def main(background: bool = False) -> None:
                 get_pyrogram_session_string_for_user,
                 save_session_string_to_file_async,
             )
+
             _existing = await _load_all_sessions_from_file_async()
             if not _existing.get("pyrogram_session") and ADMIN_USER_ID and _mongo_db:
                 _mongo_pyro = await get_pyrogram_session_string_for_user(
-                    user_id=ADMIN_USER_ID, db_model=_mongo_db,
+                    user_id=ADMIN_USER_ID,
+                    db_model=_mongo_db,
                 )
                 if _mongo_pyro:
                     await save_session_string_to_file_async(_mongo_pyro, client_type="pyrogram")

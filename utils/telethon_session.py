@@ -714,9 +714,7 @@ async def build_pyrogram_client_async(
 
     Same retry/timeout config as ``build_pyrogram_client()`` (reads env vars).
     """
-    session_str = await get_pyrogram_session_string_for_user(
-        user_id=user_id, db_model=db_model
-    )
+    session_str = await get_pyrogram_session_string_for_user(user_id=user_id, db_model=db_model)
     if not session_str:
         return None
     return build_pyrogram_client(api_id, api_hash, session_str=session_str)

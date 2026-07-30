@@ -1183,12 +1183,20 @@ class EnhancedMediaHandler:
                                                 _cancel_val = _old_hash.get(b"cancel") or _old_hash.get("cancel")
                                                 _is_cancelled = False
                                                 if _cancel_val:
-                                                    _cv = _cancel_val.decode() if isinstance(_cancel_val, bytes) else str(_cancel_val)
-                                                    _is_cancelled = (_cv == "1")
+                                                    _cv = (
+                                                        _cancel_val.decode()
+                                                        if isinstance(_cancel_val, bytes)
+                                                        else str(_cancel_val)
+                                                    )
+                                                    _is_cancelled = _cv == "1"
                                                 if not _is_cancelled:
                                                     _status = _old_hash.get(b"status") or _old_hash.get("status")
                                                     if _status:
-                                                        _s = _status.decode() if isinstance(_status, bytes) else str(_status)
+                                                        _s = (
+                                                            _status.decode()
+                                                            if isinstance(_status, bytes)
+                                                            else str(_status)
+                                                        )
                                                         _active = _s in (
                                                             "processing",
                                                             "queued",
@@ -1228,9 +1236,7 @@ class EnhancedMediaHandler:
                                 #    We'll set the value to a placeholder "pending" and
                                 #    overwrite it with the real job_id after ingest succeeds.
                                 #    If another concurrent call already claimed it, skip. ──
-                                _claimed = await _r_dedup.set(
-                                    _dedup_key, "pending", nx=True, ex=86400
-                                )
+                                _claimed = await _r_dedup.set(_dedup_key, "pending", nx=True, ex=86400)
                                 if not _claimed:
                                     # Another concurrent call claimed it — skip
                                     logger.info(

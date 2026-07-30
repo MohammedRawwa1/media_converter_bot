@@ -269,10 +269,7 @@ class CleanupManager:
                         if status in ("done", "error", "cancelled", ""):
                             await r.delete(key)
                             deleted += 1
-                            logger.debug(
-                                "lock_cleanup: deleted lock %s (job %s status=%s)",
-                                key_str, val_str, status
-                            )
+                            logger.debug("lock_cleanup: deleted lock %s (job %s status=%s)", key_str, val_str, status)
 
                     except Exception as e:
                         logger.debug("lock_cleanup: error processing key %s: %s", key, e)
@@ -359,7 +356,9 @@ class CleanupManager:
                         if status in ("done", "error", "cancelled", ""):
                             await r.delete(key)
                             deleted += 1
-                            logger.debug("redis_dedup_cleanup: deleted key %s (job %s status=%s)", key_str, val_str, status)
+                            logger.debug(
+                                "redis_dedup_cleanup: deleted key %s (job %s status=%s)", key_str, val_str, status
+                            )
 
                     except Exception as e:
                         logger.debug("redis_dedup_cleanup: error processing key %s: %s", key, e)

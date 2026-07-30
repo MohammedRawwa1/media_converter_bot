@@ -224,10 +224,11 @@ async def _parallel_upload_file(
         return None
 
     import random
-    from telethon.tl.functions.upload import SaveBigFilePartRequest, SaveFilePartRequest
-    from telethon.tl.types import InputFileBig, InputFile
 
-    file_id = random.randrange(1 << 63)
+    from telethon.tl.functions.upload import SaveBigFilePartRequest, SaveFilePartRequest
+    from telethon.tl.types import InputFile, InputFileBig
+
+    file_id = random.randrange(1 << 63)  # noqa: S311
     total_parts = max(1, (file_size + part_size - 1) // part_size)
     is_big = total_parts > 1024 or file_size > _PARALLEL_BIG_FILE_THRESHOLD
     sem = asyncio.Semaphore(workers)
@@ -330,10 +331,13 @@ async def _parallel_upload_file_pyrogram(
         return None
 
     import random as _random
-    from pyrogram.raw.functions.upload import SaveBigFilePart as _SaveBig, SaveFilePart as _SaveSmall
-    from pyrogram.raw.types import InputFileBig as _InputBig, InputFile as _InputFile
 
-    file_id = _random.randrange(1 << 63)
+    from pyrogram.raw.functions.upload import SaveBigFilePart as _SaveBig
+    from pyrogram.raw.functions.upload import SaveFilePart as _SaveSmall
+    from pyrogram.raw.types import InputFile as _InputFile
+    from pyrogram.raw.types import InputFileBig as _InputBig
+
+    file_id = _random.randrange(1 << 63)  # noqa: S311
     total_parts = max(1, (file_size + part_size - 1) // part_size)
     is_big = total_parts > 1024 or file_size > _PARALLEL_BIG_FILE_THRESHOLD
     sem = asyncio.Semaphore(workers)

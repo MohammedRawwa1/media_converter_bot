@@ -42,7 +42,6 @@ import logging
 import os
 import pathlib
 import sys
-import time
 
 # Ensure project root is on sys.path
 _ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -60,14 +59,8 @@ logger = logging.getLogger("session_creator")
 
 def get_credentials() -> tuple:
     """Return (api_id, api_hash) from env or prompt."""
-    api_id = (
-        os.getenv("API_ID")
-        or os.getenv("TELEGRAM_APP_ID")
-    )
-    api_hash = (
-        os.getenv("API_HASH")
-        or os.getenv("TELEGRAM_API_HASH")
-    )
+    api_id = os.getenv("API_ID") or os.getenv("TELEGRAM_APP_ID")
+    api_hash = os.getenv("API_HASH") or os.getenv("TELEGRAM_API_HASH")
 
     if not api_id:
         api_id = input("Enter your API_ID: ").strip()
@@ -90,10 +83,9 @@ def get_credentials() -> tuple:
 async def create_session(api_id: int, api_hash: str):
     """Create a new Telethon session interactively and export the session string."""
     try:
-        from telethon import TelegramClient, errors
-        from telethon import functions
-        from telethon.sessions import StringSession
+        from telethon import TelegramClient, errors, functions
         from telethon import utils as telethon_utils
+        from telethon.sessions import StringSession
     except ImportError:
         print("Telethon is not installed. Install it with:\n  pip install telethon")
         sys.exit(1)
@@ -134,15 +126,15 @@ async def create_session(api_id: int, api_hash: str):
 
         logger.info("send_code_request response:")
         logger.info("  phone_code_hash: %s", sent.phone_code_hash)
-        logger.info("  phone_registered: %s", getattr(sent, 'phone_registered', '?'))
-        logger.info("  timeout: %s", getattr(sent, 'timeout', '?'))
+        logger.info("  phone_registered: %s", getattr(sent, "phone_registered", "?"))
+        logger.info("  timeout: %s", getattr(sent, "timeout", "?"))
         logger.info("  type: %s", type(sent).__name__)
-        logger.info("  next_code_type: %s", getattr(sent, 'next_code_type', '?'))
-        logger.info("  is_code_available: %s", getattr(sent, 'is_code_available', '?'))
+        logger.info("  next_code_type: %s", getattr(sent, "next_code_type", "?"))
+        logger.info("  is_code_available: %s", getattr(sent, "is_code_available", "?"))
 
         # Check what type of code was sent
-        _type_str = str(getattr(sent, 'type', ''))
-        if 'sms' in _type_str.lower() or 'Sms' in _type_str:
+        _type_str = str(getattr(sent, "type", ""))
+        if "sms" in _type_str.lower() or "Sms" in _type_str:
             logger.info("  Code type: SMS (check your SMS messages)")
         else:
             logger.info("  Code type: Telegram app notification")
@@ -158,8 +150,8 @@ async def create_session(api_id: int, api_hash: str):
         logger.info("STEP 3: Attempting 2FA detection via GetPasswordRequest...")
         try:
             pwd_info = await client(functions.account.GetPasswordRequest())
-            has_pwd = bool(getattr(pwd_info, 'has_password', False))
-            hint = str(getattr(pwd_info, 'hint', '') or '')
+            has_pwd = bool(getattr(pwd_info, "has_password", False))
+            hint = str(getattr(pwd_info, "hint", "") or "")
             logger.info("GetPasswordRequest result:")
             logger.info("  has_password: %s", has_pwd)
             logger.info("  hint: '%s'", hint)
@@ -204,8 +196,8 @@ async def create_session(api_id: int, api_hash: str):
             try:
                 # Check password hint first (this should work now)
                 pwd_info2 = await client(functions.account.GetPasswordRequest())
-                has_pwd2 = bool(getattr(pwd_info2, 'has_password', False))
-                hint2 = str(getattr(pwd_info2, 'hint', '') or '')
+                has_pwd2 = bool(getattr(pwd_info2, "has_password", False))
+                hint2 = str(getattr(pwd_info2, "hint", "") or "")
                 logger.info("GetPasswordRequest (after SessionPasswordNeeded):")
                 logger.info("  has_password: %s", has_pwd2)
                 logger.info("  hint: '%s'", hint2)
@@ -219,7 +211,9 @@ async def create_session(api_id: int, api_hash: str):
             logger.error("❌ PhoneCodeExpiredError raised!")
             logger.error("This is what happens on the server.")
             logger.error("The phone_code_hash was: %s", sent.phone_code_hash)
-            logger.error("Telethon's internal hash was: %s", client._phone_code_hash.get(telethon_utils.parse_phone(phone)))
+            logger.error(
+                "Telethon's internal hash was: %s", client._phone_code_hash.get(telethon_utils.parse_phone(phone))
+            )
             logger.error("DC ID: %s", client.session.dc_id)
             print("\n❌ Code expired! This is the same error the server gets.")
             print("The hash was valid when we received it, but expired before sign_in was called.")
@@ -265,6 +259,7 @@ async def create_session(api_id: int, api_hash: str):
     except Exception as e:
         print(f"\n❌ Error: {e}")
         import traceback
+
         traceback.print_exc()
         sys.exit(1)
     finally:

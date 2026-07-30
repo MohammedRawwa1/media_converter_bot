@@ -1831,7 +1831,9 @@ async def handle_job(job: dict):
                                     await _r.close()
                             logger.info(
                                 "Job %s: final status=%s message=%s (Redis hash deleted)",
-                                job_id, _final_status, _final_msg
+                                job_id,
+                                _final_status,
+                                _final_msg,
                             )
                         except Exception:
                             logger.debug("ffmpeg worker: operation failed")
