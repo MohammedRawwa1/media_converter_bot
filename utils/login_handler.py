@@ -32,6 +32,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import time
 
 from telegram import Update
 from telegram.ext import CommandHandler, ContextTypes, MessageHandler, filters
@@ -64,6 +65,31 @@ def _pyrogram_warning_text() -> str:
             " phone number, codes may be consumed by that session."
         )
     return ""
+
+
+def _parse_proxy_config():
+    """Parse ``TELETHON_PROXY`` env var into a Telethon-compatible proxy tuple.
+
+    Format: ``socks5://host:port`` or ``socks5://user:pass@host:port``
+    Returns ``None`` if not set or invalid (unauthenticated fallback).
+    """
+    raw = os.getenv("TELETHON_PROXY", "").strip()
+    if not raw:
+        return None
+    try:
+        from urllib.parse import urlparse
+        parsed = urlparse(raw)
+        if parsed.scheme not in ("socks5", "socks4"):
+            logger.warning("proxy: only socks5/socks4 supported by Telethon, got '%s'", parsed.scheme)
+            return None
+        host = parsed.hostname
+        port = parsed.port or 1080
+        if parsed.username and parsed.password:
+            return (parsed.scheme, host, port, True, parsed.username, parsed.password)
+        return (parsed.scheme, host, port)
+    except Exception as exc:
+        logger.warning("proxy: failed to parse TELETHON_PROXY='%s': %s", raw, exc)
+        return None
 
 
 def _get_api_credentials() -> tuple:
@@ -381,43 +407,47 @@ async def _run_login_task(
     so there is **no polling gap** between them.  The user's code arrives
     via an ``asyncio.Future`` set by ``_handle_login_text``.
     """
+    t0 = time.monotonic()
     bot = context.bot
     chat_id = entry["chat_id"]
+
+    def elapsed() -> str:
+        return f"+{time.monotonic() - t0:.1f}s"
 
     try:
         from telethon import TelegramClient  # noqa: PLC0415
         from telethon.sessions import StringSession  # noqa: PLC0415
 
-        client = TelegramClient(StringSession(), api_id, api_hash)
+        # Build proxy-aware client
+        proxy_config = _parse_proxy_config()
+        logger.debug("login [%s]: building Telethon client, proxy=%s", elapsed(), proxy_config is not None)
+        client = TelegramClient(StringSession(), api_id, api_hash, proxy=proxy_config)
         entry["client"] = client
         await client.connect()
+        dc_id = client.session.dc_id
+        logger.info("login [%s]: connected to DC%s", elapsed(), dc_id)
 
         # ── Send code request ────────────────────────────────────
+        logger.debug("login [%s]: calling send_code_request...", elapsed())
         sent = await client.send_code_request(phone)
-        entry["phone_code_hash"] = sent.phone_code_hash
+        phone_code_hash = str(sent.phone_code_hash)
+        entry["phone_code_hash"] = phone_code_hash
+        code_type = type(sent).__name__
+        sent_timeout = getattr(sent, 'timeout', None)
+        logger.info(
+            "login [%s]: code sent to %s (hash=%s..., type=%s, timeout=%s)",
+            elapsed(), phone, phone_code_hash[:8], code_type, sent_timeout,
+        )
 
-        # Check 2FA upfront (best-effort)
-        has_2fa = False
-        pwd_hint = ""
-        try:
-            from telethon import functions  # noqa: PLC0415
-            pwd_info = await client(functions.account.GetPasswordRequest())
-            has_2fa = bool(getattr(pwd_info, "has_password", False))
-            pwd_hint = str(getattr(pwd_info, "hint", "") or "")
-        except Exception:
-            pass  # best-effort
-
-        logger.info("login: code sent to %s (hash=%s..., 2fa=%s)", phone, str(sent.phone_code_hash)[:8], has_2fa)
+        # NOTE: We deliberately do NOT call GetPasswordRequest here.
+        # Even though the docs say it's read-only, calling it before
+        # sign_in with a fresh anonymous StringSession has been observed
+        # to cause side-effects that invalidate the pending auth code.
+        # Instead we let the SessionPasswordNeededError catch below
+        # handle 2FA naturally — which is Telethon's intended flow.
 
         # Notify user
         msg_text = "✅ Verification code sent to your Telegram app!\n\nPlease enter the code (digits only)."
-        if has_2fa:
-            msg_text += (
-                "\n\n🔐 **Two-step verification (2FA)** is enabled on this account."
-                "\nAfter entering the code, you'll need to enter your password."
-            )
-            if pwd_hint:
-                msg_text += f"\nPassword hint: `{pwd_hint}`"
         if status_msg:
             await status_msg.edit_text(msg_text, parse_mode="Markdown")
         else:
@@ -432,24 +462,57 @@ async def _run_login_task(
             await _login_fail(bot, chat_id, status_msg, "⏰ Login timed out (no code received within 5 minutes).")
             return
 
+        code_received_at = time.monotonic()
+        code_delay = code_received_at - t0
+        logger.info(
+            "login [%s]: code received from user (total elapsed=%.1fs)",
+            elapsed(), code_delay,
+        )
+
         if entry["cancel"].is_set():
-            return  # cancelled
+            logger.debug("login [%s]: cancelled after code received", elapsed())
+            return
 
         # ── Sign in with code (NO polling gap!) ──────────────────
         retry_count = 0
+        has_2fa = False
         while retry_count < 3:
             try:
-                await client.sign_in(phone=phone, code=code)
+                sign_in_t0 = time.monotonic()
+                logger.debug(
+                    "login [%s]: calling sign_in(phone=%s, hash=%s...)",
+                    elapsed(), phone, entry["phone_code_hash"][:8],
+                )
+                # Pass phone_code_hash explicitly to bypass any internal cache issues
+                await client.sign_in(
+                    phone=phone,
+                    code=code,
+                    phone_code_hash=entry["phone_code_hash"],
+                )
+                sign_in_duration = time.monotonic() - sign_in_t0
+                logger.info("login [%s]: sign_in SUCCEEDED in %.2fs", elapsed(), sign_in_duration)
                 break  # success
             except Exception as exc:
                 exc_name = type(exc).__name__
+                exc_raw = getattr(exc, 'x', None)
+                exc_code = getattr(exc, 'code', None)
+                exc_type_attr = getattr(exc, 'type', None) or getattr(exc, 'type_name', None) or getattr(exc, 'error_code', None)
+                logger.warning(
+                    "login [%s]: sign_in FAILED — name=%s, code=%s, type=%s, raw=%s, exc=%s",
+                    elapsed(), exc_name, exc_code, exc_type_attr, exc_raw, exc,
+                )
 
                 if "SessionPasswordNeededError" in exc_name:
+                    logger.info("login [%s]: 2FA password required", elapsed())
                     has_2fa = True
                     break
 
                 if "PhoneCodeExpiredError" in exc_name:
                     retry_count += 1
+                    logger.warning(
+                        "login [%s]: code expired for %s (attempt %d/3)",
+                        elapsed(), phone, retry_count,
+                    )
                     if retry_count >= 3:
                         await _login_fail(
                             bot, chat_id, status_msg,
@@ -458,10 +521,16 @@ async def _run_login_task(
                             "Try using /logout first, then /login again."
                         )
                         return
-                    # Resend
+                    # Wait before resending — gives Telegram's backend time to
+                    # cool down (important on Railway's shared IP pool) and gives
+                    # the user time to see the new code before the next attempt.
+                    logger.debug("login [%s]: sleeping 15s before resend...", elapsed())
+                    await asyncio.sleep(15)
+                    logger.debug("login [%s]: sending new code request...", elapsed())
                     sent = await client.send_code_request(phone)
-                    entry["phone_code_hash"] = sent.phone_code_hash
-                    logger.info("login: resent code after expiry (attempt %d/3)", retry_count)
+                    phone_code_hash = str(sent.phone_code_hash)
+                    entry["phone_code_hash"] = phone_code_hash
+                    logger.info("login [%s]: resent code (attempt %d/3, new hash=%s...)", elapsed(), retry_count, phone_code_hash[:8])
                     # Set up new code future
                     entry["code"] = asyncio.get_running_loop().create_future()
                     try:
@@ -509,11 +578,15 @@ async def _run_login_task(
                 logger.exception("login: sign_in failed: %s", exc)
                 return
 
-        else:
-            # Loop exited without break (all retries exhausted) — handled inside loop
-            return
-
         if has_2fa:
+            # Fetch 2FA password info NOW (after sign_in with code has confirmed 2FA is needed)
+            try:
+                from telethon import functions  # noqa: PLC0415
+                pwd_info = await client(functions.account.GetPasswordRequest())
+                pwd_hint = str(getattr(pwd_info, "hint", "") or "")
+            except Exception:
+                pwd_hint = ""
+
             msg_text = "🔐 Two-step verification is enabled. Please enter your account password:"
             if pwd_hint:
                 msg_text += f"\nPassword hint: `{pwd_hint}`"
@@ -547,6 +620,7 @@ async def _run_login_task(
                     except asyncio.TimeoutError:
                         await _login_fail(bot, chat_id, status_msg, "⏰ Login timed out.")
                         return
+                    # Retry with new password
                     await client.sign_in(password=password)
                 else:
                     raise
