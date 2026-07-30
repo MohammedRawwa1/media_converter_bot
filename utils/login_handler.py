@@ -32,7 +32,6 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
-import time
 
 from telegram import Update
 from telegram.ext import CommandHandler, ContextTypes, MessageHandler, filters
@@ -55,6 +54,16 @@ def _normalize_code(text: str) -> str:
         }
     )
     return "".join(c for c in text.translate(trans) if c.isdigit())
+
+
+def _pyrogram_warning_text() -> str:
+    """Return a warning about Pyrogram session if one is configured."""
+    if os.getenv("PYROGRAM_SESSION"):
+        return (
+            "\n\n⚠️ A Pyrogram session is configured. If it uses the same"
+            " phone number, codes may be consumed by that session."
+        )
+    return ""
 
 
 def _get_api_credentials() -> tuple:
@@ -224,12 +233,7 @@ async def _login_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         entry["chat_id"] = chat_id
 
         # Proactive warning
-        warn = ""
-        if os.getenv("PYROGRAM_SESSION"):
-            warn = (
-                "\n\n⚠️ A Pyrogram session is configured. If it uses the same"
-                " phone number, codes may be consumed by that session."
-            )
+        warn = _pyrogram_warning_text()
 
         msg = await update.message.reply_text(
             f"📱 Phone: `{phone}`\n"
@@ -250,12 +254,7 @@ async def _login_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         entry["chat_id"] = chat_id
         entry["phone"] = asyncio.get_running_loop().create_future()
 
-        warn = ""
-        if os.getenv("PYROGRAM_SESSION"):
-            warn = (
-                "\n\n⚠️ A Pyrogram session is configured. If it uses the same"
-                " phone number, codes may be consumed by that session."
-            )
+        warn = _pyrogram_warning_text()
 
         await update.message.reply_text(
             "📱 Please send the phone number in international format,\n"
@@ -319,6 +318,20 @@ async def _handle_login_text(update: Update, context: ContextTypes.DEFAULT_TYPE)
             return  # consumed — don't pass to other handlers
         entry["phone_number"] = text
         phone_fut.set_result(text)
+        # Start the background task NOW — it was waiting for the phone
+        warn = _pyrogram_warning_text()
+        msg = await update.message.reply_text(
+            f"📱 Phone: `{text}`\n"
+            "⏳ Connecting to Telegram and requesting verification code..."
+            + warn,
+            parse_mode="Markdown",
+        )
+        entry["task"] = asyncio.create_task(
+            _run_login_task(
+                uid, text, entry["api_id"], entry["api_hash"],
+                entry, context, msg,
+            )
+        )
         return  # consumed
 
     # ── Code ─────────────────────────────────────────────────────
