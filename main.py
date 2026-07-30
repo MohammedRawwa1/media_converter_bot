@@ -536,7 +536,9 @@ def setup_handlers(application: Application) -> None:
     #     (including /cancel inside the login flow) take priority over
     #     the global /cancel command.  PTB v20+ iterates handlers in
     #     registration order and stops at the first match.
-    login_conv_handler = create_login_conversation_handler(admin_user_id=ADMIN_USER_ID)
+    # Admin authorisation is handled via application.bot_data["admin_user_id"]
+    # (set in main() before setup_handlers runs).  No parameter needed.
+    login_conv_handler = create_login_conversation_handler()
     application.add_handler(login_conv_handler)
 
     # Command handlers (wrapped for latency tracing)

@@ -106,16 +106,11 @@ def _get_api_credentials() -> tuple:
 # ── Factory ─────────────────────────────────────────────────────────
 
 
-def create_login_conversation_handler(
-    admin_user_id: int | None = None,
-) -> "ConversationHandler":
+def create_login_conversation_handler() -> "ConversationHandler":
     """Create a ``ConversationHandler`` for the ``/login`` → phone → code → 2FA flow.
 
-    Parameters
-    ----------
-    admin_user_id:
-        The Telegram user ID allowed to use ``/login``.
-        ``None`` means no restriction (everybody can use the command).
+    Admin authorisation is delegated to ``application.bot_data["admin_user_id"]``
+    (set in main.py before any handler runs).
     """
     conv_handler = ConversationHandler(
         entry_points=[CommandHandler("login", _login_start)],
@@ -148,7 +143,6 @@ def create_login_conversation_handler(
         name="userbot_login_flow",
         conversation_timeout=300,  # 5 minutes
     )
-    conv_handler._admin_user_id = admin_user_id  # type: ignore[attr-defined]
     return conv_handler
 
 
@@ -156,13 +150,12 @@ def create_login_conversation_handler(
 
 
 async def _check_admin(update: "Update", context: "ContextTypes.DEFAULT_TYPE") -> bool:
-    """Return ``True`` if the user is authorised to use ``/login``."""
-    # Resolve admin id from the handler attribute or bot_data
+    """Return ``True`` if the user is authorised to use ``/login``.
+
+    The admin user ID is read from ``application.bot_data["admin_user_id"]``
+    which is populated by ``main()`` before any handler is registered.
+    """
     admin_user_id = context.application.bot_data.get("admin_user_id")
-    if admin_user_id is None:
-        handler = context.handler
-        if handler is not None:
-            admin_user_id = getattr(handler, "_admin_user_id", None)
     if admin_user_id is not None:
         user_id = update.effective_user.id
         if user_id != admin_user_id:
