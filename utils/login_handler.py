@@ -361,18 +361,33 @@ async def _handle_login_text(update: Update, context: ContextTypes.DEFAULT_TYPE)
         phone_fut.set_result(text)
         # Start the background task NOW — it was waiting for the phone
         warn = _pyrogram_warning_text()
-        msg = await update.message.reply_text(
-            f"📱 Phone: `{text}`\n"
-            "⏳ Connecting to Telegram and requesting verification code..."
-            + warn,
-            parse_mode="Markdown",
-        )
-        entry["task"] = asyncio.create_task(
-            _run_login_task(
-                uid, text, entry["api_id"], entry["api_hash"],
-                entry, context, msg,
+        client_type = entry.get("client_type", "telethon")
+        if client_type == "pyrogram":
+            msg = await update.message.reply_text(
+                f"📱 Phone: `{text}`\n"
+                "⏳ Connecting to Telegram via Pyrogram and requesting verification code..."
+                + warn,
+                parse_mode="Markdown",
             )
-        )
+            entry["task"] = asyncio.create_task(
+                _run_pyro_login_task(
+                    uid, text, entry["api_id"], entry["api_hash"],
+                    entry, context, msg,
+                )
+            )
+        else:
+            msg = await update.message.reply_text(
+                f"📱 Phone: `{text}`\n"
+                "⏳ Connecting to Telegram and requesting verification code..."
+                + warn,
+                parse_mode="Markdown",
+            )
+            entry["task"] = asyncio.create_task(
+                _run_login_task(
+                    uid, text, entry["api_id"], entry["api_hash"],
+                    entry, context, msg,
+                )
+            )
         return  # consumed
 
     # ── Code ─────────────────────────────────────────────────────
