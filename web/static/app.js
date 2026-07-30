@@ -8,9 +8,9 @@ uploadForm.addEventListener('submit', async (e) => {
   const file = fileInput.files[0]
   const fd = new FormData()
   fd.append('file', file)
-  const tokenInput = document.getElementById('uploadTokenInput')
-  if (tokenInput && tokenInput.value) {
-    fd.append('upload_token', tokenInput.value.trim())
+  const token = getUploadToken()
+  if (token) {
+    fd.append('upload_token', token)
   }
   const res = await fetch('/upload', { method: 'POST', body: fd })
   if (!res.ok) {
@@ -67,7 +67,7 @@ function initWebSocket(jobId){
   // In production (Railway, etc.) only one port is exposed, so we connect
   // via the main app's path-based WebSocket endpoint.
   const scheme = (location.protocol === 'https:') ? 'wss' : 'ws'
-  const wsUrl = `${scheme}://${location.host}/ws/${jobId}`
+  const wsUrl = appendToken(`${scheme}://${location.host}/ws/${jobId}`)
 
   const connect = () => {
     try{
@@ -104,7 +104,7 @@ function initWebSocket(jobId){
 
 function initEventSource(jobId){
   try{
-    const es = new EventSource(`/events/${jobId}`)
+    const es = new EventSource(appendToken(`/events/${jobId}`))
     eventSources[jobId] = es
     es.onmessage = (e) => {
       try{
@@ -134,7 +134,7 @@ async function pollStatus(jobId){
     // if we have an active EventSource or WebSocket for this job, stop polling
     if (eventSources[jobId] || wsConnections[jobId]) break
     try{
-      const res = await fetch(`/status/${jobId}`)
+      const res = await fetch(appendToken(`/status/${jobId}`))
       if (!res.ok) throw new Error('not found')
       const j = await res.json()
 
@@ -183,7 +183,8 @@ async function pollStatus(jobId){
 
       if (j.status === 'done' && j.output){
         meta.textContent = `${j.message} • ✅ Done`
-        action.innerHTML = `<a href="/download/${jobId}" class="btn">Download</a>`
+        const dlUrl = appendToken(`/download/${jobId}`)
+        action.innerHTML = `<a href="${dlUrl}" class="btn">Download</a>`
         finished = true
         break
       }
@@ -260,7 +261,8 @@ function handleUpdate(j, jobId){
 
   if (j.status === 'done' && j.output){
     bar.className = 'bar bar-done'
-    action.innerHTML = `<a href="/download/${jobId}" class="btn">Download</a>`
+    const dlUrl = appendToken(`/download/${jobId}`)
+    action.innerHTML = `<a href="${dlUrl}" class="btn">Download</a>`
     try{ if (eventSources[jobId]) eventSources[jobId].close() }catch(e){}
     delete eventSources[jobId]
     try{ if (wsConnections[jobId]) wsConnections[jobId].close() }catch(e){}
@@ -285,4 +287,16 @@ function humanFileSize(bytes){
   let u = -1
   do { bytes /= thresh; ++u } while(Math.abs(bytes) >= thresh && u < units.length - 1)
   return bytes.toFixed(1) + ' ' + units[u]
+}
+
+function getUploadToken(){
+  const el = document.getElementById('uploadTokenInput')
+  return el ? el.value.trim() : ''
+}
+
+function appendToken(url){
+  const token = getUploadToken()
+  if (!token) return url
+  const sep = url.includes('?') ? '&' : '?'
+  return url + sep + 'upload_token=' + encodeURIComponent(token)
 }

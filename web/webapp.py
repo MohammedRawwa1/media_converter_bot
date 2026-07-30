@@ -657,18 +657,16 @@ def upload():
 
 @app.route("/debug/telethon-log", methods=["GET"])
 def telethon_log():
-    """
-        # Rate limiting: prevent DoS/DDoS
-        client_ip = get_client_ip(request)
-        if not web_rate_limiter.check_limit("debug_log", client_ip):
-            body, status, headers = make_rate_limit_response("debug_log", client_ip)
-            return jsonify(body), status, headers
+    """Fetch the most recent Telethon ingest log from configured storage.
 
-    Fetch the most recent Telethon ingest log from configured storage.
-
-        Protected by `DEBUG_SECRET` if present in env. Returns plain text log
-        or 404 if not found.
+    Protected by `DEBUG_SECRET` if present in env. Returns plain text log
+    or 404 if not found.
     """
+    # Rate limiting: prevent DoS/DDoS
+    client_ip = get_client_ip(request)
+    if not web_rate_limiter.check_limit("debug_log", client_ip):
+        body, status, headers = make_rate_limit_response("debug_log", client_ip)
+        return jsonify(body), status, headers
     debug_secret = os.environ.get("DEBUG_SECRET")
     if debug_secret:
         token = request.headers.get("X-Debug-Token") or request.args.get("debug_token")
@@ -776,25 +774,29 @@ def telethon_log():
 
 @app.route("/presign", methods=["POST"])
 def presign():
-    """
-        # Rate limiting: prevent DoS/DDoS
-        client_ip = get_client_ip(request)
-        if not web_rate_limiter.check_limit("presign", client_ip):
-            body, status, headers = make_rate_limit_response("presign", client_ip)
-            return jsonify(body), status, headers
+    """Return a presigned S3 POST (or PUT) for client direct upload.
 
-    Return a presigned S3 POST (or PUT) for client direct upload.
-
-        Request JSON or form data: `filename`.
-        Requires `UPLOAD_SECRET` when configured.
+    Request JSON or form data: `filename`.
+    Requires `UPLOAD_SECRET` when configured.
     """
+    # Rate limiting: prevent DoS/DDoS
+    client_ip = get_client_ip(request)
+    if not web_rate_limiter.check_limit("presign", client_ip):
+        body, status, headers = make_rate_limit_response("presign", client_ip)
+        return jsonify(body), status, headers
     upload_secret = os.environ.get("UPLOAD_SECRET")
     if upload_secret:
-        incoming_token = (
-            request.headers.get("X-Upload-Token")
-            or request.form.get("upload_token")
-            or request.args.get("upload_token")
-        )
+        incoming_token = None
+        if request.is_json:
+            _body = request.get_json(silent=True)
+            if _body:
+                incoming_token = _body.get("upload_token")
+        if not incoming_token:
+            incoming_token = (
+                request.headers.get("X-Upload-Token")
+                or request.form.get("upload_token")
+                or request.args.get("upload_token")
+            )
         if not incoming_token or incoming_token != upload_secret:
             return (
                 jsonify({"error": "unauthorized", "detail": "missing or invalid upload token"}),
@@ -854,25 +856,29 @@ def presign():
 
 @app.route("/enqueue_from_url", methods=["POST"])
 def enqueue_from_url():
-    """
-        # Rate limiting: prevent DoS/DDoS
-        client_ip = get_client_ip(request)
-        if not web_rate_limiter.check_limit("enqueue_url", client_ip):
-            body, status, headers = make_rate_limit_response("enqueue_url", client_ip)
-            return jsonify(body), status, headers
+    """Enqueue a job that downloads from a public or presigned URL.
 
-    Enqueue a job that downloads from a public or presigned URL.
-
-        Request JSON: `source_url` (required), `original_filename` (optional).
-        Requires `UPLOAD_SECRET` when configured.
+    Request JSON: `source_url` (required), `original_filename` (optional).
+    Requires `UPLOAD_SECRET` when configured.
     """
+    # Rate limiting: prevent DoS/DDoS
+    client_ip = get_client_ip(request)
+    if not web_rate_limiter.check_limit("enqueue_url", client_ip):
+        body, status, headers = make_rate_limit_response("enqueue_url", client_ip)
+        return jsonify(body), status, headers
     upload_secret = os.environ.get("UPLOAD_SECRET")
     if upload_secret:
-        incoming_token = (
-            request.headers.get("X-Upload-Token") or request.json.get("upload_token")
-            if request.is_json
-            else request.form.get("upload_token") or request.args.get("upload_token")
-        )
+        incoming_token = None
+        if request.is_json:
+            _body = request.get_json(silent=True)
+            if _body:
+                incoming_token = _body.get("upload_token")
+        if not incoming_token:
+            incoming_token = (
+                request.headers.get("X-Upload-Token")
+                or request.form.get("upload_token")
+                or request.args.get("upload_token")
+            )
         if not incoming_token or incoming_token != upload_secret:
             return (
                 jsonify({"error": "unauthorized", "detail": "missing or invalid upload token"}),
@@ -959,6 +965,19 @@ def status(job_id):
     if not web_rate_limiter.check_limit("status", client_ip):
         body, status, headers = make_rate_limit_response("status", client_ip)
         return jsonify(body), status, headers
+
+    # Optional auth: require the same upload_token when UPLOAD_SECRET is set
+    upload_secret = os.environ.get("UPLOAD_SECRET")
+    if upload_secret:
+        incoming_token = (
+            request.headers.get("X-Upload-Token")
+            or request.args.get("upload_token")
+        )
+        if not incoming_token or incoming_token != upload_secret:
+            return (
+                jsonify({"error": "unauthorized", "detail": "missing or invalid upload token"}),
+                401,
+            )
 
     # Try to read Redis job hash
     try:
@@ -1065,6 +1084,19 @@ def download(job_id):
         body, status, headers = make_rate_limit_response("download", client_ip)
         return jsonify(body), status, headers
 
+    # Optional auth: require the same upload_token when UPLOAD_SECRET is set
+    upload_secret = os.environ.get("UPLOAD_SECRET")
+    if upload_secret:
+        incoming_token = (
+            request.headers.get("X-Upload-Token")
+            or request.args.get("upload_token")
+        )
+        if not incoming_token or incoming_token != upload_secret:
+            return (
+                jsonify({"error": "unauthorized", "detail": "missing or invalid upload token"}),
+                401,
+            )
+
     # Check Redis for output path
     try:
         job_hash = _run_async(_get_job_hash(job_id)) if aioredis_available else None
@@ -1138,27 +1170,29 @@ def download(job_id):
 
 @app.route("/events/<job_id>")
 def events(job_id):
+    """DEPRECATED: Legacy Flask SSE endpoint.
+
+    Use the FastAPI SSE endpoint at ``/events/{job_id}`` instead.
     """
-        # Rate limiting: prevent DoS/DDoS
-        client_ip = get_client_ip(request)
-        if not web_rate_limiter.check_limit("events", client_ip):
-            body, status, headers = make_rate_limit_response("events", client_ip)
-            return jsonify(body), status, headers
+    # Rate limiting: prevent DoS/DDoS
+    client_ip = get_client_ip(request)
+    if not web_rate_limiter.check_limit("events", client_ip):
+        body, status, headers = make_rate_limit_response("events", client_ip)
+        return jsonify(body), status, headers
 
-    DEPRECATED: Legacy Flask SSE endpoint.
+    # Optional auth: require the same upload_token when UPLOAD_SECRET is set
+    upload_secret = os.environ.get("UPLOAD_SECRET")
+    if upload_secret:
+        incoming_token = (
+            request.headers.get("X-Upload-Token")
+            or request.args.get("upload_token")
+        )
+        if not incoming_token or incoming_token != upload_secret:
+            return (
+                jsonify({"error": "unauthorized", "detail": "missing or invalid upload token"}),
+                401,
+            )
 
-    Use the FastAPI SSE endpoint at ``/events/{job_id}`` (registered via
-    ``web/ws_fastapi.sse_router``) instead. Unlike this Flask version, the
-    FastAPI endpoint uses async Redis pubsub and does NOT consume a WSGI
-    thread per connection.
-
-    Server-Sent Events endpoint that streams Redis progress pubsub messages
-        published on channel `ffmpeg:progress:{job_id}` to the browser.
-
-    Uses a background thread for the blocking Redis pubsub ``.listen()`` call
-    and a ``queue.Queue`` to pass messages back to the Flask generator without
-    blocking the WSGI thread pool.
-    """
     logger.warning("Flask /events/%s called — DEPRECATED. Use FastAPI /events/%s instead.", job_id, job_id)
 
     def gen():
@@ -1249,19 +1283,18 @@ def events(job_id):
 
 @app.route("/get_input", methods=["GET"])
 def get_input():
-    """
-        # Rate limiting: prevent DoS/DDoS
-        client_ip = get_client_ip(request)
-        if not web_rate_limiter.check_limit("get_input", client_ip):
-            body, status, headers = make_rate_limit_response("get_input", client_ip)
-            return jsonify(body), status, headers
+    """Token-protected endpoint to download files from the input folder.
 
-    Temporary token-protected endpoint to download files from the input folder.
-        Protection: prefer `DIAG_TOKEN` (header `X-DIAG-TOKEN` or `?token=`),
-        fallback to `UPLOAD_SECRET` (header `X-Upload-Token` or `?upload_token=`).
-        Use only for short-term debugging; remove after use.
-        Query params: `name` (filename in input dir).
+    Protection: prefer `DIAG_TOKEN` (header `X-DIAG-TOKEN` or `?token=`),
+    fallback to `UPLOAD_SECRET` (header `X-Upload-Token` or `?upload_token=`).
+    Use only for short-term debugging; remove after use.
+    Query params: `name` (filename in input dir).
     """
+    # Rate limiting: prevent DoS/DDoS
+    client_ip = get_client_ip(request)
+    if not web_rate_limiter.check_limit("get_input", client_ip):
+        body, status, headers = make_rate_limit_response("get_input", client_ip)
+        return jsonify(body), status, headers
     diag_token = os.environ.get("DIAG_TOKEN")
     upload_secret = os.environ.get("UPLOAD_SECRET")
 
@@ -1277,7 +1310,7 @@ def get_input():
     else:
         # if DIAG_TOKEN not set, require upload secret as fallback
         if not upload_secret or incoming_upload != upload_secret:
-            return jsonify({"error": "unauthorized (no DIAG_TOKEN configured)"}), 401
+            return jsonify({"error": "unauthorized"}), 401
 
     name = request.args.get("name") or request.args.get("filename") or request.form.get("name")
     if not name:
@@ -1305,19 +1338,18 @@ def get_input():
 
 @app.route("/internal/diag", methods=["GET", "POST"])
 def internal_diag():
-    """
-        # Rate limiting: prevent DoS/DDoS
-        client_ip = get_client_ip(request)
-        if not web_rate_limiter.check_limit("diag", client_ip):
-            body, status, headers = make_rate_limit_response("diag", client_ip)
-            return jsonify(body), status, headers
+    """Token-protected diagnostic endpoint.
 
-    Token-protected diagnostic endpoint.
-        Set `DIAG_TOKEN` in the environment (random string). Call with header
-        `X-DIAG-TOKEN: <token>` or `?token=<token>`.
-        Returns masked env, Redis health, sample job list, optional job hash,
-        and last lines from app `logs/` directory.
+    Set `DIAG_TOKEN` in the environment (random string). Call with header
+    `X-DIAG-TOKEN: <token>` or `?token=<token>`.
+    Returns masked env, Redis health, sample job list, optional job hash,
+    and last lines from app `logs/` directory.
     """
+    # Rate limiting: prevent DoS/DDoS
+    client_ip = get_client_ip(request)
+    if not web_rate_limiter.check_limit("diag", client_ip):
+        body, status, headers = make_rate_limit_response("diag", client_ip)
+        return jsonify(body), status, headers
     token = os.environ.get("DIAG_TOKEN")
     incoming = request.headers.get("X-DIAG-TOKEN") or request.args.get("token") or request.form.get("token")
     if not token:

@@ -38,10 +38,11 @@ import asyncio
 import contextlib
 import json
 import logging
+import os
 from collections import defaultdict
 
-from fastapi import APIRouter, WebSocket, WebSocketDisconnect
-from fastapi.responses import StreamingResponse
+from fastapi import APIRouter, Header, Query, WebSocket, WebSocketDisconnect
+from fastapi.responses import JSONResponse, StreamingResponse
 
 logger = logging.getLogger(__name__)
 
@@ -68,7 +69,23 @@ ws_router = APIRouter()
 
 
 @ws_router.websocket("/ws/{job_id}")
-async def websocket_progress(websocket: WebSocket, job_id: str):
+async def websocket_progress(
+    websocket: WebSocket,
+    job_id: str,
+    upload_token: str | None = Query(None),
+):
+    """Stream progress events for a job via WebSocket.
+
+    Requires ``UPLOAD_SECRET`` when configured.
+    Token via ``?upload_token=`` query param in the WebSocket URL.
+    """
+
+    # Optional auth: reject before accepting when UPLOAD_SECRET is set
+    upload_secret = os.environ.get("UPLOAD_SECRET")
+    if upload_secret and (not upload_token or upload_token != upload_secret):
+        await websocket.close(code=4001, reason="unauthorized")
+        return
+
     await websocket.accept()
     await _register(websocket, job_id)
     logger.info("WebSocket connected for job %s", job_id)
@@ -92,17 +109,34 @@ sse_router = APIRouter()
 
 
 @sse_router.get("/events/{job_id}")
-async def sse_events(job_id: str):
+async def sse_events(
+    job_id: str,
+    upload_token: str | None = Header(None, alias="X-Upload-Token"),
+    upload_token_q: str | None = Query(None, alias="upload_token"),
+):
     """Stream progress events for a job via Server-Sent Events.
 
     Uses async Redis pubsub to subscribe to ``ffmpeg:progress:{job_id}``.
     Falls back to HTTP polling if Redis is unavailable.
+
+    Requires ``UPLOAD_SECRET`` when configured.
+    Token via ``X-Upload-Token`` header or ``?upload_token=`` query param.
 
     This is the async equivalent of the legacy Flask ``/events/<job_id>``
     endpoint (``web/webapp.py``). Unlike the Flask version, it does NOT
     consume a WSGI thread — ``StreamingResponse`` works with async generators
     directly in the event loop, making it much more scalable.
     """
+
+    # Optional auth: require the same upload_token when UPLOAD_SECRET is set
+    upload_secret = os.environ.get("UPLOAD_SECRET")
+    if upload_secret:
+        incoming_token = upload_token or upload_token_q
+        if not incoming_token or incoming_token != upload_secret:
+            return JSONResponse(
+                status_code=401,
+                content={"error": "unauthorized", "detail": "missing or invalid upload token"},
+            )
 
     async def _event_generator():
         """Async generator that yields SSE-formatted data.

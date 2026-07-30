@@ -8,6 +8,9 @@ import boto3
 import redis
 from flask import Flask, jsonify, request
 
+# SSRF protection: reuse the same validator as the main webapp
+from utils.url_validation import _validate_url_safe  # noqa: PLC0415
+
 app = Flask(__name__)
 logger = logging.getLogger("fetcher")
 logging.basicConfig(level=logging.INFO)
@@ -26,7 +29,11 @@ FETCH_CHANNEL = "ffmpeg:fetch"
 def _check_secret(req):
     if not UPLOAD_SECRET:
         return True
-    auth = req.headers.get("Authorization") or req.args.get("secret") or req.json.get("secret") if req.is_json else None
+    auth = req.headers.get("Authorization") or req.args.get("secret")
+    if not auth and req.is_json:
+        _body = req.get_json(silent=True)
+        if _body:
+            auth = _body.get("secret")
     if not auth:
         return False
     if auth.startswith("Bearer "):
@@ -71,6 +78,11 @@ def enqueue_from_url():
     source_url = data.get("url") or data.get("source_url")
     if not source_url:
         return jsonify({"error": "url required"}), 400
+
+    # SSRF protection: validate URL against private/loopback IPs
+    if not _validate_url_safe(source_url):
+        logger.warning("fetcher: SSRF blocked: source_url=%s", source_url[:120])
+        return jsonify({"error": "invalid source_url", "detail": "URL blocked for security reasons"}), 400
 
     job_id = uuid.uuid4().hex
     job = {
@@ -124,6 +136,11 @@ def presign():
     if not bucket:
         return jsonify({"error": "S3_BUCKET not configured"}), 500
     key = request.args.get("key") or request.args.get("filename") or f"uploads/{uuid.uuid4().hex}"
+    # Force key to live under uploads/ to prevent arbitrary key access
+    if ".." in key or key.startswith("/"):
+        return jsonify({"error": "invalid key"}), 400
+    if not key.startswith("uploads/"):
+        key = f"uploads/{key.lstrip('/')}"
     expires = int(os.environ.get("PRESIGN_EXPIRES", "3600"))
 
     try:

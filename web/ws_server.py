@@ -1,9 +1,11 @@
 import asyncio
 import contextlib
 import logging
+import os
 import re
 import threading
 from collections import defaultdict
+from urllib.parse import parse_qs, urlparse
 
 logger = logging.getLogger(__name__)
 
@@ -38,14 +40,29 @@ async def _unregister(ws, job_id: str):
 
 
 async def _ws_handler(websocket, path):
+    # Parse path and query params (e.g. /ws/<job_id>?upload_token=xxx)
+    parsed = urlparse(path)
+    query_params = parse_qs(parsed.query)
+
     # Expect path like /ws/<job_id>
-    m = re.match(r"^/ws/(?P<job_id>[^/]+)$", path)
+    m = re.match(r"^/ws/(?P<job_id>[^/]+)$", parsed.path)
     if not m:
         with contextlib.suppress(Exception):
             await websocket.close()
         return
 
     job_id = m.group("job_id")
+
+    # Optional auth: reject before registering when UPLOAD_SECRET is set
+    upload_secret = os.environ.get("UPLOAD_SECRET")
+    if upload_secret:
+        token_list = query_params.get("upload_token", [])
+        upload_token = token_list[0] if token_list else None
+        if not upload_token or upload_token != upload_secret:
+            with contextlib.suppress(Exception):
+                await websocket.close()
+            return
+
     await _register(websocket, job_id)
     logger.info("WebSocket connected for job %s", job_id)
     try:

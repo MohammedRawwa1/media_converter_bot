@@ -182,7 +182,25 @@ async def handle_health(request):
     return web.json_response({"service": "fetcher", "ok": True, "healthy": True})
 
 
+async def _check_secret(request) -> bool:
+    """Validate UPLOAD_SECRET on a request (aiohttp version).
+
+    Only checks headers and query params — does NOT read the request body
+    to avoid consuming it before the handler can parse its data.
+    """
+    secret = os.environ.get("UPLOAD_SECRET")
+    if not secret:
+        return True
+    auth = request.headers.get("Authorization") or request.query.get("secret")
+    if not auth:
+        return False
+    token = auth.split(" ", 1)[1] if auth.startswith("Bearer ") else auth
+    return token == secret
+
+
 async def handle_http_fetch(request):
+    if not await _check_secret(request):
+        return web.json_response({"error": "unauthorized"}, status=401)
     try:
         data = await request.json()
     except Exception:

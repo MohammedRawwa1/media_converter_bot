@@ -383,7 +383,10 @@ def _get_configured_session_string(user_id: int | None = None) -> str | None:
     Resolution order:
     1. Environment variable (``TELETHON_SESSION`` / ``API_SESSION`` etc.)
     2. Per-user JSON file (when ``user_id`` is provided)
-    3. Legacy global JSON file (backward-compatible fallback)
+    3. Legacy global JSON file (ONLY when ``user_id`` is ``None``)
+
+    When called with a ``user_id`` the global JSON is intentionally skipped
+    to prevent user A's session from leaking to user B.
     """
     # 1. Check env vars first (highest priority)
     env_str = _get_env_value(
@@ -403,8 +406,10 @@ def _get_configured_session_string(user_id: int | None = None) -> str | None:
         file_str = _load_session_string_from_file(client_type="telethon", user_id=user_id)
         if file_str:
             return file_str
+        # user_id provided but per-user file empty — STOP here, don't leak from global
+        return None
 
-    # 3. Fall back to the legacy global JSON file
+    # 3. Fall back to the legacy global JSON file (only when no user_id)
     file_str = _load_session_string_from_file(client_type="telethon")
     if file_str:
         return file_str
@@ -417,18 +422,36 @@ async def get_telethon_session_string_for_user(
 ) -> str | None:
     """Return a usable Telethon session string for the given user, if available.
 
-    Resolution order:
-    1. Environment variable
-    2. Per-user JSON file (when ``user_id`` is provided)
-    3. Legacy global JSON file
-    4. MongoDB-persisted session (when ``db_model`` is supplied)
-    """
-    # 1. Check env vars + per-user JSON + legacy global JSON
-    session_str = _get_configured_session_string(user_id=user_id)
-    if session_str:
-        return session_str
+    Resolution order (SAFE: never falls through to the global JSON file):
+    1. Environment variable (admin-configured)
+    2. Per-user JSON file (when ``user_id`` is provided, strictly scoped)
+    3. MongoDB-persisted session (when ``db_model`` is supplied, per-user)
 
-    # 2. Check MongoDB-persisted session for the given user
+    The global (legacy) JSON file is intentionally NOT checked here to
+    prevent user A's session from being served to user B in a multi-user
+    bot.  Use ``_get_configured_session_string()`` directly only in contexts
+    where no user isolation is needed (single-admin / builder).
+    """
+    # 1. Check env vars first (admin-configured session, top priority)
+    env_str = _get_env_value(
+        "API_SESSION",
+        "SESSION",
+        "api_session",
+        "USERBOT_SESSION",
+        "userbot_session",
+        "TELETHON_SESSION",
+        "telethon_session",
+    )
+    if env_str:
+        return env_str
+
+    # 2. Check per-user JSON file (strictly scoped to this user)
+    if user_id is not None:
+        file_str = _load_session_string_from_file(client_type="telethon", user_id=user_id)
+        if file_str:
+            return file_str
+
+    # 3. Check MongoDB-persisted session for the given user
     if user_id is not None and db_model is not None:
         try:
             saved_session = await db_model.load_session(user_id)
@@ -598,9 +621,11 @@ def get_pyrogram_session_string(user_id: int | None = None) -> str | None:
     Resolution order:
     1. Environment variable (``PYROGRAM_SESSION`` etc.)
     2. Per-user JSON file (when ``user_id`` is provided)
-    3. Legacy global JSON file
-    4. In-memory cache populated by ``get_pyrogram_session_string_for_user()``
-       when it finds a session in MongoDB
+    3. Legacy global JSON file (ONLY when ``user_id`` is ``None``)
+    4. In-memory cache (ONLY when ``user_id`` is ``None``)
+
+    When called with a ``user_id`` the global JSON and cache are intentionally
+    skipped to prevent user A's session from leaking to user B.
 
     For a direct MongoDB read, use ``get_pyrogram_session_string_for_user()`` (async).
     """
@@ -619,13 +644,15 @@ def get_pyrogram_session_string(user_id: int | None = None) -> str | None:
         file_str = _load_session_string_from_file(client_type="pyrogram", user_id=user_id)
         if file_str:
             return file_str
+        # user_id provided but per-user file empty — STOP here, don't leak from global/cache
+        return None
 
-    # 3. Fall back to the legacy global JSON file
+    # 3. Fall back to the legacy global JSON file (only when no user_id)
     file_str = _load_session_string_from_file(client_type="pyrogram")
     if file_str:
         return file_str
 
-    # 4. Fall back to the in-memory cache (populated by async MongoDB reads)
+    # 4. Fall back to the in-memory cache (only when no user_id)
     mongo_str = _get_pyrogram_mongo_cache()
     if mongo_str:
         return mongo_str
@@ -638,20 +665,38 @@ async def get_pyrogram_session_string_for_user(
 ) -> str | None:
     """Return a usable Pyrogram session string for the given user, if available.
 
-    Checks env vars, then the persisted JSON file, then a MongoDB-persisted
-    session when db_model is supplied.
+    Resolution order (SAFE: never falls through to the global JSON file):
+    1. Environment variable (``PYROGRAM_SESSION`` etc. — admin-configured)
+    2. Per-user JSON file (when ``user_id`` is provided, strictly scoped)
+    3. MongoDB-persisted session (when ``db_model`` is supplied, per-user)
+
+    The global (legacy) JSON file is intentionally NOT checked here to
+    prevent user A's session from being served to user B in a multi-user
+    bot.  Use ``get_pyrogram_session_string()`` directly only in contexts
+    where no user isolation is needed (single-admin / healthchecker).
 
     When a session is found in MongoDB, it is also cached in-memory via
     ``_set_pyrogram_mongo_cache()`` so that the sync
     ``get_pyrogram_session_string()`` can benefit from it without an
     async MongoDB call.
     """
-    # 1. Check env vars + persisted JSON file
-    session_str = get_pyrogram_session_string()
-    if session_str:
-        return session_str
+    # 1. Check env vars first (admin-configured session, top priority)
+    env_str = _get_env_value(
+        "PYROGRAM_SESSION",
+        "pyrogram_session",
+        "USERBOT_PYROGRAM_SESSION",
+        "userbot_pyrogram_session",
+    )
+    if env_str:
+        return env_str
 
-    # 2. Check MongoDB-persisted session for the given user
+    # 2. Check per-user JSON file (strictly scoped to this user)
+    if user_id is not None:
+        file_str = _load_session_string_from_file(client_type="pyrogram", user_id=user_id)
+        if file_str:
+            return file_str
+
+    # 3. Check MongoDB-persisted session for the given user
     if user_id is not None and db_model is not None:
         try:
             saved_session = await db_model.load_session(user_id)
@@ -819,18 +864,17 @@ def has_usable_telethon_session(user_id: int | None = None) -> bool:
         file_str = _load_session_string_from_file(client_type="telethon", user_id=user_id)
         if file_str:
             return True
+        # user_id provided but per-user file empty — don't leak from global
+        # Still check per-user .session file
+        per_user_path = get_telethon_session_path() + f".{user_id}.session"
+        return bool(os.path.exists(per_user_path))
 
-    # 3. Check legacy global JSON file
+    # 3. Check legacy global JSON file (only when no user_id)
     file_str = _load_session_string_from_file(client_type="telethon")
     if file_str:
         return True
 
-    # 4. Check file-based .session files on disk
-    if user_id is not None:
-        per_user_path = get_telethon_session_path() + f".{user_id}.session"
-        if os.path.exists(per_user_path):
-            return True
-
+    # 4. Check file-based .session files on disk (only when no user_id)
     session_path = get_telethon_session_path()
     return os.path.exists(session_path) or os.path.exists(session_path + ".session")
 

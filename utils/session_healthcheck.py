@@ -461,7 +461,11 @@ class SessionHealthChecker:
                 h.phone = getattr(me, "phone_number", None)
                 # Extract DC from raw session data
                 with contextlib.suppress(Exception):
-                    h.dc_id = client.storage.dc_id() if hasattr(client.storage, "dc_id") else None
+                    if hasattr(client.storage, "dc_id"):
+                        dc = client.storage.dc_id()
+                        if asyncio.iscoroutine(dc):
+                            dc = await dc
+                        h.dc_id = dc
                 # Persist session string to MongoDB for long-term survival
                 await self._save_pyrogram_session(client, user_id=check_user_id)
             else:
@@ -498,7 +502,7 @@ class SessionHealthChecker:
         )
 
         # Check env vars first (fast, no I/O)
-        session_str = _get_env_value(
+        env_str = _get_env_value(
             "API_SESSION",
             "SESSION",
             "api_session",
@@ -510,32 +514,35 @@ class SessionHealthChecker:
         # Resolve which user_id to use: caller-specified, then admin, then None
         check_user_id = user_id or self.admin_user_id
 
-        # 2. Check per-user JSON file first (if check_user_id is available), then global
-        if check_user_id is not None:
-            try:
-                session_str = await _load_session_string_from_file_async(
-                    client_type="telethon", user_id=check_user_id
-                )
-            except Exception as exc:
-                logger.debug("SessionHealthChecker: per-user Telethon check failed: %s", exc)
+        if env_str:
+            session_str = env_str
+        else:
+            # Check per-user JSON file first (if check_user_id is available), then global
+            if check_user_id is not None:
+                try:
+                    session_str = await _load_session_string_from_file_async(
+                        client_type="telethon", user_id=check_user_id
+                    )
+                except Exception as exc:
+                    logger.debug("SessionHealthChecker: per-user Telethon check failed: %s", exc)
 
-        if not session_str:
-            # Read the persisted global JSON file
-            try:
-                session_str = await _load_session_string_from_file_async(client_type="telethon")
-            except Exception as exc:
-                h.error = f"config check failed: {exc}"
-                return h
+            if not session_str:
+                # Read the persisted global JSON file
+                try:
+                    session_str = await _load_session_string_from_file_async(client_type="telethon")
+                except Exception as exc:
+                    h.error = f"config check failed: {exc}"
+                    return h
 
-        if not session_str:
-            # Fall back to checking for a file-based .session on disk
-            session_path = get_telethon_session_path()
-            if os.path.exists(session_path) or os.path.exists(session_path + ".session"):
-                # File-based session exists — let build_telethon_client find it
-                pass  # proceed with build below (session_str stays None)
-            else:
-                h.error = "Telethon session not configured"
-                return h
+            if not session_str:
+                # Fall back to checking for a file-based .session on disk
+                session_path = get_telethon_session_path()
+                if os.path.exists(session_path) or os.path.exists(session_path + ".session"):
+                    # File-based session exists — let build_telethon_client find it
+                    pass  # proceed with build below (session_str stays None)
+                else:
+                    h.error = "Telethon session not configured"
+                    return h
 
         try:
             api_id, api_hash = get_userbot_credentials()
