@@ -36,6 +36,7 @@ from tasks import (
     trim_media,
 )
 from utils import file_utils, job_store
+from utils.file_utils import safe_rmtree
 
 logger = logging.getLogger(__name__)
 
@@ -252,7 +253,13 @@ async def _send_video_result(
         if _cleanup_thumb and os.path.exists(_cleanup_thumb):
             try:
                 _d = os.path.dirname(_cleanup_thumb)
-                shutil.rmtree(_d, ignore_errors=True)
+                safe_rmtree(_d)
+            except RuntimeError:
+                # If dirname resolved to a protected directory (shouldn't happen
+                # now that thumbnails live in mkdtemp subdirectories), fall back
+                # to removing only the file itself.
+                with contextlib.suppress(Exception):
+                    os.remove(_cleanup_thumb)
             except Exception:
                 with contextlib.suppress(Exception):
                     os.remove(_cleanup_thumb)
@@ -1406,8 +1413,7 @@ async def handle_job(job: dict):
                                     finally:
                                         if _pre_tp:
                                             with contextlib.suppress(Exception):
-                                                os.remove(_pre_tp)
-                                                shutil.rmtree(os.path.dirname(_pre_tp), ignore_errors=True)
+                                                safe_rmtree(os.path.dirname(_pre_tp))
                                     if ok:
                                         logger.info("Sent output via userbot (direct) for job %s", job_id)
                                         sent = True
@@ -1774,8 +1780,7 @@ async def handle_job(job: dict):
                                     finally:
                                         if _pre_tp:
                                             with contextlib.suppress(Exception):
-                                                os.remove(_pre_tp)
-                                                shutil.rmtree(os.path.dirname(_pre_tp), ignore_errors=True)
+                                                safe_rmtree(os.path.dirname(_pre_tp))
                                     if ok:
                                         logger.info("Sent output via userbot (direct) for job %s", job_id)
                                         sent = True

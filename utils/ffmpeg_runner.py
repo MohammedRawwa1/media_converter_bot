@@ -685,10 +685,11 @@ async def probe_video_for_delivery(file_path: str) -> tuple[dict | None, str | N
         logger.debug("probe_video_for_delivery: ffprobe failed for %s", file_path)
 
     # ── ffmpeg thumbnail at 1s ──
+    import shutil as _shutil
     import tempfile as _tf
 
-    _fd, _tp = _tf.mkstemp(suffix=".jpg", prefix="delivery_thumb_")
-    os.close(_fd)
+    _thumb_dir = _tf.mkdtemp(prefix="delivery_thumb_")
+    _tp = os.path.join(_thumb_dir, "thumb.jpg")
     ffmpeg_bin = getattr(config, "FFMPEG_PATH", "ffmpeg")
     try:
         proc = await asyncio.create_subprocess_exec(
@@ -710,10 +711,10 @@ async def probe_video_for_delivery(file_path: str) -> tuple[dict | None, str | N
         if proc.returncode == 0 and os.path.exists(_tp) and os.path.getsize(_tp) > 0:
             thumb_path = _tp
         else:
-            os.remove(_tp)
+            _shutil.rmtree(_thumb_dir, ignore_errors=True)
     except Exception:
         logger.debug("probe_video_for_delivery: thumbnail generation failed for %s", file_path)
         with contextlib.suppress(Exception):
-            os.remove(_tp)
+            _shutil.rmtree(_thumb_dir, ignore_errors=True)
 
     return video_meta, thumb_path

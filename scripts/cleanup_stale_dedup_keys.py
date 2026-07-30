@@ -14,7 +14,6 @@ The environment variable ``REDIS_URL`` must be set.
 
 import os
 import sys
-import time
 
 # ensure repo root on sys.path so config / utils can be imported if needed
 repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))

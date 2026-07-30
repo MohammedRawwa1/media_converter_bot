@@ -6,6 +6,8 @@ File utilities for media conversion bot.
 import asyncio
 import logging
 import os
+import shutil
+import tempfile
 
 # Optional async file operations
 try:
@@ -343,6 +345,33 @@ async def validate_file_extension(file_path: str, allowed_extensions: list[str])
     except Exception as e:
         logger.error(f"Error validating extension: {e}")
         return False
+
+
+def safe_rmtree(path: str) -> None:
+    """Remove a directory tree with a safety guard against deleting system directories.
+
+    Prevents accidental ``shutil.rmtree`` calls that would recursively delete
+    ``/``, ``/tmp``, or the platform temp directory — which is what happened
+    when ``os.path.dirname("/tmp/delivery_thumb_xxxxx.jpg")`` resolved to
+    ``"/tmp"`` and was passed to ``shutil.rmtree``.
+
+    Args:
+        path: Directory path to remove.  If it resolves to a protected system
+              directory the function raises ``RuntimeError``.
+
+    Raises:
+        RuntimeError: If ``path`` resolves to ``/``, ``/tmp``, or
+            ``tempfile.gettempdir()``.
+    """
+    if not path:
+        return
+    resolved = os.path.realpath(path)
+    protected = {"/", "/tmp", os.path.realpath(tempfile.gettempdir())}  # noqa: S108  # nosec  # deliberate safety guard, not insecure usage
+    if resolved in protected:
+        raise RuntimeError(
+            f"safe_rmtree: refusing to delete system directory {resolved!r}"
+        )
+    shutil.rmtree(resolved, ignore_errors=True)
 
 
 async def sanitize_filename(name: str, max_len: int = 180) -> str:

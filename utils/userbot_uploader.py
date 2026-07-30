@@ -3,7 +3,6 @@ import contextlib
 import json
 import logging
 import os
-import shutil
 import tempfile
 from collections.abc import Callable
 
@@ -18,6 +17,8 @@ try:
     from pyrogram import Client as PyrogramClient
 except Exception:  # pragma: no cover - optional dependency
     PyrogramClient = None
+
+from utils.file_utils import safe_rmtree
 
 logger = logging.getLogger(__name__)
 
@@ -78,7 +79,7 @@ async def _send_with_telethon(
     # Gracefully fall back to a generic send if ffprobe isn't available.
     # If video_meta/thumb_path were provided externally (pre-probed in the
     # worker), skip the internal probe entirely.
-    _temp_cleanup = None
+    _thumb_dir = None
     if video_meta is None:
         try:
             video_meta = await _probe_video_metadata(file_path) or {}
@@ -90,7 +91,13 @@ async def _send_with_telethon(
         except Exception:
             thumb_path = None
     if thumb_path:
-        _temp_cleanup = os.path.dirname(thumb_path)
+        # Track the containing directory explicitly (not dirname(), which
+        # could resolve to /tmp if the file is placed directly in the system
+        # temp directory).  _generate_video_thumbnail and
+        # probe_video_for_delivery both create a mkdtemp subdirectory, so
+        # dirname() will return the private subdirectory — but this explicit
+        # tracking is more robust against future changes.
+        _thumb_dir = os.path.dirname(thumb_path)
 
     client = build_telethon_client(api_id, api_hash)
     try:
@@ -144,10 +151,10 @@ async def _send_with_telethon(
         logger.exception("userbot: Telethon failed to send file %s", file_path)
         return None
     finally:
-        # Clean up temp thumbnail directory
-        if _temp_cleanup:
+        # Clean up temp thumbnail directory using safe_rmtree
+        if _thumb_dir:
             with contextlib.suppress(Exception):
-                shutil.rmtree(_temp_cleanup, ignore_errors=True)
+                safe_rmtree(_thumb_dir)
         with contextlib.suppress(Exception):
             await client.disconnect()
 
@@ -227,10 +234,10 @@ async def _generate_video_thumbnail(path: str) -> str | None:
         if proc.returncode == 0 and os.path.exists(thumb_path) and os.path.getsize(thumb_path) > 0:
             # Keep the temp dir; caller must clean up
             return thumb_path
-        shutil.rmtree(tmp_dir, ignore_errors=True)
+        safe_rmtree(tmp_dir)
         return None
     except Exception:
-        shutil.rmtree(tmp_dir, ignore_errors=True)
+        safe_rmtree(tmp_dir)
         return None
 
 
@@ -277,7 +284,7 @@ async def _send_with_pyrogram(
 
     # Pre-fetch video metadata and thumbnail before connecting to Telegram.
     # If video_meta/thumb_path were provided externally, skip internal probe.
-    _temp_cleanup = None
+    _thumb_dir = None
     if video_meta is None:
         try:
             video_meta = await _probe_video_metadata(file_path) or {}
@@ -289,7 +296,7 @@ async def _send_with_pyrogram(
         except Exception:
             thumb_path = None
     if thumb_path:
-        _temp_cleanup = os.path.dirname(thumb_path)
+        _thumb_dir = os.path.dirname(thumb_path)
 
     try:
         await client.start()
@@ -325,10 +332,10 @@ async def _send_with_pyrogram(
         logger.exception("userbot: Pyrogram failed to send file %s", file_path)
         return None
     finally:
-        # Clean up temp thumbnail directory
-        if _temp_cleanup:
+        # Clean up temp thumbnail directory using safe_rmtree
+        if _thumb_dir:
             with contextlib.suppress(Exception):
-                shutil.rmtree(_temp_cleanup, ignore_errors=True)
+                safe_rmtree(_thumb_dir)
         with contextlib.suppress(Exception):
             await client.stop()
 
@@ -359,7 +366,7 @@ async def _send_with_pyrogram_bot(
         return None
 
     # Pre-fetch video metadata and thumbnail before connecting.
-    _temp_cleanup = None
+    _thumb_dir = None
     if video_meta is None:
         try:
             video_meta = await _probe_video_metadata(file_path) or {}
@@ -371,7 +378,7 @@ async def _send_with_pyrogram_bot(
         except Exception:
             thumb_path = None
     if thumb_path:
-        _temp_cleanup = os.path.dirname(thumb_path)
+        _thumb_dir = os.path.dirname(thumb_path)
 
     bot = None
     try:
@@ -412,10 +419,10 @@ async def _send_with_pyrogram_bot(
         logger.exception("userbot: Pyrogram (bot) failed to send file %s", file_path)
         return None
     finally:
-        # Clean up temp thumbnail directory
-        if _temp_cleanup:
+        # Clean up temp thumbnail directory using safe_rmtree
+        if _thumb_dir:
             with contextlib.suppress(Exception):
-                shutil.rmtree(_temp_cleanup, ignore_errors=True)
+                safe_rmtree(_thumb_dir)
         if bot is not None:
             with contextlib.suppress(Exception):
                 await bot.stop()
