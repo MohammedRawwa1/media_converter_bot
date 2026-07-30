@@ -58,6 +58,7 @@ JOBS_FAILED = Counter("media_jobs_failed", "Total ffmpeg jobs failed")
 JOBS_SUCCEEDED = Counter("media_jobs_succeeded", "Total ffmpeg jobs succeeded")
 JOB_DURATION = Histogram("media_job_duration_seconds", "Duration of ffmpeg jobs")
 ACTIVE_JOBS = Gauge("media_jobs_active", "Number of active ffmpeg jobs")
+LOCKS_CLEANED = Counter("media_locks_cleaned_total", "Input locks released (cleaned up) after job completion")
 
 # Forward notification event (set by background pubsub listener)
 FORWARD_NOTIFY_EVENT: asyncio.Event | None = None
@@ -671,7 +672,7 @@ async def handle_job(job: dict):
             lock_name = (job.get("input_key") or input_path or job.get("source_url") or job_id) or job_id
             lock_hash = hashlib.sha256(str(lock_name).encode()).hexdigest()
             lock_key = f"ffmpeg:lock:{lock_hash}"
-            lock_ttl = int(os.environ.get("JOB_LOCK_SECONDS", str(6 * 3600)))
+            lock_ttl = int(os.environ.get("JOB_LOCK_SECONDS", str(3600)))
             lock_acquired = await redis_lock_client.set(lock_key, job_id, nx=True, ex=lock_ttl)
         except Exception:
             lock_acquired = True
@@ -1821,9 +1822,17 @@ async def handle_job(job: dict):
                                         "status": _final_status,
                                     },
                                 )
+                                # ── Delete the job hash immediately — it's no longer needed.
+                                # The periodic cleanup (redis_job_cleanup) handles stale keys
+                                # as a safety net, but jobs should not linger for 24 hours.
+                                await _r.delete(f"ffmpeg:job:{job_id}")
                             finally:
                                 with contextlib.suppress(Exception):
                                     await _r.close()
+                            logger.info(
+                                "Job %s: final status=%s message=%s (Redis hash deleted)",
+                                job_id, _final_status, _final_msg
+                            )
                         except Exception:
                             logger.debug("ffmpeg worker: operation failed")
 
@@ -2176,7 +2185,9 @@ async def handle_job(job: dict):
         # release the input lock if we acquired one
         try:
             if lock_key and lock_acquired and job_id:
-                await release_input_lock(lock_key, job_id, redis_client=redis_lock_client)
+                _released = await release_input_lock(lock_key, job_id, redis_client=redis_lock_client)
+                if _released:
+                    LOCKS_CLEANED.inc()
         except Exception:
             logger.warning("Failed to release input lock %s for job %s", lock_key, job_id)
         finally:

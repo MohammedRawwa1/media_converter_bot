@@ -116,6 +116,11 @@ def main():
         # write metadata first to avoid race where worker pops before hash exists
         with contextlib.suppress(Exception):
             r.hset(f"ffmpeg:job:{job_id}", mapping=mapping)
+        # Safety net TTL so job hashes don't linger forever (matches JOB_METADATA_TTL in job_queue.py)
+        _ttl = int(os.environ.get("JOB_METADATA_TTL", "86400"))
+        if _ttl > 0:
+            with contextlib.suppress(Exception):
+                r.expire(f"ffmpeg:job:{job_id}", _ttl)
         r.lpush("ffmpeg:jobs", json.dumps(job))
         print("Enqueued job:", job_id)
         print("Input:", input_path)

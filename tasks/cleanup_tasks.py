@@ -65,6 +65,7 @@ class CleanupManager:
             "thumbnails": await self.cleanup_thumbnails(),
             "redis_jobs": await self.cleanup_stale_redis_jobs(),
             "redis_dedup_keys": await self.cleanup_stale_dedup_keys(),
+            "redis_lock_keys": await self.cleanup_stale_locks(),
             "empty_dirs": await self.cleanup_empty_directories(),
             # ── S3 / R2 remote cleanup ──
             "s3_inputs": await self.cleanup_s3_inputs(),
@@ -211,6 +212,89 @@ class CleanupManager:
     # ─────────────────────────────────────────────────────────────────────
     # Redis job hash cleanup
     # ─────────────────────────────────────────────────────────────────────
+
+    async def cleanup_stale_locks(self) -> int:
+        """Delete stale input lock keys (``ffmpeg:lock:*``).
+
+        A lock is stale if its associated job hash no longer exists
+        (the worker deletes job hashes after delivery), or the job
+        status is terminal (done/error/cancelled).
+
+        Returns the number of locks deleted.
+        """
+        try:
+            from utils.job_queue import get_redis
+
+            r = await get_redis()
+        except Exception as e:
+            logger.debug("lock_cleanup: cannot connect to Redis: %s", e)
+            return 0
+
+        deleted = 0
+        try:
+            cursor = 0
+            while True:
+                try:
+                    cursor, keys = await r.scan(cursor, match="ffmpeg:lock:*", count=100)
+                except Exception:
+                    break
+
+                for key in keys:
+                    try:
+                        key_str = key.decode() if isinstance(key, bytes) else key
+                        val = await r.get(key)
+                        if not val:
+                            # Already expired — delete
+                            await r.delete(key)
+                            deleted += 1
+                            continue
+
+                        val_str = val.decode() if isinstance(val, bytes) else str(val)
+
+                        # Check if the owning job is still active
+                        job_hash = await r.hgetall(f"ffmpeg:job:{val_str}")
+                        if not job_hash:
+                            # Job hash doesn't exist — stale lock
+                            await r.delete(key)
+                            deleted += 1
+                            logger.debug("lock_cleanup: deleted orphaned lock %s (job %s gone)", key_str, val_str)
+                            continue
+
+                        status = job_hash.get(b"status") or job_hash.get("status")
+                        if status:
+                            status = status.decode() if isinstance(status, bytes) else str(status)
+                        else:
+                            status = ""
+
+                        if status in ("done", "error", "cancelled", ""):
+                            await r.delete(key)
+                            deleted += 1
+                            logger.debug(
+                                "lock_cleanup: deleted lock %s (job %s status=%s)",
+                                key_str, val_str, status
+                            )
+
+                    except Exception as e:
+                        logger.debug("lock_cleanup: error processing key %s: %s", key, e)
+
+                if cursor == 0:
+                    break
+
+            if deleted > 0:
+                logger.info("lock_cleanup: deleted %d stale lock keys", deleted)
+        except Exception as e:
+            logger.error("lock_cleanup: unexpected error: %s", e)
+        finally:
+            try:
+                aclose = getattr(r, "aclose", None)
+                if aclose is not None:
+                    await aclose()
+                else:
+                    await r.close()
+            except Exception:
+                pass
+
+        return deleted
 
     async def cleanup_stale_dedup_keys(self) -> int:
         """Delete stale pipeline dedup keys (``ffmpeg:pipeline_dedup:*``).

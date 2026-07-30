@@ -2794,6 +2794,40 @@ try:
         except Exception:
             dispatcher_ready = False
 
+        # ── Redis key counts for observability ──
+        redis_keys = {"job": -1, "lock": -1, "pipeline_dedup": -1}
+        try:
+            from utils.job_queue import get_redis as _health_r
+
+            _hr = await _health_r()
+            try:
+                redis_keys["job"] = 0
+                redis_keys["lock"] = 0
+                redis_keys["pipeline_dedup"] = 0
+                _cursor = 0
+                while True:
+                    _cursor, _keys = await _hr.scan(_cursor, match="ffmpeg:job:*", count=500)
+                    redis_keys["job"] += len(_keys)
+                    if _cursor == 0:
+                        break
+                _cursor = 0
+                while True:
+                    _cursor, _keys = await _hr.scan(_cursor, match="ffmpeg:lock:*", count=500)
+                    redis_keys["lock"] += len(_keys)
+                    if _cursor == 0:
+                        break
+                _cursor = 0
+                while True:
+                    _cursor, _keys = await _hr.scan(_cursor, match="ffmpeg:pipeline_dedup:*", count=500)
+                    redis_keys["pipeline_dedup"] += len(_keys)
+                    if _cursor == 0:
+                        break
+            finally:
+                with contextlib.suppress(Exception):
+                    await _hr.close()
+        except Exception:
+            pass
+
         return {
             "status": "ok",
             "bot_initialized": BOT_APPLICATION is not None,
@@ -2801,6 +2835,7 @@ try:
             "dispatcher_ready": dispatcher_ready,
             "startup_time": BOT_STARTED_AT,
             "error": getattr(app.state, "startup_error", None),
+            "redis_keys": redis_keys,
         }
 
     @app.get("/")
