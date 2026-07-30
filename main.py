@@ -253,17 +253,21 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
 Hello {user_name}! Send a media file and choose an action from the menu.
 
-Available slash commands (exact):
-/start - Show this welcome message
-/help - Show feature list and usage
-/settings - Open your user settings (aliases: /usettings, /usersettings)
-/bulkmenu - Open bulk/URL tools
-/cancel - Cancel current operation
-/canceljob <job_id> - Request cancellation for a queued/running job
-/admin add|remove|list <user_id> - Manage allowed users (admin only)
-/addthumb - Add default thumbnail (if enabled)
-/delthumb - Remove default thumbnail (if enabled)
-/loginstatus - Live session health check (Telethon + Pyrogram)
+**⚡ Quick Commands:**
+/help — Detailed feature guide
+/settings — Your preferences
+/cancel — Stop current operation
+/canceljob <job_id> — Cancel a pending job (space between /canceljob and the job ID)
+
+**🔐 Login (for large file support):**
+/login [phone] — Login via Telethon (user account)
+/loginpyro [phone] — Login via Pyrogram (better 2FA)
+/logout — Log out Telethon session
+/logoutpyro — Log out Pyrogram session
+/loginstatus — Check live session health
+
+**📦 Bulk & URLs:**
+/bulkmenu — Bulk URL processing
 
 Send me a file to get started! 🚀
 """
@@ -316,9 +320,21 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 • Processing time: Depends on file size
 • Results auto-delete after sending
 
-**Utility Commands:**
-`/cancel` - Cancel current operation
-`/admin` - Manage allowed users (admin only)
+**🔐 Login Guide:**
+Use `/login [phone]` (Telethon) or `/loginpyro [phone]` (Pyrogram) to sign in with a Telegram user account. This enables large file processing.
+
+When you receive the verification code:
+• Type the digits **with spaces between them** — e.g. `"1 2 3 4 5"`
+• Typing them all together like `"12345"` **does not work** — you must use spaces
+• If 2FA is enabled, just type your **password normally**
+• The same applies to both Telethon (`/login`) and Pyrogram (`/loginpyro`) flows
+
+**⚙️ Utility Commands:**
+/cancel — Cancel current operation
+/canceljob <job_id> — Cancel a queued or running job (space between /canceljob and the job ID)
+/logout — Log out Telethon session
+/logoutpyro — Log out Pyrogram session
+/loginstatus — Check live session health
 
 **Need help?** Just send a file and use the menus! 🎯
 """
@@ -556,20 +572,30 @@ def setup_handlers(application: Application) -> None:
         pyro = health.get("pyrogram", {})
         tele = health.get("telethon", {})
 
-        # ── Persisted JSON file info ──
-        json_session = None
-        json_file_exists = False
+        # ── Persisted JSON file info (global + per-user) ──
+        global_json_session = None
+        global_json_exists = False
+        per_user_json_session = None
+        per_user_json_exists = False
         try:
             from utils.telethon_session import _get_persisted_session_path, _load_all_sessions_from_file_async
 
-            _p = _get_persisted_session_path()
-            json_file_exists = os.path.exists(_p)
-            json_session = await _load_all_sessions_from_file_async()
+            # Global (legacy) file
+            _global_path = _get_persisted_session_path()
+            global_json_exists = os.path.exists(_global_path)
+            global_json_session = await _load_all_sessions_from_file_async()
+
+            # Per-user file for the calling user
+            _per_user_path = _get_persisted_session_path(user_id=calling_user_id)
+            per_user_json_exists = os.path.exists(_per_user_path)
+            per_user_json_session = await _load_all_sessions_from_file_async(user_id=calling_user_id)
         except Exception:
             logger.debug("main: ── Persisted JSON file check (async, non-blocking) ──")
 
-        tele_from_json = bool(json_session and json_session.get("telethon_session")) if json_session else False
-        pyro_from_json = bool(json_session and json_session.get("pyrogram_session")) if json_session else False
+        tele_global = bool(global_json_session and global_json_session.get("telethon_session")) if global_json_session else False
+        pyro_global = bool(global_json_session and global_json_session.get("pyrogram_session")) if global_json_session else False
+        tele_per_user = bool(per_user_json_session and per_user_json_session.get("telethon_session")) if per_user_json_session else False
+        pyro_per_user = bool(per_user_json_session and per_user_json_session.get("pyrogram_session")) if per_user_json_session else False
 
         # ── Credentials check ──
         has_api_id = bool(
@@ -611,9 +637,13 @@ def setup_handlers(application: Application) -> None:
             "",
             _session_line("Pyrogram", pyro),
             "",
-            "**Persisted JSON file:** " + ("✅ Exists" if json_file_exists else "❌ Not found"),
-            f"  Telethon in JSON: {'✅' if tele_from_json else '❌'}",
-            f"  Pyrogram in JSON: {'✅' if pyro_from_json else '❌'}",
+            "**Persisted JSON files:**",
+            f"  Global: {'✅ Exists' if global_json_exists else '❌ Not found'}",
+            f"    Telethon: {'✅' if tele_global else '❌'}",
+            f"    Pyrogram: {'✅' if pyro_global else '❌'}",
+            f"  Per-user ({calling_user_id}): {'✅ Exists' if per_user_json_exists else '❌ Not found'}",
+            f"    Telethon: {'✅' if tele_per_user else '❌'}",
+            f"    Pyrogram: {'✅' if pyro_per_user else '❌'}",
             "",
             f"🔔 Admin alerts: `{admin_alerts}`",
             f"🔄 Background check: every `{check_interval}s`",
@@ -1109,7 +1139,9 @@ async def main(background: bool = False) -> None:
     # "/loginstatus" command shows "Pyrogram in JSON: ❌" even though the
     # PYROGRAM_SESSION env var is set and usable.  The healthchecker would
     # eventually write it (after ~1 hour), but we do it here immediately
-    # so the JSON file is populated right away.
+    # so both the global (legacy) and per-user JSON files are populated
+    # right away.  The per-user file is needed because the healthchecker
+    # and client builders check per-user files first.
     try:
         from utils.telethon_session import (
             _load_all_sessions_from_file_async,
@@ -1123,9 +1155,14 @@ async def main(background: bool = False) -> None:
         if pyro_env and existing_json.get("pyrogram_session") != pyro_env:
             saved = await save_session_string_to_file_async(pyro_env, client_type="pyrogram")
             if saved:
-                logger.info("Eagerly persisted PYROGRAM_SESSION env var to JSON file")
+                logger.info("Eagerly persisted PYROGRAM_SESSION env var to global JSON file")
                 # Update the in-memory snapshot so the check below sees it
                 existing_json = await _load_all_sessions_from_file_async()
+
+        # Also persist Pyrogram env var to per-user JSON so /loginstatus
+        # shows it and the per-user resolution path finds it directly.
+        if pyro_env and ADMIN_USER_ID:
+            await save_session_string_to_file_async(pyro_env, client_type="pyrogram", user_id=ADMIN_USER_ID)
 
         # Persist Telethon session from env var if different from JSON
         telethon_env = None
@@ -1145,7 +1182,11 @@ async def main(background: bool = False) -> None:
         if telethon_env and existing_json.get("telethon_session") != telethon_env:
             saved = await save_session_string_to_file_async(telethon_env, client_type="telethon")
             if saved:
-                logger.info("Eagerly persisted Telethon session env var to JSON file")
+                logger.info("Eagerly persisted Telethon session env var to global JSON file")
+
+        # Also persist Telethon env var to per-user JSON.
+        if telethon_env and ADMIN_USER_ID:
+            await save_session_string_to_file_async(telethon_env, client_type="telethon", user_id=ADMIN_USER_ID)
     except Exception as exc:
         logger.debug("Eager env-var-to-JSON persistence skipped: %s", exc)
 
@@ -1166,11 +1207,13 @@ async def main(background: bool = False) -> None:
     except Exception as exc:
         logger.debug("Eager Pyrogram->MongoDB persistence skipped: %s", exc)
 
-    # ── Startup: persist MongoDB Pyrogram session to JSON file ──
-    # When PYROGRAM_SESSION env var is NOT set (pure remote login via /loginpyro),
-    # the JSON file starts empty on a fresh deploy.  Read from MongoDB and write
-    # to JSON so the uploader/downloader (which use build_pyrogram_client →
-    # get_pyrogram_session_string → env+JSON only) can find it immediately.
+    # ── Startup: persist MongoDB sessions to per-user JSON files ──
+    # When env vars are NOT set (pure remote login via /loginpyro or /login),
+    # the JSON files start empty on a fresh deploy.  Read from MongoDB and write
+    # to per-user JSON so the uploader/downloader and /loginstatus can find them
+    # immediately without waiting for the healthchecker (~1 hour).
+
+    # Pyrogram: persist from MongoDB to per-user JSON when no env var is set
     try:
         if not os.getenv("PYROGRAM_SESSION"):
             from utils.telethon_session import (
@@ -1190,6 +1233,33 @@ async def main(background: bool = False) -> None:
                     logger.info("Startup: persisted Pyrogram session from MongoDB to per-user JSON file")
     except Exception as exc:
         logger.debug("Startup MongoDB->JSON Pyrogram persistence skipped: %s", exc)
+
+    # Telethon: persist from MongoDB to per-user JSON when no env var is set
+    try:
+        _telethon_env_keys = (
+            "API_SESSION", "SESSION", "api_session",
+            "USERBOT_SESSION", "userbot_session",
+            "TELETHON_SESSION", "telethon_session",
+        )
+        _has_telethon_env = any(os.getenv(k) for k in _telethon_env_keys)
+        if not _has_telethon_env and ADMIN_USER_ID and _mongo_db:
+            from utils.telethon_session import (
+                _load_all_sessions_from_file_async,
+                get_telethon_session_string_for_user,
+                save_session_string_to_file_async,
+            )
+
+            _existing_tl = await _load_all_sessions_from_file_async()
+            if not _existing_tl.get("telethon_session"):
+                _mongo_tele = await get_telethon_session_string_for_user(
+                    user_id=ADMIN_USER_ID,
+                    db_model=_mongo_db,
+                )
+                if _mongo_tele:
+                    await save_session_string_to_file_async(_mongo_tele, client_type="telethon", user_id=ADMIN_USER_ID)
+                    logger.info("Startup: persisted Telethon session from MongoDB to per-user JSON file")
+    except Exception as exc:
+        logger.debug("Startup MongoDB->JSON Telethon persistence skipped: %s", exc)
 
     # Check FFmpeg (binary) availability and ffmpeg-python binding; warn if missing
     try:

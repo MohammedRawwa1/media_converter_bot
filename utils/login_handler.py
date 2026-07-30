@@ -488,7 +488,13 @@ async def _run_login_task(
         # handle 2FA naturally — which is Telethon's intended flow.
 
         # Notify user
-        msg_text = "✅ Verification code sent to your Telegram app!\n\nPlease enter the code (digits only)."
+        msg_text = (
+            "✅ Verification code sent to your Telegram app!\n\n"
+            "Enter the code below.\n"
+            '• Type the digits **with spaces between them** — e.g. `"1 2 3 4 5"`\n'
+            '• Typing them all together (like `"12345"`) does not work\n'
+            "• If 2FA is enabled, you'll be prompted for your password next"
+        )
         if status_msg:
             await status_msg.edit_text(msg_text, parse_mode="Markdown")
         else:
@@ -907,7 +913,13 @@ async def _run_pyro_login_task(
         )
 
         # Notify user
-        msg_text = "✅ Verification code sent to your Telegram app!\n\nPlease enter the code (digits only)."
+        msg_text = (
+            "✅ Verification code sent to your Telegram app!\n\n"
+            "Enter the code below.\n"
+            '• Type the digits **with spaces between them** — e.g. `"1 2 3 4 5"`\n'
+            '• Typing them all together (like `"12345"`) does not work\n'
+            "• If 2FA is enabled, you'll be prompted for your password next"
+        )
         if status_msg:
             await status_msg.edit_text(msg_text, parse_mode="Markdown")
         else:
