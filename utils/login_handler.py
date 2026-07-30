@@ -443,10 +443,19 @@ async def _receive_code(
         return ConversationHandler.END  # type: ignore[return-value]
 
     try:
+        # IMPORTANT: Do NOT pass phone_code_hash explicitly.
+        # Telethon's sign_in uses _parse_phone_and_hash which falls back
+        # to the internally cached _phone_code_hash[phone] when the hash
+        # parameter is None.  Passing it explicitly from user_data can
+        # use a stale hash when two bots share API_ID/API_HASH and the
+        # other bot's Telethon activity invalidates our cached connection.
+        #
+        # By omitting it, sign_in uses the same hash Telethon stored
+        # during send_code_request — matching what client.start() does
+        # locally (which always works).
         await client.sign_in(
             phone=phone,
             code=code,
-            phone_code_hash=phone_code_hash,
         )
 
         # ✅ Login succeeded – save session and finish
