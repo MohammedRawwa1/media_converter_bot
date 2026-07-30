@@ -2239,13 +2239,13 @@ class EnhancedMediaHandler:
 
         # ── Store conversion metadata so the BigFilePipeline knows what to produce ──
         _format_ffmpeg_args = {
-            "mp4": ["-c:v", "libx264", "-c:a", "aac", "-strict", "experimental"],
-            "mkv": ["-c:v", "libx264", "-c:a", "aac"],
+            "mp4": ["-c:v", "libx264", "-c:a", "aac", "-strict", "experimental", "-movflags", "+faststart"],
+            "mkv": ["-c:v", "libx264", "-c:a", "aac", "-movflags", "+faststart"],
             "avi": ["-c:v", "libx264", "-c:a", "mp3"],
-            "mov": ["-c:v", "libx264", "-c:a", "aac"],
+            "mov": ["-c:v", "libx264", "-c:a", "aac", "-movflags", "+faststart"],
             "webm": ["-c:v", "libvpx-vp9", "-c:a", "libvorbis"],
             "flv": ["-c:v", "libx264", "-c:a", "aac"],
-            "m4v": ["-c:v", "libx264", "-c:a", "aac", "-strict", "experimental"],
+            "m4v": ["-c:v", "libx264", "-c:a", "aac", "-strict", "experimental", "-movflags", "+faststart"],
         }
         current_file["_pipeline_ffmpeg_args"] = _format_ffmpeg_args.get(target_format)
         current_file["_pipeline_output_ext"] = f".{target_format}"
@@ -4212,6 +4212,8 @@ class EnhancedMediaHandler:
             "medium",
             "-crf",
             str(_crf_value),
+            "-movflags",
+            "+faststart",
             "-c:a",
             "aac",
             "-b:a",

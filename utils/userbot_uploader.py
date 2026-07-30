@@ -101,14 +101,23 @@ async def _send_with_telethon(
         await client.start(phone=_no_phone)
         target = await _normalize_target(chat_id, client)
 
-        # If we detected video metadata, send as video with full metadata
+        # If we detected video metadata, send as video with full metadata.
+        # Telethon requires DocumentAttributeVideo for explicit video attributes
+        # (duration, width, height) — plain kwargs are silently ignored.
         if video_meta.get("duration"):
+            from telethon.tl.types import DocumentAttributeVideo
+
             kwargs = {
                 "caption": caption or "",
                 "supports_streaming": True,
-                "duration": video_meta.get("duration"),
-                "width": video_meta.get("width", 0),
-                "height": video_meta.get("height", 0),
+                "attributes": [
+                    DocumentAttributeVideo(
+                        duration=int(video_meta["duration"]),
+                        w=int(video_meta.get("width", 0)),
+                        h=int(video_meta.get("height", 0)),
+                        supports_streaming=True,
+                    )
+                ],
             }
             if thumb_path is not None:
                 kwargs["thumb"] = thumb_path
