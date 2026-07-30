@@ -229,7 +229,10 @@ async def _login_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
         saved_session = await _load_any_session(context, uid)
         if saved_session:
-            test_client = TelegramClient(StringSession(saved_session), api_id, api_hash)
+            test_client = TelegramClient(
+                StringSession(saved_session), api_id, api_hash,
+                proxy=_parse_proxy_config(),
+            )
             try:
                 await test_client.connect()
                 if await test_client.is_user_authorized():
