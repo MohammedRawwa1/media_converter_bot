@@ -924,8 +924,16 @@ class EnhancedMediaHandler:
         except Exception:
             pass
 
-    async def _cancel_stale_pipeline_job(self, session: dict, handler_name: str) -> bool:
+    async def _cancel_stale_pipeline_job(self, session: dict, handler_name: str, user_id: int | None = None) -> bool:
         """Cancel any stale pipeline job that may have been started, so the user's specific settings take effect.
+
+        Also clears the pipeline dedup Redis key so the same file can be re-processed.
+
+        Args:
+            session: The user session dict.
+            handler_name: Name of the calling handler (for logging).
+            user_id: Optional user ID. If provided, also deletes the pipeline dedup
+                     Redis key to prevent stale dedup blocking.
 
         Returns True if a job was cancelled, False otherwise.
         """
@@ -941,7 +949,18 @@ class EnhancedMediaHandler:
 
             _r_cancel = await _cancel_r()
             try:
-                await _r_cancel.hset(f"ffmpeg:job:{_existing_id}", "cancel", "1")
+                # Mark job as cancelled (both the cancel flag and the status)
+                await _r_cancel.hset(
+                    f"ffmpeg:job:{_existing_id}",
+                    mapping={"cancel": "1", "status": "cancelled"},
+                )
+                # Also clear the pipeline dedup key so future requests for the same
+                # file aren't blocked by a stale dedup reference.
+                _file_uid = current_file.get("file_unique_id")
+                if user_id and _file_uid:
+                    _dedup_key = f"ffmpeg:pipeline_dedup:{user_id}:{_file_uid}"
+                    with contextlib.suppress(Exception):
+                        await _r_cancel.delete(_dedup_key)
                 logger.info(
                     "%s: cancelled stale pipeline job %s to apply specific settings",
                     handler_name,
@@ -2203,7 +2222,7 @@ class EnhancedMediaHandler:
 
         # ── Cancel any stale pipeline job so user's specific settings take effect ──
         if current_file.get("_pipeline_job_id"):
-            await self._cancel_stale_pipeline_job(session, "convert_video_format")
+            await self._cancel_stale_pipeline_job(session, "convert_video_format", user_id)
 
         await self.safe_edit(query, f"🎬 Queuing conversion to {target_format.upper()}...")
 
@@ -2230,7 +2249,7 @@ class EnhancedMediaHandler:
                 current_file = session.get("current_file")
                 # Re-check after download — cancel if pipeline queued during download
                 if current_file and current_file.get("_pipeline_job_id"):
-                    await self._cancel_stale_pipeline_job(session, "convert_video_format")
+                    await self._cancel_stale_pipeline_job(session, "convert_video_format", user_id)
             except Exception as e:
                 await self.safe_edit(query, f"❌ Failed to download file: {e}")
                 return
@@ -4073,7 +4092,7 @@ class EnhancedMediaHandler:
 
         # ── Cancel any stale pipeline job so user's specific settings take effect ──
         if current_file and current_file.get("_pipeline_job_id"):
-            await self._cancel_stale_pipeline_job(session, "convert_to_mp3")
+            await self._cancel_stale_pipeline_job(session, "convert_to_mp3", user_id)
 
         await self._run_with_concurrency_limit(user_id, "mp3_conversion", do_conversion())
 
@@ -4190,7 +4209,7 @@ class EnhancedMediaHandler:
 
         # ── Cancel any stale pipeline job so user's specific settings take effect ──
         if current_file and current_file.get("_pipeline_job_id"):
-            await self._cancel_stale_pipeline_job(session, "compress_video")
+            await self._cancel_stale_pipeline_job(session, "compress_video", user_id)
 
         await self._run_with_concurrency_limit(user_id, "compression", do_compression())
 
@@ -4463,7 +4482,7 @@ class EnhancedMediaHandler:
 
         # ── Cancel any stale pipeline job so user's specific settings take effect ──
         if current_file and current_file.get("_pipeline_job_id"):
-            await self._cancel_stale_pipeline_job(session, "optimize_video")
+            await self._cancel_stale_pipeline_job(session, "optimize_video", update.effective_user.id)
 
         output_dir = getattr(config, "OUTPUT_PATH", "storage/output") if config else "storage/output"
         with contextlib.suppress(OSError):
@@ -4566,7 +4585,7 @@ class EnhancedMediaHandler:
 
         # ── Cancel any stale pipeline job so user's specific settings take effect ──
         if current_file and current_file.get("_pipeline_job_id"):
-            await self._cancel_stale_pipeline_job(session, "repair_video")
+            await self._cancel_stale_pipeline_job(session, "repair_video", update.effective_user.id)
 
         # enqueue repair job
         job_id = str(uuid.uuid4())
@@ -4784,7 +4803,7 @@ class EnhancedMediaHandler:
 
         # ── Cancel any stale pipeline job so user's specific settings take effect ──
         if current_file and current_file.get("_pipeline_job_id"):
-            await self._cancel_stale_pipeline_job(session, "extract_streams")
+            await self._cancel_stale_pipeline_job(session, "extract_streams", update.effective_user.id)
 
         await self.safe_edit(query, "🎞️ Extracting streams...")
 
@@ -4869,7 +4888,7 @@ class EnhancedMediaHandler:
 
         # ── Cancel any stale pipeline job so user's specific settings take effect ──
         if current_file and current_file.get("_pipeline_job_id"):
-            await self._cancel_stale_pipeline_job(session, "convert_audio_format")
+            await self._cancel_stale_pipeline_job(session, "convert_audio_format", update.effective_user.id)
 
         output_base = getattr(config, "OUTPUT_PATH", "storage/output") if config else "storage/output"
         with contextlib.suppress(OSError):
