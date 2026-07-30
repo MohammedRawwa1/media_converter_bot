@@ -572,28 +572,19 @@ def setup_handlers(application: Application) -> None:
         pyro = health.get("pyrogram", {})
         tele = health.get("telethon", {})
 
-        # ── Persisted JSON file info (global + per-user) ──
-        global_json_session = None
-        global_json_exists = False
+        # ── Persisted JSON file info (per-user only) ──
         per_user_json_session = None
         per_user_json_exists = False
         try:
             from utils.telethon_session import _get_persisted_session_path, _load_all_sessions_from_file_async
-
-            # Global (legacy) file
-            _global_path = _get_persisted_session_path()
-            global_json_exists = os.path.exists(_global_path)
-            global_json_session = await _load_all_sessions_from_file_async()
 
             # Per-user file for the calling user
             _per_user_path = _get_persisted_session_path(user_id=calling_user_id)
             per_user_json_exists = os.path.exists(_per_user_path)
             per_user_json_session = await _load_all_sessions_from_file_async(user_id=calling_user_id)
         except Exception:
-            logger.debug("main: ── Persisted JSON file check (async, non-blocking) ──")
+            logger.debug("main: Per-user JSON file check failed")
 
-        tele_global = bool(global_json_session and global_json_session.get("telethon_session")) if global_json_session else False
-        pyro_global = bool(global_json_session and global_json_session.get("pyrogram_session")) if global_json_session else False
         tele_per_user = bool(per_user_json_session and per_user_json_session.get("telethon_session")) if per_user_json_session else False
         pyro_per_user = bool(per_user_json_session and per_user_json_session.get("pyrogram_session")) if per_user_json_session else False
 
@@ -637,10 +628,7 @@ def setup_handlers(application: Application) -> None:
             "",
             _session_line("Pyrogram", pyro),
             "",
-            "**Persisted JSON files:**",
-            f"  Global: {'✅ Exists' if global_json_exists else '❌ Not found'}",
-            f"    Telethon: {'✅' if tele_global else '❌'}",
-            f"    Pyrogram: {'✅' if pyro_global else '❌'}",
+            "**Persisted JSON files (per-user):**",
             f"  Per-user ({calling_user_id}): {'✅ Exists' if per_user_json_exists else '❌ Not found'}",
             f"    Telethon: {'✅' if tele_per_user else '❌'}",
             f"    Pyrogram: {'✅' if pyro_per_user else '❌'}",
