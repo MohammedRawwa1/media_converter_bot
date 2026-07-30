@@ -152,7 +152,7 @@ def _get_futures(context: ContextTypes.DEFAULT_TYPE, user_id: int, create: bool 
             "cancel": asyncio.Event(),
             "task": None,           # asyncio.Task or None
             "client": None,         # TelegramClient or None
-            "chat_id": update.effective_chat.id if create else None,
+            "chat_id": None,        # set by caller after creation
             "phone_number": None,   # str or None
             "phone_code_hash": None,
             "api_id": None,
