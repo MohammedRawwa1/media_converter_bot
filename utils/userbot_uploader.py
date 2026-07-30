@@ -22,6 +22,232 @@ from utils.file_utils import safe_rmtree
 
 logger = logging.getLogger(__name__)
 
+# ── Parallel upload constants (FastTelethon-style) ──
+# Part size for Telegram file uploads: 512 KB (standard for big files)
+_PARALLEL_PART_SIZE: int = 512 * 1024
+# Max concurrent chunk uploads — 4-8 is the sweet spot; more triggers FloodWait
+_PARALLEL_WORKERS: int = 6
+# Files larger than this use SaveBigFilePart (vs SaveFilePart)
+_PARALLEL_BIG_FILE_THRESHOLD: int = 10 * 1024 * 1024
+# Max file size for in-memory parallel upload; beyond this we fall back to
+# sequential upload to avoid OOM from reading the entire file into memory.
+# Set to 0 or negative to disable the guard.
+_PARALLEL_MAX_MEMORY_BYTES: int = 500 * 1024 * 1024  # 500 MB
+
+
+async def _parallel_upload_file(
+    client,
+    file_path: str,
+    file_size: int,
+    progress_callback: Callable[[int, int], None] | None = None,
+    part_size: int = _PARALLEL_PART_SIZE,
+    workers: int = _PARALLEL_WORKERS,
+):
+    """Upload a file to Telegram using parallel chunked upload (FastTelethon-style).
+
+    Splits the file into fixed-size parts and uploads them concurrently via
+    Telethon's low-level ``SaveBigFilePartRequest`` (or ``SaveFilePartRequest``
+    for small files). This is significantly faster than the sequential upload
+    used by ``client.send_file()`` because it saturates the connection with
+    multiple in-flight parts.
+
+    Args:
+        client: Connected Telethon client.
+        file_path: Path to the file to upload.
+        file_size: Total file size in bytes.
+        progress_callback: Optional ``callable(sent_bytes, total_bytes)``.
+        part_size: Chunk size in bytes (default 512 KB).
+        workers: Max concurrent uploads (default 6).
+
+    Returns:
+        ``InputFileBig`` for large files or ``InputFile`` for small files,
+        ready to pass to ``client.send_file()`` as the ``file`` argument.
+    """
+    # ── Memory guard: avoid loading huge files entirely into RAM ──
+    if _PARALLEL_MAX_MEMORY_BYTES > 0 and file_size > _PARALLEL_MAX_MEMORY_BYTES:
+        logger.warning(
+            "parallel_upload: file %s size %d exceeds memory guard %d — falling back to sequential",
+            file_path,
+            file_size,
+            _PARALLEL_MAX_MEMORY_BYTES,
+        )
+        return None
+
+    import random
+    from telethon.tl.functions.upload import SaveBigFilePartRequest, SaveFilePartRequest
+    from telethon.tl.types import InputFileBig, InputFile
+
+    file_id = random.randrange(1 << 63)
+    total_parts = max(1, (file_size + part_size - 1) // part_size)
+    is_big = total_parts > 1024 or file_size > _PARALLEL_BIG_FILE_THRESHOLD
+    sem = asyncio.Semaphore(workers)
+    sent_bytes = 0
+
+    async def _upload_part(part_index: int, data: bytes) -> None:
+        nonlocal sent_bytes
+        async with sem:
+            for attempt in range(3):
+                try:
+                    if is_big:
+                        await client(
+                            SaveBigFilePartRequest(
+                                file_id=file_id,
+                                file_part=part_index,
+                                file_total_parts=total_parts,
+                                bytes=data,
+                            )
+                        )
+                    else:
+                        await client(
+                            SaveFilePartRequest(
+                                file_id=file_id,
+                                file_part=part_index,
+                                bytes=data,
+                            )
+                        )
+                    break
+                except Exception:
+                    if attempt == 2:
+                        raise
+                    await asyncio.sleep(1 * (attempt + 1))
+
+            sent_bytes += len(data)
+            if progress_callback:
+                progress_callback(sent_bytes, file_size)
+
+    # Read entire file into memory for chunking
+    with open(file_path, "rb") as f:
+        file_data = f.read()
+
+    chunks = []
+    for i in range(total_parts):
+        start = i * part_size
+        end = min(start + part_size, len(file_data))
+        chunks.append((i, file_data[start:end]))
+
+    logger.info(
+        "parallel_upload: file=%s size=%d parts=%d workers=%d is_big=%s",
+        file_path,
+        file_size,
+        total_parts,
+        workers,
+        is_big,
+    )
+
+    await asyncio.gather(*[_upload_part(i, d) for i, d in chunks])
+
+    filename = os.path.basename(file_path)
+    if is_big:
+        return InputFileBig(id=file_id, parts=total_parts, name=filename)
+    else:
+        return InputFile(id=file_id, parts=total_parts, name=filename)
+
+
+async def _parallel_upload_file_pyrogram(
+    client,
+    file_path: str,
+    file_size: int,
+    progress_callback: Callable[[int, int], None] | None = None,
+    part_size: int = _PARALLEL_PART_SIZE,
+    workers: int = _PARALLEL_WORKERS,
+):
+    """Upload a file to Telegram via Pyrogram using parallel chunked upload.
+
+    Uses Pyrogram's low-level ``raw.functions.upload.SaveBigFilePart`` / ``SaveFilePart``
+    to upload file parts concurrently, then returns an ``InputFileBig`` / ``InputFile``
+    that can be passed directly to ``client.send_video()`` as the ``video`` argument.
+
+    Args:
+        client: Connected Pyrogram client.
+        file_path: Path to the file to upload.
+        file_size: Total file size in bytes.
+        progress_callback: Optional ``callable(sent_bytes, total_bytes)``.
+        part_size: Chunk size in bytes (default 512 KB).
+        workers: Max concurrent uploads (default 6).
+
+    Returns:
+        ``InputFileBig`` for large files or ``InputFile`` for small files,
+        ready to pass to ``client.send_video()``.
+    """
+    # ── Memory guard: avoid loading huge files entirely into RAM ──
+    if _PARALLEL_MAX_MEMORY_BYTES > 0 and file_size > _PARALLEL_MAX_MEMORY_BYTES:
+        logger.warning(
+            "pyrogram_parallel_upload: file %s size %d exceeds memory guard %d — falling back to sequential",
+            file_path,
+            file_size,
+            _PARALLEL_MAX_MEMORY_BYTES,
+        )
+        return None
+
+    import random as _random
+    from pyrogram.raw.functions.upload import SaveBigFilePart as _SaveBig, SaveFilePart as _SaveSmall
+    from pyrogram.raw.types import InputFileBig as _InputBig, InputFile as _InputFile
+
+    file_id = _random.randrange(1 << 63)
+    total_parts = max(1, (file_size + part_size - 1) // part_size)
+    is_big = total_parts > 1024 or file_size > _PARALLEL_BIG_FILE_THRESHOLD
+    sem = asyncio.Semaphore(workers)
+    sent_bytes = 0
+
+    async def _upload_part(part_index: int, data: bytes) -> None:
+        nonlocal sent_bytes
+        async with sem:
+            for attempt in range(3):
+                try:
+                    if is_big:
+                        await client.invoke(
+                            _SaveBig(
+                                file_id=file_id,
+                                file_part=part_index,
+                                file_total_parts=total_parts,
+                                bytes=data,
+                            )
+                        )
+                    else:
+                        await client.invoke(
+                            _SaveSmall(
+                                file_id=file_id,
+                                file_part=part_index,
+                                bytes=data,
+                            )
+                        )
+                    break
+                except Exception:
+                    if attempt == 2:
+                        raise
+                    await asyncio.sleep(1 * (attempt + 1))
+
+            sent_bytes += len(data)
+            if progress_callback:
+                progress_callback(sent_bytes, file_size)
+
+    # Read entire file into memory for chunking
+    with open(file_path, "rb") as f:
+        file_data = f.read()
+
+    chunks = []
+    for i in range(total_parts):
+        start = i * part_size
+        end = min(start + part_size, len(file_data))
+        chunks.append((i, file_data[start:end]))
+
+    logger.info(
+        "pyrogram_parallel_upload: file=%s size=%d parts=%d workers=%d is_big=%s",
+        file_path,
+        file_size,
+        total_parts,
+        workers,
+        is_big,
+    )
+
+    await asyncio.gather(*[_upload_part(i, d) for i, d in chunks])
+
+    filename = os.path.basename(file_path)
+    if is_big:
+        return _InputBig(id=file_id, parts=total_parts, name=filename)
+    else:
+        return _InputFile(id=file_id, parts=total_parts, name=filename)
+
 
 async def _normalize_target(chat_id: int | str, client=None):
     try:
@@ -108,9 +334,19 @@ async def _send_with_telethon(
         await client.start(phone=_no_phone)
         target = await _normalize_target(chat_id, client)
 
-        # If we detected video metadata, send as video with full metadata.
-        # Telethon requires DocumentAttributeVideo for explicit video attributes
-        # (duration, width, height) — plain kwargs are silently ignored.
+        # ── Upload file data using parallel chunked transfer (FastTelethon-style) ──
+        file_size = os.path.getsize(file_path)
+        uploaded_file = await _parallel_upload_file(
+            client,
+            file_path,
+            file_size,
+            progress_callback=progress_callback,
+        )
+
+        # ── Send the file with metadata ──
+        # If parallel upload returned None (memory guard triggered), use
+        # the raw file_path instead and let Telethon upload sequentially.
+        _file_arg = uploaded_file if uploaded_file is not None else file_path
         if video_meta.get("duration"):
             from telethon.tl.types import DocumentAttributeVideo
 
@@ -128,9 +364,10 @@ async def _send_with_telethon(
             }
             if thumb_path is not None:
                 kwargs["thumb"] = thumb_path
-            if progress_callback is not None:
+            # Only pass progress_callback for sequential upload (parallel handles its own)
+            if uploaded_file is None and progress_callback is not None:
                 kwargs["progress_callback"] = progress_callback
-            msg = await client.send_file(target, file_path, **kwargs)
+            msg = await client.send_file(target, _file_arg, **kwargs)
             logger.info(
                 "userbot: Telethon sent video %s to %s (meta=%s, thumb=%s, msg_id=%s)",
                 file_path,
@@ -140,11 +377,11 @@ async def _send_with_telethon(
                 getattr(msg, "id", None),
             )
         else:
-            # Fallback: generic file send
-            kwargs = {"file": file_path, "caption": caption}
-            if progress_callback is not None:
+            # Fallback: generic file send (no video metadata)
+            kwargs = {"caption": caption}
+            if uploaded_file is None and progress_callback is not None:
                 kwargs["progress_callback"] = progress_callback
-            msg = await client.send_file(target, **kwargs)
+            msg = await client.send_file(target, _file_arg, **kwargs)
             logger.info("userbot: Telethon sent file %s to %s (msg_id=%s)", file_path, target, getattr(msg, "id", None))
         return getattr(msg, "id", None)
     except Exception:
@@ -318,7 +555,22 @@ async def _send_with_pyrogram(
         if thumb_path is not None:
             kwargs["thumb"] = thumb_path
 
-        msg = await client.send_video(target, file_path, **kwargs)
+        # ── Parallel upload then send ──
+        file_size = os.path.getsize(file_path)
+        uploaded_file = await _parallel_upload_file_pyrogram(
+            client,
+            file_path,
+            file_size,
+            progress_callback=progress_callback,
+        )
+        # If parallel upload returned None (memory guard), remove progress
+        # so Pyrogram uses file_path and reports progress itself.
+        if uploaded_file is None:
+            logger.info("userbot: Pyrogram falling back to sequential upload for %s", file_path)
+        else:
+            kwargs.pop("progress", None)  # parallel upload already handled progress
+        _file_arg = uploaded_file if uploaded_file is not None else file_path
+        msg = await client.send_video(target, _file_arg, **kwargs)
         logger.info(
             "userbot: Pyrogram sent video %s to %s (meta=%s, thumb=%s, msg_id=%s)",
             file_path,
@@ -405,7 +657,22 @@ async def _send_with_pyrogram_bot(
         if thumb_path is not None:
             kwargs["thumb"] = thumb_path
 
-        msg = await bot.send_video(target, file_path, **kwargs)
+        # ── Parallel upload then send ──
+        file_size = os.path.getsize(file_path)
+        uploaded_file = await _parallel_upload_file_pyrogram(
+            bot,
+            file_path,
+            file_size,
+            progress_callback=progress_callback,
+        )
+        # If parallel upload returned None (memory guard), remove progress
+        # so Pyrogram uses file_path and reports progress itself.
+        if uploaded_file is None:
+            logger.info("userbot: Pyrogram (bot) falling back to sequential upload for %s", file_path)
+        else:
+            kwargs.pop("progress", None)  # parallel upload already handled progress
+        _file_arg = uploaded_file if uploaded_file is not None else file_path
+        msg = await bot.send_video(target, _file_arg, **kwargs)
         logger.info(
             "userbot: Pyrogram (bot) sent video %s to %s (meta=%s, thumb=%s, msg_id=%s)",
             file_path,
