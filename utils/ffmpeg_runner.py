@@ -691,6 +691,7 @@ async def probe_video_for_delivery(file_path: str) -> tuple[dict | None, str | N
     _thumb_dir = _tf.mkdtemp(prefix="delivery_thumb_")
     _tp = os.path.join(_thumb_dir, "thumb.jpg")
     ffmpeg_bin = getattr(config, "FFMPEG_PATH", "ffmpeg")
+    proc = None
     try:
         proc = await asyncio.create_subprocess_exec(
             ffmpeg_bin,
@@ -707,13 +708,27 @@ async def probe_video_for_delivery(file_path: str) -> tuple[dict | None, str | N
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
-        await asyncio.wait_for(proc.communicate(), timeout=30)
+        try:
+            await asyncio.wait_for(proc.communicate(), timeout=30)
+        except TimeoutError:
+            logger.warning("probe_video_for_delivery: thumbnail ffmpeg timed out for %s, killing process", file_path)
+            with contextlib.suppress(Exception):
+                proc.kill()
+            with contextlib.suppress(Exception):
+                await proc.wait()
+            _shutil.rmtree(_thumb_dir, ignore_errors=True)
+            return video_meta, None
         if proc.returncode == 0 and os.path.exists(_tp) and os.path.getsize(_tp) > 0:
             thumb_path = _tp
         else:
             _shutil.rmtree(_thumb_dir, ignore_errors=True)
     except Exception:
         logger.debug("probe_video_for_delivery: thumbnail generation failed for %s", file_path)
+        if proc is not None:
+            with contextlib.suppress(Exception):
+                proc.kill()
+            with contextlib.suppress(Exception):
+                await proc.wait()
         with contextlib.suppress(Exception):
             _shutil.rmtree(_thumb_dir, ignore_errors=True)
 

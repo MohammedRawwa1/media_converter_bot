@@ -544,9 +544,11 @@ def setup_handlers(application: Application) -> None:
         await update.message.reply_text("🩺 Testing sessions live — connecting to Telegram...")
 
         # ── Run live health check via the healthchecker ──
+        # Pass the calling user's ID so per-user sessions are checked
+        calling_user_id = update.effective_user.id
         try:
             checker = get_session_healthchecker()
-            health = await checker.run_once()
+            health = await checker.run_once(user_id=calling_user_id)
         except Exception as exc:
             logger.exception("loginstatus: health check failed: %s", exc)
             health = {}
@@ -735,10 +737,16 @@ def setup_handlers(application: Application) -> None:
             await cleanup_login_flow(context, user_id)
 
         try:
-            from utils.telethon_session import get_telethon_session_path
+            from utils.telethon_session import (
+                _get_persisted_session_path,
+                _invalidate_session_cache,
+                get_telethon_session_path,
+            )
 
             session_path = get_telethon_session_path()
             removed = []
+
+            # 1. Remove global session files (backward-compatible)
             if os.path.exists(session_path):
                 try:
                     os.remove(session_path)
@@ -754,7 +762,25 @@ def setup_handlers(application: Application) -> None:
                     except Exception:
                         logger.debug("main: operation failed")
 
-            # Also clear any saved Telethon session from MongoDB
+            # 2. Remove per-user JSON session file
+            per_user_json = _get_persisted_session_path(user_id=user_id)
+            if os.path.exists(per_user_json):
+                try:
+                    os.remove(per_user_json)
+                    removed.append(f"Per-user JSON ({os.path.basename(per_user_json)})")
+                except Exception as exc:
+                    logger.debug("logout: failed to remove per-user JSON %s: %s", per_user_json, exc)
+
+            # 3. Remove per-user Telethon .session file on disk
+            per_user_session = f"{session_path}.{user_id}.session"
+            if os.path.exists(per_user_session):
+                try:
+                    os.remove(per_user_session)
+                    removed.append(f"Per-user .session ({os.path.basename(per_user_session)})")
+                except Exception as exc:
+                    logger.debug("logout: failed to remove per-user session %s: %s", per_user_session, exc)
+
+            # 4. Also clear any saved Telethon session from MongoDB
             try:
                 db_model_lo = context.application.bot_data.get("db_model")
                 if db_model_lo is not None:
@@ -762,6 +788,9 @@ def setup_handlers(application: Application) -> None:
                     removed.append("MongoDB session")
             except Exception:
                 logger.debug("main: Also clear any saved Telethon session from MongoDB")
+
+            # 5. Clear in-memory session cache for this user
+            _invalidate_session_cache(user_id=user_id)
 
             if removed:
                 await update.message.reply_text(

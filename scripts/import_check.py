@@ -19,7 +19,6 @@ modules = [
     "utils.job_queue",
     "utils.job_store",
     "utils.file_utils",
-    "utils.progress_tracker",
     "workers.ffmpeg_worker",
     "config",
 ]
