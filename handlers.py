@@ -2222,6 +2222,7 @@ class EnhancedMediaHandler:
             return
         query = update.callback_query
         current_file = session.get("current_file")
+        user_id = update.effective_user.id
 
         if not current_file or current_file["type"] != "video":
             await self.safe_edit(query, "❌ No video file found.")
@@ -2257,14 +2258,27 @@ class EnhancedMediaHandler:
             try:
                 await self._ensure_current_file_downloaded(update, context, session)
                 current_file = session.get("current_file")
-                # Re-check after download — cancel if pipeline queued during download
+                # If pipeline queued a job (big file), watch it and return.
+                # Don't create a duplicate local job or cancel the pipeline job.
                 if current_file and current_file.get("_pipeline_job_id"):
-                    await self._cancel_stale_pipeline_job(session, "convert_video_format", user_id)
+                    _pipeline_job_id = current_file["_pipeline_job_id"]
+                    kb = InlineKeyboardMarkup(
+                        [[InlineKeyboardButton("❌ Cancel", callback_data=f"cancel_job:{_pipeline_job_id}")]]
+                    )
+                    await self.safe_edit(
+                        query,
+                        f"✅ Large file queued (Job: {_pipeline_job_id[:8]}...). I'll send the result when ready.",
+                        reply_markup=kb,
+                    )
+                    with contextlib.suppress(RuntimeError):
+                        asyncio.create_task(self._watch_job_progress(query, _pipeline_job_id))
+                    return
             except Exception as e:
                 await self.safe_edit(query, f"❌ Failed to download file: {e}")
                 return
 
         # Enqueue conversion job to Redis so a worker handles heavy lifting
+        # (Only reached for small files downloaded via Bot API, not pipeline jobs)
         input_path = current_file["path"]
         output_ext = f".{target_format}"
         output_dir = getattr(config, "OUTPUT_PATH", "storage/output") if config else "storage/output"
@@ -4486,11 +4500,26 @@ class EnhancedMediaHandler:
             try:
                 await self._ensure_current_file_downloaded(update, context, session)
                 current_file = session.get("current_file")
+                # If pipeline queued a job (big file), watch it and return.
+                if current_file and current_file.get("_pipeline_job_id"):
+                    _pipeline_job_id = current_file["_pipeline_job_id"]
+                    kb = InlineKeyboardMarkup(
+                        [[InlineKeyboardButton("❌ Cancel", callback_data=f"cancel_job:{_pipeline_job_id}")]]
+                    )
+                    await self.safe_edit(
+                        query,
+                        f"✅ Large file queued (Job: {_pipeline_job_id[:8]}...). I'll send the result when ready.",
+                        reply_markup=kb,
+                    )
+                    with contextlib.suppress(RuntimeError):
+                        asyncio.create_task(self._watch_job_progress(query, _pipeline_job_id))
+                    return
             except Exception as e:
                 await self.safe_edit(query, f"❌ Failed to download file: {e}")
                 return
 
         # ── Cancel any stale pipeline job so user's specific settings take effect ──
+        # (Only reached for small files downloaded via Bot API)
         if current_file and current_file.get("_pipeline_job_id"):
             await self._cancel_stale_pipeline_job(session, "optimize_video", update.effective_user.id)
 
@@ -4583,17 +4612,39 @@ class EnhancedMediaHandler:
         if not await self._check_conversion_quota(update, context):
             return
 
+        # ── Store conversion metadata so the BigFilePipeline knows what to produce ──
+        current_file["_pipeline_ffmpeg_args"] = ["-c", "copy"]
+        current_file["_pipeline_output_ext"] = ".mp4"
+        current_file["_pipeline_conversion_type"] = "repair_video"
+        current_file["_pipeline_caption"] = "✅ Video repaired (if possible)"
+        session["current_file"] = current_file
+
         await self.safe_edit(query, "🔧 Attempting to repair video...")
         # Ensure file downloaded (lazy-download)
         if not current_file.get("path") or not os.path.exists(current_file.get("path") or ""):
             try:
                 await self._ensure_current_file_downloaded(update, context, session)
                 current_file = session.get("current_file")
+                # If pipeline queued a job (big file), watch it and return.
+                if current_file and current_file.get("_pipeline_job_id"):
+                    _pipeline_job_id = current_file["_pipeline_job_id"]
+                    kb = InlineKeyboardMarkup(
+                        [[InlineKeyboardButton("❌ Cancel", callback_data=f"cancel_job:{_pipeline_job_id}")]]
+                    )
+                    await self.safe_edit(
+                        query,
+                        f"✅ Large file queued (Job: {_pipeline_job_id[:8]}...). I'll send the result when ready.",
+                        reply_markup=kb,
+                    )
+                    with contextlib.suppress(RuntimeError):
+                        asyncio.create_task(self._watch_job_progress(query, _pipeline_job_id))
+                    return
             except Exception as e:
                 await self.safe_edit(query, f"❌ Failed to download file: {e}")
                 return
 
         # ── Cancel any stale pipeline job so user's specific settings take effect ──
+        # (Only reached for small files downloaded via Bot API)
         if current_file and current_file.get("_pipeline_job_id"):
             await self._cancel_stale_pipeline_job(session, "repair_video", update.effective_user.id)
 
@@ -4807,11 +4858,26 @@ class EnhancedMediaHandler:
             try:
                 await self._ensure_current_file_downloaded(update, context, session)
                 current_file = session.get("current_file")
+                # If pipeline queued a job (big file), watch it and return.
+                if current_file and current_file.get("_pipeline_job_id"):
+                    _pipeline_job_id = current_file["_pipeline_job_id"]
+                    kb = InlineKeyboardMarkup(
+                        [[InlineKeyboardButton("❌ Cancel", callback_data=f"cancel_job:{_pipeline_job_id}")]]
+                    )
+                    await self.safe_edit(
+                        query,
+                        f"✅ Large file queued (Job: {_pipeline_job_id[:8]}...). I'll send the result when ready.",
+                        reply_markup=kb,
+                    )
+                    with contextlib.suppress(RuntimeError):
+                        asyncio.create_task(self._watch_job_progress(query, _pipeline_job_id))
+                    return
             except Exception as e:
                 await self.safe_edit(query, f"❌ Failed to download file: {e}")
                 return
 
         # ── Cancel any stale pipeline job so user's specific settings take effect ──
+        # (Only reached for small files downloaded via Bot API)
         if current_file and current_file.get("_pipeline_job_id"):
             await self._cancel_stale_pipeline_job(session, "extract_streams", update.effective_user.id)
 
@@ -4892,11 +4958,26 @@ class EnhancedMediaHandler:
             try:
                 await self._ensure_current_file_downloaded(update, context, session)
                 current_file = session.get("current_file")
+                # If pipeline queued a job (big file), watch it and return.
+                if current_file and current_file.get("_pipeline_job_id"):
+                    _pipeline_job_id = current_file["_pipeline_job_id"]
+                    kb = InlineKeyboardMarkup(
+                        [[InlineKeyboardButton("❌ Cancel", callback_data=f"cancel_job:{_pipeline_job_id}")]]
+                    )
+                    await self.safe_edit(
+                        query,
+                        f"✅ Large file queued (Job: {_pipeline_job_id[:8]}...). I'll send the result when ready.",
+                        reply_markup=kb,
+                    )
+                    with contextlib.suppress(RuntimeError):
+                        asyncio.create_task(self._watch_job_progress(query, _pipeline_job_id))
+                    return
             except Exception as e:
                 await self.safe_edit(query, f"❌ Failed to download file: {e}")
                 return
 
         # ── Cancel any stale pipeline job so user's specific settings take effect ──
+        # (Only reached for small files downloaded via Bot API)
         if current_file and current_file.get("_pipeline_job_id"):
             await self._cancel_stale_pipeline_job(session, "convert_audio_format", update.effective_user.id)
 
