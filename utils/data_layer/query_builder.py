@@ -153,7 +153,7 @@ class PreparedQuery:
             raise ValidationError(f"Field name cannot start with '$': {field}")
         if self.fillable and field not in self.fillable and field != "_id":
             raise ValidationError(f"Field '{field}' is not in fillable fields")
-        if field in self.guarded:
+        if field in self.guarded and field != "_id":
             raise ValidationError(f"Field '{field}' is guarded")
 
     def _validate_fields(self, fields: set[str]):
@@ -421,7 +421,7 @@ class QueryBuilder:
             raise ValidationError(f"Field name cannot start with '$': {field}")
         if self.fillable and base_field not in self.fillable and base_field != "_id":
             raise ValidationError(f"Field '{base_field}' is not in fillable fields: {self.fillable}")
-        if base_field in self.guarded:
+        if base_field in self.guarded and base_field != "_id":
             raise ValidationError(f"Field '{base_field}' is guarded")
 
     def _validate_updates(self, updates: dict[str, Any]) -> dict[str, Any]:
