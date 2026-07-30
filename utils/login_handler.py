@@ -298,9 +298,17 @@ async def _receive_phone(
     from telethon.sessions import StringSession  # noqa: PLC0415
 
     try:
+        # If there's a saved session string, validate it before use.
+        # Telethon raises "Not a valid string" for corrupted/invalid
+        # session strings — fall back to an empty session gracefully.
         if saved_session_str:
-            client = TelegramClient(StringSession(saved_session_str), api_id, api_hash)
-        else:
+            try:
+                client = TelegramClient(StringSession(str(saved_session_str)), api_id, api_hash)
+            except Exception as sess_exc:
+                logger.warning("login: stored session string invalid (%s), starting fresh", sess_exc)
+                saved_session_str = None  # fall through to empty session
+
+        if not saved_session_str:
             client = TelegramClient(StringSession(), api_id, api_hash)
 
         await client.connect()
