@@ -788,6 +788,51 @@ def setup_handlers(application: Application) -> None:
 
     application.add_handler(CommandHandler("logout", latency_wrapper(logout_command, "logout_command")))
 
+    async def logoutpyro_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        user_id = update.effective_user.id
+        if ADMIN_USER_ID and user_id != ADMIN_USER_ID:
+            await update.message.reply_text("Unauthorized: admin only")
+            return
+
+        # ── Clean up any active login flow before logging out ──
+        futures_map = context.application.bot_data.get("login_futures", {})
+        if user_id in futures_map and futures_map[user_id].get("task") is not None and not futures_map[user_id]["task"].done():
+            logger.info("logoutpyro: cleaning up active login flow for user %s", user_id)
+            await cleanup_login_flow(context, user_id)
+
+        try:
+            removed = []
+
+            # 1. Clear Pyrogram session from JSON file
+            try:
+                from utils.telethon_session import save_session_string_to_file_async
+                if await save_session_string_to_file_async("", client_type="pyrogram"):
+                    removed.append("JSON file (pyrogram_session cleared)")
+            except Exception as exc:
+                logger.debug("logoutpyro: JSON clear failed: %s", exc)
+
+            # 2. Clear Pyrogram session from MongoDB (saves "" for pyrogram_session,
+            #    preserving telethon_session and string_session keys)
+            try:
+                db_model_lo = context.application.bot_data.get("db_model")
+                if db_model_lo is not None:
+                    await db_model_lo.save_session(user_id, {"pyrogram_session": ""})
+                    removed.append("MongoDB (pyrogram_session cleared)")
+            except Exception as exc:
+                logger.debug("logoutpyro: MongoDB clear failed: %s", exc)
+
+            if removed:
+                await update.message.reply_text(
+                    f"✅ Logged out of Pyrogram and cleared session:\n{chr(10).join(removed)}"
+                )
+            else:
+                await update.message.reply_text("No Pyrogram session was found to clear.")
+        except Exception as exc:
+            logger.exception("/logoutpyro failed: %s", exc)
+            await update.message.reply_text("Failed to clear the Pyrogram session. Check server logs for details.")
+
+    application.add_handler(CommandHandler("logoutpyro", latency_wrapper(logoutpyro_command, "logoutpyro_command")))
+
     async def canceljob_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_id = update.effective_user.id
         # restrict to admin or allowed users
@@ -1102,6 +1147,29 @@ async def main(background: bool = False) -> None:
                 logger.info("Eagerly persisted PYROGRAM_SESSION to MongoDB (at startup)")
     except Exception as exc:
         logger.debug("Eager Pyrogram->MongoDB persistence skipped: %s", exc)
+
+    # ── Startup: persist MongoDB Pyrogram session to JSON file ──
+    # When PYROGRAM_SESSION env var is NOT set (pure remote login via /loginpyro),
+    # the JSON file starts empty on a fresh deploy.  Read from MongoDB and write
+    # to JSON so the uploader/downloader (which use build_pyrogram_client →
+    # get_pyrogram_session_string → env+JSON only) can find it immediately.
+    try:
+        if not os.getenv("PYROGRAM_SESSION"):
+            from utils.telethon_session import (
+                _load_all_sessions_from_file_async,
+                get_pyrogram_session_string_for_user,
+                save_session_string_to_file_async,
+            )
+            _existing = await _load_all_sessions_from_file_async()
+            if not _existing.get("pyrogram_session") and ADMIN_USER_ID and _mongo_db:
+                _mongo_pyro = await get_pyrogram_session_string_for_user(
+                    user_id=ADMIN_USER_ID, db_model=_mongo_db,
+                )
+                if _mongo_pyro:
+                    await save_session_string_to_file_async(_mongo_pyro, client_type="pyrogram")
+                    logger.info("Startup: persisted Pyrogram session from MongoDB to JSON file")
+    except Exception as exc:
+        logger.debug("Startup MongoDB->JSON Pyrogram persistence skipped: %s", exc)
 
     # Check FFmpeg (binary) availability and ffmpeg-python binding; warn if missing
     try:

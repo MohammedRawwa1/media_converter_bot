@@ -84,6 +84,23 @@ _SESSION_CACHE_EXPIRES = 0.0
 _SESSION_CACHE_TTL = 60  # seconds
 _SESSION_CACHE_LOCK = threading.Lock()
 
+# ── In-memory cache for MongoDB-resolved Pyrogram session ───────────
+#
+# ``get_pyrogram_session_string()`` is synchronous and cannot call
+# ``db_model.load_session()`` directly.  To still allow the sync path
+# to find MongoDB-persisted sessions, we maintain a simple in-memory
+# cache that is populated by the async
+# ``get_pyrogram_session_string_for_user()`` whenever it successfully
+# loads a session from MongoDB.
+#
+# This cache is NOT TTL-based; it is invalidated explicitly whenever
+# the session is cleared (e.g. via ``/logoutpyro``) or when a new save
+# replaces the old value.  The cache is a single string because there
+# is at most one active Pyrogram session (admin user).
+# --------------------------------------------------------------------
+_PYROGRAM_MONGO_CACHE: str | None = None
+_PYROGRAM_MONGO_CACHE_LOCK = threading.Lock()
+
 
 def _get_cached_sessions() -> dict | None:
     """Return cached session dict if still fresh, else None."""
@@ -107,6 +124,26 @@ def _invalidate_session_cache():
         global _SESSION_CACHE_DATA, _SESSION_CACHE_EXPIRES
         _SESSION_CACHE_DATA = None
         _SESSION_CACHE_EXPIRES = 0.0
+
+
+def _clear_pyrogram_mongo_cache():
+    """Clear the in-memory MongoDB Pyrogram session cache."""
+    with _PYROGRAM_MONGO_CACHE_LOCK:
+        global _PYROGRAM_MONGO_CACHE
+        _PYROGRAM_MONGO_CACHE = None
+
+
+def _set_pyrogram_mongo_cache(session_str: str):
+    """Set the in-memory MongoDB Pyrogram session cache."""
+    with _PYROGRAM_MONGO_CACHE_LOCK:
+        global _PYROGRAM_MONGO_CACHE
+        _PYROGRAM_MONGO_CACHE = session_str
+
+
+def _get_pyrogram_mongo_cache() -> str | None:
+    """Return the cached MongoDB Pyrogram session, if any."""
+    with _PYROGRAM_MONGO_CACHE_LOCK:
+        return _PYROGRAM_MONGO_CACHE
 
 
 def _get_persisted_session_path() -> str:
@@ -217,6 +254,9 @@ def save_session_string_to_file(session_str: str, client_type: str = "telethon")
         )
         # Invalidate in-memory cache so subsequent reads see the new data
         _invalidate_session_cache()
+        # If we just cleared the Pyrogram session, also clear the MongoDB cache
+        if client_type == "pyrogram" and not session_str:
+            _clear_pyrogram_mongo_cache()
         return True
     except Exception as exc:
         logger.debug(
@@ -499,11 +539,15 @@ def build_telethon_client(api_id: int, api_hash: str, session_str: str | None = 
 
 
 def get_pyrogram_session_string() -> str | None:
-    """Return a Pyrogram session string from any available source.
+    """Return a Pyrogram session string from env vars, JSON file, or in-memory cache (sync).
 
     Resolution order:
     1. Environment variable (``PYROGRAM_SESSION`` etc.)
     2. Persisted JSON file (``pyrogram_session`` key, written by healthchecker)
+    3. In-memory cache populated by ``get_pyrogram_session_string_for_user()``
+       when it finds a session in MongoDB
+
+    For a direct MongoDB read, use ``get_pyrogram_session_string_for_user()`` (async).
     """
     # 1. Check env vars first (highest priority)
     env_str = _get_env_value(
@@ -520,11 +564,57 @@ def get_pyrogram_session_string() -> str | None:
     if file_str:
         return file_str
 
+    # 3. Fall back to the in-memory cache (populated by async MongoDB reads)
+    mongo_str = _get_pyrogram_mongo_cache()
+    if mongo_str:
+        return mongo_str
+
+    return None
+
+
+async def get_pyrogram_session_string_for_user(
+    user_id: int | None = None, db_model: object | None = None
+) -> str | None:
+    """Return a usable Pyrogram session string for the given user, if available.
+
+    Checks env vars, then the persisted JSON file, then a MongoDB-persisted
+    session when db_model is supplied.
+
+    When a session is found in MongoDB, it is also cached in-memory via
+    ``_set_pyrogram_mongo_cache()`` so that the sync
+    ``get_pyrogram_session_string()`` can benefit from it without an
+    async MongoDB call.
+    """
+    # 1. Check env vars + persisted JSON file
+    session_str = get_pyrogram_session_string()
+    if session_str:
+        return session_str
+
+    # 2. Check MongoDB-persisted session for the given user
+    if user_id is not None and db_model is not None:
+        try:
+            saved_session = await db_model.load_session(user_id)
+        except Exception as exc:
+            logger.warning("Failed to inspect MongoDB Pyrogram session for user %s: %s", user_id, exc)
+            saved_session = None
+
+        if isinstance(saved_session, dict):
+            session_value = saved_session.get("pyrogram_session")
+            if session_value:
+                logger.info(
+                    "session: loaded Pyrogram session string from MongoDB for user %s",
+                    user_id,
+                )
+                session_str = str(session_value)
+                _set_pyrogram_mongo_cache(session_str)
+                return session_str
+
+    logger.debug("session: no Pyrogram session string found for user %s", user_id)
     return None
 
 
 def build_pyrogram_client(api_id: int, api_hash: str, session_str: str | None = None) -> object | None:
-    """Build a Pyrogram client from a session string.
+    """Build a Pyrogram client from a session string (sync).
 
     Parameters
     ----------
@@ -540,6 +630,10 @@ def build_pyrogram_client(api_id: int, api_hash: str, session_str: str | None = 
     When ``session_str`` is provided explicitly, the internal resolution
     is skipped entirely, avoiding redundant file I/O — useful when the
     caller has already loaded the session string asynchronously.
+
+    For async callers that need MongoDB fallback too, prefer
+    ``build_pyrogram_client_async()`` which first checks env → JSON →
+    MongoDB before building the client.
 
     Reads the following env vars for retry/timeout configuration:
       - PYROGRAM_SLEEP_THRESHOLD (default 30): seconds to sleep before retrying
@@ -588,6 +682,44 @@ def build_pyrogram_client(api_id: int, api_hash: str, session_str: str | None = 
     except Exception:
         logger.exception("Failed to create Pyrogram client from session string")
         return None
+
+
+async def build_pyrogram_client_async(
+    api_id: int,
+    api_hash: str,
+    user_id: int | None = None,
+    db_model: object | None = None,
+) -> object | None:
+    """Build a Pyrogram client from a session string, checking MongoDB too (async).
+
+    Resolution order:
+    1. Environment variable (``PYROGRAM_SESSION`` etc.)
+    2. Persisted JSON file (``pyrogram_session`` key)
+    3. MongoDB (``pyrogram_session`` key, saved by ``/loginpyro`` or healthchecker)
+
+    Parameters
+    ----------
+    api_id:
+        Telegram API ID.
+    api_hash:
+        Telegram API hash.
+    user_id:
+        User ID for MongoDB session lookup (typically ``admin_user_id``).
+        When ``None``, MongoDB lookup is skipped.
+    db_model:
+        MongoDB model with ``load_session`` method.  Required for MongoDB lookup.
+
+    Returns a Pyrogram Client ready for ``client.start()``, or None if no
+    session string is available.
+
+    Same retry/timeout config as ``build_pyrogram_client()`` (reads env vars).
+    """
+    session_str = await get_pyrogram_session_string_for_user(
+        user_id=user_id, db_model=db_model
+    )
+    if not session_str:
+        return None
+    return build_pyrogram_client(api_id, api_hash, session_str=session_str)
 
 
 def is_pyrogram_available() -> bool:

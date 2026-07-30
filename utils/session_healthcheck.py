@@ -313,16 +313,20 @@ class SessionHealthChecker:
         """
         try:
             from utils.telethon_session import (
-                build_pyrogram_client,
-                get_pyrogram_session_string,
+                build_pyrogram_client_async,
                 get_userbot_credentials,
             )
 
-            if not get_pyrogram_session_string():
-                return False
             api_id, api_hash = get_userbot_credentials()
-            client = build_pyrogram_client(api_id, api_hash)
+
+            # Resolve session from env → JSON → MongoDB (includes /loginpyro sessions)
+            client = await build_pyrogram_client_async(
+                api_id, api_hash,
+                user_id=self.admin_user_id,
+                db_model=self.db_model,
+            )
             if client is None:
+                logger.debug("SessionHealthChecker: no Pyrogram session to recycle")
                 return False
 
             logger.info("SessionHealthChecker: attempting session recycling")
@@ -380,7 +384,7 @@ class SessionHealthChecker:
             h.error = f"import failed: {exc}"
             return h
 
-        # Check env vars first (fast, no I/O) — skip the file read if set
+        # Check env vars first (fast, no I/O)
         env_str = _get_env_value(
             "PYROGRAM_SESSION",
             "pyrogram_session",
@@ -390,12 +394,21 @@ class SessionHealthChecker:
         if env_str:
             session_str = env_str
         else:
-            # Read the persisted JSON file async to avoid blocking the event loop
+            # Read the persisted JSON file
             try:
                 session_str = await _load_session_string_from_file_async(client_type="pyrogram")
             except Exception as exc:
-                h.error = f"config check failed: {exc}"
-                return h
+                session_str = None
+
+        # If still nothing, check MongoDB (for sessions saved by /loginpyro)
+        if not session_str and self.db_model is not None and self.admin_user_id is not None:
+            try:
+                from utils.telethon_session import get_pyrogram_session_string_for_user
+                session_str = await get_pyrogram_session_string_for_user(
+                    user_id=self.admin_user_id, db_model=self.db_model
+                )
+            except Exception as exc:
+                logger.debug("SessionHealthChecker: MongoDB Pyrogram check failed: %s", exc)
 
         if not session_str:
             h.alive = False
