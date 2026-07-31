@@ -255,11 +255,11 @@ Hello {_escape_markdown(user_name)}! Send a media file and choose an action from
 /help — Detailed feature guide
 /settings — Your preferences
 /cancel — Stop current operation
-/canceljob <job_id> — Cancel a pending job (space between /canceljob and the job ID)
+/canceljob `<job_id>` — Cancel a pending job (space between /canceljob and the job ID)
 
 **🔐 Login (for large file support):**
-/login [phone] — Login via Telethon (user account)
-/loginpyro [phone] — Login via Pyrogram (better 2FA)
+/login `[phone]` — Login via Telethon (user account)
+/loginpyro `[phone]` — Login via Pyrogram (better 2FA)
 /logout — Log out Telethon session
 /logoutpyro — Log out Pyrogram session
 /loginstatus — Check live session health
@@ -329,7 +329,7 @@ When you receive the verification code:
 
 **⚙️ Utility Commands:**
 /cancel — Cancel current operation
-/canceljob <job_id> — Cancel a queued or running job (space between /canceljob and the job ID)
+/canceljob `<job_id>` — Cancel a queued or running job (space between /canceljob and the job ID)
 /logout — Log out Telethon session
 /logoutpyro — Log out Pyrogram session
 /loginstatus — Check live session health
