@@ -43,9 +43,10 @@ jobs:
           # (runtime deps aren't needed for static analysis)
           pip install -r requirements-dev.txt
 
+      # NOTE: intentionally NOT continue-on-error — a HIGH-severity Bandit
+      # finding must fail the build (the reporter below exits 1 on HIGH).
       - name: Run Bandit security scan
         id: bandit
-        continue-on-error: true
         run: |
           BANDIT_ARGS=""
           if [ -f .bandit ]; then
@@ -54,8 +55,11 @@ jobs:
           bandit $BANDIT_ARGS -r . -f json -o bandit-report.json 2>&1 || true
 
           if [ ! -f bandit-report.json ]; then
-            echo "has_issues=false" >> $GITHUB_OUTPUT
-            exit 0
+            # No report means the scan never ran (crash / config error / missing
+            # install) - fail closed rather than silently passing the gate.
+            echo "::error::Bandit produced no report; scan did not run"
+            echo "has_issues=true" >> $GITHUB_OUTPUT
+            exit 1
           fi
 
           python -c "

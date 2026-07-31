@@ -14,6 +14,8 @@ try:
 except Exception:
     aioredis = None
 
+from utils import file_utils
+
 try:
     from utils.forward_store import delete_forward_metadata, load_forward_metadata
     from utils.job_queue import enqueue_job
@@ -55,7 +57,9 @@ async def process_forward_hash(forward_hash: str):
     os.makedirs(input_dir, exist_ok=True)
 
     job_uuid = str(uuid.uuid4())
-    ext = os.path.splitext(meta.get("name") or "")[1] or ".mp4"
+    # Traversal hardening: the forward metadata `name` is attacker-influenced,
+    # so the extension must come from the shared allowlist.
+    ext = file_utils.safe_extension(meta.get("name"), ".mp4")
     input_path = os.path.join(input_dir, f"{job_uuid}{ext}")
 
     if not download_forward_via_userbot:
@@ -110,7 +114,12 @@ async def process_forward_hash(forward_hash: str):
             os.path.dirname(os.path.dirname(__file__)), "storage", "output"
         )
         os.makedirs(output_dir, exist_ok=True)
-        base_name = os.path.splitext(meta.get("name") or os.path.basename(input_path))[0]
+        # Traversal hardening: the forward metadata `name` is attacker-influenced,
+        # so it is sanitized to a single safe path component before joining it
+        # into the on-disk output path.
+        raw_name = meta.get("name") or os.path.basename(input_path)
+        base_name = os.path.splitext(await file_utils.sanitize_filename(raw_name))[0]
+        base_name = base_name or "forward"
         output_path = os.path.join(output_dir, f"{base_name}_{job_id}.mp4")
         job = {
             "job_id": job_id,

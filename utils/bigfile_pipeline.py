@@ -30,6 +30,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 
 import config
+from utils import file_utils
 
 logger = logging.getLogger(__name__)
 
@@ -128,12 +129,9 @@ class BigFilePipeline:
         job_id = uuid.uuid4().hex
         input_s3_key = f"inputs/{job_id}/source"
 
-        # Determine extension from filename
-        ext = ""
-        if original_filename:
-            _, ext = os.path.splitext(original_filename)
-        if not ext:
-            ext = ".bin"
+        # Determine extension from filename. The extension is allowlisted
+        # so traversal/arbitrary suffixes can't reach the on-disk temp path.
+        ext = file_utils.safe_extension(original_filename or "", ".bin")
 
         actual_size = 0
         s3_key = input_s3_key
@@ -283,11 +281,9 @@ class BigFilePipeline:
 
             # Determine output extension: prefer caller-supplied output_ext,
             # otherwise fall back to original filename extension or .mp4
-            _out_ext = output_ext or ".mp4"
-            if not output_ext and original_filename:
-                _, _orig_ext = os.path.splitext(original_filename)
-                if _orig_ext:
-                    _out_ext = _orig_ext
+            # Output extension: prefer caller-supplied (handler-set) value,
+            # otherwise derive from the allowlisted original-filename ext.
+            _out_ext = output_ext or file_utils.safe_extension(original_filename or "", ".mp4")
 
             # Build the job payload
             job = {

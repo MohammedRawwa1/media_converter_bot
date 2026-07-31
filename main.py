@@ -65,13 +65,13 @@ from tasks import (
 from utils import (
     ensure_directories,
 )
-from utils.markdown_utils import escape_markdown as _escape_markdown
 from utils.error_handler import (
     get_error_handler,
     setup_comprehensive_logging,
 )
 from utils.job_queue import cancel_job
 from utils.login_handler import cleanup_login_flow, register_login_handlers
+from utils.markdown_utils import escape_markdown as _escape_markdown
 from utils.rate_limiter import ConversionRateLimiter, ConversionRateLimiterRedis, TelegramAPIRateLimiter
 from utils.session_healthcheck import (
     get_session_healthchecker,
@@ -583,8 +583,16 @@ def setup_handlers(application: Application) -> None:
         except Exception:
             logger.debug("main: Per-user JSON file check failed")
 
-        tele_per_user = bool(per_user_json_session and per_user_json_session.get("telethon_session")) if per_user_json_session else False
-        pyro_per_user = bool(per_user_json_session and per_user_json_session.get("pyrogram_session")) if per_user_json_session else False
+        tele_per_user = (
+            bool(per_user_json_session and per_user_json_session.get("telethon_session"))
+            if per_user_json_session
+            else False
+        )
+        pyro_per_user = (
+            bool(per_user_json_session and per_user_json_session.get("pyrogram_session"))
+            if per_user_json_session
+            else False
+        )
 
         # ── Credentials check ──
         has_api_id = bool(
@@ -952,9 +960,7 @@ def _build_request(
         return Request(connection_pool_size=connection_pool_size, **kwargs)
     except TypeError:
         # Some PTB releases reject connection_pool_size; fall back gracefully.
-        logger.info(
-            "Request() rejected connection_pool_size; building request without it"
-        )
+        logger.info("Request() rejected connection_pool_size; building request without it")
         return Request(**kwargs)
 
 
@@ -1256,9 +1262,13 @@ async def main(background: bool = False) -> None:
     # Telethon: persist from MongoDB to per-user JSON when no env var is set
     try:
         _telethon_env_keys = (
-            "API_SESSION", "SESSION", "api_session",
-            "USERBOT_SESSION", "userbot_session",
-            "TELETHON_SESSION", "telethon_session",
+            "API_SESSION",
+            "SESSION",
+            "api_session",
+            "USERBOT_SESSION",
+            "userbot_session",
+            "TELETHON_SESSION",
+            "telethon_session",
         )
         _has_telethon_env = any(os.getenv(k) for k in _telethon_env_keys)
         if not _has_telethon_env and ADMIN_USER_ID and _mongo_db:
@@ -2557,9 +2567,7 @@ try:
                         raise RuntimeError("No dispatch path available")
                     with METRICS_LOCK:
                         METRICS["updates_dispatched"] += 1
-                    logger.info(
-                        f"Background dispatched update {getattr(u, 'update_id', 'unknown')} on attempt {i + 1}"
-                    )
+                    logger.info(f"Background dispatched update {getattr(u, 'update_id', 'unknown')} on attempt {i + 1}")
                     return True
                 except Exception as e:
                     logger.debug(f"Background dispatch attempt {i + 1} failed: {e}")

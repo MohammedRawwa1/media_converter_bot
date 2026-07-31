@@ -35,9 +35,10 @@ except ImportError:
         uuid = None
 
 try:
-    from utils.file_utils import AsyncFileLock, detect_filename
+    from utils.file_utils import AsyncFileLock, detect_filename, sanitize_filename
 except ImportError:
     AsyncFileLock = None
+    sanitize_filename = None
 
 # Import config module if available (some code references `config.<NAME>`)
 try:
@@ -1815,7 +1816,12 @@ class EnhancedMediaHandler:
                 with contextlib.suppress(OSError):
                     os.makedirs(input_dir, exist_ok=True)
 
-                ext = os.path.splitext(metadata.get("name") or "")[1] or ".mp4"
+                _meta_name = metadata.get("name") or ""
+                if _meta_name and sanitize_filename is not None:
+                    _safe_name = await sanitize_filename(_meta_name)
+                else:
+                    _safe_name = _meta_name
+                ext = os.path.splitext(_safe_name)[1] or ".mp4"
                 input_path = os.path.join(input_dir, f"{jid}{ext}") if jid else os.path.join(input_dir, f"{fh}{ext}")
 
                 fetched = False
@@ -1985,13 +1991,19 @@ class EnhancedMediaHandler:
                     )
                     with contextlib.suppress(OSError):
                         os.makedirs(output_dir, exist_ok=True)
-                    base_name = os.path.splitext(metadata.get("name") or os.path.basename(input_path))[0]
+                    _raw_name = metadata.get("name") or os.path.basename(input_path)
+                    _safe_name = (
+                        await sanitize_filename(_raw_name)
+                        if sanitize_filename is not None
+                        else os.path.basename(_raw_name)
+                    )
+                    base_name = os.path.splitext(_safe_name)[0]
                     output_path = os.path.join(output_dir, f"{base_name}_{job_id}.mp4")
                     job = {
                         "job_id": job_id,
                         "input_path": input_path,
                         "output_path": output_path,
-                        "original_filename": metadata.get("name") or os.path.basename(input_path),
+                        "original_filename": _safe_name,
                         "output_filename": os.path.basename(output_path),
                         "ffmpeg_args": [
                             "-c:v",

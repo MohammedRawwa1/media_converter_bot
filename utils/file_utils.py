@@ -372,6 +372,61 @@ def safe_rmtree(path: str) -> None:
     shutil.rmtree(resolved, ignore_errors=True)
 
 
+# Media/container extensions allowed when building on-disk paths from
+# attacker-influenced filenames. Anything else falls back to a safe
+# default so suffixes like '.html' or '.svg' can never reach the
+# filesystem as part of a path.
+ALLOWED_EXTENSIONS = frozenset(
+    {
+        ".mp4",
+        ".mkv",
+        ".avi",
+        ".mov",
+        ".webm",
+        ".flv",
+        ".wmv",
+        ".m4v",
+        ".mpg",
+        ".mpeg",
+        ".ts",
+        ".mts",
+        ".m2ts",
+        ".3gp",
+        ".ogv",
+        ".webp",
+        ".mp3",
+        ".wav",
+        ".aac",
+        ".flac",
+        ".ogg",
+        ".m4a",
+        ".opus",
+        ".wma",
+        ".jpg",
+        ".jpeg",
+        ".png",
+        ".gif",
+        ".bin",
+        ".srt",
+        ".ass",
+        ".vtt",
+        ".zip",
+    }
+)
+
+
+def safe_extension(filename: str | None, default: str = ".bin") -> str:
+    """Return an allowlisted, lowercased extension for `filename`.
+
+    Falls back to `default` when the extension is missing or not on the
+    allowlist, so attacker-supplied suffixes can never reach the filesystem.
+    """
+    if not filename:
+        return default
+    ext = os.path.splitext(str(filename))[1] or ""
+    return ext.lower() if ext.lower() in ALLOWED_EXTENSIONS else default
+
+
 async def sanitize_filename(name: str, max_len: int = 180) -> str:
     """Sanitize and normalize a filename string.
 

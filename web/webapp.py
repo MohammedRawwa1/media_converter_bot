@@ -39,22 +39,23 @@ OUTPUT_DIR = getattr(config, "OUTPUT_PATH", "storage/output")
 os.makedirs(INPUT_DIR, exist_ok=True)
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-# Allowed media extensions used when building on-disk input paths. Anything
-# else falls back to '.mp4' so attacker-supplied suffixes (e.g. '.html',
-# '.svg') can never become part of a filesystem path.
-ALLOWED_EXTENSIONS = frozenset(
-    {
-        ".mp4", ".mkv", ".avi", ".mov", ".webm", ".flv", ".wmv", ".m4v",
-        ".mp3", ".wav", ".aac", ".flac", ".ogg", ".m4a", ".opus",
-        ".srt", ".ass", ".vtt", ".zip",
-    }
-)
 
-
+# Allowed media extensions are centralized in utils.file_utils so the web
+# app and the BigFile pipeline share a single allowlist. Anything outside
+# it falls back to '.mp4' (path-traversal hardening for on-disk paths).
 def _safe_input_ext(filename: str) -> str:
-    """Return a whitelisted extension for `filename`, defaulting to ".mp4"."""
-    ext = os.path.splitext(filename or "")[1] or ""
-    return ext.lower() if ext.lower() in ALLOWED_EXTENSIONS else ".mp4"
+    """Return an allowlisted extension for `filename`, defaulting to ".mp4"."""
+    return file_utils.safe_extension(filename or "", ".mp4")
+
+
+def _is_within_output_dir(path: str) -> bool:
+    """Return True if `path` resolves inside OUTPUT_DIR (defense-in-depth)."""
+    try:
+        base = os.path.realpath(OUTPUT_DIR)
+        target = os.path.realpath(path)
+        return target == base or target.startswith(base + os.sep)
+    except Exception:
+        return False
 
 
 # Optional upload size cap (bytes) to protect memory from huge multipart uploads.
@@ -996,10 +997,7 @@ def status(job_id):
     # Optional auth: require the same upload_token when UPLOAD_SECRET is set
     upload_secret = os.environ.get("UPLOAD_SECRET")
     if upload_secret:
-        incoming_token = (
-            request.headers.get("X-Upload-Token")
-            or request.args.get("upload_token")
-        )
+        incoming_token = request.headers.get("X-Upload-Token") or request.args.get("upload_token")
         if not incoming_token or incoming_token != upload_secret:
             return (
                 jsonify({"error": "unauthorized", "detail": "missing or invalid upload token"}),
@@ -1119,10 +1117,7 @@ def download(job_id):
     # Optional auth: require the same upload_token when UPLOAD_SECRET is set
     upload_secret = os.environ.get("UPLOAD_SECRET")
     if upload_secret:
-        incoming_token = (
-            request.headers.get("X-Upload-Token")
-            or request.args.get("upload_token")
-        )
+        incoming_token = request.headers.get("X-Upload-Token") or request.args.get("upload_token")
         if not incoming_token or incoming_token != upload_secret:
             return (
                 jsonify({"error": "unauthorized", "detail": "missing or invalid upload token"}),
@@ -1149,7 +1144,7 @@ def download(job_id):
         # If output is a local path we can send it directly
         try:
             output_val = job_hash.get("output")
-            if output_val and os.path.exists(output_val):
+            if output_val and os.path.exists(output_val) and _is_within_output_dir(output_val):
                 output_path = output_val
                 filename = job_hash.get("output_filename") or os.path.basename(output_path)
                 try:
@@ -1179,7 +1174,12 @@ def download(job_id):
         local = JOB_STORE.get(job_id)
     except Exception:
         local = None
-    if local and local.get("output") and os.path.exists(local.get("output")):
+    if (
+        local
+        and local.get("output")
+        and os.path.exists(local.get("output"))
+        and _is_within_output_dir(local.get("output"))
+    ):
         try:
             return send_file(
                 local.get("output"), as_attachment=True, download_name=os.path.basename(local.get("output"))
@@ -1215,10 +1215,7 @@ def events(job_id):
     # Optional auth: require the same upload_token when UPLOAD_SECRET is set
     upload_secret = os.environ.get("UPLOAD_SECRET")
     if upload_secret:
-        incoming_token = (
-            request.headers.get("X-Upload-Token")
-            or request.args.get("upload_token")
-        )
+        incoming_token = request.headers.get("X-Upload-Token") or request.args.get("upload_token")
         if not incoming_token or incoming_token != upload_secret:
             return (
                 jsonify({"error": "unauthorized", "detail": "missing or invalid upload token"}),

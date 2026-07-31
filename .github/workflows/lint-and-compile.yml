@@ -64,31 +64,35 @@ jobs:
             -not -path './.pytest_cache/*' \
             -not -path './.ruff_cache/*' \
             -print0 | python -c "
-import ast
-import os
-import sys
+          import ast
+          import os
+          import sys
 
-issues = []
-for line in sys.stdin.buffer.read().split(b'\0'):
-    if not line:
-        continue
-    fpath = line.decode()
-    try:
-        ast.parse(open(fpath).read())
-    except SyntaxError as e:
-        rel = os.path.relpath(fpath)
-        print(f'::error file={rel}::SyntaxError: {e}')
-        issues.append(rel)
+          # Ensure UTF-8 output on any runner (avoids cp1252 UnicodeEncodeError for the
+          # emoji in the success line on Windows-local runs).
+          sys.stdout.reconfigure(encoding='utf-8', errors='replace')
 
-if issues:
-    n = len(issues)
-    print(f'::error::py_compile: {n} file(s) have syntax errors:')
-    for f in issues:
-        print(f'  - {f}')
-    sys.exit(1)
-else:
-    print('\u2705 py_compile: all files syntactically valid')
-"
+          issues = []
+          for line in sys.stdin.buffer.read().split(b'\0'):
+              if not line:
+                  continue
+              fpath = line.decode()
+              try:
+                  ast.parse(open(fpath, encoding='utf-8', errors='replace').read())
+              except SyntaxError as e:
+                  rel = os.path.relpath(fpath)
+                  print(f'::error file={rel}::SyntaxError: {e}')
+                  issues.append(rel)
+
+          if issues:
+              n = len(issues)
+              print(f'::error::py_compile: {n} file(s) have syntax errors:')
+              for f in issues:
+                  print(f'  - {f}')
+              sys.exit(1)
+          else:
+              print('\u2705 py_compile: all files syntactically valid')
+          "
 
       - name: Fail if lint or format failed
         if: steps.ruff_lint.outcome == 'failure' || steps.ruff_format.outcome == 'failure'

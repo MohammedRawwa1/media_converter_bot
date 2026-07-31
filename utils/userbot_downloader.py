@@ -32,6 +32,21 @@ except Exception:  # pragma: no cover - optional dependency
 
 logger = logging.getLogger(__name__)
 
+
+def _safe_path_token(value) -> str:
+    """Coerce a value into a filesystem-safe single path token.
+
+    Used when embedding chat/message ids into temp filenames, so an
+    attacker-influenced string can never introduce path separators.
+    """
+    if value is None:
+        return "none"
+    import re as _re
+
+    token = _re.sub(r"[^A-Za-z0-9_-]", "_", str(value))
+    return token[:80] or "none"
+
+
 # Module-level default timeouts for download operations.
 # Configurable via TELETHON_DOWNLOAD_TIMEOUT and PYROGRAM_DOWNLOAD_TIMEOUT env vars (default 600s = 10 min).
 TELETHON_DOWNLOAD_TIMEOUT = int(os.getenv("TELETHON_DOWNLOAD_TIMEOUT", "600"))
@@ -1554,7 +1569,7 @@ async def _download_bytes_with_pyrogram(
 
         _tmp_path = os.path.join(
             os.getenv("TEMP_PATH", _tempfile.gettempdir()),
-            f"recovery_{chat_id}_{message_id}.tmp",
+            f"recovery_{_safe_path_token(chat_id)}_{_safe_path_token(message_id)}.tmp",
         )
         try:
             if await _attempt_recovery_download(

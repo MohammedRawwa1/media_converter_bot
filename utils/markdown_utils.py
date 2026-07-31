@@ -15,10 +15,5 @@ def escape_markdown(text: str) -> str:
     there — only literal backticks must be stripped/replaced separately.
     """
     return (
-        str(text)
-        .replace("\\", "\\\\")
-        .replace("_", "\\_")
-        .replace("*", "\\*")
-        .replace("`", "\\`")
-        .replace("[", "\\[")
+        str(text).replace("\\", "\\\\").replace("_", "\\_").replace("*", "\\*").replace("`", "\\`").replace("[", "\\[")
     )

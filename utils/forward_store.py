@@ -1,6 +1,7 @@
 import asyncio
 import json
 import os
+import re
 import uuid
 from datetime import datetime
 
@@ -67,6 +68,18 @@ def _publish_forward_notification(fid: str, extra: dict = None) -> None:
     except Exception:
         logger.debug("forward_store: Redis publish failed (outer)")
         # never raise
+
+
+# Forward ids are server-generated ``uuid.uuid4().hex`` values. Reject any
+# other shape (path separators, traversal sequences, etc.) before it is
+# used to build an on-disk / S3 key, so attacker-supplied forward_hash
+# values can never escape the forwards storage area.
+_SAFE_FID_RE = re.compile(r"^[0-9a-f]{32}$")
+
+
+def _is_safe_fid(fid: str) -> bool:
+    """Return True if `fid` looks like a server-generated forward id."""
+    return isinstance(fid, str) and bool(_SAFE_FID_RE.fullmatch(fid))
 
 
 def _local_forwards_dir() -> str:
@@ -161,6 +174,11 @@ async def load_forward_metadata(fid: str) -> dict | None:
     Async callers should use ``await load_forward_metadata(fid)``;
     sync callers should wrap with ``asyncio.run(load_forward_metadata(fid))``.
     """
+    # Path-traversal guard: only server-generated ids are allowed.
+    if not _is_safe_fid(fid):
+        logger.warning("forward_store: refusing load of invalid fid %r", fid)
+        return None
+
     backend_name = config.get_storage_backend_name() if config else (os.getenv("STORAGE_BACKEND") or "local").lower()
     key = f"forwards/{fid}.json"
 
@@ -227,6 +245,11 @@ async def delete_forward_metadata(fid: str) -> bool:
     Async callers should use ``await delete_forward_metadata(fid)``;
     sync callers should wrap with ``asyncio.run(delete_forward_metadata(fid))``.
     """
+    # Path-traversal guard: only server-generated ids are allowed.
+    if not _is_safe_fid(fid):
+        logger.warning("forward_store: refusing delete of invalid fid %r", fid)
+        return False
+
     # When debugging it may be useful to keep forward metadata in storage
     # for investigation. Honor `KEEP_FORWARD_METADATA=1|true|yes` to skip
     # removing the saved forward JSON.

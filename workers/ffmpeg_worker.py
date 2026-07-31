@@ -469,7 +469,10 @@ async def handle_job(job: dict):
         os.makedirs(temp_dir, exist_ok=True)
         _, ext = os.path.splitext(input_key)
         if not ext:
-            ext = os.path.splitext(job.get("original_filename") or "")[1] or ""
+            # Allowlist the fallback ext (shared with the BigFile pipeline) so
+            # attacker-supplied original_filenames can't inject odd suffixes
+            # into the on-disk temp path.
+            ext = file_utils.safe_extension(job.get("original_filename") or "", "")
         temp_input_path = os.path.join(temp_dir, f"{job_id}_src{ext}")
 
         if get_storage_backend is None:

@@ -427,9 +427,7 @@ class SessionHealthChecker:
             try:
                 from utils.telethon_session import get_pyrogram_session_string_for_user
 
-                session_str = await get_pyrogram_session_string_for_user(
-                    user_id=check_user_id, db_model=self.db_model
-                )
+                session_str = await get_pyrogram_session_string_for_user(user_id=check_user_id, db_model=self.db_model)
             except Exception as exc:
                 logger.debug("SessionHealthChecker: MongoDB Pyrogram check failed: %s", exc)
 
@@ -440,9 +438,7 @@ class SessionHealthChecker:
         if not session_str:
             session_str = await self._load_any_session("pyrogram_session")
             if session_str:
-                logger.info(
-                    "SessionHealthChecker: Pyrogram session found via latest-Mongo fallback"
-                )
+                logger.info("SessionHealthChecker: Pyrogram session found via latest-Mongo fallback")
 
         if not session_str:
             h.alive = False
@@ -555,15 +551,11 @@ class SessionHealthChecker:
                             user_id=check_user_id, db_model=self.db_model
                         )
                     except Exception as exc:
-                        logger.debug(
-                            "SessionHealthChecker: per-user Mongo Telethon check failed: %s", exc
-                        )
+                        logger.debug("SessionHealthChecker: per-user Mongo Telethon check failed: %s", exc)
                 if not session_str:
                     session_str = await self._load_any_session("telethon_session")
                     if session_str:
-                        logger.info(
-                            "SessionHealthChecker: Telethon session found via latest-Mongo fallback"
-                        )
+                        logger.info("SessionHealthChecker: Telethon session found via latest-Mongo fallback")
 
             if not session_str:
                 # Fall back to checking for a file-based .session on disk
