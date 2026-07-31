@@ -433,6 +433,17 @@ class SessionHealthChecker:
             except Exception as exc:
                 logger.debug("SessionHealthChecker: MongoDB Pyrogram check failed: %s", exc)
 
+        # Fall back to the most recent session stored for ANY user. The periodic
+        # check doesn't know which user owns a /login or /loginpyro session, so
+        # when per-user lookups miss, scan MongoDB for the latest document before
+        # declaring the session unconfigured (avoids false UNHEALTHY warnings).
+        if not session_str:
+            session_str = await self._load_any_session("pyrogram_session")
+            if session_str:
+                logger.info(
+                    "SessionHealthChecker: Pyrogram session found via latest-Mongo fallback"
+                )
+
         if not session_str:
             h.alive = False
             h.error = "PYROGRAM_SESSION not configured"
@@ -533,6 +544,26 @@ class SessionHealthChecker:
                 except Exception as exc:
                     h.error = f"config check failed: {exc}"
                     return h
+
+            # If still nothing, check MongoDB (sessions saved by /login persist there)
+            if not session_str and self.db_model is not None:
+                if check_user_id is not None:
+                    try:
+                        from utils.telethon_session import get_telethon_session_string_for_user
+
+                        session_str = await get_telethon_session_string_for_user(
+                            user_id=check_user_id, db_model=self.db_model
+                        )
+                    except Exception as exc:
+                        logger.debug(
+                            "SessionHealthChecker: per-user Mongo Telethon check failed: %s", exc
+                        )
+                if not session_str:
+                    session_str = await self._load_any_session("telethon_session")
+                    if session_str:
+                        logger.info(
+                            "SessionHealthChecker: Telethon session found via latest-Mongo fallback"
+                        )
 
             if not session_str:
                 # Fall back to checking for a file-based .session on disk
@@ -716,6 +747,55 @@ class SessionHealthChecker:
                 exc,
             )
 
+    async def _load_any_session(self, key: str) -> str | None:
+        """Return the most recent session string of a given type for ANY user.
+
+        The periodic healthcheck does not know which user owns a session created
+        via /login or /loginpyro, so when per-user lookups miss we scan MongoDB
+        for the latest document containing the requested typed key
+        (e.g. "pyrogram_session" or "telethon_session").
+
+        Legacy documents that predate the typed-key split and only carry
+        ``string_session`` are used as a last resort.
+        """
+        if self.db_model is None:
+            return None
+        try:
+            # Most recent doc that actually contains this typed session key
+            doc = await (
+                self.db_model.sessions.select(
+                    filters={f"session.{key}": {"$exists": True}},
+                    projection={"_id": 0, "session": 1},
+                )
+                .sort(("updated_at", -1))
+                .first()
+            )
+            if doc:
+                sess = doc.get("session") or {}
+                return sess.get(key)
+
+            # Legacy fallback: a doc carrying ONLY the old string_session key
+            # (avoids returning a Pyrogram string for a Telethon lookup).
+            doc = await (
+                self.db_model.sessions.select(
+                    filters={
+                        "session.string_session": {"$exists": True},
+                        "session.telethon_session": {"$exists": False},
+                        "session.pyrogram_session": {"$exists": False},
+                    },
+                    projection={"_id": 0, "session": 1},
+                )
+                .sort(("updated_at", -1))
+                .first()
+            )
+            if doc:
+                sess = doc.get("session") or {}
+                return sess.get("string_session")
+        except Exception as exc:
+            logger.debug("SessionHealthChecker: latest-Mongo session load failed: %s", exc)
+            return None
+        return None
+
     # ── Admin alerts ────────────────────────────────────────────────
 
     async def _alert_admin(self, title: str, result: dict):
@@ -732,7 +812,7 @@ class SessionHealthChecker:
             "",
             f"{status_emoji} Status: `{'Alive' if result.get('alive') else 'Unhealthy'}`",
             f"\u23f1 Latency: `{result.get('latency_ms', 'N/A')} ms`",
-            f"\u26a0 Error: `{result.get('error', 'None')}`",
+            f"\u26a0 Error: `{(result.get('error') or 'None').replace('`', '')}`",
         ]
         if result.get("phone"):
             lines.append(f"\ud83d\udcf1 Phone: `{result['phone']}`")
@@ -786,7 +866,7 @@ class SessionHealthChecker:
             if r.get("dc_id"):
                 lines.append(f"   DC: `{r['dc_id']}`")
             if r.get("error"):
-                lines.append(f"   Error: `{r['error']}`")
+                lines.append(f"   Error: `{str(r['error']).replace('`', '')}`")
             lines.append("")
 
         lines.append(

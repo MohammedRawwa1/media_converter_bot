@@ -21,7 +21,12 @@ def _validate_url_safe(url: str) -> bool:
             return False
         if not parsed.netloc:
             return False
-        hostname = parsed.netloc.split(":")[0].split("@")[-1]
+        # parsed.hostname correctly handles userinfo (user:pass@host) and
+        # IPv6 brackets; manual netloc parsing would otherwise pick up the
+        # username or an IPv6 '[' as the hostname.
+        hostname = parsed.hostname
+        if not hostname:
+            return False
 
         # Try direct IP match first
         try:

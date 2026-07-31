@@ -38,6 +38,8 @@ import time
 from telegram import Update
 from telegram.ext import CommandHandler, ContextTypes, MessageHandler, filters
 
+from utils.markdown_utils import escape_markdown as _escape_markdown
+
 logger = logging.getLogger(__name__)
 
 
@@ -296,7 +298,7 @@ async def _login_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
         await update.message.reply_text(
             "📱 Please send the phone number in international format,\n"
-            "e.g. ``+1234567890``\n\n"
+            "e.g. `+1234567890`\n\n"
             "⏳ Your login flow will expire after **5 minutes** of inactivity.\n"
             "Type /cancel to abort." + warn,
             parse_mode="Markdown",
@@ -354,8 +356,8 @@ async def _handle_login_text(update: Update, context: ContextTypes.DEFAULT_TYPE)
         # Validate phone
         if not text.startswith("+"):
             await update.message.reply_text(
-                "❌ Phone number must start with ``+`` and country code.\n"
-                "e.g. ``+1234567890``\n\nPlease try again or type /cancel.",
+                "❌ Phone number must start with `+` and country code.\n"
+                "e.g. `+1234567890`\n\nPlease try again or type /cancel.",
                 parse_mode="Markdown",
             )
             return  # consumed — don't pass to other handlers
@@ -578,7 +580,7 @@ async def _run_login_task(
                             chat_id,
                             status_msg,
                             "❌ The verification codes keep expiring before they can be used.\n"
-                            "This usually happens when two bots share API_ID/API_HASH with 2FA enabled.\n"
+                            "This usually happens when two bots share `API_ID/API_HASH` with 2FA enabled.\n"
                             "Try using /logout first, then /login again.",
                         )
                         return
@@ -642,7 +644,7 @@ async def _run_login_task(
                     return
 
                 # Unhandled error
-                await _login_fail(bot, chat_id, status_msg, f"❌ Login failed: {exc}")
+                await _login_fail(bot, chat_id, status_msg, f"❌ Login failed: {_escape_markdown(exc)}")
                 logger.exception("login: sign_in failed: %s", exc)
                 return
 
@@ -658,7 +660,7 @@ async def _run_login_task(
 
             msg_text = "🔐 Two-step verification is enabled. Please enter your account password:"
             if pwd_hint:
-                msg_text += f"\nPassword hint: `{pwd_hint}`"
+                msg_text += f"\nPassword hint: `{pwd_hint.replace('`', '')}`"
             try:
                 await status_msg.edit_text(msg_text, parse_mode="Markdown")
             except Exception:
@@ -727,20 +729,20 @@ async def _run_login_task(
         try:
             await status_msg.edit_text(
                 f"✅ **Telethon login successful!**\n"
-                f"User: {uname}\n"
+                f"User: {_escape_markdown(uname)}\n"
                 f"Phone: `{phone}`\n"
                 f"DC: {client.session.dc_id}\n"
-                f"Saved to: {summary}",
+                f"Saved to: {_escape_markdown(summary)}",
                 parse_mode="Markdown",
             )
         except Exception:
             await bot.send_message(
                 chat_id,
                 f"✅ **Telethon login successful!**\n"
-                f"User: {uname}\n"
+                f"User: {_escape_markdown(uname)}\n"
                 f"Phone: `{phone}`\n"
                 f"DC: {client.session.dc_id}\n"
-                f"Saved to: {summary}",
+                f"Saved to: {_escape_markdown(summary)}",
                 parse_mode="Markdown",
             )
         logger.info("Login successful for %s (DC=%s)", phone, client.session.dc_id)
@@ -840,7 +842,7 @@ async def _pyro_login_command(update: Update, context: ContextTypes.DEFAULT_TYPE
         warn = _pyrogram_warning_text()
         await update.message.reply_text(
             "📱 Please send the phone number in international format,\n"
-            "e.g. ``+1234567890``\n\n"
+            "e.g. `+1234567890`\n\n"
             "This will use **Pyrogram** login (handles 2FA reliably).\n"
             "⏳ Your login flow will expire after **5 minutes** of inactivity.\n"
             "Type /cancel to abort." + warn,
@@ -1041,7 +1043,7 @@ async def _run_pyro_login_task(
                     exc_x,
                     exc,
                 )
-                await _login_fail(bot, chat_id, status_msg, f"❌ Login failed: {exc}")
+                await _login_fail(bot, chat_id, status_msg, f"❌ Login failed: {_escape_markdown(exc)}")
                 return
 
         if has_2fa:
@@ -1053,7 +1055,7 @@ async def _run_pyro_login_task(
 
             msg_text = "🔐 Two-step verification is enabled. Please enter your account password:"
             if pwd_hint:
-                msg_text += f"\nPassword hint: `{pwd_hint}`"
+                msg_text += f"\nPassword hint: `{pwd_hint.replace('`', '')}`"
             try:
                 await status_msg.edit_text(msg_text, parse_mode="Markdown")
             except Exception:
@@ -1088,7 +1090,7 @@ async def _run_pyro_login_task(
                 await client.check_password(password)
             except Exception as exc:
                 logger.warning("login [%s]: 2FA password failed: %s", elapsed(), exc)
-                await _login_fail(bot, chat_id, status_msg, f"❌ 2FA failed: {exc}")
+                await _login_fail(bot, chat_id, status_msg, f"❌ 2FA failed: {_escape_markdown(exc)}")
                 return
 
         # ✅ Login succeeded — export session string
@@ -1121,20 +1123,20 @@ async def _run_pyro_login_task(
         try:
             await status_msg.edit_text(
                 f"✅ **Pyrogram login successful!**\n"
-                f"User: {uname}\n"
+                f"User: {_escape_markdown(uname)}\n"
                 f"Phone: `{phone}`\n"
                 f"DC: {client.session.dc_id}\n"
-                f"Saved to: {summary}",
+                f"Saved to: {_escape_markdown(summary)}",
                 parse_mode="Markdown",
             )
         except Exception:
             await bot.send_message(
                 chat_id,
                 f"✅ **Pyrogram login successful!**\n"
-                f"User: {uname}\n"
+                f"User: {_escape_markdown(uname)}\n"
                 f"Phone: `{phone}`\n"
                 f"DC: {client.session.dc_id}\n"
-                f"Saved to: {summary}",
+                f"Saved to: {_escape_markdown(summary)}",
                 parse_mode="Markdown",
             )
         logger.info("Pyrogram login successful for %s (DC=%s)", phone, client.session.dc_id)

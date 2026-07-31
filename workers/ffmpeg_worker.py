@@ -2083,7 +2083,12 @@ async def handle_job(job: dict):
                                         tried = True
                                         async with aiohttp.ClientSession() as session:
                                             async with session.get(
-                                                job.get("source_url"), timeout=aiohttp.ClientTimeout(total=60)
+                                                # SSRF hardening: never follow redirects. The URL was
+                                                # pre-validated by webapp.py; a redirect to an internal
+                                                # address would bypass that validation.
+                                                job.get("source_url"),
+                                                timeout=aiohttp.ClientTimeout(total=60),
+                                                allow_redirects=False,
                                             ) as resp:
                                                 if resp.status == 200:
                                                     with open(input_path, "wb") as fh:

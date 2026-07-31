@@ -65,6 +65,7 @@ from tasks import (
 from utils import (
     ensure_directories,
 )
+from utils.markdown_utils import escape_markdown as _escape_markdown
 from utils.error_handler import (
     get_error_handler,
     setup_comprehensive_logging,
@@ -134,7 +135,8 @@ async def _dispatch_update_task(update):
     """Dispatch a single Update to the Application or dispatcher, updating metrics.
 
     This helper is safe to schedule from background tasks and centralizes
-    error handling and metrics increments used by webhook and ASGI consumers.
+    error handling and metrics increments used by webhook handlers and
+    long-pollers.
     """
     try:
         disp = getattr(BOT_APPLICATION, "dispatcher", None)
@@ -167,22 +169,18 @@ async def _dispatch_update_task(update):
                 logger.debug("main: operation failed")
             return
 
-        # As a last resort, try to enqueue back onto the application's update queue
+        # No dispatcher or Application.process_update available - this should not
+        # happen on supported PTB versions (v20/v21 both expose process_update),
+        # so just log and count the failure instead of queueing the update.
         try:
-            await BOT_APPLICATION.update_queue.put(update)
-            try:
-                with METRICS_LOCK:
-                    METRICS["updates_queued"] = METRICS.get("updates_queued", 0) + 1
-            except Exception:
-                logger.debug("main: As a last resort, try to enqueue back onto the application's update queue")
-            return
+            with METRICS_LOCK:
+                METRICS["dispatch_failures"] = METRICS.get("dispatch_failures", 0) + 1
         except Exception:
-            try:
-                with METRICS_LOCK:
-                    METRICS["dispatch_failures"] = METRICS.get("dispatch_failures", 0) + 1
-            except Exception:
-                logger.debug("main: operation failed")
-            logger.exception("Failed to dispatch or enqueue update")
+            logger.debug("main: operation failed")
+        logger.error(
+            "No dispatch path available for update %s",
+            getattr(update, "update_id", "unknown"),
+        )
     except Exception as exc:
         try:
             with METRICS_LOCK:
@@ -251,7 +249,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     welcome_text = f"""
 🎬 **Welcome to Media Conversion Bot** 🎧
 
-Hello {user_name}! Send a media file and choose an action from the menu.
+Hello {_escape_markdown(user_name)}! Send a media file and choose an action from the menu.
 
 **⚡ Quick Commands:**
 /help — Detailed feature guide
@@ -611,7 +609,7 @@ def setup_handlers(application: Application) -> None:
                 latency = result.get("latency_ms") or "?"
                 return f"✅ **{name}** — Working\n   Phone: `{phone}`\n   DC: `{dc}` | Latency: `{latency}ms`"
             else:
-                err = result.get("error") or "Not configured"
+                err = (result.get("error") or "Not configured").replace("`", "")
                 return f"❌ **{name}** — `{err}`"
 
         # Get healthcheck interval from the checker
@@ -927,6 +925,39 @@ def setup_handlers(application: Application) -> None:
     logger.info("✅ All handlers registered successfully")
 
 
+def _build_request(
+    connection_pool_size: int,
+    pool_timeout: float,
+    connect_timeout: float,
+    read_timeout: float,
+):
+    """Build an HTTPXRequest/Request tolerating PTB releases that reject
+    the ``connection_pool_size`` kwarg.
+
+    The kwarg exists across PTB v20-v22 (default 1, then 256 from v22.4),
+    but some releases/forks reject it — retrying without it keeps the
+    builder working on any supported version.
+
+    Returns ``None`` when no Request class is importable so callers can
+    fall back to their default behavior.
+    """
+    if Request is None:
+        return None
+    kwargs = {
+        "pool_timeout": pool_timeout,
+        "connect_timeout": connect_timeout,
+        "read_timeout": read_timeout,
+    }
+    try:
+        return Request(connection_pool_size=connection_pool_size, **kwargs)
+    except TypeError:
+        # Some PTB releases reject connection_pool_size; fall back gracefully.
+        logger.info(
+            "Request() rejected connection_pool_size; building request without it"
+        )
+        return Request(**kwargs)
+
+
 async def main(background: bool = False) -> None:
     """Start the bot."""
     # Run quick env validation (logs missing keys but never prints secrets)
@@ -960,7 +991,7 @@ async def main(background: bool = False) -> None:
         http_read_timeout = 30.0
 
     try:
-        req = Request(
+        req = _build_request(
             connection_pool_size=http_pool_size,
             pool_timeout=http_pool_timeout,
             connect_timeout=http_connect_timeout,
@@ -987,7 +1018,7 @@ async def main(background: bool = False) -> None:
             try:
                 gu_pool_size = int(os.environ.get("GET_UPDATES_POOL_SIZE", "5"))
                 gu_pool_timeout = float(os.environ.get("GET_UPDATES_POOL_TIMEOUT", str(http_pool_timeout)))
-                gu_req = Request(
+                gu_req = _build_request(
                     connection_pool_size=gu_pool_size,
                     pool_timeout=gu_pool_timeout,
                     connect_timeout=http_connect_timeout,
@@ -1348,7 +1379,6 @@ async def main(background: bool = False) -> None:
                 logger.exception("Failed to evaluate dispatcher presence for FORCE_POLLING fallback")
 
             polling_task = None
-            polling_task = None
             # Background ASGI mode: support either webhook mode or an opt-in
             # FORCE_POLLING long-poller (useful when running under ASGI but
             # developer wants getUpdates polling instead of webhooks).
@@ -1370,7 +1400,7 @@ async def main(background: bool = False) -> None:
             else:
                 # FORCE_POLLING override: delete any existing webhook and
                 # start a lightweight long-polling task that fetches updates
-                # via getUpdates and enqueues them onto Application.update_queue
+                # via getUpdates and dispatches them through Application.process_update
                 if WEBHOOK_URL and force_polling:
                     try:
                         await application.bot.delete_webhook(drop_pending_updates=False)
@@ -1427,10 +1457,10 @@ async def main(background: bool = False) -> None:
                                     except Exception:
                                         logger.debug("main: operation failed")
                                     try:
-                                        # Enqueue for ASGI consumer/dispatcher
-                                        await BOT_APPLICATION.update_queue.put(u)
+                                        # Dispatch directly via process_update (non-deprecated API)
+                                        asyncio.create_task(_dispatch_update_task(u))
                                     except Exception:
-                                        logger.exception("Failed to enqueue polled update")
+                                        logger.exception("Failed to schedule polled update dispatch")
                             else:
                                 # no updates; brief pause before next long-poll
                                 await asyncio.sleep(0.1)
@@ -1699,7 +1729,13 @@ try:
     # web uploader and static UI remain available when running under ASGI/uvicorn.
     try:
         from fastapi.responses import RedirectResponse
-        from starlette.middleware.wsgi import WSGIMiddleware
+
+        # Use a2wsgi (the official replacement for starlette's deprecated
+        # WSGIMiddleware) when available; fall back to starlette otherwise.
+        try:
+            from a2wsgi import WSGIMiddleware
+        except Exception:
+            from starlette.middleware.wsgi import WSGIMiddleware
 
         import web.webapp as flask_webapp
 
@@ -2504,7 +2540,6 @@ try:
 
         # Helper: background retry dispatcher
         async def _background_retry_dispatch(u, attempts=12, delay=0.5):
-            disp = getattr(BOT_APPLICATION, "dispatcher", None)
             for i in range(attempts):
                 try:
                     disp = getattr(BOT_APPLICATION, "dispatcher", None)
@@ -2512,12 +2547,20 @@ try:
                         with METRICS_LOCK:
                             METRICS["dispatch_attempts"] += 1
                         await disp.process_update(u)
+                    elif BOT_APPLICATION is not None and hasattr(BOT_APPLICATION, "process_update"):
+                        # PTB v21+ has no dispatcher; Application.process_update is the
+                        # non-deprecated API for feeding updates to the application.
                         with METRICS_LOCK:
-                            METRICS["updates_dispatched"] += 1
-                        logger.info(
-                            f"Background dispatched update {getattr(u, 'update_id', 'unknown')} on attempt {i + 1}"
-                        )
-                        return True
+                            METRICS["dispatch_attempts"] += 1
+                        await BOT_APPLICATION.process_update(u)
+                    else:
+                        raise RuntimeError("No dispatch path available")
+                    with METRICS_LOCK:
+                        METRICS["updates_dispatched"] += 1
+                    logger.info(
+                        f"Background dispatched update {getattr(u, 'update_id', 'unknown')} on attempt {i + 1}"
+                    )
+                    return True
                 except Exception as e:
                     logger.debug(f"Background dispatch attempt {i + 1} failed: {e}")
                     with METRICS_LOCK:
@@ -2526,11 +2569,16 @@ try:
             logger.error(f"Background dispatch exhausted for update {getattr(u, 'update_id', 'unknown')}")
             return False
 
-        # Try immediate dispatch by scheduling a background dispatch task
+        # Try immediate dispatch by scheduling a background dispatch task.
+        # Note: PTB v21 removed the dispatcher attribute, so also accept
+        # Application.process_update here to avoid pointless retry sleeps.
         attempts = 6
         for i in range(attempts):
             dispatcher = getattr(BOT_APPLICATION, "dispatcher", None)
-            if dispatcher and hasattr(dispatcher, "process_update"):
+            has_dispatch_path = bool(dispatcher and hasattr(dispatcher, "process_update")) or (
+                BOT_APPLICATION is not None and hasattr(BOT_APPLICATION, "process_update")
+            )
+            if has_dispatch_path:
                 try:
                     # Schedule non-blocking dispatch so webhook returns quickly
                     asyncio.create_task(_dispatch_update_task(update))
@@ -2549,15 +2597,17 @@ try:
                         logger.debug("main: operation failed")
             await asyncio.sleep(0.25)
 
-        # Immediate dispatch not successful — try to enqueue
+        # Immediate dispatch not successful — schedule background dispatch
         try:
-            await BOT_APPLICATION.update_queue.put(update)
+            asyncio.create_task(_dispatch_update_task(update))
             with METRICS_LOCK:
                 METRICS["updates_queued"] += 1
-            logger.info(f"Queued update {getattr(update, 'update_id', 'unknown')} after immediate attempts")
+            logger.info(
+                f"Scheduled background dispatch for update {getattr(update, 'update_id', 'unknown')} after immediate attempts"
+            )
             return {"ok": True, "update_id": getattr(update, "update_id", None), "queued": True}
-        except Exception as enqueue_exc:
-            logger.warning(f"Enqueue failed: {enqueue_exc}; scheduling background retry and returning 200")
+        except Exception as schedule_exc:
+            logger.warning(f"Scheduling dispatch failed: {schedule_exc}; scheduling background retry and returning 200")
             # Schedule background retry but return 200 immediately (retry-accept policy)
             try:
                 asyncio.create_task(_background_retry_dispatch(update))
@@ -2597,7 +2647,7 @@ try:
             f"media_bot_webhooks_received {METRICS.get('webhooks_received', 0)}",
             "# HELP media_bot_updates_dispatched Total updates dispatched by dispatcher",
             f"media_bot_updates_dispatched {METRICS.get('updates_dispatched', 0)}",
-            "# HELP media_bot_updates_queued Total updates queued to application",
+            "# HELP media_bot_updates_queued Total updates handed to background dispatch",
             f"media_bot_updates_queued {METRICS.get('updates_queued', 0)}",
             "# HELP media_bot_dispatch_failures Total dispatch failures",
             f"media_bot_dispatch_failures {METRICS.get('dispatch_failures', 0)}",
@@ -2702,40 +2752,9 @@ try:
 
             logger.info("Background bot task started via ASGI startup event")
 
-            # Start a lightweight update consumer only after the bot is ready.
-            async def _update_consumer():
-                await BOT_READY.wait()
-                logger.info("Starting ASGI update consumer task")
-                app.state.update_consumer_running = True
-                try:
-                    while True:
-                        try:
-                            update = await BOT_APPLICATION.update_queue.get()
-                        except Exception:
-                            await asyncio.sleep(0.1)
-                            continue
-                        try:
-                            # Schedule dispatch in background so the consumer loop never
-                            # blocks waiting for handler completion. The helper
-                            # `_dispatch_update_task` updates metrics and logs errors.
-                            try:
-                                asyncio.create_task(_dispatch_update_task(update))
-                            except Exception:
-                                logger.exception("Failed to schedule dispatch task for update")
-                        except Exception:
-                            logger.exception("Unhandled error while scheduling dispatch task")
-                except asyncio.CancelledError:
-                    logger.info("ASGI update consumer task cancelled")
-                finally:
-                    app.state.update_consumer_running = False
-
-            try:
-                app.state.update_consumer = asyncio.create_task(_update_consumer())
-            except Exception:
-                logger.exception("Failed to start ASGI update consumer task")
             # If dispatcher isn't available (some hosting variants), start a
-            # fallback long-poller that uses getUpdates and enqueues updates
-            # onto the Application.update_queue so handlers still run.
+            # fallback long-poller that uses getUpdates and dispatches updates
+            # via Application.process_update so handlers still run.
             try:
                 force_polling_env = os.environ.get("FORCE_POLLING", "").lower() in ("1", "true", "yes")
                 dispatcher = getattr(BOT_APPLICATION, "dispatcher", None)
@@ -2782,9 +2801,10 @@ try:
                                             except Exception:
                                                 logger.debug("main: operation failed")
                                             try:
-                                                await BOT_APPLICATION.update_queue.put(u)
+                                                # Dispatch directly via process_update (non-deprecated API)
+                                                asyncio.create_task(_dispatch_update_task(u))
                                             except Exception:
-                                                logger.exception("ASGI long-poller failed to enqueue update")
+                                                logger.exception("ASGI long-poller failed to schedule update dispatch")
                                     else:
                                         await asyncio.sleep(0.1)
                                 except asyncio.CancelledError:
@@ -2851,18 +2871,6 @@ try:
         finally:
             with contextlib.suppress(Exception):
                 globals()["LONG_POLLER_STARTED"] = False
-        # Cancel update consumer if present
-        try:
-            uc = getattr(app.state, "update_consumer", None)
-            if uc and not uc.done():
-                uc.cancel()
-                try:
-                    await uc
-                except asyncio.CancelledError:
-                    logger.info("ASGI update consumer cancelled on shutdown")
-        except Exception as e:
-            logger.error(f"Error stopping ASGI update consumer: {e}")
-
         # Close dedicated get_updates client if present
         try:
             gu = globals().get("GET_UPDATES_BOT")

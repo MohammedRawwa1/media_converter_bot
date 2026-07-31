@@ -39,6 +39,24 @@ OUTPUT_DIR = getattr(config, "OUTPUT_PATH", "storage/output")
 os.makedirs(INPUT_DIR, exist_ok=True)
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
+# Allowed media extensions used when building on-disk input paths. Anything
+# else falls back to '.mp4' so attacker-supplied suffixes (e.g. '.html',
+# '.svg') can never become part of a filesystem path.
+ALLOWED_EXTENSIONS = frozenset(
+    {
+        ".mp4", ".mkv", ".avi", ".mov", ".webm", ".flv", ".wmv", ".m4v",
+        ".mp3", ".wav", ".aac", ".flac", ".ogg", ".m4a", ".opus",
+        ".srt", ".ass", ".vtt", ".zip",
+    }
+)
+
+
+def _safe_input_ext(filename: str) -> str:
+    """Return a whitelisted extension for `filename`, defaulting to ".mp4"."""
+    ext = os.path.splitext(filename or "")[1] or ""
+    return ext.lower() if ext.lower() in ALLOWED_EXTENSIONS else ".mp4"
+
+
 # Optional upload size cap (bytes) to protect memory from huge multipart uploads.
 try:
     max_bytes = int(os.environ.get("MAX_CONTENT_LENGTH_BYTES", "0") or 0)
@@ -190,7 +208,7 @@ def upload():
     request_id = str(uuid.uuid4())
     if f:
         filename = f.filename or ""
-        ext = os.path.splitext(filename)[1] or ".mp4"
+        ext = _safe_input_ext(filename)
         input_path = os.path.join(INPUT_DIR, f"{job_id}{ext}")
         f.save(input_path)
         # If configured with remote storage (S3/R2/MinIO), we'll upload the input
@@ -379,7 +397,7 @@ def upload():
 
         # Determine extension from original metadata or fallback to .mp4
         filename = meta.get("name") or ""
-        ext = os.path.splitext(filename)[1] or ".mp4"
+        ext = _safe_input_ext(filename)
         input_path = os.path.join(INPUT_DIR, f"{job_id}{ext}")
 
         # Try to download using an opt-in userbot (Telethon) if available
@@ -900,9 +918,13 @@ def enqueue_from_url():
         return jsonify({"error": "invalid source_url", "detail": "URL blocked for security reasons"}), 400
 
     job_id = str(uuid.uuid4())
-    output_filename = (
-        (os.path.splitext(original_filename or job_id)[0] + ".mp4") if original_filename else f"{job_id}.mp4"
-    )
+    # Sanitize the user-supplied filename (path traversal protection): the
+    # derived output_filename must never be able to escape OUTPUT_DIR.
+    if original_filename:
+        _sanitized_name = _run_async(file_utils.sanitize_filename(str(original_filename)))
+        output_filename = f"{os.path.splitext(_sanitized_name)[0] or job_id}.mp4"
+    else:
+        output_filename = f"{job_id}.mp4"
     output_path = os.path.join(OUTPUT_DIR, output_filename)
 
     job = {
@@ -965,6 +987,11 @@ def status(job_id):
     if not web_rate_limiter.check_limit("status", client_ip):
         body, status, headers = make_rate_limit_response("status", client_ip)
         return jsonify(body), status, headers
+
+    # job_id comes from the URL path; only allow UUID-safe characters so it
+    # can never traverse out of OUTPUT_DIR in the filesystem lookups below.
+    if not job_id or not re.fullmatch(r"[A-Za-z0-9_-]+", job_id):
+        return jsonify({"error": "invalid job_id"}), 400
 
     # Optional auth: require the same upload_token when UPLOAD_SECRET is set
     upload_secret = os.environ.get("UPLOAD_SECRET")
@@ -1083,6 +1110,11 @@ def download(job_id):
     if not web_rate_limiter.check_limit("download", client_ip):
         body, status, headers = make_rate_limit_response("download", client_ip)
         return jsonify(body), status, headers
+
+    # job_id comes from the URL path; only allow UUID-safe characters so it
+    # can never traverse out of OUTPUT_DIR in the filesystem lookups below.
+    if not job_id or not re.fullmatch(r"[A-Za-z0-9_-]+", job_id):
+        return jsonify({"error": "invalid job_id"}), 400
 
     # Optional auth: require the same upload_token when UPLOAD_SECRET is set
     upload_secret = os.environ.get("UPLOAD_SECRET")

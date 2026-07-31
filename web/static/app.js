@@ -2,6 +2,16 @@ const uploadForm = document.getElementById('uploadForm')
 const fileInput = document.getElementById('fileInput')
 const jobsDiv = document.getElementById('jobs')
 
+function escapeHtml(str){
+  return String(str).replace(/[&<>"']/g, c => ({
+    '&': '&amp;',
+    '<': '&lt;',
+    '>': '&gt;',
+    '"': '&quot;',
+    "'": '&#39;'
+  }[c]))
+}
+
 uploadForm.addEventListener('submit', async (e) => {
   e.preventDefault()
   if (!fileInput.files.length) return
@@ -29,7 +39,7 @@ function addJobCard(jobId, filename, fileSizeBytes){
   div.innerHTML = `
     <div class="job-row">
       <div>
-        <strong>${filename}</strong>
+        <strong>${escapeHtml(filename)}</strong>
         <div class="meta" id="meta-${jobId}">Queued</div>
         <div class="meta size" id="size-${jobId}">${fileSizeBytes ? humanFileSize(fileSizeBytes) : ''}</div>
       </div>

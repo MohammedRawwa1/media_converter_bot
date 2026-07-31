@@ -1,6 +1,7 @@
 # handlers.py
 import asyncio
 import contextlib
+import html
 import json
 import logging
 import os
@@ -3797,8 +3798,10 @@ class EnhancedMediaHandler:
                     await self.safe_edit(query, text, reply_markup=InlineKeyboardMarkup(kb), parse_mode="HTML")
                 else:
                     text = "⚙️ <b>Your Settings — Page 2</b>\n\n"
-                    text += f"• Words to remove: {', '.join(s.get('words_remove') or [])}\n"
-                    text += f"• Default thumbnail: {s.get('default_thumbnail')}\n"
+                    _words = html.escape(", ".join(s.get("words_remove") or []))
+                    text += f"• Words to remove: {_words}\n"
+                    _thumb = html.escape(str(s.get("default_thumbnail") or ""))
+                    text += f"• Default thumbnail: {_thumb}\n"
                     kb = [
                         [InlineKeyboardButton("⬅️ Prev", callback_data="settings_page:1")],
                         [InlineKeyboardButton("Close", callback_data="menu_main")],
