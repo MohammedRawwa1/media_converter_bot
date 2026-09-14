@@ -1330,38 +1330,34 @@ async def main(background: bool = False) -> None:
     except Exception as e:
         logger.error(f"Failed to start session healthcheck: {e}")
 
-    # ── Eagerly persist env var session strings to JSON file on startup ──
-    # After a rebuild on Railway the persisted JSON file is empty, so the
-    # "/loginstatus" command shows "Pyrogram in JSON: ❌" even though the
-    # PYROGRAM_SESSION env var is set and usable.  The healthchecker would
-    # eventually write it (after ~1 hour), but we do it here immediately
-    # so both the global (legacy) and per-user JSON files are populated
-    # right away.  The per-user file is needed because the healthchecker
-    # and client builders check per-user files first.
+    # ── Eagerly persist env-var session strings to per-user JSON + MongoDB ──
+    # Mirrors the reference bot: after a redeploy the persisted per-user JSON
+    # files are empty, so /loginstatus shows the owner's env session as missing
+    # and per-user resolution falls back to env every time. Persisting here
+    # populates the owner's per-user file right away.
     try:
         from utils.telethon_session import (
             _load_all_sessions_from_file_async,
             save_session_string_to_file_async,
         )
 
-        existing_json = await _load_all_sessions_from_file_async()
+        _admin_persist_id = ADMIN_USER_ID
+        _existing_json = await _load_all_sessions_from_file_async()
 
-        # Persist Pyrogram session from env var if different from JSON
-        pyro_env = os.getenv("PYROGRAM_SESSION")
-        if pyro_env and existing_json.get("pyrogram_session") != pyro_env:
-            saved = await save_session_string_to_file_async(pyro_env, client_type="pyrogram")
-            if saved:
-                logger.info("Eagerly persisted PYROGRAM_SESSION env var to global JSON file")
-                # Update the in-memory snapshot so the check below sees it
-                existing_json = await _load_all_sessions_from_file_async()
+        _pyro_env = os.getenv("PYROGRAM_SESSION") or os.getenv("USERBOT_PYROGRAM_SESSION")
+        if _pyro_env and _existing_json.get("pyrogram_session") != _pyro_env:
+            await save_session_string_to_file_async(_pyro_env, client_type="pyrogram")
 
-        # Also persist Pyrogram env var to per-user JSON so /loginstatus
-        # shows it and the per-user resolution path finds it directly.
-        if pyro_env and ADMIN_USER_ID:
-            await save_session_string_to_file_async(pyro_env, client_type="pyrogram", user_id=ADMIN_USER_ID)
+        if _pyro_env and _admin_persist_id:
+            await save_session_string_to_file_async(_pyro_env, client_type="pyrogram", user_id=_admin_persist_id)
+            _mongo_db = application.bot_data.get("db_model")
+            if _mongo_db is not None:
+                await _mongo_db.save_session(
+                    _admin_persist_id,
+                    {"pyrogram_session": _pyro_env},
+                )
 
-        # Persist Telethon session from env var if different from JSON
-        telethon_env = None
+        _telethon_env = None
         for _k in (
             "API_SESSION",
             "SESSION",
@@ -1373,45 +1369,37 @@ async def main(background: bool = False) -> None:
         ):
             _v = os.getenv(_k)
             if _v:
-                telethon_env = _v
+                _telethon_env = _v
                 break
-        if telethon_env and existing_json.get("telethon_session") != telethon_env:
-            saved = await save_session_string_to_file_async(telethon_env, client_type="telethon")
-            if saved:
-                logger.info("Eagerly persisted Telethon session env var to global JSON file")
 
-        # Also persist Telethon env var to per-user JSON.
-        if telethon_env and ADMIN_USER_ID:
-            await save_session_string_to_file_async(telethon_env, client_type="telethon", user_id=ADMIN_USER_ID)
-    except Exception as exc:
-        logger.debug("Eager env-var-to-JSON persistence skipped: %s", exc)
+        if _telethon_env and _existing_json.get("telethon_session") != _telethon_env:
+            await save_session_string_to_file_async(_telethon_env, client_type="telethon")
 
-    # ── Eagerly persist PYROGRAM_SESSION to MongoDB at startup ──
-    # Full redundancy: JSON file + MongoDB, both populated immediately
-    # after a rebuild so the session survives restarts no matter which
-    # persistence layer is available at recovery time.
-    try:
-        _mongo_db = application.bot_data.get("db_model")
-        if _mongo_db is not None:
-            _mongo_pyro = os.getenv("PYROGRAM_SESSION")
-            if _mongo_pyro:
+        if _telethon_env and _admin_persist_id:
+            await save_session_string_to_file_async(_telethon_env, client_type="telethon", user_id=_admin_persist_id)
+            _mongo_db = application.bot_data.get("db_model")
+            if _mongo_db is not None:
                 await _mongo_db.save_session(
-                    ADMIN_USER_ID,
-                    {"pyrogram_session": _mongo_pyro},
+                    _admin_persist_id,
+                    {"telethon_session": _telethon_env},
                 )
-                logger.info("Eagerly persisted PYROGRAM_SESSION to MongoDB (at startup)")
+
+        logger.info(
+            "Startup: persisted env-var sessions to per-user JSON (admin=%s)",
+            _admin_persist_id,
+        )
     except Exception as exc:
-        logger.debug("Eager Pyrogram->MongoDB persistence skipped: %s", exc)
+        logger.debug("Startup env->per-user JSON persistence skipped: %s", exc)
 
     # ── Startup: persist MongoDB sessions to per-user JSON files ──
     # When env vars are NOT set (pure remote login via /loginpyro or /login),
     # the JSON files start empty on a fresh deploy.  Read from MongoDB and write
     # to per-user JSON so the uploader/downloader and /loginstatus can find them
     # immediately without waiting for the healthchecker (~1 hour).
-
-    # Pyrogram: persist from MongoDB to per-user JSON when no env var is set
     try:
-        if not os.getenv("PYROGRAM_SESSION"):
+        _mongo_db = application.bot_data.get("db_model")
+
+        if not os.getenv("PYROGRAM_SESSION") and ADMIN_USER_ID and _mongo_db:
             from utils.telethon_session import (
                 _load_all_sessions_from_file_async,
                 get_pyrogram_session_string_for_user,
@@ -1419,19 +1407,19 @@ async def main(background: bool = False) -> None:
             )
 
             _existing = await _load_all_sessions_from_file_async()
-            if not _existing.get("pyrogram_session") and ADMIN_USER_ID and _mongo_db:
+            if not _existing.get("pyrogram_session"):
                 _mongo_pyro = await get_pyrogram_session_string_for_user(
                     user_id=ADMIN_USER_ID,
                     db_model=_mongo_db,
                 )
                 if _mongo_pyro:
-                    await save_session_string_to_file_async(_mongo_pyro, client_type="pyrogram", user_id=ADMIN_USER_ID)
+                    await save_session_string_to_file_async(
+                        _mongo_pyro,
+                        client_type="pyrogram",
+                        user_id=ADMIN_USER_ID,
+                    )
                     logger.info("Startup: persisted Pyrogram session from MongoDB to per-user JSON file")
-    except Exception as exc:
-        logger.debug("Startup MongoDB->JSON Pyrogram persistence skipped: %s", exc)
 
-    # Telethon: persist from MongoDB to per-user JSON when no env var is set
-    try:
         _telethon_env_keys = (
             "API_SESSION",
             "SESSION",
@@ -1456,17 +1444,20 @@ async def main(background: bool = False) -> None:
                     db_model=_mongo_db,
                 )
                 if _mongo_tele:
-                    await save_session_string_to_file_async(_mongo_tele, client_type="telethon", user_id=ADMIN_USER_ID)
+                    await save_session_string_to_file_async(
+                        _mongo_tele,
+                        client_type="telethon",
+                        user_id=ADMIN_USER_ID,
+                    )
                     logger.info("Startup: persisted Telethon session from MongoDB to per-user JSON file")
     except Exception as exc:
-        logger.debug("Startup MongoDB->JSON Telethon persistence skipped: %s", exc)
+        logger.debug("Startup MongoDB->JSON persistence skipped: %s", exc)
 
     # ── Restore per-user JSON session files for ALL users from MongoDB ──
     # The per-user JSON session files live on an ephemeral filesystem and are
-    # wiped on every redeploy.  Re-materialize each stored user's JSON file from
+    # wiped on every redeploy. Re-materialize each stored user's JSON file from
     # the durable MongoDB sessions collection so per-user sessions created via
-    # /login or /loginpyro keep working immediately after a deployment, instead
-    # of waiting up to a full healthcheck interval for the recovery to happen.
+    # /login or /loginpyro keep working immediately after a deployment.
     try:
         from utils.telethon_session import restore_per_user_session_files
 
