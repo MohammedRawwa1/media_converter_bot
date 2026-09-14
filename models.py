@@ -427,6 +427,31 @@ class MediaConversionModel(FillableModel):
             logger.error("Error loading session for %s: %s", user_id, e)
             return None
 
+    async def load_sessions(self, user_id: int) -> dict[str, Any] | None:
+        """Load and merge all persisted client sessions for a user.
+
+        Login records are keyed by phone, so the newest record may contain
+        only one client type. Merge every record to preserve both clients.
+        """
+        try:
+            query = {"user_id": user_id}
+            if self.bot_id is not None:
+                query["bot_id"] = self.bot_id
+            cursor = self._sessions_coll.find(query, {"_id": 0, "session": 1}).sort("updated_at", -1)
+            docs = await cursor.to_list(length=None)
+            merged: dict[str, Any] = {}
+            for doc in docs or []:
+                session = doc.get("session") if isinstance(doc, dict) else None
+                if not isinstance(session, dict):
+                    continue
+                for key in ("telethon_session", "pyrogram_session", "string_session", "session_string"):
+                    if session.get(key) and key not in merged:
+                        merged[key] = session[key]
+            return merged or None
+        except Exception as e:
+            logger.error("Error loading sessions for %s: %s", user_id, e)
+            return None
+
     async def delete_session(self, user_id: int, phone: str | None = None) -> bool:
         """Delete a persisted session for a user.
 

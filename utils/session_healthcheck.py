@@ -709,7 +709,14 @@ class SessionHealthChecker:
         except Exception:
             logger.debug("SessionHealthChecker: failed to read stored %s session from JSON", client_type)
 
-        if self.db_model is not None and hasattr(self.db_model, "load_session"):
+        if self.db_model is not None and hasattr(self.db_model, "load_sessions"):
+            try:
+                doc = await self.db_model.load_sessions(user_id)
+                if isinstance(doc, dict) and doc.get(key):
+                    return str(doc[key])
+            except Exception:
+                logger.debug("SessionHealthChecker: failed to read stored %s session from MongoDB", client_type)
+        elif self.db_model is not None and hasattr(self.db_model, "load_session"):
             try:
                 doc = await self.db_model.load_session(user_id)
                 if isinstance(doc, dict) and doc.get(key):

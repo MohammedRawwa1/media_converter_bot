@@ -14,6 +14,14 @@ class FakeDbModel:
         return self.payload
 
 
+class FakeMergedDbModel(FakeDbModel):
+    async def load_sessions(self, user_id):
+        return {
+            "telethon_session": "telethon-from-phone-a",
+            "pyrogram_session": "pyro-from-phone-b",
+        }
+
+
 def test_async_telethon_status_uses_mongodb_session(monkeypatch):
     monkeypatch.delenv("API_SESSION", raising=False)
     monkeypatch.delenv("SESSION", raising=False)
@@ -48,6 +56,24 @@ def test_get_telethon_session_string_for_user_uses_mongodb(monkeypatch):
     )
 
     assert session_str == "abc"
+
+
+def test_mongodb_resolution_merges_client_sessions(monkeypatch, tmp_path):
+    _reset_session_env(monkeypatch, tmp_path)
+
+    telethon_value, _ = asyncio.run(
+        telethon_session._resolve_telethon_session_with_source(
+            user_id=42, db_model=FakeMergedDbModel({})
+        )
+    )
+    pyrogram_value, _ = asyncio.run(
+        telethon_session._resolve_pyrogram_session_with_source(
+            user_id=42, db_model=FakeMergedDbModel({})
+        )
+    )
+
+    assert telethon_value == "telethon-from-phone-a"
+    assert pyrogram_value == "pyro-from-phone-b"
 
 
 # ── Resolution order (fresh persisted session must beat a stale env var) ──

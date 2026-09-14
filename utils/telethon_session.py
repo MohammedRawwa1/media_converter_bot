@@ -467,6 +467,8 @@ async def _load_mongo_session(db_model: object | None, user_id: int | None) -> o
         return None
     if hasattr(db_model, "load_session"):
         try:
+            if hasattr(db_model, "load_sessions"):
+                return await db_model.load_sessions(user_id)
             return await db_model.load_session(user_id)
         except Exception as exc:
             logger.warning("Failed to inspect MongoDB session for user %s: %s", user_id, exc)
