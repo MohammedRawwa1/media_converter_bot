@@ -627,6 +627,20 @@ class EnhancedMediaHandler:
                     await _edit(f"⚠️ Job {job_id} finished with status: {status}")
             except Exception:
                 logger.debug("handlers: final fetch for output or error")
+
+            # Terminal jobs no longer need their temporary status messages. Delete
+            # both the dedicated progress message and the callback message when
+            # they are distinct; Telegram BadRequest is harmless if one is gone.
+            _messages_to_delete = []
+            if progress_msg is not None:
+                _messages_to_delete.append(progress_msg)
+            _query_message = getattr(query, "message", None)
+            if _query_message is not None and _query_message is not progress_msg:
+                _messages_to_delete.append(_query_message)
+            for _message in _messages_to_delete:
+                with contextlib.suppress(Exception):
+                    await _message.delete()
+
             # ── T19: Cleanup pubsub subscription and connections ──
             if _pubsub_obj is not None:
                 with contextlib.suppress(Exception):

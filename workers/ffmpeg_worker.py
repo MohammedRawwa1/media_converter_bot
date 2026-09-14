@@ -466,6 +466,27 @@ async def handle_job(job: dict):
     # Early cancel check: if the job was cancelled (hash has cancel=1), bail out now.
     if job_id and await _check_upload_cancelled(job_id):
         logger.info("Job %s was cancelled — skipping processing entirely", job_id)
+        try:
+            r = await get_redis()
+            try:
+                await r.hset(
+                    f"ffmpeg:job:{job_id}",
+                    mapping={"status": "cancelled", "progress": "0", "message": "cancelled by user"},
+                )
+                await publish_update(
+                    progress_channel,
+                    {
+                        "job_id": job_id,
+                        "progress": 0,
+                        "status": "cancelled",
+                        "message": "cancelled by user",
+                    },
+                )
+            finally:
+                with contextlib.suppress(Exception):
+                    await r.close()
+        except Exception:
+            logger.debug("ffmpeg worker: could not publish early cancellation for %s", job_id)
         return
 
     # If job references a remote storage key (S3/MinIO), prefer to download it
@@ -1856,10 +1877,10 @@ async def handle_job(job: dict):
                                         "status": _final_status,
                                     },
                                 )
-                                # ── Delete the job hash immediately — it's no longer needed.
-                                # The periodic cleanup (redis_job_cleanup) handles stale keys
-                                # as a safety net, but jobs should not linger for 24 hours.
-                                await _r.delete(f"ffmpeg:job:{job_id}")
+                                # Keep the terminal hash until the watcher observes it. The
+                                # watcher owns the Telegram progress-message lifecycle; deleting
+                                # this hash here makes it wait forever and leaves the message stuck.
+                                # JOB_METADATA_TTL and periodic cleanup remove it later.
                             finally:
                                 with contextlib.suppress(Exception):
                                     await _r.close()
