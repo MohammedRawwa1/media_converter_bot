@@ -492,13 +492,14 @@ class SessionHealthChecker:
                         if asyncio.iscoroutine(dc):
                             dc = await dc
                         h.dc_id = dc
-                # Persist the live session string for long-term survival.  The local
-                # per-user JSON file must be written whenever it is missing or stale,
-                # even if MongoDB already contains the same valid session string.
-                # This is the admin/per-user parity rule: an admin session is still
-                # scoped to one user and must be persisted like any other user.
+                # Persist the live session string for long-term survival.  Both the
+                # per-user JSON file *and* MongoDB must end up holding the verified
+                # session: the JSON survives the process, the MongoDB document
+                # survives the ephemeral redeploy.  Writing whenever either store
+                # differs keeps them converged instead of trusting a single copy.
                 local_stored = await self._local_session_for_user(check_user_id, "pyrogram")
-                if local_stored is None or local_stored != session_str:
+                mongo_stored = await self._mongo_session_for_user(check_user_id, "pyrogram")
+                if local_stored != session_str or mongo_stored != session_str:
                     await self._save_pyrogram_session(client, user_id=check_user_id)
             else:
                 h.error = "get_me() returned None (not authorized)"
@@ -506,27 +507,17 @@ class SessionHealthChecker:
             elapsed = (time.time() - t0) * 1000
             h.latency_ms = round(elapsed, 1)
             h.error = str(exc)[:200]
-
-            if check_user_id is not None and "AUTH_KEY_UNREGISTERED" in str(exc):
-                retry_session, retry_source = await self._invalidate_stale_pyrogram_session(user_id=check_user_id)
-                if retry_session:
-                    h.error = f"{h.error} (cleared stale per-user JSON and retried from {retry_source})"
-                    h.source = retry_source
-                    h.alive = True
-                    h.phone = None
-                    h.dc_id = None
-                    h.latency_ms = round(elapsed, 1)
-                    try:
-                        await self._save_pyrogram_session(
-                            build_pyrogram_client(
-                                api_id,
-                                api_hash,
-                                session_str=retry_session,
-                            ),
-                            user_id=check_user_id,
-                        )
-                    except Exception:
-                        logger.debug("SessionHealthChecker: failed to refresh stale Pyrogram session after retry")
+            # A failed check must never mutate stored sessions.  The previous
+            # implementation blanked the per-user JSON entry and then marked the
+            # session healthy without verifying it, which surfaced as
+            # "Pyrogram: Working" with no phone/DC while the per-user JSON showed
+            # Pyrogram ❌ — and destroyed a valid session on every cycle.
+            # Recovery is an explicit, user-driven action (`/recoverpyro`).
+            logger.warning(
+                "SessionHealthChecker: Pyrogram check failed for user %s (session left untouched): %s",
+                check_user_id,
+                h.error,
+            )
         finally:
             with contextlib.suppress(Exception):
                 await asyncio.sleep(0.5)
@@ -609,11 +600,12 @@ class SessionHealthChecker:
                     logger.debug("SessionHealthChecker: failed to get Telethon user info")
                 with contextlib.suppress(Exception):
                     h.dc_id = client.session.dc_id if hasattr(client.session, "dc_id") else None
-                # Persist the live session string for long-term survival.  The local
-                # per-user JSON file must be written whenever it is missing or stale,
-                # even if MongoDB already contains the same valid session string.
+                # Persist the live session string for long-term survival.  Both the
+                # per-user JSON file *and* MongoDB must end up holding the verified
+                # session (see ``_check_pyrogram`` for the rationale).
                 local_stored = await self._local_session_for_user(check_user_id, "telethon")
-                if local_stored is None or local_stored != session_str:
+                mongo_stored = await self._mongo_session_for_user(check_user_id, "telethon")
+                if local_stored != session_str or mongo_stored != session_str:
                     await self._save_telethon_session(client, user_id=check_user_id)
             else:
                 h.error = "Session exists but user is not authorized"
@@ -804,6 +796,27 @@ class SessionHealthChecker:
                 return str(data[key])
         except Exception:
             logger.debug("SessionHealthChecker: failed to read local %s session from JSON", client_type)
+        return None
+
+    async def _mongo_session_for_user(self, user_id: int | None, client_type: str) -> str | None:
+        """Return the session string persisted in MongoDB only (ignores JSON).
+
+        Used alongside :meth:`_local_session_for_user` so a successful check
+        repairs **both** stores.  Checking only the local JSON would let a
+        session that is present on disk but missing (or stale) in MongoDB stay
+        un-persisted — so it would be lost on the next ephemeral redeploy.
+        """
+        if user_id is None or self.db_model is None:
+            return None
+        key = "telethon_session" if client_type == "telethon" else "pyrogram_session"
+        try:
+            from utils.telethon_session import _load_mongo_session
+
+            doc = await _load_mongo_session(self.db_model, user_id)
+            if isinstance(doc, dict) and doc.get(key):
+                return str(doc[key])
+        except Exception:
+            logger.debug("SessionHealthChecker: failed to read %s session from MongoDB", client_type)
         return None
 
     async def _load_any_session(self, key: str) -> str | None:

@@ -355,3 +355,121 @@ def test_session_healthchecker_persists_missing_per_user_pyrogram_json(monkeypat
     assert result.alive is True
     value = asyncio.run(telethon_session._load_session_string_from_file_async("pyrogram", user_id=42))
     assert value == "live-session-string"
+
+
+# ── Reference-flow regressions: a fresh per-user session must always win ──
+
+
+def test_pyrogram_resolution_prefers_fresh_json_over_stale_mongodb(monkeypatch, tmp_path):
+    """A fresh per-user JSON session must outrank a stale durable MongoDB one."""
+    _reset_session_env(monkeypatch, tmp_path)
+
+    asyncio.run(
+        telethon_session.save_session_string_to_file_async("fresh-json", client_type="pyrogram", user_id=42)
+    )
+
+    value, source = asyncio.run(
+        telethon_session._resolve_pyrogram_session_with_source(
+            user_id=42, db_model=FakeDbModel({"pyrogram_session": "stale-mongo"})
+        )
+    )
+
+    assert value == "fresh-json"
+    assert source == "json"
+
+
+def test_sync_pyrogram_resolution_does_not_leak_another_users_session(monkeypatch, tmp_path):
+    """Resolving one user's durable session must never leak into another user's sync lookup."""
+    _reset_session_env(monkeypatch, tmp_path)
+
+    asyncio.run(
+        telethon_session._resolve_pyrogram_session_with_source(
+            user_id=111, db_model=FakeDbModel({"pyrogram_session": "admin-session"})
+        )
+    )
+
+    assert telethon_session.get_pyrogram_session_string(user_id=222) is None
+
+
+def test_healthcheck_repairs_mongodb_when_json_already_matches(monkeypatch, tmp_path):
+    """A verified session must be written to MongoDB even if the local JSON matches."""
+    _reset_session_env(monkeypatch, tmp_path)
+
+    asyncio.run(
+        telethon_session.save_session_string_to_file_async("live-session-string", client_type="pyrogram", user_id=42)
+    )
+
+    class FakePyroClient:
+        def __init__(self):
+            self.storage = type("Storage", (), {"dc_id": lambda self: 4})()
+
+        async def start(self):
+            return None
+
+        async def get_me(self):
+            return type("Me", (), {"phone_number": "96176390078"})()
+
+        async def export_session_string(self):
+            return "live-session-string"
+
+        async def stop(self):
+            return None
+
+    class RecordingDbModel(FakeDbModel):
+        def __init__(self):
+            super().__init__(None)
+            self.saved = []
+
+        async def save_session(self, user_id, session_data, phone=None):
+            self.saved.append((user_id, session_data))
+            return True
+
+    db_model = RecordingDbModel()
+    monkeypatch.setenv("PYROGRAM_SESSION", "live-session-string")
+    monkeypatch.setattr(telethon_session, "build_pyrogram_client", lambda *a, **k: FakePyroClient())
+    monkeypatch.setattr(telethon_session, "get_userbot_credentials", lambda: (123, "hash"))
+
+    checker = SessionHealthChecker(admin_user_id=42, db_model=db_model)
+    result = asyncio.run(checker._check_pyrogram(user_id=42))
+
+    assert result.alive is True
+    assert result.phone == "96176390078"
+    assert any(data.get("pyrogram_session") == "live-session-string" for _uid, data in db_model.saved)
+
+
+def test_healthcheck_keeps_pyrogram_json_on_auth_failure(monkeypatch, tmp_path):
+    """A failed check must report unhealthy and leave the per-user JSON untouched."""
+    _reset_session_env(monkeypatch, tmp_path)
+
+    asyncio.run(
+        telethon_session.save_session_string_to_file_async("stored-good", client_type="pyrogram", user_id=42)
+    )
+
+    class AuthFailClient:
+        storage = type("Storage", (), {"dc_id": lambda self: 4})()
+
+        async def start(self):
+            raise Exception("AUTH_KEY_UNREGISTERED")
+
+        async def get_me(self):
+            return None
+
+        async def stop(self):
+            return None
+
+        async def export_session_string(self):
+            return "never-saved"
+
+    monkeypatch.setattr(
+        telethon_session, "build_pyrogram_client", lambda *a, **k: AuthFailClient()
+    )
+    monkeypatch.setattr(telethon_session, "get_userbot_credentials", lambda: (123, "hash"))
+
+    checker = SessionHealthChecker(admin_user_id=42, db_model=FakeDbModel({}))
+    result = asyncio.run(checker._check_pyrogram(user_id=42))
+
+    assert result.alive is False
+    assert "AUTH_KEY_UNREGISTERED" in (result.error or "")
+    # The stored session must survive an automatic failed check.
+    value = asyncio.run(telethon_session._load_session_string_from_file_async("pyrogram", user_id=42))
+    assert value == "stored-good"

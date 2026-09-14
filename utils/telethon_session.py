@@ -96,24 +96,6 @@ def _cache_key(user_id: int | None = None) -> str:
     return _GLOBAL_CACHE_KEY
 
 
-# ── In-memory cache for MongoDB-resolved Pyrogram session ───────────
-#
-# ``get_pyrogram_session_string()`` is synchronous and cannot call
-# ``db_model.load_session()`` directly.  To still allow the sync path
-# to find MongoDB-persisted sessions, we maintain a simple in-memory
-# cache that is populated by the async
-# ``get_pyrogram_session_string_for_user()`` whenever it successfully
-# loads a session from MongoDB.
-#
-# This cache is NOT TTL-based; it is invalidated explicitly whenever
-# the session is cleared (e.g. via ``/logoutpyro``) or when a new save
-# replaces the old value.  The cache is a single string because there
-# is at most one active Pyrogram session (admin user).
-# --------------------------------------------------------------------
-_PYROGRAM_MONGO_CACHE: str | None = None
-_PYROGRAM_MONGO_CACHE_LOCK = threading.Lock()
-
-
 def _get_cached_sessions(user_id: int | None = None) -> dict | None:
     """Return cached session dict for a given user if still fresh, else None."""
     k = _cache_key(user_id)
@@ -146,26 +128,6 @@ def _invalidate_session_cache(user_id: int | None = None):
         else:
             _SESSION_CACHE_DATA.clear()
             _SESSION_CACHE_EXPIRES.clear()
-
-
-def _clear_pyrogram_mongo_cache():
-    """Clear the in-memory MongoDB Pyrogram session cache."""
-    with _PYROGRAM_MONGO_CACHE_LOCK:
-        global _PYROGRAM_MONGO_CACHE
-        _PYROGRAM_MONGO_CACHE = None
-
-
-def _set_pyrogram_mongo_cache(session_str: str):
-    """Set the in-memory MongoDB Pyrogram session cache."""
-    with _PYROGRAM_MONGO_CACHE_LOCK:
-        global _PYROGRAM_MONGO_CACHE
-        _PYROGRAM_MONGO_CACHE = session_str
-
-
-def _get_pyrogram_mongo_cache() -> str | None:
-    """Return the cached MongoDB Pyrogram session, if any."""
-    with _PYROGRAM_MONGO_CACHE_LOCK:
-        return _PYROGRAM_MONGO_CACHE
 
 
 def _get_persisted_session_path(user_id: int | None = None) -> str:
@@ -291,9 +253,6 @@ def save_session_string_to_file(session_str: str, client_type: str = "telethon",
         )
         # Invalidate in-memory cache so subsequent reads see the new data
         _invalidate_session_cache(user_id=user_id)
-        # If we just cleared the Pyrogram session, also clear the MongoDB cache
-        if client_type == "pyrogram" and not session_str:
-            _clear_pyrogram_mongo_cache()
         return True
     except Exception as exc:
         logger.debug(
@@ -678,22 +637,16 @@ def build_telethon_client(api_id: int, api_hash: str, session_str: str | None = 
 def get_pyrogram_session_string(user_id: int | None = None) -> str | None:
     """Return a usable Pyrogram session string.
 
-    Resolution order (matches ``_resolve_pyrogram_session_with_source``):
-    1. In-memory MongoDB cache (last successful persisted session)
-    2. Per-user JSON file (fallback when no MongoDB cache exists)
-    3. Environment variable (``PYROGRAM_SESSION``, admin-configured)
-    4. Legacy global JSON file (unscoped only)
+    Resolution order (matches the reference header-extractor flow):
+    1. Per-user JSON file — a session written by ``/loginpyro`` or the
+       healthcheck must outrank a possibly stale durable session.
+    2. Environment variable (``PYROGRAM_SESSION``, admin-configured).
+    3. Legacy global JSON file (unscoped lookups only).
 
     The legacy global JSON file is only consulted when ``user_id`` is ``None``,
     so one user's session is never served to another.
     """
-    # 1. Prefer the durable cached MongoDB session when available.  This avoids
-    # reusing a stale per-user JSON file that may still contain a revoked auth key
-    # even though a newer valid session is already stored remotely.
-    mongo_str = _get_pyrogram_mongo_cache()
-    if mongo_str:
-        return mongo_str
-
+    # 1. Per-user JSON file first (freshest persisted session)
     if user_id is not None:
         file_str = _load_session_string_from_file(client_type="pyrogram", user_id=user_id)
         if file_str:
@@ -709,7 +662,7 @@ def get_pyrogram_session_string(user_id: int | None = None) -> str | None:
     if env_str:
         return env_str
 
-    # 3. Unscoped-only fallbacks: legacy global JSON
+    # 3. Unscoped-only fallback: legacy global JSON
     if user_id is None:
         return _load_session_string_from_file(client_type="pyrogram")
 
@@ -722,28 +675,28 @@ async def _resolve_pyrogram_session_with_source(
     """Resolve a Pyrogram session string and label the source it came from.
 
     Resolution order (the reference header-extractor flow):
-    1. ``mongodb``       per-user session document (durable persisted session)
-    2. ``json``          per-user JSON file — fallback when MongoDB is unavailable
-    3. ``env``           ``PYROGRAM_SESSION`` env var
-    4. ``mongodb-cache`` / ``global-json`` — unscoped lookups only
+    1. ``json``         per-user JSON file — freshest, written on login/healthcheck
+    2. ``mongodb``      per-user session document (durable)
+    3. ``env``          ``PYROGRAM_SESSION`` env var
+    4. ``global-json``  legacy shared JSON file (unscoped lookups only)
 
-    The durable MongoDB session is preferred over the per-user JSON file because
-    the JSON file can be stale after a revoked auth key has been persisted there
-    but a newer valid session already exists in MongoDB.
+    The per-user JSON file is preferred over the durable MongoDB document because
+    the JSON is rewritten on every successful check while MongoDB can still hold a
+    revoked session string.  A freshly persisted session must never be masked by a
+    stale durable one — that is what left the admin's Pyrogram session unusable.
     """
-    # 1. MongoDB-persisted session for the given user (durable, merged per-phone)
-    saved_session = await _load_mongo_session(db_model, user_id)
-    session_value = _extract_session_value(saved_session, ("pyrogram_session",))
-    if session_value:
-        logger.info("session: loaded Pyrogram session string from MongoDB for user %s", user_id)
-        _set_pyrogram_mongo_cache(session_value)
-        return session_value, "mongodb"
-
-    # 2. Per-user JSON file (strictly scoped to this user)
+    # 1. Per-user JSON file (strictly scoped to this user)
     if user_id is not None:
         file_str = _load_session_string_from_file(client_type="pyrogram", user_id=user_id)
         if file_str:
             return file_str, "json"
+
+    # 2. MongoDB-persisted session for the given user (durable, merged per-phone)
+    saved_session = await _load_mongo_session(db_model, user_id)
+    session_value = _extract_session_value(saved_session, ("pyrogram_session",))
+    if session_value:
+        logger.info("session: loaded Pyrogram session string from MongoDB for user %s", user_id)
+        return session_value, "mongodb"
 
     # 3. Environment variable
     env_str = _get_env_value(
@@ -755,11 +708,8 @@ async def _resolve_pyrogram_session_with_source(
     if env_str:
         return env_str, "env"
 
-    # 4. Unscoped-only fallbacks (isolation safety)
+    # 4. Legacy global JSON file — unscoped lookups only (isolation safety)
     if user_id is None:
-        cached = _get_pyrogram_mongo_cache()
-        if cached:
-            return cached, "mongodb-cache"
         file_str = _load_session_string_from_file(client_type="pyrogram")
         if file_str:
             return file_str, "global-json"
@@ -774,11 +724,9 @@ async def get_pyrogram_session_string_for_user(
     """Return a usable Pyrogram session string for the given user, if available.
 
     Delegates to :func:`_resolve_pyrogram_session_with_source` so a freshly
-    logged-in per-user or MongoDB session outranks a stale env var.  The legacy
-    global JSON file is only consulted for unscoped lookups.  When a session is
-    found in MongoDB it is also cached in-memory via ``_set_pyrogram_mongo_cache``
-    so the sync ``get_pyrogram_session_string()`` can benefit from it without an
-    async MongoDB call.
+    logged-in per-user JSON or MongoDB session outranks a stale env var.  The
+    legacy global JSON file is only consulted for unscoped lookups, so one user's
+    session is never served to another.
     """
     value, _source = await _resolve_pyrogram_session_with_source(user_id, db_model)
     return value

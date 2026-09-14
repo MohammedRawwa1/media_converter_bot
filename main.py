@@ -1331,31 +1331,52 @@ async def main(background: bool = False) -> None:
         logger.error(f"Failed to start session healthcheck: {e}")
 
     # ── Eagerly persist env-var session strings to per-user JSON + MongoDB ──
-    # Mirrors the reference bot: after a redeploy the persisted per-user JSON
-    # files are empty, so /loginstatus shows the owner's env session as missing
-    # and per-user resolution falls back to env every time. Persisting here
-    # populates the owner's per-user file right away.
+    # After a redeploy the ephemeral per-user JSON files are empty, so this
+    # seeds the owner's file right away instead of waiting for the healthcheck.
+    #
+    # This seeding is strictly **additive**: it must never overwrite a session
+    # that is already stored (JSON or MongoDB).  A stale ``PYROGRAM_SESSION`` /
+    # ``TELETHON_SESSION`` env var would otherwise re-poison the durable session
+    # on every deploy and wipe out a fresher session created via ``/loginpyro``
+    # or ``/login`` — which is exactly why the owner's Pyrogram session kept
+    # expiring while every other user's persisted normally.
     try:
         from utils.telethon_session import (
             _load_all_sessions_from_file_async,
+            _load_mongo_session,
             save_session_string_to_file_async,
         )
 
         _admin_persist_id = ADMIN_USER_ID
-        _existing_json = await _load_all_sessions_from_file_async()
+        _mongo_db = application.bot_data.get("db_model")
+
+        async def _has_stored_session(key: str) -> bool:
+            """True when a session of ``key`` is already stored for the admin."""
+            if not _admin_persist_id:
+                return False
+            stored = await _load_all_sessions_from_file_async(user_id=_admin_persist_id)
+            if isinstance(stored, dict) and stored.get(key):
+                return True
+            try:
+                doc = await _load_mongo_session(_mongo_db, _admin_persist_id)
+            except Exception:
+                doc = None
+            return bool(isinstance(doc, dict) and doc.get(key))
 
         _pyro_env = os.getenv("PYROGRAM_SESSION") or os.getenv("USERBOT_PYROGRAM_SESSION")
-        if _pyro_env and _existing_json.get("pyrogram_session") != _pyro_env:
-            await save_session_string_to_file_async(_pyro_env, client_type="pyrogram")
-
-        if _pyro_env and _admin_persist_id:
-            await save_session_string_to_file_async(_pyro_env, client_type="pyrogram", user_id=_admin_persist_id)
-            _mongo_db = application.bot_data.get("db_model")
-            if _mongo_db is not None:
-                await _mongo_db.save_session(
-                    _admin_persist_id,
-                    {"pyrogram_session": _pyro_env},
-                )
+        if _pyro_env and not await _has_stored_session("pyrogram_session"):
+            _existing_json = await _load_all_sessions_from_file_async()
+            if _existing_json.get("pyrogram_session") != _pyro_env:
+                await save_session_string_to_file_async(_pyro_env, client_type="pyrogram")
+            if _admin_persist_id:
+                await save_session_string_to_file_async(_pyro_env, client_type="pyrogram", user_id=_admin_persist_id)
+                if _mongo_db is not None:
+                    await _mongo_db.save_session(
+                        _admin_persist_id,
+                        {"pyrogram_session": _pyro_env},
+                    )
+        elif _pyro_env:
+            logger.info("Startup: kept existing Pyrogram session (env seeding skipped)")
 
         _telethon_env = None
         for _k in (
@@ -1372,20 +1393,22 @@ async def main(background: bool = False) -> None:
                 _telethon_env = _v
                 break
 
-        if _telethon_env and _existing_json.get("telethon_session") != _telethon_env:
-            await save_session_string_to_file_async(_telethon_env, client_type="telethon")
-
-        if _telethon_env and _admin_persist_id:
-            await save_session_string_to_file_async(_telethon_env, client_type="telethon", user_id=_admin_persist_id)
-            _mongo_db = application.bot_data.get("db_model")
-            if _mongo_db is not None:
-                await _mongo_db.save_session(
-                    _admin_persist_id,
-                    {"telethon_session": _telethon_env},
-                )
+        if _telethon_env and not await _has_stored_session("telethon_session"):
+            _existing_json = await _load_all_sessions_from_file_async()
+            if _existing_json.get("telethon_session") != _telethon_env:
+                await save_session_string_to_file_async(_telethon_env, client_type="telethon")
+            if _admin_persist_id:
+                await save_session_string_to_file_async(_telethon_env, client_type="telethon", user_id=_admin_persist_id)
+                if _mongo_db is not None:
+                    await _mongo_db.save_session(
+                        _admin_persist_id,
+                        {"telethon_session": _telethon_env},
+                    )
+        elif _telethon_env:
+            logger.info("Startup: kept existing Telethon session (env seeding skipped)")
 
         logger.info(
-            "Startup: persisted env-var sessions to per-user JSON (admin=%s)",
+            "Startup: env-var session seeding complete (admin=%s)",
             _admin_persist_id,
         )
     except Exception as exc:
