@@ -284,6 +284,10 @@ class BigFilePipeline:
             # Output extension: prefer caller-supplied (handler-set) value,
             # otherwise derive from the allowlisted original-filename ext.
             _out_ext = output_ext or file_utils.safe_extension(original_filename or "", ".mp4")
+            _source_name = original_filename or f"file_{job_id}{ext}"
+            _safe_source_name = await file_utils.sanitize_filename(_source_name)
+            _source_stem = os.path.splitext(_safe_source_name)[0] or f"file_{job_id}"
+            _output_filename = f"{_source_stem}{_out_ext}"
 
             # Build the job payload
             job = {
@@ -296,7 +300,8 @@ class BigFilePipeline:
                 "chat_id": user_id or chat_id,
                 "user_id": user_id,
                 "message_id": message_id,
-                "original_filename": original_filename or f"file_{job_id}{ext}",
+                "original_filename": _safe_source_name,
+                "output_filename": _output_filename,
                 "file_unique_id": file_unique_id,
                 "file_size": actual_size,
                 "progress_channel": f"ffmpeg:progress:{job_id}",

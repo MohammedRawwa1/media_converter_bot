@@ -415,17 +415,6 @@ class SessionHealthChecker:
             return h
         h.source = source
 
-        # Only for unscoped background checks: fall back to the most recent
-        # session stored for ANY user. The periodic check doesn't know which user
-        # owns a /login or /loginpyro session, so it scans MongoDB before declaring
-        # the session unconfigured (avoids false UNHEALTHY warnings).  Scoped
-        # (per-user) lookups must never pick up another user's session.
-        if not session_str and user_id is None:
-            session_str = await self._load_any_session("pyrogram_session")
-            if session_str:
-                h.source = "any-user-mongodb"
-                logger.info("SessionHealthChecker: Pyrogram session found via latest-Mongo fallback")
-
         if not session_str:
             h.alive = False
             h.error = "PYROGRAM_SESSION not configured"
@@ -515,15 +504,6 @@ class SessionHealthChecker:
             h.error = f"config check failed: {exc}"
             return h
         h.source = source
-
-        # Only for unscoped background checks: fall back to the most recent
-        # session stored for ANY user.  Scoped (per-user) lookups must never pick
-        # up another user's session.
-        if not session_str and user_id is None:
-            session_str = await self._load_any_session("telethon_session")
-            if session_str:
-                h.source = "any-user-mongodb"
-                logger.info("SessionHealthChecker: Telethon session found via latest-Mongo fallback")
 
         if not session_str:
             # Fall back to checking for a file-based .session on disk

@@ -1493,6 +1493,7 @@ async def handle_job(job: dict):
                                     _vid_width = _probe_vm.get("width") if _probe_vm else None
                                     _vid_height = _probe_vm.get("height") if _probe_vm else None
                                     _output_ext = os.path.splitext(out)[1].lower() if out else ""
+                                    _delivery_name = job.get("output_filename") or os.path.basename(out or "output")
                                     if _output_ext in (".mp3", ".wav", ".m4a", ".aac", ".flac", ".ogg", ".opus"):
                                         kind = "audio"
                                     elif _vid_width is not None or _probe_vm:
@@ -1649,8 +1650,8 @@ async def handle_job(job: dict):
                                                         chat_id=chat_id,
                                                         audio=fh,
                                                         caption=caption,
-                                                        title=os.path.basename(out),
-                                                        filename=os.path.basename(out),
+                                                        title=os.path.splitext(_delivery_name)[0],
+                                                        filename=_delivery_name,
                                                         mime_type=_audio_mime,
                                                     )
                                             elif kind == "video":

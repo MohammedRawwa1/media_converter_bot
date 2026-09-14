@@ -832,7 +832,7 @@ async def restore_per_user_session_files(db_model: object | None = None) -> int:
         cursor = coll.find(query, projection).sort("updated_at", -1)
         docs = await cursor.to_list(length=None)
 
-        seen: set[int] = set()
+        sessions_by_user: dict[int, dict[str, str]] = {}
         for doc in docs or []:
             if not isinstance(doc, dict):
                 continue
@@ -841,9 +841,6 @@ async def restore_per_user_session_files(db_model: object | None = None) -> int:
                 uid = int(uid)
             except (TypeError, ValueError):
                 continue
-            if uid in seen:
-                continue
-
             sess = doc.get("session")
             if not isinstance(sess, dict):
                 continue
@@ -856,9 +853,18 @@ async def restore_per_user_session_files(db_model: object | None = None) -> int:
             if not tele and not pyro:
                 continue
 
-            # Mark as handled only once we actually found a session, so an older
-            # document can still backfill a user whose newest doc has no session.
-            seen.add(uid)
+            # Sessions are stored per (user_id, phone). Merge all phone documents
+            # so Telethon and Pyrogram, or two separately logged-in accounts, do
+            # not cause the later document to hide keys from the earlier one.
+            merged = sessions_by_user.setdefault(uid, {})
+            if tele and "telethon_session" not in merged:
+                merged["telethon_session"] = str(tele)
+            if pyro and "pyrogram_session" not in merged:
+                merged["pyrogram_session"] = str(pyro)
+
+        for uid, merged in sessions_by_user.items():
+            tele = merged.get("telethon_session")
+            pyro = merged.get("pyrogram_session")
 
             # Only fill keys that are MISSING locally.  On a persistent volume the
             # local JSON can be fresher than MongoDB (e.g. a login whose Mongo

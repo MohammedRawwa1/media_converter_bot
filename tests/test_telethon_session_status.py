@@ -200,6 +200,27 @@ def test_restore_per_user_session_files_without_model_is_noop():
     assert asyncio.run(telethon_session.restore_per_user_session_files(None)) == 0
 
 
+def test_restore_per_user_session_files_merges_per_phone_sessions(monkeypatch, tmp_path):
+    """Separate phone documents preserve both Telethon and Pyrogram sessions."""
+    _reset_session_env(monkeypatch, tmp_path)
+
+    model = FakeMongoModel(
+        [
+            {"user_id": 5, "session": {"pyrogram_session": "pyro-phone"}},
+            {"user_id": 5, "session": {"telethon_session": "telethon-phone"}},
+        ]
+    )
+
+    assert asyncio.run(telethon_session.restore_per_user_session_files(model)) == 1
+    pyro, _ = asyncio.run(telethon_session._resolve_pyrogram_session_with_source(user_id=5, db_model=None))
+    tele, _ = asyncio.run(
+        telethon_session._resolve_telethon_session_with_source(user_id=5, db_model=None)
+    )
+
+    assert pyro == "pyro-phone"
+    assert tele == "telethon-phone"
+
+
 # ── Registered db_model (used by the downloader/uploader, which pass none) ──
 
 
