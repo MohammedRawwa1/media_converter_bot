@@ -492,13 +492,13 @@ class SessionHealthChecker:
                         if asyncio.iscoroutine(dc):
                             dc = await dc
                         h.dc_id = dc
-                # Persist the live session string for long-term survival.  For a
-                # scoped (per-user) check only refresh a session that has not been
-                # replaced since it was resolved, so a newer session is never
-                # overwritten by an older one.  Unscoped background checks always
-                # persist — that is what keeps MongoDB/JSON fresh.
-                stored = await self._stored_session_for_user(user_id, "pyrogram")
-                if (stored and session_str == stored) or user_id is None:
+                # Persist the live session string for long-term survival.  The local
+                # per-user JSON file must be written whenever it is missing or stale,
+                # even if MongoDB already contains the same valid session string.
+                # This is the admin/per-user parity rule: an admin session is still
+                # scoped to one user and must be persisted like any other user.
+                local_stored = await self._local_session_for_user(check_user_id, "pyrogram")
+                if local_stored is None or local_stored != session_str:
                     await self._save_pyrogram_session(client, user_id=check_user_id)
             else:
                 h.error = "get_me() returned None (not authorized)"
@@ -609,10 +609,11 @@ class SessionHealthChecker:
                     logger.debug("SessionHealthChecker: failed to get Telethon user info")
                 with contextlib.suppress(Exception):
                     h.dc_id = client.session.dc_id if hasattr(client.session, "dc_id") else None
-                # Persist the live session string for long-term survival (see the
-                # guard comment in ``_check_pyrogram`` for the rationale).
-                stored = await self._stored_session_for_user(user_id, "telethon")
-                if (stored and session_str == stored) or user_id is None:
+                # Persist the live session string for long-term survival.  The local
+                # per-user JSON file must be written whenever it is missing or stale,
+                # even if MongoDB already contains the same valid session string.
+                local_stored = await self._local_session_for_user(check_user_id, "telethon")
+                if local_stored is None or local_stored != session_str:
                     await self._save_telethon_session(client, user_id=check_user_id)
             else:
                 h.error = "Session exists but user is not authorized"
@@ -788,6 +789,21 @@ class SessionHealthChecker:
                     return str(doc[key])
             except Exception:
                 logger.debug("SessionHealthChecker: failed to read stored %s session from MongoDB", client_type)
+        return None
+
+    async def _local_session_for_user(self, user_id: int | None, client_type: str) -> str | None:
+        """Return the local per-user JSON session string without consulting MongoDB."""
+        if user_id is None:
+            return None
+        key = "telethon_session" if client_type == "telethon" else "pyrogram_session"
+        try:
+            from utils.telethon_session import _load_all_sessions_from_file_async
+
+            data = await _load_all_sessions_from_file_async(user_id=user_id)
+            if isinstance(data, dict) and data.get(key):
+                return str(data[key])
+        except Exception:
+            logger.debug("SessionHealthChecker: failed to read local %s session from JSON", client_type)
         return None
 
     async def _load_any_session(self, key: str) -> str | None:

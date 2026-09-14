@@ -321,3 +321,37 @@ def test_session_healthchecker_invalidates_stale_pyrogram_json_before_fallback(m
     value, resolved_source = asyncio.run(telethon_session._resolve_pyrogram_session_with_source(user_id=42, db_model=None))
     assert value == "fresh-mongo-session"
     assert resolved_source == "mongodb"
+
+
+def test_session_healthchecker_persists_missing_per_user_pyrogram_json(monkeypatch, tmp_path):
+    """A healthy user-scoped Pyrogram session should write a per-user JSON file when it is missing."""
+    _reset_session_env(monkeypatch, tmp_path)
+
+    class FakePyroClient:
+        def __init__(self):
+            self.storage = type("Storage", (), {"dc_id": lambda self: 4})()
+
+        async def start(self):
+            return None
+
+        async def get_me(self):
+            return type("Me", (), {"phone_number": "96176390078"})()
+
+        async def export_session_string(self):
+            return "live-session-string"
+
+        async def stop(self):
+            return None
+
+    monkeypatch.setenv("PYROGRAM_SESSION", "live-session-string")
+    monkeypatch.setattr(telethon_session, "build_pyrogram_client", lambda api_id, api_hash, session_str=None: FakePyroClient())
+    monkeypatch.setattr(telethon_session, "get_userbot_credentials", lambda: (123, "hash"))
+
+    checker = SessionHealthChecker(admin_user_id=42, db_model=None)
+    checker._stored_session_for_user = lambda user_id, client_type: None
+
+    result = asyncio.run(checker._check_pyrogram(user_id=42))
+
+    assert result.alive is True
+    value = asyncio.run(telethon_session._load_session_string_from_file_async("pyrogram", user_id=42))
+    assert value == "live-session-string"
