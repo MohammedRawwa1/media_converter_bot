@@ -8,6 +8,15 @@ from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 from .callbacks import (
     ADD_AUDIO,
     BITRATE_PREFIX,
+    BULK_BITRATE_DEFAULT,
+    BULK_BITRATE_MENU,
+    BULK_CRF_CHOICES,
+    BULK_CRF_DEFAULT,
+    BULK_CRF_MENU,
+    BULK_PRESET_CHOICES,
+    BULK_PRESET_DEFAULT,
+    BULK_PRESET_LABELS,
+    BULK_PRESET_MENU,
     CANCEL,
     CAPTION_EDITOR,
     COMPRESS_MENU,
@@ -15,6 +24,7 @@ from .callbacks import (
     CONVERT_FORMAT_MENU,
     CREATE_ARCHIVE,
     EDIT_METADATA,
+    EXTRACT_MENU,
     FADE_BOTH,
     FADE_IN,
     FADE_OUT,
@@ -28,6 +38,8 @@ from .callbacks import (
     MERGE_MENU,
     MERGE_VIDEOS_START,
     MERGE_VIEW,
+    MP3_DEFAULT_BITRATE,
+    MP3_QUALITY_CHOICES,
     OPTIMIZE_MENU,
     REMOVE_AUDIO,
     RESOLUTION_MENU,
@@ -43,6 +55,10 @@ from .callbacks import (
     VIDEO_RENAMER,
     VIDEO_TO_AUDIO,
     VIDEOS_SPLITTER,
+    bulk_bitrate_key,
+    bulk_crf_key,
+    bulk_preset_key,
+    mp3_quality_key,
 )
 
 
@@ -181,16 +197,20 @@ class MediaMenuBuilder:
 
     @staticmethod
     def get_bitrate_menu(media_type: str = "audio") -> InlineKeyboardMarkup:
-        """Get bitrate adjustment menu."""
+        """Get bitrate adjustment menu (re-encodes an existing audio file)."""
         if media_type == "audio":
             buttons = [
                 [
                     InlineKeyboardButton("320k (Best)", callback_data="bitrate_320"),
-                    InlineKeyboardButton("256k (High)", callback_data="bitrate_256"),
+                    InlineKeyboardButton("256k (Very High)", callback_data="bitrate_256"),
                 ],
                 [
-                    InlineKeyboardButton("192k (Medium)", callback_data="bitrate_192"),
-                    InlineKeyboardButton("128k (Low)", callback_data="bitrate_128"),
+                    InlineKeyboardButton("192k (High)", callback_data="bitrate_192"),
+                    InlineKeyboardButton("128k (Standard)", callback_data="bitrate_128"),
+                ],
+                [
+                    InlineKeyboardButton("96k (Small)", callback_data="bitrate_96"),
+                    InlineKeyboardButton("✏️ Custom", callback_data="bitrate_custom"),
                 ],
             ]
         else:  # video
@@ -205,6 +225,26 @@ class MediaMenuBuilder:
                 ],
             ]
 
+        buttons.append([InlineKeyboardButton("↩️ Back", callback_data=MENU_MAIN)])
+        return InlineKeyboardMarkup(buttons)
+
+    @staticmethod
+    def get_mp3_quality_menu(current: str | None = None) -> InlineKeyboardMarkup:
+        """Get the MP3 quality menu used when extracting audio from a video.
+
+        ``current`` is the bitrate that will be used if the user re-opens the
+        menu, and is marked in the labels so it is obvious which one is active.
+        """
+        current = current or MP3_DEFAULT_BITRATE
+
+        def _label(value: str) -> str:
+            return f"{'✅ ' if value == current else ''}{value}"
+
+        rows = [MP3_QUALITY_CHOICES[i : i + 2] for i in range(0, len(MP3_QUALITY_CHOICES), 2)]
+        buttons = [
+            [InlineKeyboardButton(_label(v), callback_data=mp3_quality_key(v)) for v in row] for row in rows
+        ]
+        buttons.append([InlineKeyboardButton("✏️ Custom bitrate", callback_data=mp3_quality_key("custom"))])
         buttons.append([InlineKeyboardButton("↩️ Back", callback_data=MENU_MAIN)])
         return InlineKeyboardMarkup(buttons)
 
@@ -243,7 +283,9 @@ class MediaMenuBuilder:
         """Bulk mode toggles menu. `settings` is a dict of current user settings.
 
         This menu presents toggle switches for bulk-mode actions instead of
-        immediate single-file actions.
+        immediate single-file actions, plus the encoding quality the next Apply
+        will use (compress CRF / optimize preset) so those are not silent
+        defaults.
         """
         # default empty settings
         s = settings or {}
@@ -270,6 +312,23 @@ class MediaMenuBuilder:
         if row:
             buttons.append(row)
 
+        # Encoding quality for the next Apply (shown so the pick is never a
+        # hidden default).
+        crf = s.get("bulk_crf")
+        crf = crf if isinstance(crf, int) and not isinstance(crf, bool) else BULK_CRF_DEFAULT
+        preset = s.get("bulk_optimize_preset") or BULK_PRESET_DEFAULT
+        preset_label = BULK_PRESET_LABELS.get(preset, BULK_PRESET_LABELS[BULK_PRESET_DEFAULT])
+        buttons.append(
+            [
+                InlineKeyboardButton(f"🎚️ Compress CRF: {crf}", callback_data=BULK_CRF_MENU),
+                InlineKeyboardButton(f"⚡ Optimize: {preset_label}", callback_data=BULK_PRESET_MENU),
+            ]
+        )
+        bitrate = s.get("bulk_extract_bitrate") or BULK_BITRATE_DEFAULT
+        buttons.append(
+            [InlineKeyboardButton(f"🎵 Extract Audio: {bitrate}", callback_data=BULK_BITRATE_MENU)]
+        )
+
         # actions: apply and back
         buttons.append(
             [
@@ -277,6 +336,63 @@ class MediaMenuBuilder:
                 InlineKeyboardButton("↩️ Back", callback_data=MENU_MAIN),
             ]
         )
+        return InlineKeyboardMarkup(buttons)
+
+    @staticmethod
+    def get_bulk_crf_menu(current=None) -> InlineKeyboardMarkup:
+        """Compress quality (CRF) picker for bulk mode, marking the active value."""
+        try:
+            active = int(current)
+        except (TypeError, ValueError):
+            active = BULK_CRF_DEFAULT
+
+        def _quality(crf: int, label: str) -> InlineKeyboardButton:
+            mark = "✅ " if crf == active else ""
+            return InlineKeyboardButton(f"{mark}{label}", callback_data=bulk_crf_key(crf))
+
+        buttons = [
+            [_quality(BULK_CRF_CHOICES[0], "🟢 High Quality (18)"), _quality(BULK_CRF_CHOICES[1], "🟡 Medium (23)")],
+            [_quality(BULK_CRF_CHOICES[2], "🔴 Low (28)"), _quality(BULK_CRF_CHOICES[3], "⚫ Extreme (35)")],
+            [InlineKeyboardButton("✏️ Custom CRF", callback_data=bulk_crf_key("custom"))],
+            [InlineKeyboardButton("↩️ Back", callback_data="bulk_menu")],
+        ]
+        return InlineKeyboardMarkup(buttons)
+
+    @staticmethod
+    def get_bulk_bitrate_menu(current: str = None) -> InlineKeyboardMarkup:
+        """Extract-audio bitrate picker for bulk mode, marking the active value.
+
+        Same choices as the single-file video -> MP3 picker so the two never
+        drift, but with bulk triggers so choosing one never starts a conversion.
+        """
+        active = current if current in MP3_QUALITY_CHOICES else BULK_BITRATE_DEFAULT
+
+        def _label(value: str) -> str:
+            return f"{'✅ ' if value == active else ''}{value}"
+
+        rows = [MP3_QUALITY_CHOICES[i : i + 2] for i in range(0, len(MP3_QUALITY_CHOICES), 2)]
+        buttons = [[InlineKeyboardButton(_label(v), callback_data=bulk_bitrate_key(v)) for v in row] for row in rows]
+        buttons.append([InlineKeyboardButton("✏️ Custom bitrate", callback_data=bulk_bitrate_key("custom"))])
+        buttons.append([InlineKeyboardButton("↩️ Back", callback_data="bulk_menu")])
+        return InlineKeyboardMarkup(buttons)
+
+    @staticmethod
+    def get_bulk_preset_menu(current: str = None) -> InlineKeyboardMarkup:
+        """Optimize preset picker for bulk mode, marking the active preset."""
+        active = current if current in BULK_PRESET_CHOICES else BULK_PRESET_DEFAULT
+        icons = {"web": "🌐", "mobile": "📱", "tv": "📺", "storage": "💾"}
+
+        def _preset(name: str) -> InlineKeyboardButton:
+            mark = "✅ " if name == active else ""
+            icon = icons.get(name, "")
+            label = BULK_PRESET_LABELS.get(name, name.title())
+            return InlineKeyboardButton(f"{mark}{icon} {label}", callback_data=bulk_preset_key(name))
+
+        buttons = [
+            [_preset("web"), _preset("mobile")],
+            [_preset("tv"), _preset("storage")],
+            [InlineKeyboardButton("↩️ Back", callback_data="bulk_menu")],
+        ]
         return InlineKeyboardMarkup(buttons)
 
     @staticmethod
@@ -352,6 +468,9 @@ class MediaMenuBuilder:
                 InlineKeyboardButton("🎧 Remove Audio", callback_data=REMOVE_AUDIO),
                 InlineKeyboardButton("🔉 Add Audio", callback_data=ADD_AUDIO),
             ],
+            # Opens the extraction picker: Audio Only / Video Only /
+            # Subtitles / All Streams.
+            [InlineKeyboardButton("🗂️ Extract Streams", callback_data=EXTRACT_MENU)],
             [InlineKeyboardButton("↩️ Back", callback_data=MENU_MAIN)],
         ]
         return InlineKeyboardMarkup(buttons)

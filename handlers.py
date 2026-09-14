@@ -35,10 +35,14 @@ except ImportError:
         uuid = None
 
 try:
-    from utils.file_utils import AsyncFileLock, detect_filename, sanitize_filename
+    from utils.file_utils import AsyncFileLock, detect_filename, filename_from_url, sanitize_filename
 except ImportError:
     AsyncFileLock = None
     sanitize_filename = None
+
+    def filename_from_url(url: str, default_ext: str = ".mp4", fallback_stem: str = "media") -> str:
+        """Fallback used only when utils.file_utils cannot be imported."""
+        return f"{fallback_stem}{default_ext}"
 
 # Import config module if available (some code references `config.<NAME>`)
 try:
@@ -147,6 +151,313 @@ def _parse_time_to_seconds(tstr: str) -> float:
             return float(parts[0])
     except Exception as e:
         raise ValueError(f"Invalid time format: {tstr}") from e
+
+
+# Fallback bitrate for every video -> MP3 extraction when the user has not
+# picked one explicitly. Mirrors utils.callbacks.MP3_DEFAULT_BITRATE.
+_DEFAULT_AUDIO_BITRATE = "128k"
+
+# Accepted bitrate range. Anything outside it (or non-numeric) falls back to
+# the default so a user-supplied string can never reach the ffmpeg command line.
+_AUDIO_BITRATE_MIN_KBPS = 32
+_AUDIO_BITRATE_MAX_KBPS = 320
+
+# ── Bulk mode ────────────────────────────────────────────────────────────────
+# Each toggle maps to the same encoding the matching single-file action uses, so
+# bulk results look like the ones produced from the per-file menus.
+#
+# Compress quality and the Optimize preset are user picks (the bulk menu's quality
+# row), stored per user as `bulk_crf` / `bulk_optimize_preset`. The values below
+# are only the fallbacks used until the user changes them; keep the choices in
+# sync with utils.callbacks.BULK_CRF_* and BULK_PRESET_*.
+
+# Compress quality: libx264 CRF, lower is better quality. Mirrors
+# utils.callbacks.BULK_CRF_DEFAULT.
+_BULK_COMPRESS_CRF_DEFAULT = 28
+_BULK_COMPRESS_CRF_MIN = 18
+_BULK_COMPRESS_CRF_MAX = 51
+_BULK_COMPRESS_AUDIO_ARGS = ["-c:a", "aac", "-b:a", "128k"]
+
+# Optimize presets, mirroring the preset_map in `optimize_video()`:
+# preset -> (encoder preset, crf, audio bitrate). The keys must match
+# utils.callbacks.BULK_PRESET_CHOICES.
+_BULK_OPTIMIZE_PRESETS: dict[str, tuple[str, int, str]] = {
+    "web": ("slow", 23, "128k"),
+    "mobile": ("medium", 28, "96k"),
+    "tv": ("slow", 20, "192k"),
+    "storage": ("veryfast", 35, "64k"),
+}
+_BULK_OPTIMIZE_DEFAULT = "web"
+
+# Extract Audio bitrate, mirroring utils.callbacks.BULK_BITRATE_DEFAULT.
+# Validated through `_sanitize_audio_bitrate` so the pick can never reach the
+# ffmpeg command line as free text.
+_BULK_EXTRACT_BITRATE_DEFAULT = _DEFAULT_AUDIO_BITRATE
+
+# Convert to MP4 — see convert_video_format(). Values are (video_args, audio_args);
+# audio args are replaced by -an when the Remove Audio toggle is also on.
+_BULK_CONVERT_ARGS: tuple[list[str], list[str]] = (
+    ["-c:v", "libx264", "-movflags", "+faststart"],
+    ["-c:a", "aac", "-strict", "experimental"],
+)
+
+# Precedence when several video toggles are on: only one encode pass is possible.
+_BULK_VIDEO_PRECEDENCE = ("bulk_compress", "bulk_optimize", "bulk_convert_mp4")
+
+_BULK_ACTION_LABELS = {
+    "bulk_convert_mp4": "Convert to MP4",
+    "bulk_compress": "Compress",
+    "bulk_extract_audio": "Extract Audio",
+    "bulk_remove_audio": "Remove Audio",
+    "bulk_rename": "Rename",
+    "bulk_optimize": "Optimize",
+}
+
+# "Video Only" extraction: keep the first video stream, drop audio/subtitles.
+# Re-encoding to H.264 makes the result playable regardless of the source codec.
+_EXTRACT_VIDEO_FFMPEG_ARGS = [
+    "-map",
+    "0:v:0",
+    "-c:v",
+    "libx264",
+    "-preset",
+    "veryfast",
+    "-crf",
+    "23",
+    "-an",
+    "-movflags",
+    "+faststart",
+]
+
+
+def _sanitize_audio_bitrate(value, default: str = _DEFAULT_AUDIO_BITRATE) -> str:
+    """Normalize a user-supplied audio bitrate to a safe ``"<kbps>k"`` string."""
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        value = f"{int(value)}k"
+    text = str(value or "").strip().lower()
+    if text.endswith("k"):
+        text = text[:-1].strip()
+    if text.endswith("kbps"):
+        text = text[:-4].strip()
+    if not text.isdigit():
+        return default
+    kbps = int(text)
+    if not _AUDIO_BITRATE_MIN_KBPS <= kbps <= _AUDIO_BITRATE_MAX_KBPS:
+        return default
+    return f"{kbps}k"
+
+
+def _audio_delivery_name(name: str | None, fallback_id=None, extension: str = ".mp3") -> str:
+    """Build the filename used when delivering an extracted audio file.
+
+    The original media name is preserved (only the extension is swapped) so the
+    user receives ``My Video.mp3`` instead of an opaque storage key.
+    """
+    stem = os.path.basename((name or "").strip())
+    stem = os.path.splitext(stem)[0]
+    if not stem:
+        stem = f"audio_{fallback_id}" if fallback_id else "audio"
+    return f"{stem}{extension}"
+
+
+def _bulk_rename_filename(filename: str | None, settings: dict | None) -> tuple[str, bool]:
+    """Rename ``filename`` using the user's prefix/suffix/words-to-remove settings.
+
+    Returns ``(new_name, changed)``. The extension is always preserved.
+    """
+    name = os.path.basename(filename or "")
+    stem, ext = os.path.splitext(name)
+    if not stem:
+        return name, False
+
+    settings = settings or {}
+    new_stem = stem
+    for word in settings.get("words_remove") or []:
+        if word:
+            new_stem = new_stem.replace(str(word), "")
+    new_stem = new_stem.strip() or stem
+    renamed = f"{settings.get('prefix') or ''}{new_stem}{settings.get('suffix') or ''}".strip() or new_stem
+    new_name = f"{renamed}{ext}"
+    return new_name, new_name != name
+
+
+def _parse_bulk_crf(value) -> int | None:
+    """Parse a user-supplied bulk CRF, returning ``None`` when out of range.
+
+    Separate from the sanitizer so the text-input path can tell "invalid" apart
+    from "unset", which the sanitizer deliberately collapses into the default.
+    """
+    if isinstance(value, bool):
+        return None
+    try:
+        number = int(str(value).strip())
+    except (TypeError, ValueError):
+        return None
+    if _BULK_COMPRESS_CRF_MIN <= number <= _BULK_COMPRESS_CRF_MAX:
+        return number
+    return None
+
+
+def _sanitize_bulk_crf(value, default: int = _BULK_COMPRESS_CRF_DEFAULT) -> int:
+    """Coerce a stored bulk CRF to a valid libx264 value.
+
+    Anything unusable (missing, non-numeric, out of range) falls back to the
+    default so a stale setting can never reach the ffmpeg command line.
+    """
+    parsed = _parse_bulk_crf(value)
+    return default if parsed is None else parsed
+
+
+def _sanitize_bulk_preset(value, default: str = _BULK_OPTIMIZE_DEFAULT) -> str:
+    """Coerce a stored bulk optimize preset to a known preset name."""
+    name = str(value or "").strip().lower()
+    return name if name in _BULK_OPTIMIZE_PRESETS else default
+
+
+def _sanitize_bulk_extract_bitrate(value, default: str = _BULK_EXTRACT_BITRATE_DEFAULT) -> str:
+    """Coerce a stored bulk Extract Audio bitrate to a safe ``"<kbps>k"`` string.
+
+    Shares the single-file sanitizer, so the accepted range and the normalising
+    of ``128`` / ``128kbps`` / `` 128K `` are identical to the MP3 picker.
+    """
+    return _sanitize_audio_bitrate(value, default=default)
+
+
+def _bulk_video_recipe(key: str, settings: dict | None = None) -> tuple[list[str], list[str]]:
+    """Video and audio args for one video toggle, honoring the quality picks.
+
+    Returns ``(video_args, audio_args)``; the caller replaces the audio args with
+    ``-an`` when Remove Audio is also on.
+    """
+    settings = settings or {}
+
+    if key == "bulk_compress":
+        crf = _sanitize_bulk_crf(settings.get("bulk_crf"))
+        return (
+            ["-c:v", "libx264", "-preset", "medium", "-crf", str(crf), "-movflags", "+faststart"],
+            list(_BULK_COMPRESS_AUDIO_ARGS),
+        )
+
+    if key == "bulk_optimize":
+        preset = _sanitize_bulk_preset(settings.get("bulk_optimize_preset"))
+        encoder, crf, bitrate = _BULK_OPTIMIZE_PRESETS[preset]
+        return (
+            ["-c:v", "libx264", "-preset", encoder, "-crf", str(crf), "-movflags", "+faststart"],
+            ["-c:a", "aac", "-b:a", bitrate],
+        )
+
+    return list(_BULK_CONVERT_ARGS[0]), list(_BULK_CONVERT_ARGS[1])
+
+
+def _bulk_quality_label(plan: dict) -> str:
+    """Describe the encoding quality a plan will use, for the Apply summary."""
+    if "bulk_compress" in plan.get("applied", []):
+        return f"CRF {plan.get('crf')}"
+    if "bulk_optimize" in plan.get("applied", []):
+        preset = plan.get("optimize_preset") or _BULK_OPTIMIZE_DEFAULT
+        return f"Optimize preset: {preset}"
+    if "bulk_extract_audio" in plan.get("applied", []):
+        return f"MP3 {plan.get('extract_bitrate') or _BULK_EXTRACT_BITRATE_DEFAULT}"
+    return ""
+
+
+def _resolve_bulk_plan(settings: dict | None) -> dict:
+    """Resolve the bulk toggles into the single ffmpeg pass applied to each file.
+
+    A worker job is one ffmpeg invocation, so contradictory toggles cannot all
+    run. Extraction wins over video work (it discards video anyway), Compress
+    wins over Optimize over Convert, and Remove Audio / Rename act as
+    modifiers. Dropped toggles are reported in ``ignored`` so the user is told
+    instead of silently getting something else.
+
+    Compress uses the user's ``bulk_crf`` and Optimize the user's
+    ``bulk_optimize_preset`` (both defaulted and validated here).
+
+    Returns a dict with ``ffmpeg_args``, ``output_ext``, ``convert_type``,
+    ``applied``, ``ignored``, ``rename``, ``crf`` and ``optimize_preset``.
+    """
+    settings = settings or {}
+
+    extract_audio = bool(settings.get("bulk_extract_audio"))
+    remove_audio = bool(settings.get("bulk_remove_audio"))
+    rename = bool(settings.get("bulk_rename"))
+    video_keys = [key for key in _BULK_VIDEO_PRECEDENCE if settings.get(key)]
+
+    crf = _sanitize_bulk_crf(settings.get("bulk_crf"))
+    optimize_preset = _sanitize_bulk_preset(settings.get("bulk_optimize_preset"))
+    extract_bitrate = _sanitize_bulk_extract_bitrate(settings.get("bulk_extract_bitrate"))
+
+    ignored: list[str] = []
+    if extract_audio:
+        ffmpeg_args = ["-vn", "-acodec", "libmp3lame", "-ab", extract_bitrate]
+        output_ext, convert_type = ".mp3", "extract_audio"
+        applied = ["bulk_extract_audio"]
+        # Video work and audio removal are meaningless once the audio is the
+        # only thing being delivered.
+        ignored = list(video_keys) + (["bulk_remove_audio"] if remove_audio else [])
+    elif video_keys:
+        chosen = video_keys[0]
+        video_args, audio_args = _bulk_video_recipe(chosen, settings)
+        applied = [chosen]
+        ignored = list(video_keys[1:])
+        if remove_audio:
+            ffmpeg_args = list(video_args) + ["-an"]
+            applied.append("bulk_remove_audio")
+        else:
+            ffmpeg_args = list(video_args) + list(audio_args)
+        output_ext, convert_type = ".mp4", "ffmpeg"
+    elif remove_audio:
+        # Stream copy keeps this lossless and fast.
+        ffmpeg_args = ["-an", "-c:v", "copy"]
+        output_ext, convert_type = ".mp4", "ffmpeg"
+        applied = ["bulk_remove_audio"]
+    else:
+        # Nothing selected: keep the historic default (MP4 conversion).
+        video_args, audio_args = _bulk_video_recipe("bulk_convert_mp4", settings)
+        ffmpeg_args = list(video_args) + list(audio_args)
+        output_ext, convert_type = ".mp4", "ffmpeg"
+        applied = ["bulk_convert_mp4"]
+
+    if rename:
+        applied.append("bulk_rename")
+
+    return {
+        "ffmpeg_args": ffmpeg_args,
+        "output_ext": output_ext,
+        "convert_type": convert_type,
+        "applied": applied,
+        "ignored": ignored,
+        "rename": rename,
+        "crf": crf,
+        "optimize_preset": optimize_preset,
+        "extract_bitrate": extract_bitrate,
+    }
+
+
+def _read_bulk_settings(user_id, session: dict | None) -> dict:
+    """Read the bulk settings the same way Apply does (settings store, else session).
+
+    Reading and writing through one pair keeps the menu, the toggles, the quality
+    pickers and Apply from ever looking at different stores.
+    """
+    try:
+        if user_settings:
+            return user_settings.get_user_settings(user_id) or {}
+        return (session or {}).get("bulk_settings") or {}
+    except Exception:
+        logger.exception("Failed to read bulk settings for %s", user_id)
+        return {}
+
+
+def _write_bulk_setting(user_id, session: dict | None, key: str, value) -> None:
+    """Persist one bulk setting next to the toggles (settings store or session)."""
+    try:
+        if user_settings:
+            user_settings.set_user_setting(user_id, key, value)
+        elif session is not None:
+            session.setdefault("bulk_settings", {})[key] = value
+    except Exception:
+        logger.exception("Failed to persist bulk setting %s", key)
 
 
 def _format_seconds_to_hhmmss(sec: float) -> str:
@@ -2143,9 +2454,20 @@ class EnhancedMediaHandler:
     async def show_bulk_menu(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Show the bulk-mode action menu (either as reply or edit)."""
         user_id = update.effective_user.id if update and update.effective_user else None
-        s = user_settings.get_user_settings(user_id) if user_settings else {}
+        s = _read_bulk_settings(user_id, self.user_sessions.get(user_id))
         status = "On" if s.get("bulk_mode") else "Off"
-        text = f"📦 <b>Bulk Mode Actions</b>\n\nCurrent Status >> Bulk Mode : {status}\n\nPlease select your preferred action below 👇"
+        crf = _sanitize_bulk_crf(s.get("bulk_crf"))
+        preset = _sanitize_bulk_preset(s.get("bulk_optimize_preset"))
+        bitrate = _sanitize_bulk_extract_bitrate(s.get("bulk_extract_bitrate"))
+        text = (
+            f"📦 <b>Bulk Mode Actions</b>\n\n"
+            f"Current Status >> Bulk Mode : {status}\n"
+            f"Quality >> Compress CRF : {crf} · Optimize preset : {preset} · Extract Audio : {bitrate}\n\n"
+            "Toggle one or more actions, then press ▶️ Apply Bulk.\n"
+            "<i>One encoding pass per file: Extract Audio replaces the video actions, "
+            "Compress wins over Optimize over Convert, and Remove Audio / Rename combine with them.</i>\n\n"
+            "Please select your preferred action below 👇"
+        )
         # Build keyboard defensively. MediaMenuBuilder may be missing or raise,
         # so capture failures and still show a helpful message.
         kb = None
@@ -2228,6 +2550,8 @@ class EnhancedMediaHandler:
             job = {
                 "job_id": job_id,
                 "source_url": url,
+                # Keeps the delivered filename derived from the URL instead of the job id.
+                "original_filename": filename_from_url(url),
                 "progress_channel": f"ffmpeg:progress:{job_id}",
                 "chat_id": update.effective_chat.id if update and update.effective_chat else None,
                 "cleanup_input": True,
@@ -2326,6 +2650,8 @@ class EnhancedMediaHandler:
             "input_path": input_path,
             "input_key": current_file.get("input_key"),
             "output_path": output_path,
+            # Keeps the delivered filename derived from the original name.
+            "original_filename": current_file.get("name") or os.path.basename(output_path),
             "ffmpeg_args": current_file.get("_pipeline_ffmpeg_args") or _format_ffmpeg_args.get(target_format),
             "output_ext": f".{target_format}",
             "progress_channel": f"ffmpeg:progress:{job_id}",
@@ -2516,12 +2842,24 @@ class EnhancedMediaHandler:
                 output_path = input_path + ".tagged" + os.path.splitext(input_path)[1]
                 try:
                     ok = await self.converter.edit_metadata(input_path, output_path, tags)
-                    if ok:
-                        await update.message.reply_text(
-                            "✅ Tags applied. I'll replace the current file with the tagged version."
-                        )
+                    if ok and os.path.exists(output_path):
                         # replace current file path
                         current_file["path"] = output_path
+                        # Deliver the tagged file right away as streamable audio,
+                        # otherwise the user never sees the result of this action.
+                        delivery_name = _audio_delivery_name(
+                            current_file.get("name"),
+                            current_file.get("id"),
+                            extension=os.path.splitext(output_path)[1] or ".mp3",
+                        )
+                        with open(output_path, "rb") as audio_file:
+                            await update.message.reply_audio(
+                                audio=audio_file,
+                                caption="✅ Tags applied",
+                                title=tags.get("title") or os.path.splitext(delivery_name)[0],
+                                performer=tags.get("artist") or tags.get("performer") or "Media Bot",
+                                filename=delivery_name,
+                            )
                     else:
                         await update.message.reply_text("❌ Failed to apply tags.")
                 except Exception:
@@ -2614,6 +2952,8 @@ class EnhancedMediaHandler:
                         "job_id": job_id,
                         "source_url": url,
                         "output_path": output_path,
+                        # Keeps the delivered filename derived from the URL instead of the job id.
+                        "original_filename": filename_from_url(url),
                         "ffmpeg_args": [
                             "-c:v",
                             "libx264",
@@ -2667,9 +3007,22 @@ class EnhancedMediaHandler:
             return
 
         # Register file lazily (do not download yet). We'll download on-demand
+        # Preserve the filename Telegram gives us (videos sent as files carry
+        # ``video.file_name``). Only fall back to a generated name when the
+        # client did not send one, otherwise converted audio/video would be
+        # delivered under an opaque ``{user_id}_{file_id}`` name.
         file_id = video.file_id
         ext = ".mp4"
-        default_name = f"{user_id}_{file_id}{ext}"
+        _original_name = (getattr(video, "file_name", None) or "").strip()
+        if _original_name:
+            _orig_ext = os.path.splitext(_original_name)[1].lower()
+            if _orig_ext in self.converter.supported_formats["video"]:
+                ext = _orig_ext
+            default_name = _original_name if _orig_ext else f"{_original_name}{ext}"
+        else:
+            # Telegram did not send a filename (common for gallery videos), so
+            # use a readable timestamp instead of the old "<user>_<file_id>" blob.
+            default_name = f"video_{datetime.now().strftime('%Y%m%d_%H%M%S')}{ext}"
         final_name = default_name
         thumb = None
         try:
@@ -2760,7 +3113,15 @@ class EnhancedMediaHandler:
             }
             ext = ext_map.get(audio.mime_type, ".mp3")
 
-        default_name = audio.title or f"{user_id}_{audio.file_id}{ext}"
+        # Prefer the sender's own filename, then the audio title, and only then a
+        # generated name — so the delivered audio keeps the original name.
+        _audio_original = (getattr(audio, "file_name", None) or "").strip()
+        if _audio_original:
+            default_name = _audio_original
+        elif audio.title:
+            default_name = audio.title
+        else:
+            default_name = f"audio_{datetime.now().strftime('%Y%m%d_%H%M%S')}{ext}"
         final_name = default_name
         thumb = None
         try:
@@ -3050,8 +3411,23 @@ class EnhancedMediaHandler:
                 query, "✅ Fade applied! Sending file...", reply_markup=MediaMenuBuilder.get_back_button()
             )
             try:
-                with open(output_path, "rb") as f:
-                    await context.bot.send_document(chat_id=update.effective_chat.id, document=f)
+                if current_file.get("type") == "audio":
+                    # Deliver faded audio as streamable audio, not as a document.
+                    delivery_name = _audio_delivery_name(
+                        current_file.get("name"), current_file.get("id"), extension=ext or ".mp3"
+                    )
+                    with open(output_path, "rb") as audio_file:
+                        await context.bot.send_audio(
+                            chat_id=update.effective_chat.id,
+                            audio=audio_file,
+                            caption="✅ Fade applied",
+                            title=os.path.splitext(delivery_name)[0],
+                            filename=delivery_name,
+                            performer="Media Bot",
+                        )
+                else:
+                    with open(output_path, "rb") as f:
+                        await context.bot.send_document(chat_id=update.effective_chat.id, document=f)
             except Exception:
                 await self.safe_edit(
                     query,
@@ -3140,9 +3516,9 @@ class EnhancedMediaHandler:
             # Screenshot menu differences
             "screenshot_grid_3": "screenshot_9grid",
             "screenshot_grid_4": "screenshot_multiple",
-            # Extraction aliases
+            # Extraction aliases (see MediaMenuBuilder.get_extraction_menu)
             "extract_audio_only": "extract_audio",
-            "extract_video_only": "extract_streams",
+            "extract_video_only": "extract_video",
             "extract_all": "extract_all_streams",
             # Misc small mappings
             "add_audio": "merge_av_menu",
@@ -3224,7 +3600,19 @@ class EnhancedMediaHandler:
 
             # Video tools
             elif data == "convert_mp3":
-                await self.convert_to_mp3(update, context, session)
+                # Let the user pick the MP3 quality before extracting audio.
+                await self.show_mp3_quality_menu(update, context, session)
+
+            elif isinstance(data, str) and data.startswith("mp3q_"):
+                quality = data.split("_", 1)[1]
+                if quality == "custom":
+                    await self.safe_edit(query, "✏️ Send the MP3 bitrate (32k-320k, e.g. 128k):")
+                    for key in list(context.user_data.keys()):
+                        if key.startswith("awaiting_"):
+                            del context.user_data[key]
+                    context.user_data["awaiting_mp3_bitrate"] = True
+                    return
+                await self.convert_to_mp3(update, context, session, bitrate=quality)
 
             elif data == "compress_menu":
                 await self.safe_edit(
@@ -3386,11 +3774,25 @@ class EnhancedMediaHandler:
                 option = data.split("_")[1]
                 await self.take_screenshot(update, context, session, option)
 
+            elif data == "extraction_menu":
+                # Opened from the video tools menu; the individual actions are
+                # handled by extract_audio / extract_streams / extract_subtitles.
+                _has_video = bool(current_file) and current_file.get("type") == "video"
+                _hint = "" if _has_video else "\n\nℹ️ Video Only, Subtitles and All Streams need a video file."
+                await self.safe_edit(
+                    query,
+                    f"🗂️ **Extract Streams**\nChoose what to extract:{_hint}",
+                    reply_markup=MediaMenuBuilder.get_extraction_menu(),
+                )
+
             elif data == "extract_streams":
                 await self.extract_streams(update, context, session)
 
             elif data == "extract_audio":
                 await self.extract_audio(update, context, session)
+
+            elif data == "extract_video":
+                await self.extract_video(update, context, session)
 
             # Audio tools
             elif data == "convert_format_menu":
@@ -3410,6 +3812,16 @@ class EnhancedMediaHandler:
 
             elif isinstance(data, str) and data.startswith("format_"):
                 format_type = data.split("_")[1]
+                if format_type in ("audio", "video"):
+                    # "🔄 Convert" entry points use format_audio/format_video to
+                    # only open the picker — they are not conversion targets.
+                    media_type = "video" if format_type == "video" else "audio"
+                    await self.safe_edit(
+                        query,
+                        f"🔄 **Convert {media_type.title()} Format**\nSelect target format:",
+                        reply_markup=MediaMenuBuilder.get_format_menu(media_type),
+                    )
+                    return
                 # Route to video or audio conversion depending on current file type
                 try:
                     if current_file and current_file.get("type") == "video":
@@ -3512,10 +3924,12 @@ class EnhancedMediaHandler:
                     query,
                     "⏱️ **Change Framerate**\nEnter target FPS (e.g., 24, 30, 60).",
                 )
-                context.user_data["awaiting_framerate"] = True
+                # Clear previous prompts *before* arming this one, otherwise the
+                # loop below would delete the flag we just set.
                 for key in list(context.user_data.keys()):
                     if key.startswith("awaiting_"):
                         del context.user_data[key]
+                context.user_data["awaiting_framerate"] = True
 
             elif data == "fade_menu":
                 await self.safe_edit(
@@ -3554,11 +3968,13 @@ class EnhancedMediaHandler:
                 await self.adjust_bitrate(update, context, session, bitrate)
 
             elif data == "trim_audio":
-                await self.safe_edit(query, "✂️ **Trim Audio**\nSend start time (HH:MM:SS):")
-                context.user_data["awaiting_trim"] = "start"
+                # Clear previous prompts *before* arming this one, otherwise the
+                # loop below would delete the flag we just set.
                 for key in list(context.user_data.keys()):
                     if key.startswith("awaiting_"):
                         del context.user_data[key]
+                context.user_data["awaiting_trim"] = "start"
+                await self.safe_edit(query, "✂️ **Trim Audio**\nSend start time (HH:MM:SS):")
 
             elif data == "caption_editor":
                 # Ask user to send a new caption for the current file
@@ -3659,15 +4075,9 @@ class EnhancedMediaHandler:
                     return
 
                 try:
-                    if user_settings:
-                        new = user_settings.toggle_user_setting(user_id, key)
-                    else:
-                        # fallback to session-scoped bulk settings
-                        sess = session or self.user_sessions.setdefault(user_id, {})
-                        b = sess.setdefault("bulk_settings", {})
-                        cur = bool(b.get(key))
-                        new = not cur
-                        b[key] = new
+                    sess = session or self.user_sessions.setdefault(user_id, {})
+                    new = not bool(_read_bulk_settings(user_id, sess).get(key))
+                    _write_bulk_setting(user_id, sess, key, new)
 
                     await self.safe_edit(query, f"✅ {key.replace('_', ' ').title()}: {'On' if new else 'Off'}")
                     # re-render the bulk menu to show updated status
@@ -3675,6 +4085,98 @@ class EnhancedMediaHandler:
                 except Exception:
                     logger.exception("Failed to toggle bulk setting %s", key)
                     await self.safe_edit(query, "⚠️ Failed to toggle setting")
+
+            elif data == "bulk_crf_menu":
+                # Compress quality picker for the next Apply
+                sess = session or self.user_sessions.setdefault(user_id, {})
+                current = _sanitize_bulk_crf(_read_bulk_settings(user_id, sess).get("bulk_crf"))
+                await self.safe_edit(
+                    query,
+                    f"🎚️ <b>Bulk compress quality</b>\n\nCurrent: CRF {current}\n"
+                    "<i>Lower CRF means better quality and a larger file.</i>",
+                    reply_markup=MediaMenuBuilder.get_bulk_crf_menu(current),
+                )
+
+            elif data == "bulk_preset_menu":
+                # Optimize preset picker for the next Apply
+                sess = session or self.user_sessions.setdefault(user_id, {})
+                current = _sanitize_bulk_preset(_read_bulk_settings(user_id, sess).get("bulk_optimize_preset"))
+                await self.safe_edit(
+                    query,
+                    f"⚡ <b>Bulk optimize preset</b>\n\nCurrent: {current}\n"
+                    "<i>Applied when the Optimize toggle is on.</i>",
+                    reply_markup=MediaMenuBuilder.get_bulk_preset_menu(current),
+                )
+
+            elif data == "bulk_bitrate_menu":
+                # Extract Audio bitrate picker for the next Apply
+                sess = session or self.user_sessions.setdefault(user_id, {})
+                current = _sanitize_bulk_extract_bitrate(
+                    _read_bulk_settings(user_id, sess).get("bulk_extract_bitrate")
+                )
+                await self.safe_edit(
+                    query,
+                    f"🎵 <b>Bulk Extract Audio bitrate</b>\n\nCurrent: {current}\n"
+                    "<i>Applied when the Extract Audio toggle is on — higher is better quality and a bigger file.</i>",
+                    reply_markup=MediaMenuBuilder.get_bulk_bitrate_menu(current),
+                )
+
+            elif isinstance(data, str) and data.startswith("bulk_set_bitrate:"):
+                # Store the chosen Extract Audio bitrate (or arm the custom prompt)
+                value = data.split(":", 1)[1]
+                sess = session or self.user_sessions.setdefault(user_id, {})
+                if value == "custom":
+                    for key in list(context.user_data.keys()):
+                        if key.startswith("awaiting_"):
+                            del context.user_data[key]
+                    context.user_data["awaiting_bulk_bitrate"] = True
+                    await self.safe_edit(
+                        query,
+                        f"✏️ Send the MP3 bitrate ({_AUDIO_BITRATE_MIN_KBPS}k-{_AUDIO_BITRATE_MAX_KBPS}k, e.g. 128k):",
+                    )
+                else:
+                    bitrate = _sanitize_audio_bitrate(value, default="")
+                    if not bitrate:
+                        await self.safe_edit(query, "⚠️ Invalid bitrate option.")
+                    else:
+                        _write_bulk_setting(user_id, sess, "bulk_extract_bitrate", bitrate)
+                        await self.safe_edit(query, f"✅ Bulk Extract Audio bitrate set to {bitrate}.")
+                        await self.show_bulk_menu(update, context)
+
+            elif isinstance(data, str) and data.startswith("bulk_set_crf:"):
+                # Store the chosen CRF (or arm the custom-input prompt)
+                value = data.split(":", 1)[1]
+                sess = session or self.user_sessions.setdefault(user_id, {})
+                if value == "custom":
+                    for key in list(context.user_data.keys()):
+                        if key.startswith("awaiting_"):
+                            del context.user_data[key]
+                    context.user_data["awaiting_bulk_crf"] = True
+                    await self.safe_edit(
+                        query,
+                        f"✏️ Enter a CRF between {_BULK_COMPRESS_CRF_MIN} and {_BULK_COMPRESS_CRF_MAX}"
+                        " (e.g. 23). Lower means better quality.",
+                    )
+                else:
+                    crf = _parse_bulk_crf(value)
+                    if crf is None:
+                        await self.safe_edit(query, "⚠️ Invalid CRF option.")
+                    else:
+                        _write_bulk_setting(user_id, sess, "bulk_crf", crf)
+                        await self.safe_edit(query, f"✅ Bulk compress CRF set to {crf}.")
+                        await self.show_bulk_menu(update, context)
+
+            elif isinstance(data, str) and data.startswith("bulk_set_preset:"):
+                # Store the chosen optimize preset
+                value = data.split(":", 1)[1]
+                sess = session or self.user_sessions.setdefault(user_id, {})
+                preset = str(value or "").strip().lower()
+                if preset not in _BULK_OPTIMIZE_PRESETS:
+                    await self.safe_edit(query, "⚠️ Invalid preset option.")
+                else:
+                    _write_bulk_setting(user_id, sess, "bulk_optimize_preset", preset)
+                    await self.safe_edit(query, f"✅ Bulk optimize preset set to {preset}.")
+                    await self.show_bulk_menu(update, context)
 
             elif data == "bulk_apply":
                 # Apply bulk actions to files in session.merge_list or current_file
@@ -3687,6 +4189,16 @@ class EnhancedMediaHandler:
                     if not files:
                         await self.safe_edit(query, "❌ No files selected for bulk processing.")
                         return
+
+                    # Honor every bulk toggle (convert / compress / extract audio /
+                    # remove audio / rename / optimize) and tell the user which
+                    # ones could not fit into the single pass, so nothing is
+                    # silently ignored.
+                    _bulk_settings = _read_bulk_settings(user_id, sess)
+
+                    _plan = _resolve_bulk_plan(_bulk_settings)
+                    _bulk_args = _plan["ffmpeg_args"]
+                    _bulk_ext = _plan["output_ext"]
 
                     enqueued = 0
                     for f in list(files):
@@ -3709,27 +4221,33 @@ class EnhancedMediaHandler:
                             )
                             with contextlib.suppress(OSError):
                                 os.makedirs(output_dir, exist_ok=True)
-                            out_path = os.path.join(output_dir, f"{f.get('id')}_bulk.mp4")
+                            out_path = os.path.join(output_dir, f"{f.get('id')}_bulk{_bulk_ext}")
+                            # Keep the delivered filename derived from the original
+                            # name, applying the Rename toggle when it is on.
+                            _bulk_name = f.get("name") or os.path.basename(out_path)
+                            if _plan["rename"]:
+                                _renamed, _renamed_ok = _bulk_rename_filename(_bulk_name, _bulk_settings)
+                                if _renamed_ok:
+                                    _bulk_name = _renamed
                             job = {
                                 "job_id": job_id,
                                 "input_path": f.get("path"),
                                 "input_key": f.get("input_key"),
                                 "output_path": out_path,
-                                "ffmpeg_args": [
-                                    "-c:v",
-                                    "libx264",
-                                    "-c:a",
-                                    "aac",
-                                    "-strict",
-                                    "experimental",
-                                ],
-                                "output_ext": ".mp4",
+                                "original_filename": _bulk_name,
+                                "ffmpeg_args": list(_bulk_args),
+                                "output_ext": _bulk_ext,
+                                "type": _plan["convert_type"],
                                 "progress_channel": f"ffmpeg:progress:{job_id}",
                                 "chat_id": update.effective_chat.id
                                 if update and getattr(update, "effective_chat", None)
                                 else None,
-                                "thumbnail": f.get("thumbnail"),
-                                "caption": f"Bulk conversion finished for {f.get('name') or f.get('id')}",
+                                "thumbnail": None if _bulk_ext == ".mp3" else f.get("thumbnail"),
+                                "caption": (
+                                    f"✅ Audio extracted ({_plan['extract_bitrate']})"
+                                    if _bulk_ext == ".mp3"
+                                    else f"Bulk conversion finished for {_bulk_name}"
+                                ),
                                 "cleanup_input": True,
                                 "cleanup_output": False,
                             }
@@ -3750,7 +4268,15 @@ class EnhancedMediaHandler:
                         except Exception:
                             logger.exception("Failed processing bulk file %s", f.get("id"))
 
-                    await self.safe_edit(query, f"✅ Bulk apply queued for {enqueued} file(s).")
+                    _applied = ", ".join(_BULK_ACTION_LABELS[key] for key in _plan["applied"])
+                    _quality = _bulk_quality_label(_plan)
+                    if _quality:
+                        _applied = f"{_applied} ({_quality})"
+                    _summary = f"✅ Bulk apply queued for {enqueued} file(s).\n• Applied: {_applied}"
+                    if _plan["ignored"]:
+                        _skipped = ", ".join(_BULK_ACTION_LABELS[key] for key in _plan["ignored"])
+                        _summary += f"\n⚠️ Skipped — cannot run in the same pass: {_skipped}"
+                    await self.safe_edit(query, _summary)
                 except Exception:
                     logger.exception("bulk_apply failed")
                     await self.safe_edit(query, "⚠️ Failed to apply bulk actions.")
@@ -3765,12 +4291,15 @@ class EnhancedMediaHandler:
             elif data == "mp3_tag_editor":
                 # Simple entry point for mp3 tag edits (advanced editor may be added later)
                 try:
+                    # Clear stale prompts before arming this one (see add_subtitles).
+                    for key in list(context.user_data.keys()):
+                        if key.startswith("awaiting_"):
+                            del context.user_data[key]
+                    context.user_data["awaiting_mp3_tags"] = True
                     await self.safe_edit(
                         query,
                         '✏️ Mp3 Tag Editor\n\nSend a JSON object with tag keys and values (example: {"title":"Song"}).',
                     )
-                    # mark awaiting state so next message can be treated as metadata
-                    context.user_data["awaiting_mp3_tags"] = True
                 except Exception:
                     await self.safe_edit(query, "⚠️ Failed to open Mp3 Tag Editor.")
 
@@ -3939,9 +4468,13 @@ class EnhancedMediaHandler:
                 await self.create_thumbnail_grid(update, context, session)
 
             elif data == "add_subtitles":
-                await self.safe_edit(query, "➕ **Add Subtitles**\nSend subtitle file (.srt, .ass):")
-                # Expect next document upload to be subtitle file to attach
+                # Clear stale prompts before arming this one so the next upload is
+                # routed here rather than into a previously armed flow.
+                for key in list(context.user_data.keys()):
+                    if key.startswith("awaiting_"):
+                        del context.user_data[key]
                 context.user_data["awaiting_subtitle_file"] = True
+                await self.safe_edit(query, "➕ **Add Subtitles**\nSend subtitle file (.srt, .ass):")
 
             elif data == "burn_subtitles":
                 # Ask user to send subtitle file to burn into current video
@@ -3949,11 +4482,14 @@ class EnhancedMediaHandler:
                 if not current_file or current_file.get("type") != "video":
                     await self.safe_edit(query, "❌ No video file found to burn subtitles into.")
                 else:
+                    for key in list(context.user_data.keys()):
+                        if key.startswith("awaiting_"):
+                            del context.user_data[key]
+                    context.user_data["awaiting_burn_subtitle"] = True
                     await self.safe_edit(
                         query,
                         ("✏️ **Burn Subtitles**\nSend subtitle file (.srt, .ass) to burn into the current video:"),
                     )
-                    context.user_data["awaiting_burn_subtitle"] = True
 
             # Information
             elif data == "info":
@@ -4027,9 +4563,61 @@ class EnhancedMediaHandler:
 
     # ========== IMPLEMENTATION METHODS ==========
 
-    async def convert_to_mp3(self, update: Update, context: ContextTypes.DEFAULT_TYPE, session: dict):
-        """Convert video to MP3."""
-        # Defensive: ensure this was invoked via a callback query
+    async def show_mp3_quality_menu(self, update: Update, context: ContextTypes.DEFAULT_TYPE, session: dict):
+        """Show the MP3 quality picker used before extracting audio from a video."""
+        if not await self._require_callback(update):
+            return
+        query = update.callback_query
+        current_file = session.get("current_file")
+
+        if not current_file or current_file.get("type") != "video":
+            await self.safe_edit(query, "❌ No video file found.")
+            return
+
+        current = _sanitize_audio_bitrate(current_file.get("audio_bitrate"))
+        await self.safe_edit(
+            query,
+            "🎵 **Extract Audio (MP3)**\n"
+            f"Current quality: **{current}**\n"
+            f"{current} keeps the file small and still sounds good.",
+            reply_markup=MediaMenuBuilder.get_mp3_quality_menu(current),
+        )
+
+    async def extract_audio(self, update: Update, context: ContextTypes.DEFAULT_TYPE, session: dict):
+        """Extract the audio track of the current media ("Audio Only" button).
+
+        Videos go through the MP3 quality picker; audio files go through the
+        bitrate picker, which re-encodes them at the chosen quality.
+        """
+        if not await self._require_callback(update):
+            return
+        query = update.callback_query
+        current_file = session.get("current_file")
+
+        if not current_file:
+            await self.safe_edit(query, "❌ No file found.")
+            return
+
+        if current_file.get("type") == "video":
+            await self.show_mp3_quality_menu(update, context, session)
+            return
+
+        if current_file.get("type") == "audio":
+            await self.safe_edit(
+                query,
+                "🎚️ Choose the target bitrate for this audio:",
+                reply_markup=MediaMenuBuilder.get_bitrate_menu("audio"),
+            )
+            return
+
+        await self.safe_edit(query, "❌ Audio can only be extracted from a video or audio file.")
+
+    async def extract_video(self, update: Update, context: ContextTypes.DEFAULT_TYPE, session: dict):
+        """Extract the video track only (audio/subtitles dropped) into an MP4.
+
+        This is the "🎬 Video Only" action of the extraction menu; "All Streams"
+        (``extract_streams``) keeps every track and delivers a ZIP instead.
+        """
         if not await self._require_callback(update):
             return
         query = update.callback_query
@@ -4040,6 +4628,127 @@ class EnhancedMediaHandler:
             await self.safe_edit(query, "❌ No video file found.")
             return
 
+        if not await self._check_conversion_quota(update, context):
+            return
+
+        # ── Cancel any stale pipeline job so user's specific settings take effect ──
+        if current_file.get("_pipeline_job_id"):
+            await self._cancel_stale_pipeline_job(session, "extract_video", user_id)
+
+        await self.safe_edit(query, "🎬 Extracting video (without audio)...")
+
+        # ── Store conversion metadata so the BigFilePipeline knows what to produce ──
+        current_file["_pipeline_ffmpeg_args"] = list(_EXTRACT_VIDEO_FFMPEG_ARGS)
+        current_file["_pipeline_output_ext"] = ".mp4"
+        current_file["_pipeline_conversion_type"] = "extract_video"
+        current_file["_pipeline_caption"] = "✅ Video extracted (audio removed)"
+        session["current_file"] = current_file
+
+        # Ensure file is available locally (lazy-download)
+        if not current_file.get("path") or not os.path.exists(current_file.get("path") or ""):
+            try:
+                await self._ensure_current_file_downloaded(update, context, session)
+                current_file = session.get("current_file")
+                # If the pipeline queued a job (big file), watch it and return.
+                if current_file and current_file.get("_pipeline_job_id"):
+                    _pipeline_job_id = current_file["_pipeline_job_id"]
+                    kb = InlineKeyboardMarkup(
+                        [[InlineKeyboardButton("❌ Cancel", callback_data=f"cancel_job:{_pipeline_job_id}")]]
+                    )
+                    await self.safe_edit(
+                        query,
+                        f"✅ Large file queued (Job: {_pipeline_job_id[:8]}...). I'll send the video when ready.",
+                        reply_markup=kb,
+                    )
+                    with contextlib.suppress(RuntimeError):
+                        asyncio.create_task(self._watch_job_progress(query, _pipeline_job_id))
+                    return
+            except Exception as e:
+                await self.safe_edit(query, f"❌ Failed to download file: {e}")
+                return
+
+        # Enqueue the job so a worker handles the encoding, progress and delivery
+        output_dir = getattr(config, "OUTPUT_PATH", "storage/output") if config else "storage/output"
+        with contextlib.suppress(OSError):
+            os.makedirs(output_dir, exist_ok=True)
+        output_path = os.path.join(output_dir, f"{current_file['id']}_video_only.mp4")
+        job_id = str(uuid.uuid4())
+        job = {
+            "job_id": job_id,
+            "input_path": current_file["path"],
+            "input_key": current_file.get("input_key"),
+            "output_path": output_path,
+            # Keeps the delivered filename derived from the original name.
+            "original_filename": current_file.get("name") or os.path.basename(output_path),
+            "ffmpeg_args": list(_EXTRACT_VIDEO_FFMPEG_ARGS),
+            "output_ext": ".mp4",
+            "type": "extract_video",
+            "progress_channel": f"ffmpeg:progress:{job_id}",
+            "chat_id": update.effective_chat.id if update and update.effective_chat else None,
+            "thumbnail": current_file.get("thumbnail"),
+            "caption": "✅ Video extracted (audio removed)",
+            "cleanup_input": True,
+            "cleanup_output": False,
+        }
+
+        try:
+            try:
+                job["request_id"] = getattr(update, "request_id", None)
+            except Exception:
+                job["request_id"] = None
+            await enqueue_job(job)
+        except Exception:
+            logger.exception("Failed to enqueue extract_video job")
+            await self.safe_edit(query, "❌ Failed to queue extraction.")
+            return
+
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data=f"cancel_job:{job_id}")]])
+        await self.safe_edit(query, f"✅ Job queued (ID: {job_id}). I'll send the video when ready.", reply_markup=kb)
+        with contextlib.suppress(RuntimeError):
+            asyncio.create_task(self._watch_job_progress(query, job_id))
+
+    async def convert_to_mp3(
+        self,
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+        session: dict,
+        bitrate: str | None = None,
+    ):
+        """Extract MP3 audio from the current video and deliver it as playable audio.
+
+        ``bitrate`` is the requested audio bitrate (e.g. ``"128k"``). When it is
+        omitted the bitrate previously chosen for this file — or the 128k
+        default — is used. The original media name is preserved for delivery.
+        """
+        query = getattr(update, "callback_query", None)
+        message = getattr(update, "message", None)
+
+        if query is None and message is None:
+            logger.warning("convert_to_mp3 invoked without callback_query or message")
+            return
+
+        async def notify(text, **kwargs):
+            """Report progress through whichever update context triggered this run."""
+            if query is not None:
+                await self.safe_edit(query, text, **kwargs)
+            else:
+                await message.reply_text(text)
+
+        current_file = session.get("current_file")
+        user_id = update.effective_user.id
+
+        if not current_file or current_file.get("type") != "video":
+            await notify("❌ No video file found.")
+            return
+
+        audio_bitrate = _sanitize_audio_bitrate(
+            bitrate or current_file.get("audio_bitrate") or _DEFAULT_AUDIO_BITRATE
+        )
+        current_file["audio_bitrate"] = audio_bitrate
+        session["current_file"] = current_file
+        delivery_name = _audio_delivery_name(current_file.get("name"), current_file.get("id"))
+        caption = f"✅ Audio extracted ({audio_bitrate})"
+
         # Conversion quota enforcement
         if not await self._check_conversion_quota(update, context):
             return
@@ -4047,9 +4756,9 @@ class EnhancedMediaHandler:
         # Check rate limiting
         conversion_limiter = context.application.bot_data.get("conversion_rate_limiter")
         if conversion_limiter:
-            allowed, message = await conversion_limiter.can_convert(str(user_id))
+            allowed, limit_message = await conversion_limiter.can_convert(str(user_id))
             if not allowed:
-                await self.safe_edit(query, message)
+                await notify(limit_message)
                 return
 
         # Check queue status
@@ -4058,88 +4767,79 @@ class EnhancedMediaHandler:
 
         if active_count >= max_conversions:
             queue_position = active_count - max_conversions + 1
-            await self.safe_edit(
-                query,
+            await notify(
                 f"⏳ Queue position: #{queue_position}\n"
                 f"Active conversions: {active_count}/{max_conversions}\n"
                 f"Your conversion will start soon...",
             )
         else:
-            await self.safe_edit(query, "🎵 Converting to MP3...")
+            await notify(f"🎵 Converting to MP3 ({audio_bitrate})...")
 
         async def do_conversion():
             # Lock the input file to prevent concurrent access
             output_dir = getattr(config, "OUTPUT_PATH", "storage/output") if config else "storage/output"
             with contextlib.suppress(OSError):
                 os.makedirs(output_dir, exist_ok=True)
+            # Transient on-disk name; ``delivery_name`` carries the original name.
             output_path = os.path.join(output_dir, f"{current_file['id']}_audio.mp3")
+
+            async def _deliver():
+                """Send the extracted MP3 as streamable Telegram audio (music player)."""
+                file_size = os.path.getsize(output_path)
+                if file_size > config.BOT_API_MAX_BYTES:
+                    await notify(
+                        f"❌ File too large ({file_size // 1024 // 1024}MB).\nTry compression first.",
+                    )
+                    return
+                # send_audio keeps the file in Telegram's music player (streamable)
+                # instead of delivering it as an opaque downloadable document.
+                with open(output_path, "rb") as audio_file:
+                    await context.bot.send_audio(
+                        chat_id=update.effective_chat.id,
+                        audio=audio_file,
+                        caption=caption,
+                        title=os.path.splitext(delivery_name)[0],
+                        filename=delivery_name,
+                        performer="Media Bot",
+                    )
 
             if AsyncFileLock:
                 # Defensive: ensure we have a concrete file path before attempting locks
                 path = current_file.get("path")
                 if not path:
-                    await self.safe_edit(query, "❌ Local file missing. Try re-downloading or use the web uploader.")
+                    await notify("❌ Local file missing. Try re-downloading or use the web uploader.")
                     return
 
                 lock = await AsyncFileLock.acquire(path)
                 async with lock:
-                    success = await self.converter.extract_audio_from_video(path, output_path, "mp3", "192k")
+                    success = await self.converter.extract_audio_from_video(path, output_path, "mp3", audio_bitrate)
 
                     if success and os.path.exists(output_path):
-                        file_size = os.path.getsize(output_path)
-                        if file_size > config.BOT_API_MAX_BYTES:
-                            await self.safe_edit(
-                                query,
-                                f"❌ File too large ({file_size // 1024 // 1024}MB).\nTry compression first.",
-                            )
-                            os.remove(output_path)
-                        else:
-                            with open(output_path, "rb") as audio_file:
-                                await context.bot.send_audio(
-                                    chat_id=update.effective_chat.id,
-                                    audio=audio_file,
-                                    caption="✅ Converted to MP3",
-                                    title=current_file.get("name", "file").replace(".mp4", ".mp3"),
-                                    performer="Media Bot",
-                                )
-
-                            os.remove(output_path)
+                        await _deliver()
+                        os.remove(output_path)
                     else:
-                        await self.safe_edit(query, "❌ Conversion failed.")
+                        await notify("❌ Conversion failed.")
 
                 await AsyncFileLock.release(path)
             else:
                 # Fallback without locking
                 success = await self.converter.extract_audio_from_video(
-                    current_file["path"], output_path, "mp3", "192k"
+                    current_file["path"], output_path, "mp3", audio_bitrate
                 )
 
                 if success and os.path.exists(output_path):
-                    file_size = os.path.getsize(output_path)
-                    if file_size > config.BOT_API_MAX_BYTES:
-                        await self.safe_edit(
-                            query,
-                            f"❌ File too large ({file_size // 1024 // 1024}MB).\nTry compression first.",
-                        )
-                        os.remove(output_path)
-                    else:
-                        with open(output_path, "rb") as audio_file:
-                            await context.bot.send_audio(
-                                chat_id=update.effective_chat.id,
-                                audio=audio_file,
-                                caption="✅ Converted to MP3",
-                                title=current_file.get("name", "file").replace(".mp4", ".mp3"),
-                                performer="Media Bot",
-                            )
-                        os.remove(output_path)
+                    await _deliver()
+                    os.remove(output_path)
                 else:
-                    await self.safe_edit(query, "❌ Conversion failed.")
+                    await notify("❌ Conversion failed.")
 
         # ── Store conversion metadata so the BigFilePipeline knows what to produce ──
-        current_file["_pipeline_ffmpeg_args"] = ["-vn", "-acodec", "libmp3lame", "-ab", "192k"]
+        # The pipeline derives the delivered filename from ``original_filename``
+        # (i.e. ``current_file["name"]``), so the original name is preserved.
+        current_file["_pipeline_ffmpeg_args"] = ["-vn", "-acodec", "libmp3lame", "-ab", audio_bitrate]
         current_file["_pipeline_output_ext"] = ".mp3"
         current_file["_pipeline_conversion_type"] = "extract_audio"
-        current_file["_pipeline_caption"] = "✅ Audio extracted"
+        current_file["_pipeline_caption"] = caption
         session["current_file"] = current_file
 
         # Ensure file downloaded before conversion (lazy-download)
@@ -4152,16 +4852,17 @@ class EnhancedMediaHandler:
                     kb = InlineKeyboardMarkup(
                         [[InlineKeyboardButton("❌ Cancel", callback_data=f"cancel_job:{_pipeline_job_id}")]]
                     )
-                    await self.safe_edit(
-                        query,
+                    await notify(
                         f"✅ Large file queued (Job: {_pipeline_job_id[:8]}...). I'll send the MP3 when ready.",
                         reply_markup=kb,
                     )
-                    with contextlib.suppress(RuntimeError):
-                        asyncio.create_task(self._watch_job_progress(query, _pipeline_job_id))
+                    # Progress can only be watched when we own the callback message.
+                    if query is not None:
+                        with contextlib.suppress(RuntimeError):
+                            asyncio.create_task(self._watch_job_progress(query, _pipeline_job_id))
                     return
             except Exception as e:
-                await self.safe_edit(query, f"❌ Failed to download file: {e}")
+                await notify(f"❌ Failed to download file: {e}")
                 return
 
         # ── Cancel any stale pipeline job so user's specific settings take effect ──
@@ -4187,11 +4888,15 @@ class EnhancedMediaHandler:
             return
 
         if crf == "custom":
-            await self.safe_edit(query, "Enter CRF value (18-51, lower=better quality):")
-            context.user_data["awaiting_crf"] = True
+            # Clear previous prompts *before* arming this one (the loop would
+            # otherwise delete the flag we just set) and stop here so the value
+            # typed by the user is the one that gets used.
             for key in list(context.user_data.keys()):
                 if key.startswith("awaiting_"):
                     del context.user_data[key]
+            context.user_data["awaiting_crf"] = True
+            await self.safe_edit(query, "✏️ Enter CRF value (18-51, lower=better quality):")
+            return
 
         current_file = session.get("current_file")
         if not current_file or current_file["type"] != "video":
@@ -4367,12 +5072,20 @@ class EnhancedMediaHandler:
         success = await self.converter.merge_audios(session["merge_list"], output_path)
 
         if success and os.path.exists(output_path):
+            # Use the first input's name as the base so the merge keeps a
+            # recognisable (and streamable) audio filename.
+            _first_name = session["current_file"].get("name") if session.get("current_file") else None
+            delivery_name = _audio_delivery_name(
+                _first_name or "Merged Audio", int(datetime.now().timestamp()), extension=".mp3"
+            )
             with open(output_path, "rb") as audio_file:
                 await context.bot.send_audio(
                     chat_id=update.effective_chat.id,
                     audio=audio_file,
                     caption=f"✅ Merged {len(session['merge_list'])} audio files",
-                    title="Merged Audio",
+                    title=os.path.splitext(delivery_name)[0],
+                    filename=delivery_name,
+                    performer="Media Bot",
                 )
 
             # Cleanup
@@ -4455,11 +5168,14 @@ class EnhancedMediaHandler:
         }
 
         if resolution == "custom":
-            await self.safe_edit(query, "Enter resolution (WIDTHxHEIGHT):\nExample: 1280x720")
-            context.user_data["awaiting_resolution"] = True
+            # Clear previous prompts before arming this one, then stop so the
+            # resolution typed by the user is the one that gets encoded.
             for key in list(context.user_data.keys()):
                 if key.startswith("awaiting_"):
                     del context.user_data[key]
+            context.user_data["awaiting_resolution"] = True
+            await self.safe_edit(query, "📐 Enter resolution (WIDTHxHEIGHT):\nExample: 1280x720")
+            return
 
         if not await self._check_conversion_quota(update, context):
             return
@@ -4524,14 +5240,17 @@ class EnhancedMediaHandler:
         }
 
         if preset == "custom":
-            await self.safe_edit(
-                query,
-                "Enter optimization settings:\nFormat: preset,crf,bitrate\nExample: slow,23,128k",
-            )
-            context.user_data["awaiting_optimize"] = True
+            # Clear previous prompts before arming this one, then stop so the
+            # settings typed by the user are the ones that get encoded.
             for key in list(context.user_data.keys()):
                 if key.startswith("awaiting_"):
                     del context.user_data[key]
+            context.user_data["awaiting_optimize"] = True
+            await self.safe_edit(
+                query,
+                "⚡ Enter optimization settings:\nFormat: preset,crf,bitrate\nExample: slow,23,128k",
+            )
+            return
 
         if preset not in preset_map:
             await self.safe_edit(query, "❌ Invalid preset.")
@@ -4617,6 +5336,8 @@ class EnhancedMediaHandler:
                 "input_path": current_file["path"],
                 "input_key": current_file.get("input_key"),
                 "output_path": output_path,
+                # Keeps the delivered filename derived from the original name.
+                "original_filename": current_file.get("name") or os.path.basename(output_path),
                 "ffmpeg_args": cmd,
                 "progress_channel": f"ffmpeg:progress:{job_id}",
                 "chat_id": update.effective_chat.id if update and update.effective_chat else None,
@@ -4724,6 +5445,8 @@ class EnhancedMediaHandler:
             "input_path": current_file["path"],
             "input_key": current_file.get("input_key"),
             "output_path": output_path,
+            # Keeps the delivered filename derived from the original name.
+            "original_filename": current_file.get("name") or os.path.basename(output_path),
             "ffmpeg_args": ["-c", "copy"],
             "progress_channel": f"ffmpeg:progress:{job_id}",
             "chat_id": update.effective_chat.id if update and update.effective_chat else None,
@@ -4746,6 +5469,81 @@ class EnhancedMediaHandler:
             logger.exception("Failed to enqueue repair job")
             await self.safe_edit(query, "❌ Failed to queue repair job.")
         return
+
+    async def _quick_screenshot(
+        self,
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+        session: dict,
+        time_str: str,
+    ):
+        """Take a single screenshot for the Start/Middle/End shortcuts.
+
+        ``time_str`` may be ``"__middle__"`` or ``"__end__"``, which are resolved
+        against the media duration; any other value is passed to ffmpeg as-is.
+        """
+        if not await self._require_callback(update):
+            return
+        query = update.callback_query
+        current_file = session.get("current_file")
+
+        if not current_file or current_file.get("type") != "video":
+            await self.safe_edit(query, "❌ No video file found.")
+            return
+
+        if not await self._check_conversion_quota(update, context):
+            return
+
+        # Ensure file downloaded (lazy-download)
+        if not current_file.get("path") or not os.path.exists(current_file.get("path") or ""):
+            try:
+                await self._ensure_current_file_downloaded(update, context, session)
+                current_file = session.get("current_file")
+            except Exception as e:
+                await self.safe_edit(query, f"❌ Failed to download file: {e}")
+                return
+
+        input_path = current_file.get("path")
+        if not input_path or not os.path.exists(input_path):
+            await self.safe_edit(query, "❌ File not available on disk.")
+            return
+
+        if time_str in ("__middle__", "__end__"):
+            duration = None
+            try:
+                from utils.ffmpeg_runner import probe_media
+
+                _meta = await probe_media(input_path)
+                duration = _meta.get("duration")
+            except Exception:
+                duration = None
+            if duration:
+                if time_str == "__middle__":
+                    time_str = f"{float(duration) / 2:.3f}"
+                else:
+                    time_str = f"{max(0.0, float(duration) - 1):.3f}"
+            else:
+                logger.warning("Could not read duration of %s; using 00:00:01", input_path)
+                time_str = "00:00:01"
+
+        output_dir = getattr(config, "OUTPUT_PATH", "storage/output") if config else "storage/output"
+        with contextlib.suppress(OSError):
+            os.makedirs(output_dir, exist_ok=True)
+        output_path = os.path.join(output_dir, f"{current_file.get('id', 'unknown')}_screenshot.jpg")
+
+        await self.safe_edit(query, f"🖼️ Taking screenshot at {time_str}...")
+        success = await self.converter.take_screenshot_at_time(input_path, output_path, time_str)
+
+        if success and os.path.exists(output_path):
+            with open(output_path, "rb") as photo_file:
+                await context.bot.send_photo(
+                    chat_id=update.effective_chat.id,
+                    photo=photo_file,
+                    caption=f"✅ Screenshot at {time_str}",
+                )
+            os.remove(output_path)
+        else:
+            await self.safe_edit(query, "❌ Failed to take screenshot.")
 
     async def take_screenshot(
         self,
@@ -4804,11 +5602,14 @@ class EnhancedMediaHandler:
             return
 
         if option == "custom":
-            await self.safe_edit(query, "Enter time (HH:MM:SS or seconds):")
-            context.user_data["awaiting_screenshot_time"] = True
+            # Clear previous prompts before arming this one and wait for the time
+            # instead of falling through and grabbing a frame at 00:00:01.
             for key in list(context.user_data.keys()):
                 if key.startswith("awaiting_"):
                     del context.user_data[key]
+            context.user_data["awaiting_screenshot_time"] = True
+            await self.safe_edit(query, "✏️ Enter time (HH:MM:SS or seconds):")
+            return
 
         # Calculate time based on option
         def _fmt_time(seconds: float) -> str:
@@ -4831,11 +5632,14 @@ class EnhancedMediaHandler:
             await self.create_thumbnail_grid(update, context, session)
             return
         elif option == "multiple":
-            await self.safe_edit(query, "How many screenshots? (2-20)")
-            context.user_data["awaiting_screenshot_count"] = True
+            # Clear previous prompts before arming this one and wait for the count
+            # instead of falling through and taking a single screenshot.
             for key in list(context.user_data.keys()):
                 if key.startswith("awaiting_"):
                     del context.user_data[key]
+            context.user_data["awaiting_screenshot_count"] = True
+            await self.safe_edit(query, "✏️ How many screenshots? (2-20)")
+            return
 
         time_str = time_map.get(option, "00:00:01")
         await self.safe_edit(query, f"🖼️ Taking screenshot at {time_str}...")
@@ -4955,6 +5759,10 @@ class EnhancedMediaHandler:
         with contextlib.suppress(OSError):
             os.makedirs(out_dir, exist_ok=True)
         archive_path = f"{out_dir}.zip"
+        # The worker delivers `archive_path`, not `output_path`, so the archive
+        # name has to be carried explicitly or the zip arrives as `{job_id}_streams.zip`.
+        _source_stem = os.path.splitext(current_file.get("name") or "")[0]
+        _streams_name = f"{_source_stem}_streams.zip" if _source_stem else os.path.basename(archive_path)
         job = {
             "job_id": job_id,
             "type": "extract_streams",
@@ -4962,6 +5770,8 @@ class EnhancedMediaHandler:
             "input_key": current_file.get("input_key"),
             "output_dir": out_dir,
             "archive_path": archive_path,
+            "original_filename": current_file.get("name") or os.path.basename(archive_path),
+            "output_filename": _streams_name,
             "progress_channel": f"ffmpeg:progress:{job_id}",
             "chat_id": update.effective_chat.id if update and update.effective_chat else None,
             "thumbnail": current_file.get("thumbnail"),
@@ -5004,10 +5814,16 @@ class EnhancedMediaHandler:
             return
 
         # ── Store conversion metadata so the BigFilePipeline knows what to produce ──
+        # Every target gets an explicit codec: anything missing here must not
+        # silently fall back to ``-c:a copy`` (that produces a file whose
+        # contents do not match its extension).
         _format_ffmpeg_args = {
-            "mp3": ["-c:a", "libmp3lame", "-q:a", "2"],
+            "mp3": ["-c:a", "libmp3lame", "-b:a", _DEFAULT_AUDIO_BITRATE],
             "wav": ["-c:a", "pcm_s16le"],
             "aac": ["-c:a", "aac", "-b:a", "128k"],
+            "m4a": ["-c:a", "aac", "-b:a", "128k"],
+            "flac": ["-c:a", "flac"],
+            "ogg": ["-c:a", "libvorbis", "-b:a", "128k"],
             "opus": ["-c:a", "libopus", "-b:a", "96k"],
         }
         current_file["_pipeline_ffmpeg_args"] = _format_ffmpeg_args.get(format_type, ["-c:a", "copy"])
@@ -5053,22 +5869,20 @@ class EnhancedMediaHandler:
         success = await self.converter.convert_audio_format(current_file["path"], output_path, format_type)
 
         if success and os.path.exists(output_path):
-            mime_type = {
-                "mp3": "audio/mpeg",
-                "wav": "audio/wav",
-                "aac": "audio/aac",
-                "flac": "audio/flac",
-                "ogg": "audio/ogg",
-                "m4a": "audio/mp4",
-            }.get(format_type, "audio/mpeg")
-
+            # NOTE: Bot API infers the MIME type from the filename, and
+            # ``send_audio`` has no mime_type parameter — passing one raises
+            # TypeError and would silently downgrade delivery to a document.
+            delivery_name = _audio_delivery_name(
+                current_file.get("name"), current_file.get("id"), extension=f".{format_type}"
+            )
             with open(output_path, "rb") as audio_file:
                 await context.bot.send_audio(
                     chat_id=update.effective_chat.id,
                     audio=audio_file,
                     caption=f"✅ Converted to {format_type.upper()}",
-                    title=f"{os.path.splitext(current_file['name'])[0]}.{format_type}",
-                    mime_type=mime_type,
+                    title=os.path.splitext(delivery_name)[0],
+                    filename=delivery_name,
+                    performer="Media Bot",
                 )
             os.remove(output_path)
         else:
@@ -5081,35 +5895,48 @@ class EnhancedMediaHandler:
         session: dict,
         bitrate: str,
     ):
-        """Adjust audio bitrate."""
+        """Re-encode the current audio file at a specific bitrate."""
         if not await self._require_callback(update):
             return
         query = update.callback_query
         current_file = session.get("current_file")
 
-        if not current_file or current_file["type"] != "audio":
+        if not current_file:
             await self.safe_edit(query, "❌ No audio file found.")
+            return
+
+        if current_file.get("type") != "audio":
+            # Videos are handled by the Video -> Audio flow so the user also
+            # gets to pick the container/quality before anything is encoded.
+            await self.safe_edit(query, "❌ No audio file found. Use 🎵 Video To Audio for videos.")
             return
 
         if not await self._check_conversion_quota(update, context):
             return
 
         if bitrate == "custom":
-            await self.safe_edit(query, "Enter bitrate (e.g., 128k, 320k):")
-            context.user_data["awaiting_bitrate"] = True
+            # Clear previous prompts *before* arming this one, otherwise the
+            # loop would delete the flag we just set.
             for key in list(context.user_data.keys()):
                 if key.startswith("awaiting_"):
                     del context.user_data[key]
+            context.user_data["awaiting_bitrate"] = True
+            await self.safe_edit(query, "✏️ Enter bitrate (32k-320k, e.g. 128k, 320k):")
+            return
 
-        await self.safe_edit(query, f"🎚️ Setting bitrate to {bitrate}...")
+        audio_bitrate = _sanitize_audio_bitrate(bitrate)
+        current_file["audio_bitrate"] = audio_bitrate
+        session["current_file"] = current_file
+
+        await self.safe_edit(query, f"🎚️ Setting bitrate to {audio_bitrate}...")
 
         output_base = getattr(config, "OUTPUT_PATH", "storage/output") if config else "storage/output"
         with contextlib.suppress(OSError):
             os.makedirs(output_base, exist_ok=True)
-        output_path = os.path.join(output_base, f"{current_file['id']}_{bitrate}.mp3")
+        output_path = os.path.join(output_base, f"{current_file['id']}_{audio_bitrate}.mp3")
 
         # Convert with specific bitrate
-        cmd = ["-c:a", "libmp3lame", "-b:a", bitrate]
+        cmd = ["-c:a", "libmp3lame", "-b:a", audio_bitrate]
 
         # Ensure file downloaded (lazy-download)
         if not current_file.get("path") or not os.path.exists(current_file.get("path") or ""):
@@ -5123,12 +5950,15 @@ class EnhancedMediaHandler:
         success, _ = await self.converter.execute_ffmpeg(cmd, current_file["path"], output_path)
 
         if success and os.path.exists(output_path):
+            delivery_name = _audio_delivery_name(current_file.get("name"), current_file.get("id"))
             with open(output_path, "rb") as audio_file:
                 await context.bot.send_audio(
                     chat_id=update.effective_chat.id,
                     audio=audio_file,
-                    caption=f"✅ Bitrate: {bitrate}",
-                    title=f"{current_file['name']}_{bitrate}",
+                    caption=f"✅ Bitrate: {audio_bitrate}",
+                    title=os.path.splitext(delivery_name)[0],
+                    filename=delivery_name,
+                    performer="Media Bot",
                 )
             os.remove(output_path)
         else:
@@ -5154,6 +5984,7 @@ class EnhancedMediaHandler:
         with contextlib.suppress(OSError):
             os.makedirs(output_base, exist_ok=True)
         output_path = os.path.join(output_base, f"{current_file['id']}_normalized.mp3")
+        audio_bitrate = _sanitize_audio_bitrate(current_file.get("audio_bitrate"))
 
         # Use loudnorm filter for normalization
         cmd = [
@@ -5162,7 +5993,7 @@ class EnhancedMediaHandler:
             "-c:a",
             "libmp3lame",
             "-b:a",
-            "192k",
+            audio_bitrate,
         ]
 
         # Ensure file downloaded (lazy-download)
@@ -5177,12 +6008,15 @@ class EnhancedMediaHandler:
         success, _ = await self.converter.execute_ffmpeg(cmd, current_file["path"], output_path)
 
         if success and os.path.exists(output_path):
+            delivery_name = _audio_delivery_name(current_file.get("name"), current_file.get("id"))
             with open(output_path, "rb") as audio_file:
                 await context.bot.send_audio(
                     chat_id=update.effective_chat.id,
                     audio=audio_file,
                     caption="✅ Audio normalized",
-                    title=f"{current_file['name']}_normalized",
+                    title=os.path.splitext(delivery_name)[0],
+                    filename=delivery_name,
+                    performer="Media Bot",
                 )
             os.remove(output_path)
         else:
@@ -5351,6 +6185,10 @@ class EnhancedMediaHandler:
             "type": "create_archive",
             "files": file_paths,
             "output_path": archive_path,
+            # Name the delivered archive after the first selected file.
+            "original_filename": f"{os.path.splitext(os.path.basename(file_paths[0]))[0]}_archive.zip"
+            if file_paths
+            else os.path.basename(archive_path),
             "progress_channel": f"ffmpeg:progress:{job_id}",
             "chat_id": update.effective_chat.id if update and update.effective_chat else None,
         }
@@ -5668,6 +6506,35 @@ class EnhancedMediaHandler:
                     if key.startswith("awaiting_"):
                         del context.user_data[key]
 
+        elif context.user_data.get("awaiting_bulk_bitrate"):
+            # Custom Extract Audio bitrate for the next ▶️ Apply Bulk.
+            for key in list(context.user_data.keys()):
+                if key.startswith("awaiting_"):
+                    del context.user_data[key]
+            _bitrate = _sanitize_audio_bitrate(user_input, default="")
+            if not _bitrate:
+                await update.message.reply_text(
+                    f"❌ Invalid bitrate. Use a value between {_AUDIO_BITRATE_MIN_KBPS}k and"
+                    f" {_AUDIO_BITRATE_MAX_KBPS}k (e.g. 128k)."
+                )
+            else:
+                _write_bulk_setting(user_id, session, "bulk_extract_bitrate", _bitrate)
+                await update.message.reply_text(f"✅ Bulk Extract Audio bitrate set to {_bitrate}.")
+
+        elif context.user_data.get("awaiting_bulk_crf"):
+            # Custom compress quality for the next ▶️ Apply Bulk.
+            for key in list(context.user_data.keys()):
+                if key.startswith("awaiting_"):
+                    del context.user_data[key]
+            _crf = _parse_bulk_crf(user_input)
+            if _crf is None:
+                await update.message.reply_text(
+                    f"❌ Invalid CRF. Enter {_BULK_COMPRESS_CRF_MIN}-{_BULK_COMPRESS_CRF_MAX}."
+                )
+            else:
+                _write_bulk_setting(user_id, session, "bulk_crf", _crf)
+                await update.message.reply_text(f"✅ Bulk compress CRF set to {_crf}.")
+
         elif context.user_data.get("awaiting_resolution"):
             if "x" in user_input:
                 try:
@@ -5852,40 +6719,74 @@ class EnhancedMediaHandler:
                         del context.user_data[key]
 
         elif context.user_data.get("awaiting_trim"):
-            # Handle trim time input
+            # Handle trim time input (audio or video).
+            # NOTE: the awaiting flag must survive the start -> end transition,
+            # otherwise the second reply never reaches this branch.
             context.user_data["trim_time"] = user_input
             if context.user_data["awaiting_trim"] == "start":
-                context.user_data["start_time"] = user_input
+                context.user_data["start_time"] = user_input.strip()
                 context.user_data["awaiting_trim"] = "end"
+                await update.message.reply_text(
+                    "📥 Start time saved. Now send the END time (HH:MM:SS[.ms])\nExample: 00:01:30"
+                )
+                return
+
+            # Perform trim
+            start_time = context.user_data.get("start_time", "00:00:00")
+            end_time = user_input
+
+            if not current_file or not current_file.get("path"):
+                await update.message.reply_text("❌ No file available to trim.")
                 for key in list(context.user_data.keys()):
                     if key.startswith("awaiting_"):
                         del context.user_data[key]
-            else:
-                # Perform trim
-                start_time = context.user_data.get("start_time", "00:00:00")
-                end_time = user_input
+                return
 
-                await update.message.reply_text(f"✂️ Trimming from {start_time} to {end_time}...")
+            await update.message.reply_text(f"✂️ Trimming from {start_time} to {end_time}...")
 
-                if not await self._check_conversion_quota(update, context):
-                    return
+            if not await self._check_conversion_quota(update, context):
+                return
 
-                output_base = getattr(config, "OUTPUT_PATH", "storage/output") if config else "storage/output"
-                with contextlib.suppress(OSError):
-                    os.makedirs(output_base, exist_ok=True)
-                output_path = os.path.join(output_base, f"{current_file['id']}_trimmed.mp4")
-                success = await self.converter.trim_video(current_file["path"], output_path, start_time, end_time)
+            _is_audio_trim = current_file.get("type") == "audio"
+            _trim_ext = os.path.splitext(current_file.get("name") or "")[1].lower()
+            if _trim_ext not in (self.converter.supported_formats["audio"] if _is_audio_trim else []):
+                _trim_ext = ".mp3" if _is_audio_trim else ".mp4"
 
-                if success and os.path.exists(output_path):
+            output_base = getattr(config, "OUTPUT_PATH", "storage/output") if config else "storage/output"
+            with contextlib.suppress(OSError):
+                os.makedirs(output_base, exist_ok=True)
+            output_path = os.path.join(output_base, f"{current_file['id']}_trimmed{_trim_ext}")
+            # trim_video delegates to the shared trim_media implementation, which
+            # stream-copies either container, so it is safe for audio too.
+            success = await self.converter.trim_video(current_file["path"], output_path, start_time, end_time)
+
+            if success and os.path.exists(output_path):
+                if _is_audio_trim:
+                    delivery_name = _audio_delivery_name(
+                        current_file.get("name"), current_file.get("id"), extension=_trim_ext
+                    )
+                    with open(output_path, "rb") as audio_file:
+                        await context.bot.send_audio(
+                            chat_id=update.effective_chat.id,
+                            audio=audio_file,
+                            caption=f"✅ Trimmed {start_time}-{end_time}",
+                            title=os.path.splitext(delivery_name)[0],
+                            filename=delivery_name,
+                            performer="Media Bot",
+                        )
+                else:
                     await self._send_video_result(
                         context.bot,
                         update.effective_chat.id,
                         output_path,
                         caption=f"✅ Trimmed {start_time}-{end_time}",
                     )
-                    os.remove(output_path)
-                else:
-                    await update.message.reply_text("❌ Failed to trim video.")
+                os.remove(output_path)
+            else:
+                await update.message.reply_text("❌ Failed to trim media.")
+            for key in list(context.user_data.keys()):
+                if key.startswith("awaiting_"):
+                    del context.user_data[key]
 
         elif context.user_data.get("awaiting_screenshot_time"):
             # Handle screenshot time
@@ -5973,12 +6874,24 @@ class EnhancedMediaHandler:
                     if key.startswith("awaiting_"):
                         del context.user_data[key]
 
+        elif context.user_data.get("awaiting_mp3_bitrate"):
+            # Handle a custom bitrate for video -> MP3 extraction
+            parsed = _sanitize_audio_bitrate(user_input, default="")
+            if parsed:
+                await self.convert_to_mp3(update, context, session, bitrate=parsed)
+            else:
+                await update.message.reply_text("❌ Invalid bitrate. Use a value between 32k and 320k (e.g. 128k).")
+                for key in list(context.user_data.keys()):
+                    if key.startswith("awaiting_"):
+                        del context.user_data[key]
+
         elif context.user_data.get("awaiting_bitrate"):
             # Handle custom bitrate
-            if user_input.endswith("k"):
-                await self.adjust_bitrate(update, context, session, user_input)
+            parsed = _sanitize_audio_bitrate(user_input, default="")
+            if parsed:
+                await self.adjust_bitrate(update, context, session, parsed)
             else:
-                await update.message.reply_text("❌ Invalid bitrate. Use format like 128k, 320k.")
+                await update.message.reply_text("❌ Invalid bitrate. Use a value between 32k and 320k (e.g. 128k).")
                 for key in list(context.user_data.keys()):
                     if key.startswith("awaiting_"):
                         del context.user_data[key]

@@ -450,6 +450,12 @@ async def handle_job(job: dict):
                         job["source_url"] = _sval("source_url")
                     if not job.get("output_path") and _sval("output"):
                         job["output_path"] = _sval("output")
+                    # Naming fields are persisted by enqueue_job; restore them so a
+                    # requeued/retried job still delivers under the original name.
+                    if not job.get("original_filename") and _sval("original_filename"):
+                        job["original_filename"] = _sval("original_filename")
+                    if not job.get("output_filename") and _sval("output_filename"):
+                        job["output_filename"] = _sval("output_filename")
             except Exception:
                 logger.debug("ffmpeg worker: operation failed")
             try:
@@ -1408,6 +1414,18 @@ async def handle_job(job: dict):
                         except Exception:
                             file_size = 0
 
+                        # Delivery name = the filename shown in Telegram. It is derived
+                        # from the original media name (never from the storage key), and
+                        # for audio outputs the file must be sent as Telegram audio so
+                        # the client shows the streamable music player.
+                        _delivery_name = job.get("output_filename") or os.path.basename(out or "output")
+                        try:
+                            from utils.userbot_uploader import is_audio_delivery_output
+
+                            _media_kind = "audio" if is_audio_delivery_output(out or "") else None
+                        except Exception:
+                            _media_kind = None
+
                         bot_api_max_bytes = config.BOT_API_MAX_BYTES
 
                         send_link = config.ENABLE_LINK_SEND
@@ -1445,7 +1463,12 @@ async def handle_job(job: dict):
                                     # (Telethon/Pyrogram). This preserves all video metadata (duration,
                                     # dimensions, thumbnail, codecs, streaming support) and works for
                                     # files of any size (no Bot API 50MB limit).
-                                    _pre_vm, _pre_tp = await _probe_output_metadata(out)
+                                    if _media_kind == "audio":
+                                        # Audio has no video metadata/thumbnail to probe;
+                                        # the uploader reads the audio tags itself.
+                                        _pre_vm, _pre_tp = (None, None)
+                                    else:
+                                        _pre_vm, _pre_tp = await _probe_output_metadata(out)
                                     try:
                                         ok = await send_file_via_userbot(
                                             chat_id,
@@ -1455,6 +1478,8 @@ async def handle_job(job: dict):
                                             video_meta=_pre_vm,
                                             thumb_path=_pre_tp,
                                             user_id=job.get("user_id"),
+                                            media_kind=_media_kind,
+                                            delivery_name=_delivery_name,
                                         )
                                     finally:
                                         if _pre_tp:
@@ -1613,7 +1638,7 @@ async def handle_job(job: dict):
                                                                         chat_id=chat_id,
                                                                         document=fh,
                                                                         caption=caption,
-                                                                        thumb=tf,
+                                                                        thumbnail=tf,
                                                                     )
                                                             except Exception:
                                                                 await bot.send_document(
@@ -1630,16 +1655,12 @@ async def handle_job(job: dict):
                                                     except Exception:
                                                         logger.debug("ffmpeg worker: operation failed")
                                             elif kind == "audio":
+                                                # Sent via ``send_audio`` so it arrives as
+                                                # streamable Telegram audio. Bot API infers
+                                                # the MIME type from the filename, so no
+                                                # mime_type argument is passed (send_audio
+                                                # does not accept one).
                                                 _bot_up_cb = _make_upload_progress_callback(job_id, progress_channel)
-                                                _audio_mime = {
-                                                    ".mp3": "audio/mpeg",
-                                                    ".wav": "audio/wav",
-                                                    ".m4a": "audio/mp4",
-                                                    ".aac": "audio/aac",
-                                                    ".flac": "audio/flac",
-                                                    ".ogg": "audio/ogg",
-                                                    ".opus": "audio/opus",
-                                                }.get(_output_ext, "audio/mpeg")
                                                 with open(out, "rb") as fh:
                                                     fh = (
                                                         _ProgressFileWrapper(fh, file_size, _bot_up_cb)
@@ -1652,7 +1673,7 @@ async def handle_job(job: dict):
                                                         caption=caption,
                                                         title=os.path.splitext(_delivery_name)[0],
                                                         filename=_delivery_name,
-                                                        mime_type=_audio_mime,
+                                                        performer="Media Bot",
                                                     )
                                             elif kind == "video":
                                                 # Try to attach thumbnail (thumb) when available
@@ -1801,7 +1822,7 @@ async def handle_job(job: dict):
                                                                         chat_id=chat_id,
                                                                         document=fh,
                                                                         caption=caption,
-                                                                        thumb=tf,
+                                                                        thumbnail=tf,
                                                                     )
                                                             except Exception:
                                                                 await bot.send_document(
@@ -1846,7 +1867,10 @@ async def handle_job(job: dict):
                                     # Direct userbot delivery (fallback): sends directly to user's DM via MTProto.
                                     # This preserves all video metadata and works for files of any size.
                                     _up_cb = _make_upload_progress_callback(job_id, progress_channel)
-                                    _pre_vm, _pre_tp = await _probe_output_metadata(out)
+                                    if _media_kind == "audio":
+                                        _pre_vm, _pre_tp = (None, None)
+                                    else:
+                                        _pre_vm, _pre_tp = await _probe_output_metadata(out)
                                     try:
                                         ok = await send_file_via_userbot(
                                             chat_id,
@@ -1856,6 +1880,8 @@ async def handle_job(job: dict):
                                             video_meta=_pre_vm,
                                             thumb_path=_pre_tp,
                                             user_id=job.get("user_id"),
+                                            media_kind=_media_kind,
+                                            delivery_name=_delivery_name,
                                         )
                                     finally:
                                         if _pre_tp:

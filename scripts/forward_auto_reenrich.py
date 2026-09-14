@@ -147,8 +147,9 @@ async def _process_forward(fid, payload: dict, client) -> None:
                     logger.debug("forward auto: failed to mark as processed, may duplicate")
 
                 # Build minimal job payload and call enqueue_job which HSETs then LPUSHes
+                carry_over_job_naming = None
                 try:
-                    from utils.job_queue import enqueue_job
+                    from utils.job_queue import carry_over_job_naming, enqueue_job
                 except Exception:
                     enqueue_job = None
 
@@ -158,9 +159,14 @@ async def _process_forward(fid, payload: dict, client) -> None:
                     out = _sval("output")
                     if out:
                         job["output_path"] = out
-                    orig = _sval("original_filename") or _sval("original_name")
-                    if orig:
-                        job["original_filename"] = orig
+                    if carry_over_job_naming is not None:
+                        # Carries both naming fields (and the legacy `original_name`
+                        # alias) so the redelivered file keeps its own name.
+                        carry_over_job_naming(job, stored)
+                    else:
+                        orig = _sval("original_filename") or _sval("original_name")
+                        if orig:
+                            job["original_filename"] = orig
                 except Exception:
                     logger.debug("forward auto: in _sval()")
 

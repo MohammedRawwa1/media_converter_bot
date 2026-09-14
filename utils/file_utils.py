@@ -8,6 +8,7 @@ import logging
 import os
 import shutil
 import tempfile
+from datetime import UTC
 
 # Optional async file operations
 try:
@@ -427,6 +428,96 @@ def safe_extension(filename: str | None, default: str = ".bin") -> str:
     return ext.lower() if ext.lower() in ALLOWED_EXTENSIONS else default
 
 
+# Extensions we trust when deriving a filename from a URL. Anything else is
+# treated as "not an extension" so a query-ish tail never becomes the suffix.
+_MEDIA_EXT_HINTS = {
+    ".mp4",
+    ".mkv",
+    ".webm",
+    ".mov",
+    ".avi",
+    ".flv",
+    ".m4v",
+    ".ts",
+    ".mp3",
+    ".m4a",
+    ".wav",
+    ".aac",
+    ".flac",
+    ".ogg",
+    ".opus",
+    ".zip",
+}
+
+
+# Path segments that are clearly not a media name (``/download?id=123``); for
+# these a timestamped fallback reads better than ``download.mp4``.
+_GENERIC_URL_STEMS = {
+    "download",
+    "downloads",
+    "watch",
+    "video",
+    "videos",
+    "stream",
+    "streaming",
+    "play",
+    "player",
+    "index",
+    "media",
+    "file",
+    "files",
+    "get",
+    "view",
+    "embed",
+    "content",
+    "redirect",
+}
+
+
+def filename_from_url(url: str, default_ext: str = ".mp4", fallback_stem: str = "media") -> str:
+    """Derive a readable filename from a URL.
+
+    Jobs queued from a bare URL used to be delivered under an opaque job id, so
+    the last path segment (percent-decoded, query and fragment stripped) is used
+    instead. When the URL carries no usable name (``https://host/`` or
+    ``/download?id=123``) a timestamped fallback is returned so the delivered
+    file is still human-readable.
+
+    The path is percent-decoded *before* the basename is taken, so an encoded
+    separator (``%2F``) can never smuggle a path into the name.
+
+    Pure and synchronous so it is safe to call from job builders and tests.
+    """
+    import re
+    from urllib.parse import unquote, urlsplit
+
+    try:
+        path = urlsplit(str(url or "")).path or ""
+    except Exception:
+        path = ""
+
+    candidate = os.path.basename(unquote(path))
+    candidate = re.sub(r"[^A-Za-z0-9._\-()\[\] ]+", "_", candidate)
+    candidate = re.sub(r"_+", "_", candidate).strip("_. ")
+
+    stem, ext = os.path.splitext(candidate)
+    if stem and ext.lower() in _MEDIA_EXT_HINTS:
+        candidate = stem + ext.lower()
+    else:
+        # Unknown or absent extension: keep only the stem.
+        candidate = stem
+
+    if not candidate or candidate.lower() in _GENERIC_URL_STEMS:
+        from datetime import datetime
+
+        stamp = datetime.now(UTC).strftime("%Y%m%d_%H%M%S")
+        return f"{fallback_stem}_{stamp}{default_ext}"
+
+    if not os.path.splitext(candidate)[1]:
+        candidate += default_ext
+    return candidate
+
+
 async def sanitize_filename(name: str, max_len: int = 180) -> str:
     """Sanitize and normalize a filename string.
 
@@ -470,16 +561,29 @@ async def detect_filename(input_path: str, message=None) -> str:
 
     Strategy:
     - If `message.document.file_name` present, use it.
+    - Otherwise use the filename carried by the video/audio message itself, so a
+      file sent as a video is not renamed to an opaque local path.
     - If caption contains a filename-like token, use it.
     - Probe file via ffprobe/ffmpeg to get title tag or container format for extension.
     - Fallback to basename of input_path.
     """
-    # 1) document filename
+    # 1) filename carried by the message
     try:
         if message is not None:
             doc = getattr(message, "document", None)
             if doc and getattr(doc, "file_name", None):
                 return await sanitize_filename(doc.file_name)
+
+            # Videos/audios sent as media (not as files) still carry the
+            # sender's original filename on the Bot API objects.
+            for _media_attr in ("video", "audio", "animation", "voice"):
+                _media = getattr(message, _media_attr, None)
+                _media_name = getattr(_media, "file_name", None) if _media else None
+                if _media_name:
+                    _, _media_ext = os.path.splitext(_media_name)
+                    if not _media_ext:
+                        _media_ext = os.path.splitext(input_path)[1]
+                    return await sanitize_filename(_media_name + _media_ext)
 
             # Caption heuristic
             caption = getattr(message, "caption", None) or getattr(message, "text", None) or ""

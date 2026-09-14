@@ -57,6 +57,21 @@ def bitrate_key(val: str) -> str:
     return f"{BITRATE_PREFIX}{val}"
 
 
+# Video -> MP3 extraction quality.
+# Kept separate from BITRATE_PREFIX because that one re-encodes an already
+# imported audio file, while these start the video -> MP3 extraction itself.
+MP3_QUALITY_PREFIX = "mp3q_"
+
+# Default extraction bitrate: 128k keeps speech/music files small while still
+# sounding fine, and keeps Telegram delivery fast.
+MP3_DEFAULT_BITRATE = "128k"
+MP3_QUALITY_CHOICES = ("64k", "96k", "128k", "192k", "256k", "320k")
+
+
+def mp3_quality_key(val: str) -> str:
+    return f"{MP3_QUALITY_PREFIX}{val}"
+
+
 # Screenshot
 SCREENSHOT_PREFIX = "screenshot_"
 
@@ -79,7 +94,11 @@ BITRATE_MENU = "bitrate_menu"
 SCREENSHOTS_MENU = "screenshots_menu"
 OPTIMIZE_MENU = "optimize_menu"
 CONVERT_FORMAT_MENU = "convert_format_menu"
+# Opens the extraction picker (Audio Only / Video Only / Subtitles / All Streams).
+# The individual actions below are the triggers it renders.
+EXTRACT_MENU = "extraction_menu"
 EXTRACT_AUDIO = "extract_audio"
+EXTRACT_VIDEO = "extract_video"
 EXTRACT_STREAMS = "extract_streams"
 EXTRACT_SUBTITLES = "extract_subtitles"
 EXTRACT_ALL_STREAMS = "extract_all_streams"
@@ -118,7 +137,7 @@ OPTIMIZE_TV = "optimize_tv"
 OPTIMIZE_STORAGE = "optimize_storage"
 OPTIMIZE_CUSTOM = "optimize_custom"
 
-# Extraction variants
+# Extraction variants (rendered by get_extraction_menu())
 EXTRACT_AUDIO_ONLY = "extract_audio_only"
 EXTRACT_VIDEO_ONLY = "extract_video_only"
 EXTRACT_ALL = "extract_all"
@@ -162,3 +181,46 @@ SCREENSHOT_MULTIPLE = "screenshot_multiple"
 
 # Resolution custom
 RES_CUSTOM = "res_custom"
+
+# Bulk encoding quality: the bulk menu's Compress CRF and Optimize preset are
+# per-user picks applied by the next "Apply Bulk", not fixed defaults.
+BULK_CRF_MENU = "bulk_crf_menu"
+BULK_PRESET_MENU = "bulk_preset_menu"
+BULK_CRF_PREFIX = "bulk_set_crf:"
+BULK_PRESET_PREFIX = "bulk_set_preset:"
+
+# Compress quality choices, mirroring the single-file compression menu.
+BULK_CRF_CHOICES = (18, 23, 28, 35)
+BULK_CRF_MIN = 18
+BULK_CRF_MAX = 51
+BULK_CRF_DEFAULT = 28
+
+# Optimize presets, mirroring the single-file optimize presets.
+BULK_PRESET_CHOICES = ("web", "mobile", "tv", "storage")
+BULK_PRESET_DEFAULT = "web"
+BULK_PRESET_LABELS = {
+    "web": "For Web",
+    "mobile": "For Mobile",
+    "tv": "For TV",
+    "storage": "For Storage",
+}
+
+
+def bulk_crf_key(crf) -> str:
+    return f"{BULK_CRF_PREFIX}{crf}"
+
+
+def bulk_preset_key(name: str) -> str:
+    return f"{BULK_PRESET_PREFIX}{name}"
+
+
+# Bulk Extract Audio bitrate. Shares MP3_QUALITY_CHOICES with the single-file
+# video -> MP3 picker so both offer the same values, and defaults to the same
+# MP3_DEFAULT_BITRATE.
+BULK_BITRATE_MENU = "bulk_bitrate_menu"
+BULK_BITRATE_PREFIX = "bulk_set_bitrate:"
+BULK_BITRATE_DEFAULT = MP3_DEFAULT_BITRATE
+
+
+def bulk_bitrate_key(val) -> str:
+    return f"{BULK_BITRATE_PREFIX}{val}"

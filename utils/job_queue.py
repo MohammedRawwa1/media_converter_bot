@@ -23,6 +23,84 @@ DELAYED_SET = "ffmpeg:delayed"
 # Set JOB_METADATA_TTL=0 to disable automatic expiry.
 JOB_METADATA_TTL = int(os.getenv("JOB_METADATA_TTL", "86400"))
 
+# Job-hash fields that describe the media's name. A requeue rebuilds the payload
+# from the stored hash (often carrying only the id, input and output paths), so
+# these have to be carried over explicitly or the redelivered file comes back
+# named after the job id.
+NAMING_JOB_FIELDS = ("original_filename", "output_filename")
+
+# Older hashes stored the name under `original_name`; the worker accepts both.
+_NAMING_FIELD_SOURCES = {
+    "original_filename": ("original_filename", "original_name"),
+    "output_filename": ("output_filename",),
+}
+
+
+def _as_hash_str(value):
+    """Normalize a value out of a Redis hash, which may arrive as bytes."""
+    if isinstance(value, bytes):
+        try:
+            value = value.decode()
+        except Exception:
+            return None
+    if value is None:
+        return None
+    if isinstance(value, str):
+        return value or None
+    return str(value) or None
+
+
+def _normalized_hash(stored: dict | None) -> dict:
+    """Normalize a hash read without ``decode_responses`` (bytes keys) to str keys.
+
+    Every client in this project decodes responses, but a stray sync client or a
+    raw pipeline can still hand back bytes, and looking up the name then silently
+    fails.
+    """
+    normalized = {}
+    for key, value in (stored or {}).items():
+        if isinstance(key, (bytes, bytearray)):
+            try:
+                key = key.decode()
+            except Exception:
+                continue
+        normalized[str(key)] = value
+    return normalized
+
+
+def stored_job_naming(stored: dict | None) -> dict:
+    """Extract the usable naming fields from a stored job hash.
+
+    Bytes-safe and alias-aware, so a hash written by any past version still
+    yields a name.
+    """
+    stored = _normalized_hash(stored)
+    naming = {}
+    for field in NAMING_JOB_FIELDS:
+        for source in _NAMING_FIELD_SOURCES.get(field, (field,)):
+            try:
+                value = _as_hash_str(stored.get(source))
+            except Exception:
+                value = None
+            if value:
+                naming[field] = value
+                break
+    return naming
+
+
+def carry_over_job_naming(job: dict, stored: dict | None, *, overwrite: bool = False) -> dict:
+    """Copy the media name recorded in a stored job hash onto a rebuilt payload.
+
+    Use this when requeueing a job: the name lives in the hash, not in the
+    payload the requeue builds. With ``overwrite=False`` (the default) an
+    explicit name already on the payload wins, so a caller-supplied override is
+    never silently replaced.
+    """
+    for field, value in stored_job_naming(stored).items():
+        if overwrite or not job.get(field):
+            job[field] = value
+    return job
+
 
 async def get_redis():
     # Use a shared aioredis client for the process to avoid exhausting
@@ -143,10 +221,19 @@ async def enqueue_job(job: dict) -> None:
                 # the input lives even when local temp files are removed.
                 "input": job.get("input_path") or job.get("input_key") or job.get("source_url") or "",
                 "input_key": job.get("input_key") or "",
-                "output": job.get("output_path") or job.get("output") or "",
                 "created_at": str(time.time()),
                 "request_id": job.get("request_id") or "",
             }
+            output_value = job.get("output_path") or job.get("output") or ""
+            if output_value:
+                mapping["output"] = output_value
+            # Persist the naming fields so a requeued job (or a retry that only
+            # reads the hash back) still delivers under the original media name.
+            # These are written only when the payload actually carries them: a
+            # requeue payload has no name, and writing "" here would erase the
+            # name already stored for this job id.
+            for _field, _value in stored_job_naming(job).items():
+                mapping[_field] = _value
             # Attempt to set the hash first
             try:
                 await r.hset(f"ffmpeg:job:{job_id}", mapping=mapping)

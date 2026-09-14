@@ -125,19 +125,22 @@ async def _run_once():
                 remote_key = meta.get("remote_key") or meta.get("input_key") or meta.get("s3_key") or meta.get("key")
 
             if remote_key:
+                carry_over_job_naming = None
                 try:
-                    from utils.job_queue import enqueue_job
+                    from utils.job_queue import carry_over_job_naming, enqueue_job
                 except Exception:
                     enqueue_job = None
 
+                # Build the payload once (including the stored media name) so the
+                # LPUSH fallback cannot deliver the file under an opaque job id.
+                job = {"job_id": job_id, "input_key": remote_key}
+                out = _sval("output")
+                if out:
+                    job["output_path"] = out
+                if carry_over_job_naming is not None:
+                    carry_over_job_naming(job, stored)
+
                 if enqueue_job:
-                    job = {"job_id": job_id, "input_key": remote_key}
-                    out = _sval("output")
-                    if out:
-                        job["output_path"] = out
-                    orig = _sval("original_filename")
-                    if orig:
-                        job["original_filename"] = orig
                     try:
                         await enqueue_job(job)
                         logger.info("Re-enqueued job %s with input_key %s", job_id, remote_key)
@@ -146,7 +149,7 @@ async def _run_once():
                         logger.exception("enqueue_job failed for %s; falling back to LPUSH", job_id)
 
                 try:
-                    await client.lpush("ffmpeg:jobs", json.dumps({"job_id": job_id, "input_key": remote_key}))
+                    await client.lpush("ffmpeg:jobs", json.dumps(job))
                     return 1
                 except Exception:
                     logger.exception("Fallback LPUSH failed for %s", job_id)

@@ -2,12 +2,16 @@
 """Safely requeue an ffmpeg job after verifying input exists locally or in storage.
 
 Usage:
-  python3 scripts/requeue_job.py --job JOB_ID [--input-key KEY | --input-path PATH] [--dry-run] [--force]
+  python3 scripts/requeue_job.py --job JOB_ID [--input-key KEY | --input-path PATH] [--name NAME] [--dry-run] [--force]
 
 This helper will check whether a local file exists or whether the configured
 storage backend contains the provided remote key (via `exists()`). When checks
 pass (or when `--force` is used), it calls `enqueue_job()` which atomically
 HSETs the job metadata then LPUSHes the job JSON onto the queue.
+
+The media name is carried over from the stored job hash so the redelivered file
+keeps its original name; pass --name to override it (useful when the hash has no
+name at all).
 """
 
 from __future__ import annotations
@@ -27,7 +31,7 @@ if str(project_root) not in sys.path:
     sys.path.insert(0, str(project_root))
 
 try:
-    from utils.job_queue import enqueue_job, get_redis
+    from utils.job_queue import carry_over_job_naming, enqueue_job, get_redis, stored_job_naming
     from utils.storage import get_storage_backend_sync
 except Exception:
     print(
@@ -48,6 +52,7 @@ async def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--input-key", help="Storage key (remote) to set as input")
     parser.add_argument("--input-path", help="Local file path to set as input")
     parser.add_argument("--force", action="store_true", help="Force requeue without verifying remote existence")
+    parser.add_argument("--name", help="Delivered filename to use (defaults to the name stored on the job)")
     parser.add_argument("--dry-run", action="store_true", help="Print actions without performing them")
     args = parser.parse_args(argv)
 
@@ -136,9 +141,21 @@ async def main(argv: list[str] | None = None) -> int:
             print(f"Remote key not found: {final_input_key}")
             return 6
 
+    # The rebuilt payload carries no name of its own, so the stored one is copied
+    # over explicitly instead of relying on the worker to read it back out of the
+    # hash (an explicit --name always wins).
+    naming = stored_job_naming(stored)
+    if not naming:
+        logger.warning(
+            "Job %s has no stored media name; the delivered file will be named after the job id. "
+            "Pass --name to set one.",
+            job_id,
+        )
+
     # Dry-run - summarize and exit
     if args.dry_run:
         print("Dry run: would requeue job", job_id)
+        print(" - delivered name:", naming.get("original_filename") or "(none stored)")
         if use_local:
             print(" - using local input path:", final_input_path)
         elif use_remote:
@@ -152,6 +169,12 @@ async def main(argv: list[str] | None = None) -> int:
         job["input_path"] = pathlib.PurePath(final_input_path).as_posix()
     else:
         job["input_key"] = final_input_key
+
+    # Copy the stored media name onto the rebuilt payload (an explicit --name
+    # always wins) so the redelivered file is not named after the job id.
+    if args.name:
+        job["original_filename"] = args.name
+    carry_over_job_naming(job, stored)
 
     try:
         await enqueue_job(job)
