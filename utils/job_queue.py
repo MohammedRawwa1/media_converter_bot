@@ -169,14 +169,43 @@ async def enqueue_job(job: dict) -> None:
     except Exception:
         logger.debug("job_queue: failed to prepare job hash for %s", job_id)
 
-    # Finally push the job into the queue
+    # Push the job onto its queue. Which queue is decided per job: with the
+    # RabbitMQ backend enabled and a rollout below 100%, only a share of jobs
+    # goes to the broker and every other job keeps using the Redis list (see
+    # utils.eventbus). A broker that is unreachable or refuses the publish also
+    # falls back to the list, so a broker problem costs latency, never a job.
+    routed_to_broker = False
     try:
-        await r.lpush(JOB_LIST, json.dumps(job))
+        from utils.eventbus import publish_job
+
+        routed_to_broker = await publish_job(job)
     except Exception:
-        # If push fails, there's not much we can do here - leave the hash as-is
-        with contextlib.suppress(Exception):
-            logging.getLogger(__name__).exception("Failed to push job onto Redis list for job %s", job.get("job_id"))
-        logger.debug("job_queue: lpush failed for job %s", job.get("job_id"))
+        logger.debug("job_queue: event bus unavailable for job %s", job.get("job_id"))
+
+    if not routed_to_broker:
+        try:
+            await r.lpush(JOB_LIST, json.dumps(job))
+        except Exception:
+            # If push fails, there's not much we can do here - leave the hash as-is
+            with contextlib.suppress(Exception):
+                logging.getLogger(__name__).exception(
+                    "Failed to push job onto Redis list for job %s", job.get("job_id")
+                )
+            logger.debug("job_queue: lpush failed for job %s", job.get("job_id"))
+
+    # Lifecycle event: the job has been accepted by a queue (best-effort; the
+    # event log is a record of what happened, not a second queue).
+    try:
+        from utils.eventbus import JOB_QUEUED, emit_event
+
+        await emit_event(
+            JOB_QUEUED,
+            job=job,
+            payload={"queue": "rabbitmq" if routed_to_broker else "redis"},
+            source="enqueue",
+        )
+    except Exception:
+        logger.debug("job_queue: event mirror failed for job %s", job.get("job_id"))
     # persist to Mongo if available (best-effort)
     try:
         from .job_store import save_job
@@ -239,6 +268,28 @@ async def publish_update(channel: str, payload: dict) -> None:
         await r.publish(channel, json.dumps(payload))
     finally:
         await r.close()
+
+    # Mirror progress into the event log. This is the single choke point every
+    # progress update already goes through, which is why the mirroring lives
+    # here instead of at the ~30 call sites. Throttled and best-effort: the
+    # Redis publish above has already happened, and a Kafka problem must never
+    # affect a progress update.
+    try:
+        if isinstance(payload, dict) and payload.get("job_id"):
+            from utils.eventbus import JOB_PROGRESS, emit_event
+
+            await emit_event(
+                JOB_PROGRESS,
+                job_id=str(payload.get("job_id")),
+                payload={
+                    key: value
+                    for key, value in payload.items()
+                    if key in ("progress", "message", "status", "note", "error")
+                },
+                source=channel,
+            )
+    except Exception:
+        logger.debug("job_queue: progress event mirror failed")
 
 
 async def cancel_job(job_id: str) -> None:

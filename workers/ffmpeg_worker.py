@@ -35,7 +35,15 @@ from tasks import (
     merge_videos,
     trim_media,
 )
-from utils import file_utils, job_store
+from utils import eventbus, file_utils, job_store
+from utils.eventbus import (
+    JOB_CANCELLED,
+    JOB_COMPLETED,
+    JOB_FAILED,
+    JOB_STARTED,
+    emit_event,
+    is_rabbitmq_job,
+)
 from utils.file_utils import safe_rmtree
 
 logger = logging.getLogger(__name__)
@@ -705,17 +713,29 @@ async def handle_job(job: dict):
             await publish_update(
                 progress_channel, {"job_id": job_id, "progress": 0, "message": "locked", "note": "input_locked"}
             )
-        try:
-            # Push into delayed set with a small backoff to avoid tight requeue loop
-            backoff = int(os.environ.get("JOB_LOCK_BACKOFF", "5"))
+        # A job delivered by RabbitMQ goes back to RabbitMQ through its retry
+        # (delay) queue, so it keeps the acknowledgement semantics and the retry
+        # counter it arrived with. Jobs from the Redis list keep using the
+        # delayed set exactly as before - this is what stops a lock collision
+        # from moving a job between the two queues.
+        requeued_on_broker = False
+        if is_rabbitmq_job(job):
             try:
-                # zadd mapping: {member: score}
-                await redis_lock_client.zadd("ffmpeg:delayed", {json.dumps(job): time.time() + backoff})
+                requeued_on_broker = await eventbus.requeue_job(job)
             except Exception:
-                # fallback to lpush if zadd not supported
-                await redis_lock_client.lpush(JOB_LIST, json.dumps(job))
-        except Exception:
-            logger.warning("Failed to requeue locked job %s", job_id)
+                requeued_on_broker = False
+        if not requeued_on_broker:
+            try:
+                # Push into delayed set with a small backoff to avoid tight requeue loop
+                backoff = int(os.environ.get("JOB_LOCK_BACKOFF", "5"))
+                try:
+                    # zadd mapping: {member: score}
+                    await redis_lock_client.zadd("ffmpeg:delayed", {json.dumps(job): time.time() + backoff})
+                except Exception:
+                    # fallback to lpush if zadd not supported
+                    await redis_lock_client.lpush(JOB_LIST, json.dumps(job))
+            except Exception:
+                logger.warning("Failed to requeue locked job %s", job_id)
         try:
             try:
                 aclose = getattr(redis_lock_client, "aclose", None)
@@ -1808,6 +1828,15 @@ async def handle_job(job: dict):
                         try:
                             _final_status = "done" if sent else "error"
                             _final_msg = "delivered to Telegram" if sent else "delivery failed"
+                            # Lifecycle event: the job reached its end. Published
+                            # before the Redis hash is deleted, and best-effort, so
+                            # the log records the outcome even if the UI state goes.
+                            await emit_event(
+                                JOB_COMPLETED if sent else JOB_FAILED,
+                                job=job,
+                                payload={"status": _final_status, "message": _final_msg, "progress": 100},
+                                source="worker",
+                            )
                             _r = await get_redis()
                             try:
                                 await _r.hset(
@@ -2176,12 +2205,26 @@ async def handle_job(job: dict):
                         await asyncio.sleep(backoff)
                         continue
                     else:
+                        # Only the last attempt ends the job's life; intermediate
+                        # attempts are retried just above.
+                        await emit_event(
+                            JOB_FAILED,
+                            job=job,
+                            payload={"status": "error", "error": info, "attempt": attempt},
+                            source="worker",
+                        )
                         return
 
             except asyncio.CancelledError:
                 logger.info("Job cancelled via worker shutdown")
                 with contextlib.suppress(Exception):
                     await job_store.update_job(job_id, {"status": "cancelled", "message": "shutdown"})
+                await emit_event(
+                    JOB_CANCELLED,
+                    job=job,
+                    payload={"status": "cancelled", "message": "shutdown"},
+                    source="worker",
+                )
                 raise
             except Exception as e:
                 JOBS_FAILED.inc()
@@ -2194,6 +2237,12 @@ async def handle_job(job: dict):
                     await asyncio.sleep(2**attempt)
                     continue
                 else:
+                    await emit_event(
+                        JOB_FAILED,
+                        job=job,
+                        payload={"status": "error", "error": "processing_failed", "attempt": attempt},
+                        source="worker",
+                    )
                     return
             finally:
                 ACTIVE_JOBS.dec()
@@ -2238,8 +2287,34 @@ async def _start_healthcheck_server():
         return None
 
 
+async def _run_queued_job(job: dict, source: str) -> None:
+    """Process one job that came off a queue, whichever queue that was.
+
+    Kept separate so the Redis list and the RabbitMQ consumer share exactly the
+    same job path: the difference between them is where a job is taken from and
+    what happens when processing raises, not what processing does.
+    """
+    logger.info("Picked job: %s (via %s)", job.get("job_id"), source)
+    # ensure persisted
+    with contextlib.suppress(Exception):
+        await job_store.save_job(job)
+    await emit_event(JOB_STARTED, job=job, source=source)
+    await handle_job(job)
+
+
+async def _rabbitmq_consumer_task(stop_event: asyncio.Event | None = None) -> None:
+    """Consume jobs from RabbitMQ (messages are acked only after processing)."""
+    queue = eventbus.get_queue()
+    await queue.consume(lambda job: _run_queued_job(job, "rabbitmq"), stop_event=stop_event)
+
+
 async def worker_loop(stop_event: asyncio.Event | None = None):
-    """Main worker loop: pop jobs from Redis, process them, deliver results.
+    """Main worker loop: pop jobs from the queue(s), process them, deliver results.
+
+    The Redis list is always drained - it holds jobs queued before a broker
+    rollout as well as the share the rollout keeps on Redis - and the RabbitMQ
+    consumer runs alongside it whenever the broker carries any traffic. A
+    consumer that dies takes only its own queue out of service.
 
     Args:
         stop_event: When set, the worker loop exits gracefully.
@@ -2248,6 +2323,13 @@ async def worker_loop(stop_event: asyncio.Event | None = None):
 
     # Start healthcheck server for Railway
     await _start_healthcheck_server()
+
+    # Prove the event log is writable before accepting work. A misconfigured
+    # Kafka previously only showed up as a debug line per dropped event, so the
+    # first symptom was an empty topic. This logs an ERROR on failure, and raises
+    # when EVENTBUS_REQUIRE_BROKERS is set - which turns "silently no events"
+    # into a process that refuses to start.
+    await eventbus.verify_events_startup()
 
     # init job store if MONGO_URI available
     try:
@@ -2276,6 +2358,18 @@ async def worker_loop(stop_event: asyncio.Event | None = None):
     except Exception:
         forward_task = None
 
+    # Optional RabbitMQ consumer. Enabled by EVENTBUS_QUEUE_BACKEND=rabbitmq with
+    # a non-zero rollout; the Redis loop below keeps running either way, because
+    # during a rollout both queues hold jobs.
+    rabbit_task = None
+    try:
+        if eventbus.get_settings().consumes_rabbitmq:
+            rabbit_task = asyncio.create_task(_rabbitmq_consumer_task(stop_event))
+            logger.info("eventbus: RabbitMQ job consumer started alongside the Redis queue")
+    except Exception:
+        rabbit_task = None
+        logger.debug("ffmpeg worker: RabbitMQ consumer not started")
+
     try:
         while True:
             if stop_event and stop_event.is_set():
@@ -2286,11 +2380,7 @@ async def worker_loop(stop_event: asyncio.Event | None = None):
                 if not job:
                     await asyncio.sleep(0.2)
                     continue
-                logger.info(f"Picked job: {job.get('job_id')}")
-                # ensure persisted
-                with contextlib.suppress(Exception):
-                    await job_store.save_job(job)
-                await handle_job(job)
+                await _run_queued_job(job, "redis")
             except asyncio.CancelledError:
                 logger.info("Worker cancelled, exiting")
                 break
@@ -2306,6 +2396,17 @@ async def worker_loop(stop_event: asyncio.Event | None = None):
                     await forward_task
         except Exception:
             logger.debug("ffmpeg worker: ensure forward listener is cancelled")
+        # Stop the broker consumer and close both adapters so an in-flight
+        # message is redelivered instead of being acked by a dying process.
+        try:
+            if rabbit_task:
+                rabbit_task.cancel()
+                with contextlib.suppress(Exception):
+                    await rabbit_task
+        except Exception:
+            logger.debug("ffmpeg worker: RabbitMQ consumer shutdown failed")
+        with contextlib.suppress(Exception):
+            await eventbus.close_eventbus()
 
 
 def create_worker_task(stop_event: asyncio.Event | None = None) -> asyncio.Task:

@@ -3,3 +3,4 @@
 bandit>=1.9.0
 ruff>=0.7.0
 pip-audit>=2.0.0
+pytest>=8.0.0

@@ -178,6 +178,24 @@ def is_user_allowed(user_id: int) -> bool:
         return True  # default to allowed on error to avoid locking out users
 
 
+def is_admin_user(user_id: int | None) -> bool:
+    """Return True only for the configured admin user.
+
+    Deliberately the opposite of :func:`is_user_allowed`, which fails *open* so an
+    empty ACL never locks every user out. This fails **closed**: when
+    ``ADMIN_USER_ID`` is not set nobody is an admin, so a deployment that never
+    configured it cannot reach an admin-only command (``/admin remove``,
+    ``/cancelall``, ``/clear_cache``) through an accidental ``if ADMIN_USER_ID and
+    ...`` guard. Mirrors the reference bot's ``config.is_admin_user``.
+    """
+    if user_id is None or ADMIN_USER_ID is None:
+        return False
+    try:
+        return int(user_id) == ADMIN_USER_ID
+    except (TypeError, ValueError):
+        return False
+
+
 # Normalize MongoDB environment variable names for compatibility.
 # Some deployments (Railway, Docker) may set variables using references
 # like "$MONGO_URI" which are not expanded by the platform. Resolve

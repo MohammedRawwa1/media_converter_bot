@@ -6,6 +6,7 @@ from telegram import Update
 from telegram.ext import CallbackContext, CommandHandler
 
 import config
+from utils.confirm import split_confirm
 
 
 async def add_thumb(update: Update, context: CallbackContext):
@@ -27,6 +28,21 @@ async def add_thumb(update: Update, context: CallbackContext):
 
 
 async def del_thumb(update: Update, context: CallbackContext):
+    """Delete the caller's custom thumbnail.
+
+    Requires an explicit ``confirm``: the file is not recoverable from the bot, so a
+    mistyped command would silently change the thumbnail of every later conversion.
+    """
+    confirmed, _ = split_confirm(context.args if hasattr(context, "args") else [])
+    if not confirmed:
+        await update.message.reply_text(
+            "⚠️ *Delete your custom thumbnail*?\n"
+            "Later conversions will fall back to the default thumbnail.\n"
+            "Reply with `/delthumb confirm` to proceed.",
+            parse_mode="Markdown",
+        )
+        return
+
     user_id = update.effective_user.id
     thumb_dir = getattr(config, "THUMBNAIL_PATH", "storage/thumbnails")
     thumb_path = os.path.join(thumb_dir, f"{user_id}.jpg")

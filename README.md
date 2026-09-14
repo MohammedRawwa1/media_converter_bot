@@ -14,6 +14,7 @@
 - **Userbot Integration:** Login via Telethon or Pyrogram for large file handling (bypasses 50MB Bot API limit)
 - **Web UI:** File upload via browser with progress tracking (WebSocket + SSE)
 - **Job Queue:** Redis-backed async job processing with ffmpeg workers
+- **Optional Event Bus:** RabbitMQ work queue + Kafka job-event log, rolled out per job ([details](#-optional-event-bus-rabbitmq--kafka))
 - **Session Persistence:** Sessions survive redeploys via MongoDB + JSON file fallback
 - **Remote Storage:** Optional S3/MinIO/R2 backend for large files
 - **Webhook/Polling:** Supports both webhook and long-polling modes
@@ -65,6 +66,11 @@ git push origin main
 │   ├── cache.py                  # Redis caching layer
 │   ├── callbacks.py              # Callback data constants
 │   ├── error_handler.py          # 11-category error system
+│   ├── eventbus/                 # Optional RabbitMQ + Kafka event bus
+│   │   ├── config.py             # Backend selection + rollout, degrades safely
+│   │   ├── messages.py           # Versioned event envelope + job projection
+│   │   ├── rabbit.py             # Job queue: durable, manual ack, retries, DLQ
+│   │   └── kafka.py              # Job-event log: idempotent producer + replay
 │   ├── ffmpeg_runner.py          # FFmpeg subprocess runner + progress
 │   ├── file_utils.py             # File I/O helpers
 │   ├── filter_utils.py           # Message filter builders
@@ -114,6 +120,8 @@ git push origin main
 │   ├── create_telethon_session.py  # Generate Telethon session string
 │   ├── check_sessions.py           # Check session status
 │   ├── check_jobs_redis.py         # Inspect Redis job queue
+│   ├── check_eventbus.py           # Inspect RabbitMQ + Kafka connectivity
+│   ├── check_eventbus_integration.py  # Real-broker check: ack, retry, DLQ, events
 │   ├── import_check.py             # Verify all modules import cleanly
 │   └── ... (diagnostics, cleanup, migration)
 │
@@ -137,6 +145,7 @@ git push origin main
 │
 ├── Dockerfile               # Container deployment
 ├── docker-compose.fetcher.yml
+├── docker-compose.eventbus.yml   # Optional: local RabbitMQ + Kafka (KRaft)
 ├── railway.json             # Railway deployment manifest
 ├── Procfile                 # Process type definitions
 ├── runtime.txt              # Python 3.12.8
@@ -208,6 +217,22 @@ Supported operations: Format conversion, compression, resolution change, framera
 | `AWS_SECRET_ACCESS_KEY` | Secret key |
 | `PRESIGN_EXPIRES` | Presigned URL expiry in seconds (default `3600`) |
 
+### Event bus (all optional — off by default)
+| Variable | Default | Description |
+|---|---|---|
+| `EVENTBUS_QUEUE_BACKEND` | `redis` | Where *jobs* are queued: `redis` (existing list) or `rabbitmq` |
+| `EVENTBUS_QUEUE_ROLLOUT_PERCENT` | `0` | Share of jobs sent to RabbitMQ when it is selected (`0`–`100`) |
+| `EVENTBUS_EVENTS_BACKEND` | `off` | Whether *lifecycle events* also go to Kafka: `off` or `kafka` |
+| `RABBITMQ_URL` | — | AMQP URL (`amqps://` for managed brokers) |
+| `RABBITMQ_MAX_RETRIES` | `3` | Attempts before a job is dead-lettered |
+| `RABBITMQ_PREFETCH` | `1` | Unacked messages per worker (1 matches the sequential worker) |
+| `RABBITMQ_RETRY_TTL_MS` | `30000` | Base backoff; doubles per attempt, capped at 10× |
+| `KAFKA_BOOTSTRAP_SERVERS` | — | Kafka brokers, comma-separated |
+| `KAFKA_EVENTS_TOPIC` | `media.job.events` | Event-log topic (keyed by job id) |
+| `KAFKA_EMIT_PROGRESS_EVENTS` | `false` | Also log progress events (throttled) |
+| `KAFKA_PROGRESS_MIN_INTERVAL_MS` | `2000` | Progress throttle per job |
+| `KAFKA_SECURITY_PROTOCOL` / `KAFKA_SASL_MECHANISM` / `KAFKA_SASL_USERNAME` / `KAFKA_SASL_PASSWORD` | — | Managed-Kafka auth (SASL/SSL) |
+
 ### Full reference
 See `.env.example` for the complete list of all supported environment variables.
 
@@ -265,6 +290,110 @@ Session strings are persisted to **both** MongoDB and local JSON files, ensuring
 5. **File-based .session**: Telethon's native file persistence (backup)
 
 The session healthchecker (`SessionHealthChecker`) runs every hour, verifies sessions are alive, and automatically persists working sessions to both MongoDB and JSON.
+
+---
+
+## 🔀 Optional event bus: RabbitMQ + Kafka
+
+The bot can run its job queue through **RabbitMQ** and record every job's
+lifecycle in **Kafka**. Both are **off by default**: with no configuration the
+process behaves exactly as it did before (Redis list + progress pub/sub).
+
+### Why two brokers — they do not own the same thing
+
+| | RabbitMQ | Kafka |
+|---|---|---|
+| Owns | **job execution** | **job history** |
+| Carries | one message per job to run | one event per lifecycle change (`job.queued`, `job.started`, `job.progress`, `job.completed` / `job.failed` / `job.cancelled`) |
+| Mechanism | durable queue, manual ack, retries via a delay queue, dead-letter queue | idempotent producer, topic keyed by job id, replayable log |
+| Replaces | the `LPUSH`/`BRPOP` list for the rollout share | Redis `PUBLISH` as the *record* of what happened (pub/sub stays the live notification path) |
+
+The Redis queue remains in place and remains the fallback: it takes any job the
+rollout does not select, and takes a job back if the broker refuses the publish.
+`utils/eventbus/` is the only module that knows either broker exists; the rest of
+the code calls `publish_job()` / `emit_event()` and never branches on
+configuration.
+
+### What the broker actually adds to job execution
+
+The Redis list removes a job the moment it is handed to a worker, so a worker
+killed mid-encode takes that job with it. RabbitMQ replaces that with:
+
+- **manual acknowledgement** — the message is acked only after the handler
+  returns, and redelivered if the worker dies first;
+- **bounded retries through a delay queue** — a failed attempt is re-published
+  with its attempt count in a header and dead-lettered back onto the work queue
+  after a backoff (the broker waits, not the worker);
+- **a dead-letter queue** (`media.jobs.dead`) — after `RABBITMQ_MAX_RETRIES` a
+  message waits to be inspected or replayed instead of vanishing.
+
+A consumer therefore has to be idempotent: at-least-once delivery means a job
+can arrive twice. Nothing new is needed for that — the worker's input lock
+(`ffmpeg:lock:*`) and job-hash dedup already make a repeated delivery a no-op.
+
+### Rolling it out
+
+```bash
+EVENTBUS_QUEUE_BACKEND=rabbitmq
+EVENTBUS_QUEUE_ROLLOUT_PERCENT=10     # start here, watch, then raise to 100
+RABBITMQ_URL=amqp://user:pass@host:5672/
+EVENTBUS_EVENTS_BACKEND=kafka
+KAFKA_BOOTSTRAP_SERVERS=host:9092
+```
+
+The decision is a SHA-256 bucket of the job id, so every producer (the bot,
+`fetcher/`, `tools/telethon_ingest.py`) independently agrees on which queue a job
+belongs to and `10` really is a tenth of the jobs. While the rollout is partial
+**both** queues are drained by the same worker, and a job delivered by RabbitMQ
+that hits a lock is requeued on RabbitMQ rather than being moved to the Redis
+delay set. Rollback is `EVENTBUS_QUEUE_ROLLOUT_PERCENT=0`; jobs already in the
+broker are still processed.
+
+### Local stack and how to verify it
+
+```bash
+docker compose -f docker-compose.eventbus.yml up -d   # RabbitMQ + Kafka (KRaft)
+python scripts/check_eventbus.py                      # config, connectivity, depths
+python scripts/check_eventbus.py --publish-test       # also publish one throwaway job
+python scripts/check_eventbus.py --replay <job_id>    # read a job's events back
+python scripts/check_eventbus_integration.py          # 38 checks against the live brokers
+pytest tests/ -q                                      # broker-free unit tests
+```
+
+`check_eventbus_integration.py` is the one that exercises delivery semantics rather
+than connectivity: publisher confirms, ack-only-after-the-handler, retry with the
+attempt counter going up, dead-lettering once the retries run out, a graceful stop
+that keeps an unprocessed job in the queue, the worker's own consumer task, and the
+lifecycle events read back from Kafka. It **purges the queues first** and refuses to
+run against a non-localhost broker, so it cannot be aimed at production by accident.
+
+`scripts/check_eventbus.py` exits non-zero when an *enabled* component is
+unreachable and reports a disabled one as disabled (not as a failure). The
+RabbitMQ management UI is at http://localhost:15672 once the local stack is up.
+
+### Coverage, honestly stated
+
+The unit tests in `tests/test_eventbus_*.py` cover the parts that can be checked
+without a broker: backend selection and degradation, the rollout bucketing, the
+retry/backoff/dead-letter decisions, the event envelope and its secret-safe job
+projection, the progress throttle, and failure isolation (a broker error must
+never surface in a job).
+
+Broker behaviour is covered by `scripts/check_eventbus_integration.py`, run
+against local RabbitMQ + Kafka (their defaults, `docker compose -f
+docker-compose.eventbus.yml up -d`): 38 checks, all passing, covering publisher
+confirms, manual ack, the retry/delay-queue path with its attempt counter, the
+dead-letter queue, graceful shutdown, the worker's consumer task, and the event
+log read back in order. What that still does **not** claim is production
+behaviour: it is a single-node broker on one machine, not a HA cluster under real
+load, and this repository has no measured throughput, uptime or p99 numbers.
+
+No throughput or uptime number is claimed anywhere in this repository. What is
+instrumented instead is what you would measure to make such a claim:
+`eventbus_jobs_routed_total`, `eventbus_jobs_routed_fallback_total`,
+`eventbus_events_published_total`, `eventbus_events_publish_failed_total`,
+`eventbus_queue_retries_total` and `eventbus_queue_dead_lettered_total` on the
+existing Prometheus endpoint.
 
 ---
 

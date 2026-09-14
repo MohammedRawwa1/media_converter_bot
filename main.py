@@ -54,6 +54,7 @@ from config import (
     FFMPEG_PATH,
     WEBHOOK_SECRET,
     WEBHOOK_URL,
+    is_admin_user,
     is_user_allowed,
     persist_allowed_users,
 )
@@ -65,6 +66,7 @@ from tasks import (
 from utils import (
     ensure_directories,
 )
+from utils.confirm import split_confirm
 from utils.error_handler import (
     get_error_handler,
     setup_comprehensive_logging,
@@ -72,6 +74,7 @@ from utils.error_handler import (
 from utils.job_queue import cancel_job
 from utils.login_handler import cleanup_login_flow, register_login_handlers
 from utils.markdown_utils import escape_markdown as _escape_markdown
+from utils.queue_admin import cancel_all_jobs, clear_cache_keys
 from utils.rate_limiter import ConversionRateLimiter, ConversionRateLimiterRedis, TelegramAPIRateLimiter
 from utils.session_healthcheck import (
     get_session_healthchecker,
@@ -706,30 +709,46 @@ def setup_handlers(application: Application) -> None:
     # Admin commands (manage allowed users)
     async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_id = update.effective_user.id
-        # Only admin may manage allowed users
-        if ADMIN_USER_ID and user_id != ADMIN_USER_ID:
+        # Only admin may manage allowed users. Fails closed: with ADMIN_USER_ID
+        # unset nobody is an admin, so this cannot be reached by accident.
+        if not is_admin_user(user_id):
             await update.message.reply_text("Unauthorized: admin only")
             return
 
-        args = context.args if hasattr(context, "args") else []
-        if not args:
-            await update.message.reply_text("Usage: /admin add|remove|list <user_id>")
+        confirmed, positional = split_confirm(context.args if hasattr(context, "args") else [])
+        if not positional:
+            await update.message.reply_text("Usage: /admin add|remove|list <user_id> [confirm]")
             return
 
-        cmd = args[0].lower()
+        cmd = positional[0].lower()
         if cmd == "list":
             users = sorted(list(ALLOWED_USER_IDS))
             await update.message.reply_text(f"Allowed users: {users}")
             return
 
-        if len(args) < 2:
+        if cmd not in ("add", "remove"):
+            await update.message.reply_text("Unknown admin command")
+            return
+
+        if len(positional) < 2:
             await update.message.reply_text("Specify a user id")
             return
 
         try:
-            target = int(args[1])
+            target = int(positional[1])
         except Exception:
             await update.message.reply_text("Invalid user id")
+            return
+
+        # Both directions need an explicit confirm: `remove` locks a user out, and
+        # `add` hands out access - the id comes from a human, and one wrong digit
+        # is a stranger.
+        if not confirmed:
+            action = "Grant access to" if cmd == "add" else "Revoke access for"
+            await update.message.reply_text(
+                f"⚠️ *{action}* `{target}`?\nReply with `/admin {cmd} {target} confirm` to proceed.",
+                parse_mode="Markdown",
+            )
             return
 
         if cmd == "add":
@@ -743,11 +762,22 @@ def setup_handlers(application: Application) -> None:
             await update.message.reply_text(f"Removed {target} from allowed users")
             return
 
-        await update.message.reply_text("Unknown admin command")
-
     application.add_handler(CommandHandler("admin", latency_wrapper(admin_command, "admin_command")))
 
     async def logout_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Log out and delete the Telethon session. Requires an explicit confirm."""
+        confirmed, _ = split_confirm(context.args if hasattr(context, "args") else [])
+        if not confirmed:
+            await update.message.reply_text(
+                "⚠️ *Log out and delete the Telethon session*\n"
+                "• Removes the session file, its journal/lock and your per-user copy\n"
+                "• Clears the session stored in MongoDB for your account\n"
+                "• You will have to run /login again, with a fresh Telegram code\n\n"
+                "Reply with `/logout confirm` to proceed.",
+                parse_mode="Markdown",
+            )
+            return
+
         user_id = update.effective_user.id
 
         # ── Clean up any active login flow before logging out ──
@@ -829,6 +859,19 @@ def setup_handlers(application: Application) -> None:
     application.add_handler(CommandHandler("logout", latency_wrapper(logout_command, "logout_command")))
 
     async def logoutpyro_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Log out of Pyrogram and clear its session. Requires an explicit confirm."""
+        confirmed, _ = split_confirm(context.args if hasattr(context, "args") else [])
+        if not confirmed:
+            await update.message.reply_text(
+                "⚠️ *Log out of Pyrogram and clear its session*\n"
+                "• Clears the Pyrogram session JSON (per-user and global)\n"
+                "• Clears the Pyrogram session string stored in MongoDB\n"
+                "• You will have to run /loginpyro again\n\n"
+                "Reply with `/logoutpyro confirm` to proceed.",
+                parse_mode="Markdown",
+            )
+            return
+
         user_id = update.effective_user.id
 
         # ── Clean up any active login flow before logging out ──
@@ -882,12 +925,22 @@ def setup_handlers(application: Application) -> None:
     application.add_handler(CommandHandler("logoutpyro", latency_wrapper(logoutpyro_command, "logoutpyro_command")))
 
     async def canceljob_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-        args = context.args if hasattr(context, "args") else []
-        if not args:
-            await update.message.reply_text("Usage: /canceljob <job_id>")
+        """Cancel one job. Requires an explicit ``confirm``, like /cancelall."""
+        confirmed, positional = split_confirm(context.args if hasattr(context, "args") else [])
+        if not positional:
+            await update.message.reply_text("Usage: /canceljob <job_id> confirm")
             return
 
-        job_id = args[0]
+        job_id = positional[0]
+        if not confirmed:
+            await update.message.reply_text(
+                f"⚠️ *Cancel job* `{job_id}`?\n"
+                "The worker stops at its next checkpoint and the job is discarded.\n"
+                f"Reply with `/canceljob {job_id} confirm` to proceed.",
+                parse_mode="Markdown",
+            )
+            return
+
         try:
             await cancel_job(job_id)
             await update.message.reply_text(f"Requested cancellation for job {job_id}")
@@ -896,6 +949,75 @@ def setup_handlers(application: Application) -> None:
             await update.message.reply_text(f"Failed to cancel job {job_id}: {e}")
 
     application.add_handler(CommandHandler("canceljob", latency_wrapper(canceljob_command, "canceljob_command")))
+
+    def _admin_only(update: Update) -> bool:
+        """True when the caller is the configured admin.
+
+        Delegates to ``config.is_admin_user`` so every admin-gated command shares
+        one fail-closed rule instead of repeating an ``if ADMIN_USER_ID and ...``
+        guard that authorises everybody when the id is unset.
+        """
+        user = getattr(update, "effective_user", None)
+        return is_admin_user(getattr(user, "id", None))
+
+    async def cancelall_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Cancel every queued, delayed and running job for every user, on both pipes."""
+        if not _admin_only(update):
+            await update.message.reply_text("Unauthorized: admin only")
+            return
+
+        confirmed, _ = split_confirm(context.args if hasattr(context, "args") else [])
+        if not confirmed:
+            await update.message.reply_text(
+                "⚠️ *Cancel every job on both pipes*\n"
+                "• Redis queue: `ffmpeg:jobs` + `ffmpeg:delayed`\n"
+                "• Running jobs: flagged `cancel=1` so workers stop\n"
+                "• RabbitMQ: `media.jobs.run` / `.retry` / `.dead` purged\n"
+                "• Progress keys, input locks and stale dedup keys cleared\n\n"
+                "This affects *all users*, not just yours.\n"
+                "Reply with `/cancelall confirm` to proceed.",
+                parse_mode="Markdown",
+            )
+            return
+
+        status = await update.message.reply_text("🧹 Draining both pipes, this can take a moment...")
+        try:
+            report = await cancel_all_jobs()
+            await status.edit_text("\n".join(report.as_lines()))
+        except Exception:
+            logger.exception("/cancelall failed")
+            await status.edit_text("❌ /cancelall failed — check the logs for details.")
+
+    application.add_handler(CommandHandler("cancelall", latency_wrapper(cancelall_command, "cancelall_command")))
+
+    async def clear_cache_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Wipe the Redis cache keys written by utils.cache and utils.route_cache."""
+        if not _admin_only(update):
+            await update.message.reply_text("Unauthorized: admin only")
+            return
+
+        confirmed, _ = split_confirm(context.args if hasattr(context, "args") else [])
+        if not confirmed:
+            await update.message.reply_text(
+                "🧼 *Clear Redis cache*\n"
+                "• `cache:job:` and `cache:file:` (including cached file bytes)\n"
+                "• `cache:user:` / `cache:meta:` / `cache:resp:`\n"
+                "• `routecache:` and the in-memory route cache\n\n"
+                "Job state (`ffmpeg:job:*`) is left alone — use `/cancelall` for that.\n"
+                "Reply with `/clear_cache confirm` to proceed.",
+                parse_mode="Markdown",
+            )
+            return
+
+        status = await update.message.reply_text("🧼 Clearing cache keys...")
+        try:
+            report = await clear_cache_keys()
+            await status.edit_text("\n".join(report.as_lines()))
+        except Exception:
+            logger.exception("/clear_cache failed")
+            await status.edit_text("❌ /clear_cache failed — check the logs for details.")
+
+    application.add_handler(CommandHandler("clear_cache", latency_wrapper(clear_cache_command, "clear_cache_command")))
 
     # Settings command - forward to handler manager's show_settings
     async def settings_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1507,6 +1629,18 @@ async def main(background: bool = False) -> None:
                         logger.info("Another worker holds long-poller lock; skipping")
                 except Exception:
                     logger.exception("Failed to start background long-poller")
+
+            # Fail loudly at startup when Kafka events are enabled but the
+            # producer cannot publish: without this the layer reports
+            # events_enabled=true and then drops every event from a debug log.
+            # Raises only when EVENTBUS_REQUIRE_BROKERS is set.
+            try:
+                from utils import eventbus as _eventbus
+
+                await _eventbus.verify_events_startup()
+            except Exception:
+                logger.exception("eventbus: startup verification failed")
+                raise
 
             # Start the ffmpeg worker as a background task so the web service
             # can process jobs whenever it is awake (critical for free tier
@@ -2404,15 +2538,31 @@ try:
         except Exception:
             pass
 
-        return {
-            "status": "ok",
-            "bot_initialized": BOT_APPLICATION is not None,
-            "bot_ready": BOT_READY.is_set(),
-            "dispatcher_ready": dispatcher_ready,
-            "startup_time": BOT_STARTED_AT,
-            "error": getattr(app.state, "startup_error", None),
-            "redis_keys": redis_keys,
-        }
+        # Shared pipe report (status/redis/broker/eventbus) plus this bot's own
+        # readiness fields. collect_health never raises and bounds every probe, so
+        # a dead Redis or a hung broker degrades a field instead of the endpoint.
+        from utils.health import collect_health
+
+        try:
+            payload = await collect_health()
+        except Exception:
+            logger.exception("health: probe collection failed")
+            payload = {"status": "degraded", "redis": None, "broker": None, "eventbus": None}
+
+        # Always HTTP 200: this endpoint backs the platform healthcheck and the
+        # keep-alive ping, so a degraded pipe must be visible in the body rather
+        # than restarting a container that is still converting files.
+        payload.update(
+            {
+                "bot_initialized": BOT_APPLICATION is not None,
+                "bot_ready": BOT_READY.is_set(),
+                "dispatcher_ready": dispatcher_ready,
+                "startup_time": BOT_STARTED_AT,
+                "error": getattr(app.state, "startup_error", None),
+                "redis_keys": redis_keys,
+            }
+        )
+        return payload
 
     @app.get("/")
     async def root_index(request: Request):

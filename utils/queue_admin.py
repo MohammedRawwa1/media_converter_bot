@@ -1,0 +1,439 @@
+"""Admin maintenance for both background pipes and the Redis cache.
+
+media_conversion_bot queues work on two independent pipes, and admin maintenance
+has to reason about both or it silently leaves jobs behind:
+
+1. Redis pipe (``utils/job_queue.py``)
+     - Queue list    ``ffmpeg:jobs``              JSON job dicts, popped by workers
+     - Delayed set   ``ffmpeg:delayed``           zset promoted onto the list by ``pop_job``
+     - Job hashes    ``ffmpeg:job:<id>``          status/progress, read by /status
+     - Progress      ``ffmpeg:progress:<id>``     live progress mirrors
+     - Input locks   ``ffmpeg:lock:<sha256>``     one owner per input
+     - Dedup keys    ``ffmpeg:pipeline_dedup:*``  -> job id that owns the input
+2. RabbitMQ pipe (``utils/eventbus/rabbit.py``)
+     - ``media.jobs.run`` / ``media.jobs.retry`` / ``media.jobs.dead``
+
+``cancel_all_jobs`` drains both. It purges the broker even when
+``EVENTBUS_QUEUE_ROLLOUT_PERCENT`` is 0, because that setting only stops *new*
+jobs from being routed there - anything already queued must still be drained, or
+a rollback would strand in-flight jobs (see ``EventBusSettings.consumes_rabbitmq``).
+
+Both entry points return a report object instead of printing, so the Telegram
+commands and any future CLI can render the same outcome.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import contextlib
+import json
+import logging
+import os
+from dataclasses import dataclass, field
+
+from utils import job_queue
+from utils.cache import PREFIX_FILE, PREFIX_JOB, PREFIX_META, PREFIX_RESPONSE, PREFIX_USER
+
+logger = logging.getLogger(__name__)
+
+JOB_HASH_PREFIX = "ffmpeg:job:"
+PROGRESS_PREFIX = "ffmpeg:progress:"
+LOCK_PREFIX = "ffmpeg:lock:"
+DEDUP_PREFIX = "ffmpeg:pipeline_dedup:"
+ROUTE_CACHE_PREFIX = "routecache:"
+
+# Statuses the worker writes to ``ffmpeg:job:<id>`` that mean "no longer running".
+TERMINAL_STATUSES = frozenset({"done", "completed", "error", "failed", "cancelled", "canceled"})
+
+# Statuses that mean "this job is still the live owner of its input". Kept in step
+# with the dedup check in ``scripts/cleanup_stale_dedup_keys.py`` and with
+# ``_ensure_current_file_downloaded``.
+ACTIVE_STATUSES = frozenset({"processing", "queued", "waiting", "started", "uploading", "sending"})
+
+# ``pending`` is the placeholder the BigFilePipeline writes while a file is still
+# being ingested, before the real job id exists. It has no job hash to look up and
+# must be treated as active so a cancel-all never un-dedups an in-progress ingest.
+PENDING_PLACEHOLDER = "pending"
+
+CANCEL_REASON = "cancelled by admin"
+
+# A broker that is configured but unreachable must not hold the command open: the
+# Redis pipe is already drained by then, so the purge is reported as an error and
+# the admin still gets an answer. Same spirit as ``publish_job`` falling back to
+# the Redis list when the broker declines a job.
+BROKER_PURGE_TIMEOUT_SECONDS = float(os.getenv("ADMIN_BROKER_PURGE_TIMEOUT", "20"))
+
+
+def _text(value) -> str:
+    """Return a Redis value as ``str`` whether the client decodes or not."""
+    if isinstance(value, (bytes, bytearray)):
+        return value.decode("utf-8", "replace")
+    return "" if value is None else str(value)
+
+
+async def _scan_keys(redis, pattern: str, count: int = 500) -> list[str]:
+    keys: list[str] = []
+    async for key in redis.scan_iter(match=pattern, count=count):
+        keys.append(_text(key))
+    return keys
+
+
+@dataclass
+class QueueReport:
+    """Outcome of a ``/cancelall`` run, one counter per thing that was cleared."""
+
+    queued: int = 0
+    delayed: int = 0
+    in_flight: int = 0
+    progress_keys: int = 0
+    locks_released: int = 0
+    dedup_keys: int = 0
+    job_ids: list[str] = field(default_factory=list)
+    broker: dict[str, int | str] = field(default_factory=dict)
+    errors: list[str] = field(default_factory=list)
+
+    @property
+    def cancelled_jobs(self) -> int:
+        """Jobs removed from the queue plus jobs flagged while already running."""
+        return self.queued + self.delayed + self.in_flight
+
+    def as_lines(self) -> list[str]:
+        lines = ["🧹 Cancelled jobs on both pipes"]
+        lines.append(f"• Queued removed:      {self.queued}")
+        lines.append(f"• Delayed removed:     {self.delayed}")
+        lines.append(f"• Running flagged:     {self.in_flight}")
+        lines.append(f"• Progress keys:       {self.progress_keys}")
+        lines.append(f"• Locks released:      {self.locks_released}")
+        lines.append(f"• Dedup keys dropped:  {self.dedup_keys}")
+        if self.broker:
+            purged = ", ".join(f"{name}={count}" for name, count in sorted(self.broker.items()))
+            lines.append(f"• Broker queues:       {purged}")
+        else:
+            lines.append("• Broker queues:       not configured")
+        lines.append(f"\nTotal jobs affected: {self.cancelled_jobs}")
+        if self.errors:
+            lines.append("\n⚠️ Some steps failed:")
+            lines.extend(f"• {err}" for err in self.errors)
+        return lines
+
+
+@dataclass
+class CacheReport:
+    """Outcome of a ``/clear_cache`` run."""
+
+    prefixes: dict[str, int] = field(default_factory=dict)
+    route_cache_keys: int = 0
+    route_cache_memory: int = 0
+    errors: list[str] = field(default_factory=list)
+
+    @property
+    def total_keys(self) -> int:
+        return sum(self.prefixes.values()) + self.route_cache_keys
+
+    def as_lines(self) -> list[str]:
+        lines = ["🧼 Redis cache cleared"]
+        for prefix, count in sorted(self.prefixes.items()):
+            lines.append(f"• {prefix}*  →  {count}")
+        lines.append(f"• {ROUTE_CACHE_PREFIX}*  →  {self.route_cache_keys}")
+        if self.route_cache_memory:
+            lines.append(f"• in-memory route cache  →  {self.route_cache_memory}")
+        lines.append(f"\nTotal keys deleted: {self.total_keys}")
+        if self.errors:
+            lines.append("\n⚠️ Some steps failed:")
+            lines.extend(f"• {err}" for err in self.errors)
+        return lines
+
+
+async def _flag_job_cancelled(redis, job_id: str) -> None:
+    """Set the same flags ``job_queue.cancel_job`` sets, so a running worker stops.
+
+    The hash is deliberately kept (not deleted): a worker that is already
+    mid-job only stops when it reads ``cancel=1`` from it.
+    """
+    if not job_id:
+        return
+    with contextlib.suppress(Exception):
+        await redis.hset(
+            f"{JOB_HASH_PREFIX}{job_id}",
+            mapping={
+                "cancel": "1",
+                "status": "cancelled",
+                "message": CANCEL_REASON,
+                "progress": "0",
+            },
+        )
+
+
+async def _drain_job_list(redis, report: QueueReport, cancelled: set[str]) -> None:
+    """Remove every queued job from ``ffmpeg:jobs``.
+
+    Flag each job's hash before deleting the list: a worker may pop an entry
+    between the read and the delete, and the flag is what stops that job.
+    """
+    entries = await redis.lrange(job_queue.JOB_LIST, 0, -1)
+    for entry in entries:
+        job_id = _job_id_of(entry)
+        if job_id:
+            cancelled.add(job_id)
+            report.job_ids.append(job_id)
+            await _flag_job_cancelled(redis, job_id)
+    if entries:
+        await redis.delete(job_queue.JOB_LIST)
+    report.queued = len(entries)
+
+
+async def _drain_delayed_set(redis, report: QueueReport, cancelled: set[str]) -> None:
+    """Remove every delayed job from ``ffmpeg:delayed``.
+
+    Delayed entries are cancelled by removal - ``pop_job`` promotes them onto the
+    live list, so anything left here would be re-queued later.
+    """
+    entries = await redis.zrange(job_queue.DELAYED_SET, 0, -1)
+    for entry in entries:
+        job_id = _job_id_of(entry)
+        if job_id:
+            cancelled.add(job_id)
+            report.job_ids.append(job_id)
+            await _flag_job_cancelled(redis, job_id)
+    if entries:
+        await redis.delete(job_queue.DELAYED_SET)
+    report.delayed = len(entries)
+
+
+async def _cancel_in_flight(redis, report: QueueReport, cancelled: set[str]) -> None:
+    """Flag every non-terminal job hash, including jobs the workers already popped."""
+    for key in await _scan_keys(redis, f"{JOB_HASH_PREFIX}*"):
+        job_id = key[len(JOB_HASH_PREFIX) :]
+        if not job_id:
+            continue
+        try:
+            data = await redis.hgetall(key) or {}
+        except Exception as exc:
+            report.errors.append(f"{key}: {exc}")
+            continue
+        if not data:
+            continue
+        status = _text(data.get("status") or data.get(b"status") or "")
+        if status in TERMINAL_STATUSES:
+            continue
+        cancelled.add(job_id)
+        report.job_ids.append(job_id)
+        await _flag_job_cancelled(redis, job_id)
+        report.in_flight += 1
+
+
+async def _drop_progress_keys(redis, report: QueueReport) -> None:
+    """Drop the live-progress mirrors; they are derived state for cancelled jobs."""
+    keys = await _scan_keys(redis, f"{PROGRESS_PREFIX}*")
+    for start in range(0, len(keys), 500):
+        batch = keys[start : start + 500]
+        with contextlib.suppress(Exception):
+            await redis.delete(*batch)
+    report.progress_keys = len(keys)
+
+
+async def _drop_stale_dedup_keys(redis, report: QueueReport) -> None:
+    """Drop dedup keys whose job is gone or no longer active, so files can re-run.
+
+    Mirrors ``scripts/cleanup_stale_dedup_keys.py``: a key is only removed when the
+    job hash says the job is finished, cancelled or errored, and an unreadable
+    state keeps the key (conservative - never un-dedup something mid-ingest).
+    """
+    for key in await _scan_keys(redis, f"{DEDUP_PREFIX}*"):
+        try:
+            owner = _text(await redis.get(key))
+        except Exception as exc:
+            report.errors.append(f"{key}: {exc}")
+            continue
+        if not owner:
+            continue
+        if await _job_is_active(redis, owner):
+            continue
+        with contextlib.suppress(Exception):
+            await redis.delete(key)
+            report.dedup_keys += 1
+
+
+async def _job_is_active(redis, job_id: str) -> bool:
+    """True when ``job_id`` still owns its input. Unknown state counts as active."""
+    if job_id == PENDING_PLACEHOLDER:
+        return True
+    try:
+        data = await redis.hgetall(f"{JOB_HASH_PREFIX}{job_id}") or {}
+    except Exception:
+        return True
+    if not data:
+        return False
+    status = _text(data.get("status") or data.get(b"status") or "")
+    if not status:
+        return False
+    return status in ACTIVE_STATUSES
+
+
+async def _release_stale_locks(redis, report: QueueReport, cancelled: set[str]) -> None:
+    """Release input locks held by cancelled jobs or by jobs that no longer exist.
+
+    Lock keys are derived from a hash of the input, so they cannot be enumerated
+    from a job id - the owner is read out of the lock value instead.
+    """
+    for key in await _scan_keys(redis, f"{LOCK_PREFIX}*"):
+        try:
+            owner = _text(await redis.get(key))
+        except Exception as exc:
+            report.errors.append(f"{key}: {exc}")
+            continue
+        if not owner:
+            continue
+        if owner not in cancelled and await _job_is_active(redis, owner):
+            continue
+        try:
+            if await job_queue.release_input_lock(key, owner, redis_client=redis):
+                report.locks_released += 1
+        except Exception as exc:
+            report.errors.append(f"{key}: {exc}")
+
+
+async def _purge_broker_queues(report: QueueReport) -> None:
+    """Purge the RabbitMQ pipe, including the dead-letter queue.
+
+    ``consumes_rabbitmq`` (not ``queue_enabled``) is the gate: it stays true when
+    the rollout is 0, because a rollback still has to drain what is in the broker.
+    """
+    try:
+        from utils.eventbus import get_settings
+
+        settings = get_settings()
+        if not settings.consumes_rabbitmq:
+            return
+        from utils.eventbus.rabbit import get_queue
+
+        purged = await asyncio.wait_for(get_queue().purge_queues(), timeout=BROKER_PURGE_TIMEOUT_SECONDS)
+        report.broker = {name: count for name, count in (purged or {}).items()}
+    except TimeoutError:
+        logger.error("cancelall: broker purge timed out after %ss", BROKER_PURGE_TIMEOUT_SECONDS)
+        report.errors.append(f"broker purge timed out after {BROKER_PURGE_TIMEOUT_SECONDS:g}s")
+    except Exception as exc:
+        logger.exception("cancelall: broker purge failed")
+        report.errors.append(f"broker purge: {exc}")
+
+
+async def cancel_all_jobs(*, purge_broker: bool = True) -> QueueReport:
+    """Cancel every queued, delayed and in-flight job for every user on both pipes.
+
+    Each step is isolated: one failing step is recorded in ``report.errors`` and
+    the remaining steps still run, so a cancel-all never half-completes because a
+    single key misbehaved.
+    """
+    report = QueueReport()
+    redis = None
+    try:
+        redis = await job_queue.get_redis()
+    except Exception as exc:
+        logger.exception("cancelall: Redis unavailable")
+        report.errors.append(f"Redis unavailable: {exc}")
+
+    if redis is not None:
+        cancelled: set[str] = set()
+        steps = (
+            ("queued", _drain_job_list(redis, report, cancelled)),
+            ("delayed", _drain_delayed_set(redis, report, cancelled)),
+            ("in-flight", _cancel_in_flight(redis, report, cancelled)),
+            ("progress keys", _drop_progress_keys(redis, report)),
+            ("stale locks", _release_stale_locks(redis, report, cancelled)),
+            ("dedup keys", _drop_stale_dedup_keys(redis, report)),
+        )
+        for name, step in steps:
+            try:
+                await step
+            except Exception as exc:
+                logger.exception("cancelall: %s step failed", name)
+                report.errors.append(f"{name}: {exc}")
+
+    if purge_broker:
+        await _purge_broker_queues(report)
+
+    logger.info(
+        "cancelall: queued=%s delayed=%s in_flight=%s broker=%s errors=%s",
+        report.queued,
+        report.delayed,
+        report.in_flight,
+        report.broker,
+        len(report.errors),
+    )
+    return report
+
+
+async def _delete_prefix(redis, prefix: str, report: CacheReport) -> int:
+    keys = await _scan_keys(redis, f"{prefix}*")
+    removed = 0
+    for start in range(0, len(keys), 500):
+        batch = keys[start : start + 500]
+        try:
+            removed += int(await redis.delete(*batch) or 0)
+        except Exception as exc:
+            report.errors.append(f"{prefix}*: {exc}")
+    report.prefixes[prefix] = removed
+    return removed
+
+
+async def clear_cache_keys(*, clear_route_cache: bool = True) -> CacheReport:
+    """Delete every Redis cache key the app writes, optionally including route cache.
+
+    Covers the ``utils.cache`` prefixes (job/file/user/meta/response, including the
+    binary ``cache:file:bytes:`` entries) and ``utils.route_cache`` keys. Job state
+    (``ffmpeg:job:*``) is never touched here - that is ``/cancelall``.
+    """
+    report = CacheReport()
+    prefixes = (PREFIX_JOB, PREFIX_FILE, PREFIX_USER, PREFIX_META, PREFIX_RESPONSE)
+
+    try:
+        redis = await job_queue.get_redis()
+    except Exception as exc:
+        logger.exception("clear_cache: Redis unavailable")
+        report.errors.append(f"Redis unavailable: {exc}")
+        return report
+
+    for prefix in prefixes:
+        try:
+            await _delete_prefix(redis, prefix, report)
+        except Exception as exc:
+            logger.exception("clear_cache: prefix %s failed", prefix)
+            report.errors.append(f"{prefix}*: {exc}")
+
+    if clear_route_cache:
+        try:
+            await _delete_prefix(redis, ROUTE_CACHE_PREFIX, report)
+            report.route_cache_keys = report.prefixes.pop(ROUTE_CACHE_PREFIX, 0)
+        except Exception as exc:
+            report.errors.append(f"{ROUTE_CACHE_PREFIX}*: {exc}")
+        # The route cache also keeps a process-local fallback dict; with no Redis
+        # client injected it only touches that dict, so one call covers both.
+        try:
+            from utils.route_cache import route_cache
+
+            report.route_cache_memory = route_cache.invalidate_prefix("")
+        except Exception as exc:
+            report.errors.append(f"in-memory route cache: {exc}")
+
+    logger.info(
+        "clear_cache: prefixes=%s route_cache=%s memory=%s errors=%s",
+        report.prefixes,
+        report.route_cache_keys,
+        report.route_cache_memory,
+        len(report.errors),
+    )
+    return report
+
+
+def _job_id_of(raw) -> str:
+    """Extract ``job_id`` from a raw ``ffmpeg:jobs`` / ``ffmpeg:delayed`` entry."""
+    text = _text(raw)
+    if not text:
+        return ""
+    try:
+        parsed = json.loads(text)
+    except Exception:
+        return ""
+    if not isinstance(parsed, dict):
+        return ""
+    return str(parsed.get("job_id") or "")

@@ -29,4 +29,11 @@ Flask-Cors>=3.0.10
 a2wsgi>=1.10.0,<2.0.0
 gunicorn>=22.0.0,<23.0.0
 minio>=7.1.0
+# ── Optional event bus (utils/eventbus/) ──
+# Both clients are optional at runtime: if either is missing the layer logs a
+# warning and the code keeps using Redis (see utils/eventbus/config.py).
+# aio-pika 10 changed Queue.declare()/Message.expiration - both are handled, and
+# 10.x is what this integration was verified against (scripts/check_eventbus_integration.py).
+aio-pika>=9.4.0,<11.0.0
+aiokafka>=0.11.0,<1.0.0
 

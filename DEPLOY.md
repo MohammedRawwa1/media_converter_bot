@@ -137,6 +137,14 @@ Railway provides several useful environment variables automatically:
 | `WEBHOOK_SECRET` | Optional | Secret token for webhook security |
 | `MONGODB_URI` | Optional | MongoDB connection string — Railway generates `MONGO_URL` when you add MongoDB; config.py normalizes it to all common names (see MongoDB Setup below) |
 | `REDIS_URL` | Optional | Redis connection URL for job queue |
+| `EVENTBUS_QUEUE_BACKEND` | Optional | `redis` (default) or `rabbitmq` — where jobs are queued |
+| `EVENTBUS_QUEUE_ROLLOUT_PERCENT` | Optional | `0`–`100`, share of jobs sent to RabbitMQ (default `0` = off) |
+| `EVENTBUS_EVENTS_BACKEND` | Optional | `off` (default) or `kafka` — job lifecycle events |
+| `RABBITMQ_URL` | Conditional | Required when `EVENTBUS_QUEUE_BACKEND=rabbitmq` (use `amqps://` with a managed broker) |
+| `KAFKA_BOOTSTRAP_SERVERS` | Conditional | Required when `EVENTBUS_EVENTS_BACKEND=kafka` |
+| `KAFKA_SECURITY_PROTOCOL` | Conditional | `SASL_SSL` for most managed Kafka providers |
+| `KAFKA_SASL_MECHANISM` | Conditional | e.g. `SCRAM-SHA-256` |
+| `KAFKA_SASL_USERNAME` / `KAFKA_SASL_PASSWORD` | Conditional | Managed Kafka credentials |
 | `SENTRY_DSN` | Optional | Sentry DSN for error monitoring |
 | `ADMIN_USER_ID` | Optional | Telegram user ID for admin |
 | `ALLOWED_USER_IDS` | Optional | Comma-separated allowed user IDs |
@@ -152,3 +160,77 @@ Railway provides several useful environment variables automatically:
 | `KEEP_ALIVE_DISABLED` | Optional | Set to `true` to disable the keep-alive heartbeat |
 | `KEEP_ALIVE_INTERVAL` | Optional | Keep-alive ping interval in seconds (default: `600`, range: 60–840) |
 | `HTTP_POOL_SIZE` | Optional | HTTP connection pool size for Telegram Bot API (default: `50`) |
+
+## Optional Event Bus in Production (RabbitMQ + Kafka)
+
+See the README section [“Optional event bus”](README.md#-optional-event-bus-rabbitmq--kafka) for what each broker owns. The
+production-relevant points are below.
+
+### Adding the brokers
+
+Two options, and the application code is identical for both:
+
+1. **Managed instances (recommended on Railway).** RabbitMQ and Kafka are not
+   first-class Railway plugins, so point the two URLs at a managed provider —
+   CloudAMQP (RabbitMQ) and Confluent Cloud / Redpanda Cloud / Upstash (Kafka)
+   all expose exactly the values the two variables expect (an `amqps://` URL, and
+   a bootstrap list + SASL credentials). Aiven offers both from one account.
+2. **Self-hosted containers.** `docker-compose.eventbus.yml` in this repository
+   is the local stack; the same images run as services anywhere Docker runs. Note
+   that on a free Railway plan the extra containers compete with ffmpeg for the
+   RAM budget — the managed option exists for that reason.
+
+### Setting the variables
+
+**Set them on every service, not just the worker.** All four processes both
+produce and consume: the web service enqueues from Telegram, `fetcher/`
+enqueues from forwards, `telethon_ingest` enqueues from channels, and the web
+service plus the worker both run a consumer. A service left with the defaults
+keeps enqueueing to Redis, which is safe — the worker always drains Redis — but
+its share of the rollout is silently not being exercised.
+
+### Rollout procedure
+
+1. Deploy with `EVENTBUS_QUEUE_BACKEND=rabbitmq` and
+   `EVENTBUS_QUEUE_ROLLOUT_PERCENT=0`. Nothing moves; the RabbitMQ consumer is
+   not started.
+2. Raise it to `5`, then `25`, watching `eventbus_queue_retries_total`,
+   `eventbus_queue_dead_lettered_total` and the `media.jobs.dead` queue depth.
+3. Raise to `100` once retries and dead-letters are quiet, and only then switch
+   `EVENTBUS_EVENTS_BACKEND=kafka` if the event log is wanted.
+4. **Rollback is `EVENTBUS_QUEUE_ROLLOUT_PERCENT=0`** — new jobs go back to
+   Redis immediately, and anything already sitting in RabbitMQ is still consumed
+   because the consumer keeps running until the queue is empty (set
+   `EVENTBUS_QUEUE_BACKEND=redis` only once `media.jobs.run` shows 0 ready).
+
+### Verifying before you raise the rollout
+
+Run both checks against a local stack before pointing production at a broker:
+
+```bash
+python scripts/check_eventbus.py              # resolved config, connectivity, depths
+python scripts/check_eventbus_integration.py  # delivery semantics (destructive, localhost only)
+```
+
+The integration check purges the configured queues, so it refuses to run when
+`RABBITMQ_URL` is not localhost. The equivalent against a managed broker is a
+throwaway queue name (set `RABBITMQ_JOBS_QUEUE` to something like
+`media.jobs.canary`) rather than `--force` on the real queue.
+
+### Operational notes
+
+- **Two processes acked the same job? Not a problem, but know why.** The broker
+  guarantees at-least-once, so a job that is redelivered after a crash can be
+  handled twice. The existing `ffmpeg:lock:*` input lock and the job-hash dedup
+  make the second attempt a no-op, which is why no new idempotency layer was
+  added.
+- **`RABBITMQ_PREFETCH` stays at `1` by default.** The worker processes one job
+  at a time; raising it hands a single worker several unacked jobs, which is a
+  deliberate throughput decision rather than a free win.
+- **A missing client library is not an outage.** If `aio-pika` / `aiokafka` are
+  not installed, or a URL is missing, the layer logs the reason and the
+  deployment keeps running on Redis, and the reason is logged on startup.
+  `python scripts/check_eventbus.py` reports the resolved settings and exits
+  non-zero only when an *enabled* component is unreachable.
+- **Dependency image size.** `aio-pika` and `aiokafka` are two small pure-Python
+  packages; the event bus adds no system packages to the image.
