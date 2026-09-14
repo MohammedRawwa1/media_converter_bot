@@ -820,19 +820,17 @@ async def restore_per_user_session_files(db_model: object | None = None) -> int:
             tele = merged.get("telethon_session")
             pyro = merged.get("pyrogram_session")
 
-            # Only fill keys that are MISSING locally.  On a persistent volume the
-            # local JSON can be fresher than MongoDB (e.g. a login whose Mongo
-            # write failed), and clobbering it would reintroduce the very
-            # "not authorized" breakage this restore exists to prevent.
-            local = await _load_all_sessions_from_file_async(user_id=uid)
-            local = local if isinstance(local, dict) else {}
-
+            # Rehydrate the per-user JSON file from the durable MongoDB session
+            # record on startup.  This is the parity behavior expected after a
+            # redeploy: the local JSON file is ephemeral and must be restored to
+            # the latest durable session, even if it already exists locally with
+            # a stale auth key.
             written = False
-            if tele and not local.get(_KEY_TELETHON):
+            if tele:
                 written = (
                     await save_session_string_to_file_async(str(tele), client_type="telethon", user_id=uid)
                 ) or written
-            if pyro and not local.get(_KEY_PYROGRAM):
+            if pyro:
                 written = (
                     await save_session_string_to_file_async(str(pyro), client_type="pyrogram", user_id=uid)
                 ) or written

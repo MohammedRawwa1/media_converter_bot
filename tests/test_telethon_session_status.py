@@ -291,18 +291,18 @@ def test_has_usable_telethon_session_async_sees_mongodb(monkeypatch, tmp_path):
     assert asyncio.run(telethon_session.has_usable_telethon_session_async(user_id=11, db_model=None)) is True
 
 
-def test_restore_does_not_clobber_a_fresher_local_session(monkeypatch, tmp_path):
-    """A local JSON session must not be overwritten by an older MongoDB one."""
+def test_restore_rehydrates_local_session_from_mongodb_even_when_json_exists(monkeypatch, tmp_path):
+    """Startup restore should rehydrate per-user JSON from MongoDB so redeploys do not keep stale sessions."""
     _reset_session_env(monkeypatch, tmp_path)
 
-    asyncio.run(telethon_session.save_session_string_to_file_async("local-fresh", client_type="telethon", user_id=8))
+    asyncio.run(telethon_session.save_session_string_to_file_async("local-stale", client_type="telethon", user_id=8))
 
-    model = FakeMongoModel([{"user_id": 8, "session": {"telethon_session": "mongo-old"}}])
+    model = FakeMongoModel([{"user_id": 8, "session": {"telethon_session": "mongo-new"}}])
     restored = asyncio.run(telethon_session.restore_per_user_session_files(model))
-    assert restored == 0
+    assert restored == 1
 
     value, _ = asyncio.run(telethon_session._resolve_telethon_session_with_source(user_id=8, db_model=None))
-    assert value == "local-fresh"
+    assert value == "mongo-new"
 
 
 def test_session_healthchecker_invalidates_stale_pyrogram_json_before_fallback(monkeypatch, tmp_path):
