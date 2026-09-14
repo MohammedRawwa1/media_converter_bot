@@ -1338,6 +1338,9 @@ async def handle_job(job: dict):
 
                                             # ── T10: Store output ffprobe metadata in Redis for delivery ──
                                             if _probe_meta:
+                                                raw_ffprobe = _probe_meta.get("raw_ffprobe")
+                                                if raw_ffprobe is not None:
+                                                    mapping["output_metadata"] = json.dumps(raw_ffprobe)
                                                 if _probe_meta.get("duration"):
                                                     mapping["output_duration"] = str(_probe_meta["duration"])
                                                 if _probe_meta.get("width"):

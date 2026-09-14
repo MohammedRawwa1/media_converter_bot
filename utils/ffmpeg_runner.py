@@ -679,6 +679,7 @@ async def probe_video_for_delivery(file_path: str) -> tuple[dict | None, str | N
             if fmt.get("duration"):
                 with contextlib.suppress(ValueError, TypeError):
                     meta["duration"] = int(float(fmt["duration"]))
+            meta["raw_ffprobe"] = data
             if meta:
                 video_meta = meta
     except Exception:
