@@ -1492,7 +1492,10 @@ async def handle_job(job: dict):
                                     _vid_duration = _probe_vm.get("duration") if _probe_vm else None
                                     _vid_width = _probe_vm.get("width") if _probe_vm else None
                                     _vid_height = _probe_vm.get("height") if _probe_vm else None
-                                    if _vid_width is not None or _probe_vm:
+                                    _output_ext = os.path.splitext(out)[1].lower() if out else ""
+                                    if _output_ext in (".mp3", ".wav", ".m4a", ".aac", ".flac", ".ogg", ".opus"):
+                                        kind = "audio"
+                                    elif _vid_width is not None or _probe_vm:
                                         kind = "video"
                                     elif out and str(out).lower().endswith(".zip"):
                                         kind = "zip"
@@ -1625,6 +1628,31 @@ async def handle_job(job: dict):
                                                             os.remove(_temp_thumb)
                                                     except Exception:
                                                         logger.debug("ffmpeg worker: operation failed")
+                                            elif kind == "audio":
+                                                _bot_up_cb = _make_upload_progress_callback(job_id, progress_channel)
+                                                _audio_mime = {
+                                                    ".mp3": "audio/mpeg",
+                                                    ".wav": "audio/wav",
+                                                    ".m4a": "audio/mp4",
+                                                    ".aac": "audio/aac",
+                                                    ".flac": "audio/flac",
+                                                    ".ogg": "audio/ogg",
+                                                    ".opus": "audio/opus",
+                                                }.get(_output_ext, "audio/mpeg")
+                                                with open(out, "rb") as fh:
+                                                    fh = (
+                                                        _ProgressFileWrapper(fh, file_size, _bot_up_cb)
+                                                        if file_size
+                                                        else fh
+                                                    )
+                                                    await bot.send_audio(
+                                                        chat_id=chat_id,
+                                                        audio=fh,
+                                                        caption=caption,
+                                                        title=os.path.basename(out),
+                                                        filename=os.path.basename(out),
+                                                        mime_type=_audio_mime,
+                                                    )
                                             elif kind == "video":
                                                 # Try to attach thumbnail (thumb) when available
                                                 thumb_path = None

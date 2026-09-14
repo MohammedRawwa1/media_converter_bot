@@ -4147,6 +4147,19 @@ class EnhancedMediaHandler:
             try:
                 await self._ensure_current_file_downloaded(update, context, session)
                 current_file = session.get("current_file")
+                if current_file and current_file.get("_pipeline_job_id"):
+                    _pipeline_job_id = current_file["_pipeline_job_id"]
+                    kb = InlineKeyboardMarkup(
+                        [[InlineKeyboardButton("❌ Cancel", callback_data=f"cancel_job:{_pipeline_job_id}")]]
+                    )
+                    await self.safe_edit(
+                        query,
+                        f"✅ Large file queued (Job: {_pipeline_job_id[:8]}...). I'll send the MP3 when ready.",
+                        reply_markup=kb,
+                    )
+                    with contextlib.suppress(RuntimeError):
+                        asyncio.create_task(self._watch_job_progress(query, _pipeline_job_id))
+                    return
             except Exception as e:
                 await self.safe_edit(query, f"❌ Failed to download file: {e}")
                 return
@@ -4266,6 +4279,19 @@ class EnhancedMediaHandler:
             try:
                 await self._ensure_current_file_downloaded(update, context, session)
                 current_file = session.get("current_file")
+                if current_file and current_file.get("_pipeline_job_id"):
+                    _pipeline_job_id = current_file["_pipeline_job_id"]
+                    kb = InlineKeyboardMarkup(
+                        [[InlineKeyboardButton("❌ Cancel", callback_data=f"cancel_job:{_pipeline_job_id}")]]
+                    )
+                    await self.safe_edit(
+                        query,
+                        f"✅ Large file queued (Job: {_pipeline_job_id[:8]}...). I'll send the compressed video when ready.",
+                        reply_markup=kb,
+                    )
+                    with contextlib.suppress(RuntimeError):
+                        asyncio.create_task(self._watch_job_progress(query, _pipeline_job_id))
+                    return
             except Exception as e:
                 await self.safe_edit(query, f"❌ Failed to download file: {e}")
                 return
