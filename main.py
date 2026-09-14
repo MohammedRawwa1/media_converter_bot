@@ -930,6 +930,49 @@ def setup_handlers(application: Application) -> None:
 
     application.add_handler(CommandHandler("logoutpyro", latency_wrapper(logoutpyro_command, "logoutpyro_command")))
 
+    async def recoverpyro_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Recover a stale per-user Pyrogram session from persisted MongoDB state."""
+        confirmed, _ = split_confirm(context.args if hasattr(context, "args") else [])
+        if not confirmed:
+            await update.message.reply_text(
+                "⚠️ *Recover a stale Pyrogram session*\n"
+                "• Clears the per-user Pyrogram JSON entry if it is stale\n"
+                "• Re-resolves the session from persisted MongoDB\n"
+                "• Restores the per-user JSON file so uploads/downloads work again\n\n"
+                "Reply with `/recoverpyro confirm` to proceed.",
+                parse_mode="Markdown",
+            )
+            return
+
+        user_id = update.effective_user.id
+
+        try:
+            checker = get_session_healthchecker()
+            session_str, source = await checker._invalidate_stale_pyrogram_session(user_id=user_id)
+
+            if not session_str:
+                await update.message.reply_text(
+                    "⚠️ No persisted Pyrogram session could be recovered for your account. "
+                    "Try `/loginpyro` again if you need a fresh login."
+                )
+                return
+
+            from utils.telethon_session import save_session_string_to_file_async
+
+            await save_session_string_to_file_async(session_str, client_type="pyrogram", user_id=user_id)
+            await update.message.reply_text(
+                f"✅ Recovered Pyrogram session for your account.\n"
+                f"Source: `{source}`\n"
+                f"The per-user JSON file has been restored so the bot can use it again."
+            )
+        except Exception as exc:
+            logger.exception("/recoverpyro failed: %s", exc)
+            await update.message.reply_text(
+                "Failed to recover the Pyrogram session. Check server logs for details."
+            )
+
+    application.add_handler(CommandHandler("recoverpyro", latency_wrapper(recoverpyro_command, "recoverpyro_command")))
+
     async def canceljob_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Cancel one job. Requires an explicit ``confirm``, like /cancelall."""
         confirmed, positional = split_confirm(context.args if hasattr(context, "args") else [])

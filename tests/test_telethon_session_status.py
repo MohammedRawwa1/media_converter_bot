@@ -4,6 +4,7 @@ from unittest.mock import patch
 import pytest
 
 from utils import telethon_session
+from utils.session_healthcheck import SessionHealthChecker
 
 
 class FakeDbModel:
@@ -302,3 +303,21 @@ def test_restore_does_not_clobber_a_fresher_local_session(monkeypatch, tmp_path)
 
     value, _ = asyncio.run(telethon_session._resolve_telethon_session_with_source(user_id=8, db_model=None))
     assert value == "local-fresh"
+
+
+def test_session_healthchecker_invalidates_stale_pyrogram_json_before_fallback(monkeypatch, tmp_path):
+    """A dead per-user Pyrogram JSON entry should be cleared so MongoDB can supply the valid session."""
+    _reset_session_env(monkeypatch, tmp_path)
+
+    asyncio.run(telethon_session.save_session_string_to_file_async("stale-json-session", client_type="pyrogram", user_id=42))
+
+    checker = SessionHealthChecker(admin_user_id=42, db_model=FakeDbModel({"pyrogram_session": "fresh-mongo-session"}))
+    session_str, source = asyncio.run(checker._invalidate_stale_pyrogram_session(user_id=42))
+
+    assert session_str == "fresh-mongo-session"
+    assert source == "mongodb"
+
+    telethon_session.set_db_model(checker.db_model)
+    value, resolved_source = asyncio.run(telethon_session._resolve_pyrogram_session_with_source(user_id=42, db_model=None))
+    assert value == "fresh-mongo-session"
+    assert resolved_source == "mongodb"

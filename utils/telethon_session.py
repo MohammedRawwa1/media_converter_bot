@@ -676,17 +676,24 @@ def build_telethon_client(api_id: int, api_hash: str, session_str: str | None = 
 
 
 def get_pyrogram_session_string(user_id: int | None = None) -> str | None:
-    """Return a Pyrogram session string, preferring persisted over env.
+    """Return a usable Pyrogram session string.
 
     Resolution order (matches ``_resolve_pyrogram_session_with_source``):
-    1. Per-user JSON file (freshest persisted session)
-    2. Environment variable (``PYROGRAM_SESSION``, admin-configured)
-    3. In-memory MongoDB cache / legacy global JSON file (unscoped only)
+    1. In-memory MongoDB cache (last successful persisted session)
+    2. Per-user JSON file (fallback when no MongoDB cache exists)
+    3. Environment variable (``PYROGRAM_SESSION``, admin-configured)
+    4. Legacy global JSON file (unscoped only)
 
     The legacy global JSON file is only consulted when ``user_id`` is ``None``,
     so one user's session is never served to another.
     """
-    # 1. Per-user JSON file first (freshest persisted session)
+    # 1. Prefer the durable cached MongoDB session when available.  This avoids
+    # reusing a stale per-user JSON file that may still contain a revoked auth key
+    # even though a newer valid session is already stored remotely.
+    mongo_str = _get_pyrogram_mongo_cache()
+    if mongo_str:
+        return mongo_str
+
     if user_id is not None:
         file_str = _load_session_string_from_file(client_type="pyrogram", user_id=user_id)
         if file_str:
@@ -702,11 +709,8 @@ def get_pyrogram_session_string(user_id: int | None = None) -> str | None:
     if env_str:
         return env_str
 
-    # 3. Unscoped-only fallbacks: in-memory MongoDB cache, then global JSON
+    # 3. Unscoped-only fallbacks: legacy global JSON
     if user_id is None:
-        mongo_str = _get_pyrogram_mongo_cache()
-        if mongo_str:
-            return mongo_str
         return _load_session_string_from_file(client_type="pyrogram")
 
     return None
@@ -718,28 +722,28 @@ async def _resolve_pyrogram_session_with_source(
     """Resolve a Pyrogram session string and label the source it came from.
 
     Resolution order (the reference header-extractor flow):
-    1. ``json``          per-user JSON file — freshest, written on login/healthcheck
-    2. ``mongodb``       per-user session document (also cached for the sync path)
+    1. ``mongodb``       per-user session document (durable persisted session)
+    2. ``json``          per-user JSON file — fallback when MongoDB is unavailable
     3. ``env``           ``PYROGRAM_SESSION`` env var
     4. ``mongodb-cache`` / ``global-json`` — unscoped lookups only
 
-    Persisted sessions deliberately outrank the environment variable so a stale
-    env session string cannot mask a freshly logged-in session.
+    The durable MongoDB session is preferred over the per-user JSON file because
+    the JSON file can be stale after a revoked auth key has been persisted there
+    but a newer valid session already exists in MongoDB.
     """
-    # 1. Per-user JSON file (strictly scoped to this user)
-    if user_id is not None:
-        file_str = _load_session_string_from_file(client_type="pyrogram", user_id=user_id)
-        if file_str:
-            return file_str, "json"
-
-    # 2. MongoDB-persisted session for the given user
+    # 1. MongoDB-persisted session for the given user (durable, merged per-phone)
     saved_session = await _load_mongo_session(db_model, user_id)
     session_value = _extract_session_value(saved_session, ("pyrogram_session",))
     if session_value:
         logger.info("session: loaded Pyrogram session string from MongoDB for user %s", user_id)
-        # Cache it so the synchronous ``get_pyrogram_session_string()`` can use it.
         _set_pyrogram_mongo_cache(session_value)
         return session_value, "mongodb"
+
+    # 2. Per-user JSON file (strictly scoped to this user)
+    if user_id is not None:
+        file_str = _load_session_string_from_file(client_type="pyrogram", user_id=user_id)
+        if file_str:
+            return file_str, "json"
 
     # 3. Environment variable
     env_str = _get_env_value(

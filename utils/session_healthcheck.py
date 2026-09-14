@@ -377,6 +377,50 @@ class SessionHealthChecker:
             logger.warning("SessionHealthChecker: session recycling error: %s", exc)
             return False
 
+    async def _invalidate_stale_pyrogram_session(self, user_id: int | None = None) -> tuple[str | None, str]:
+        """Clear a stale per-user Pyrogram JSON entry and re-resolve the current session.
+
+        When a per-user JSON file contains a revoked auth key, the resolver can end
+        up reusing that dead value even though MongoDB already has a newer valid
+        session string. Clearing the stale JSON entry lets the durable session
+        source win on the next resolution attempt.
+        """
+        if user_id is None:
+            return None, "missing"
+
+        try:
+            from utils.telethon_session import (
+                _load_all_sessions_from_file_async,
+                _resolve_pyrogram_session_with_source,
+                save_session_string_to_file_async,
+            )
+
+            existing = await _load_all_sessions_from_file_async(user_id=user_id)
+            if existing.get("pyrogram_session"):
+                await save_session_string_to_file_async("", client_type="pyrogram", user_id=user_id)
+                logger.warning(
+                    "SessionHealthChecker: cleared stale per-user Pyrogram JSON session for user %s",
+                    user_id,
+                )
+        except Exception as exc:
+            logger.debug(
+                "SessionHealthChecker: failed to clear stale per-user Pyrogram JSON session for user %s: %s",
+                user_id,
+                exc,
+            )
+
+        try:
+            from utils.telethon_session import _resolve_pyrogram_session_with_source
+
+            return await _resolve_pyrogram_session_with_source(user_id=user_id, db_model=self.db_model)
+        except Exception as exc:
+            logger.debug(
+                "SessionHealthChecker: retry resolution after clearing stale Pyrogram JSON failed for user %s: %s",
+                user_id,
+                exc,
+            )
+            return None, "missing"
+
     async def _check_pyrogram(self, user_id: int | None = None) -> SessionHealth:
         """Check if the Pyrogram session string is still valid.
 
@@ -462,6 +506,27 @@ class SessionHealthChecker:
             elapsed = (time.time() - t0) * 1000
             h.latency_ms = round(elapsed, 1)
             h.error = str(exc)[:200]
+
+            if check_user_id is not None and "AUTH_KEY_UNREGISTERED" in str(exc):
+                retry_session, retry_source = await self._invalidate_stale_pyrogram_session(user_id=check_user_id)
+                if retry_session:
+                    h.error = f"{h.error} (cleared stale per-user JSON and retried from {retry_source})"
+                    h.source = retry_source
+                    h.alive = True
+                    h.phone = None
+                    h.dc_id = None
+                    h.latency_ms = round(elapsed, 1)
+                    try:
+                        await self._save_pyrogram_session(
+                            build_pyrogram_client(
+                                api_id,
+                                api_hash,
+                                session_str=retry_session,
+                            ),
+                            user_id=check_user_id,
+                        )
+                    except Exception:
+                        logger.debug("SessionHealthChecker: failed to refresh stale Pyrogram session after retry")
         finally:
             with contextlib.suppress(Exception):
                 await asyncio.sleep(0.5)
