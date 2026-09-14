@@ -10,6 +10,7 @@ import asyncio
 import dataclasses
 import logging
 import ssl
+from types import SimpleNamespace
 
 import pytest
 from aiokafka import errors as kafka_errors
@@ -449,6 +450,60 @@ def test_offline_problems_name_the_missing_ca_and_credentials(eventbus_env, tmp_
 
     assert any("KAFKA_SSL_CAFILE" in problem for problem in problems)
     assert any("SASL" in problem for problem in problems)
+
+
+def test_preflight_names_a_topic_the_broker_does_not_have(eventbus_env, monkeypatch):
+    """The real-world symptom: the send retries until it times out, but the cause is the topic.
+
+    ``Topic X not found in cluster metadata`` is only an aiokafka log line, and
+    the resulting ``TimeoutError`` reads like a network problem, so the metadata is
+    checked explicitly before the write is attempted.
+    """
+    settings = eventbus_env(EVENTBUS_EVENTS_BACKEND="kafka", KAFKA_BOOTSTRAP_SERVERS="localhost:9092")
+
+    class NoTopicProducer(FakeProducer):
+        def __init__(self):
+            super().__init__()
+            self.client = SimpleNamespace(
+                cluster=SimpleNamespace(topics=lambda exclude_internal_topics=True: {"some-other-topic"})
+            )
+
+        async def partitions_for(self, topic):
+            raise kafka_errors.KafkaTimeoutError()
+
+    monkeypatch.setattr(kafka, "AIOKafkaProducer", lambda **kwargs: NoTopicProducer())
+
+    result = asyncio.run(kafka.preflight(settings))
+
+    assert result["ok"] is False
+    assert result["cause"] == "topic_missing"
+    assert settings.kafka_topic in result["detail"]
+    assert "Create the topic" in result["remedy"]
+
+
+def test_preflight_confirms_a_working_event_log(eventbus_env, monkeypatch):
+    settings = eventbus_env(EVENTBUS_EVENTS_BACKEND="kafka", KAFKA_BOOTSTRAP_SERVERS="localhost:9092")
+    topic = settings.kafka_topic
+
+    class GoodProducer(FakeProducer):
+        def __init__(self):
+            super().__init__()
+            self.client = SimpleNamespace(cluster=SimpleNamespace(topics=lambda exclude_internal_topics=True: {topic}))
+
+        async def partitions_for(self, _topic):
+            return [0]
+
+    producer = GoodProducer()
+    monkeypatch.setattr(kafka, "AIOKafkaProducer", lambda **kwargs: producer)
+
+    result = asyncio.run(kafka.preflight(settings))
+
+    assert result["ok"] is True
+    assert result["cause"] == "ok"
+    assert topic in result["detail"]
+    # The probe is operational, not a job event: no job id, so a reader ignores it.
+    assert producer.sent
+    assert messages.decode(producer.sent[0]["value"])["type"] == messages.EVENTS_PROBE
 
 
 def test_startup_verification_reports_the_cause(eventbus_env, monkeypatch, caplog):

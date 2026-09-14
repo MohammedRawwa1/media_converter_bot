@@ -459,7 +459,11 @@ def classify_kafka_failure(exc: BaseException | None) -> tuple[str, str]:
     # TimeoutError is an OSError subclass, so it has to be tested before the
     # connection branch or every timeout would be reported as "unreachable".
     if isinstance(exc, TimeoutError):
-        return "timeout", "The broker did not answer in time; check reachability and broker load."
+        return "timeout", (
+            "The broker did not answer in time. A topic that is missing from cluster "
+            "metadata also surfaces this way, so confirm the topic exists before "
+            "suspecting the network."
+        )
     if isinstance(exc, _connection_error_types()):
         return "unreachable", (
             "Could not reach the bootstrap servers. Check KAFKA_BOOTSTRAP_SERVERS "
@@ -488,6 +492,15 @@ def _offline_problems(settings: EventBusSettings) -> list[str]:
     ):
         problems.append("SASL is selected but KAFKA_SASL_USERNAME / KAFKA_SASL_PASSWORD are not both set")
     return problems
+
+
+def _known_topics(producer) -> set[str] | None:
+    """Topics present in the client's cluster metadata, or ``None`` if unreadable."""
+    try:
+        topics = producer.client.cluster.topics(exclude_internal_topics=False)
+        return {str(topic) for topic in topics}
+    except Exception:
+        return None
 
 
 async def preflight(
@@ -564,6 +577,38 @@ async def preflight(
         return result
 
     try:
+        # Resolve the topic's metadata before writing.  A topic the broker does not
+        # have makes the send retry until it times out, which then reads as a
+        # network problem - the exact misdiagnosis this function exists to avoid.
+        try:
+            partitions = await asyncio.wait_for(
+                producer.partitions_for(settings.kafka_topic), timeout=probe_timeout_s
+            )
+        except Exception as exc:
+            known = _known_topics(producer)
+            if known is not None and settings.kafka_topic not in known:
+                result.update(
+                    cause="topic_missing",
+                    detail=f"the broker's cluster metadata does not list topic {settings.kafka_topic!r}",
+                    remedy=(
+                        "Create the topic on the broker. Auto-create is off on most managed "
+                        "brokers and this code never creates it, so topic ACLs stay inert "
+                        "until it exists."
+                    ),
+                )
+                return result
+            cause, remedy = classify_kafka_failure(exc)
+            result.update(cause=cause, detail=f"metadata lookup failed: {type(exc).__name__}: {exc}", remedy=remedy)
+            return result
+
+        if not partitions:
+            result.update(
+                cause="topic_missing",
+                detail=f"topic {settings.kafka_topic!r} exists but has no partitions",
+                remedy="Recreate the topic with at least one partition.",
+            )
+            return result
+
         probe = new_event(EVENTS_PROBE, source="preflight")
         await asyncio.wait_for(
             producer.send_and_wait(settings.kafka_topic, value=encode(probe)),
