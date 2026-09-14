@@ -892,6 +892,7 @@ async def _download_with_telethon(
 
     from utils.telethon_session import (
         build_telethon_client,
+        get_db_model,
         get_telethon_session_string_for_user,
         get_userbot_credentials,
     )
@@ -901,7 +902,9 @@ async def _download_with_telethon(
 
     session_str = None
     try:
-        session_str = await get_telethon_session_string_for_user(user_id=user_id, db_model=None)
+        # Pass the registered MongoDB model so a session stored only in Mongo is
+        # still usable here (these call paths never see ``application.bot_data``).
+        session_str = await get_telethon_session_string_for_user(user_id=user_id, db_model=get_db_model())
     except Exception:
         session_str = None
 
@@ -1355,12 +1358,15 @@ async def _download_bytes_with_pyrogram(
 
     from utils.telethon_session import (
         build_pyrogram_client,
-        get_pyrogram_session_string,
+        get_db_model,
+        get_pyrogram_session_string_for_user,
         get_userbot_credentials,
     )
 
     api_id, api_hash = get_userbot_credentials()
-    pyro_session = get_pyrogram_session_string(user_id=user_id)
+    # Resolve via per-user JSON -> MongoDB -> env so a session stored only in
+    # MongoDB is usable outside the healthcheck (the sync variant cannot await).
+    pyro_session = await get_pyrogram_session_string_for_user(user_id=user_id, db_model=get_db_model())
     client = build_pyrogram_client(api_id, api_hash, session_str=pyro_session)
     if client is None:
         logger.info("userbot: Pyrogram session string not configured; cannot do in-memory download")
@@ -1626,12 +1632,15 @@ async def _download_with_pyrogram(
 
     from utils.telethon_session import (
         build_pyrogram_client,
-        get_pyrogram_session_string,
+        get_db_model,
+        get_pyrogram_session_string_for_user,
         get_userbot_credentials,
     )
 
     api_id, api_hash = get_userbot_credentials()
-    pyro_session = get_pyrogram_session_string(user_id=user_id)
+    # Resolve via per-user JSON -> MongoDB -> env so a session stored only in
+    # MongoDB is usable outside the healthcheck (the sync variant cannot await).
+    pyro_session = await get_pyrogram_session_string_for_user(user_id=user_id, db_model=get_db_model())
     client = build_pyrogram_client(api_id, api_hash, session_str=pyro_session)
     if client is None:
         logger.info("userbot: Pyrogram session string not configured")
@@ -1994,11 +2003,14 @@ async def download_forward_via_userbot(
         )
 
     from utils.telethon_session import (
-        get_pyrogram_session_string,
-        has_usable_telethon_session,
+        get_db_model,
+        get_pyrogram_session_string_for_user,
+        has_usable_telethon_session_async,
     )
 
-    pyrogram_session_configured = bool(get_pyrogram_session_string(user_id=user_id))
+    pyrogram_session_configured = bool(
+        await get_pyrogram_session_string_for_user(user_id=user_id, db_model=get_db_model())
+    )
 
     # Prefer a pre-configured Pyrogram session when available; it avoids
     # interactive Telethon login prompts on server environments.
@@ -2013,8 +2025,10 @@ async def download_forward_via_userbot(
         except Exception as e:
             logger.warning("userbot: Pyrogram download error (%s); trying Telethon fallback", e)
 
-    # Try Telethon only when a usable session exists.
-    if TelegramClient is not None and has_usable_telethon_session(user_id=user_id):
+    # Try Telethon only when a usable session exists (MongoDB included).
+    if TelegramClient is not None and await has_usable_telethon_session_async(
+        user_id=user_id, db_model=get_db_model()
+    ):
         try:
             result = await _download_with_telethon(
                 chat_id,
@@ -2068,11 +2082,16 @@ async def download_bytes_via_userbot(
         )
 
     from utils.telethon_session import (
+        get_db_model,
         get_pyrogram_session_string,
+        get_pyrogram_session_string_for_user,
         has_usable_telethon_session,
+        has_usable_telethon_session_async,
     )
 
-    pyrogram_session_configured = bool(get_pyrogram_session_string(user_id=user_id))
+    pyrogram_session_configured = bool(
+        await get_pyrogram_session_string_for_user(user_id=user_id, db_model=get_db_model())
+    )
 
     # Try Pyrogram in-memory first
     if PyrogramClient is not None and pyrogram_session_configured:
@@ -2093,8 +2112,10 @@ async def download_bytes_via_userbot(
                 e,
             )
 
-    # Try Telethon with BytesIO as fallback
-    if TelegramClient is not None and has_usable_telethon_session(user_id=user_id):
+    # Try Telethon with BytesIO as fallback (MongoDB included)
+    if TelegramClient is not None and await has_usable_telethon_session_async(
+        user_id=user_id, db_model=get_db_model()
+    ):
         try:
             from utils.telethon_session import build_telethon_client
             from utils.telethon_session import get_userbot_credentials as _get_creds

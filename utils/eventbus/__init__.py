@@ -32,6 +32,7 @@ from utils.eventbus.config import (
     reset_settings_cache,
 )
 from utils.eventbus.kafka import get_bus
+from utils.eventbus.kafka import preflight as kafka_preflight
 from utils.eventbus.messages import (
     EVENTS_PROBE,
     JOB_CANCELLED,
@@ -158,16 +159,23 @@ async def verify_events_startup() -> bool:
     settings = get_settings()
     if not settings.events_enabled:
         return True
+    bus = get_bus()
     probe = new_event(EVENTS_PROBE, source="startup")
-    ok, detail = await get_bus().verify_publish(probe)
+    ok, detail = await bus.verify_publish(probe)
     if ok:
         logger.info("eventbus: Kafka event log verified (%s)", detail)
         return True
+    # Name the cause, not just the symptom: TLS, auth, a topic that was never
+    # created and a write-ACL denial all read the same ("events are dropped")
+    # without this.  The probe's own exception is classified, so this adds no
+    # second round trip and no extra wait.
+    diagnosis = await kafka_preflight(settings, failure=bus.last_failure)
     message = (
         f"Kafka events are enabled but cannot be published, so every event will be dropped: {detail}. "
-        f"Check KAFKA_BOOTSTRAP_SERVERS, KAFKA_SECURITY_PROTOCOL, KAFKA_SASL_*, KAFKA_SSL_CAFILE, "
-        f"and that the topic {settings.kafka_topic!r} exists."
+        f"Cause: {diagnosis['cause']} - {diagnosis['detail']}. Fix: {diagnosis['remedy']}"
     )
+    if diagnosis["problems"]:
+        message += " Configuration problems: " + "; ".join(diagnosis["problems"]) + "."
     if settings.require_brokers:
         raise RuntimeError(f"eventbus: {message}")
     logger.error("eventbus: %s", message)

@@ -5386,6 +5386,11 @@ class EnhancedMediaHandler:
                     )
                     # Cache on the handler so subsequent calls reuse the same model
                     self.db_model = model
+                    # Register globally too, so the userbot downloader/uploader
+                    # (which only receive a user_id) can reach MongoDB.
+                    from utils.telethon_session import set_db_model
+
+                    set_db_model(model)
 
                     # Ensure indexes asynchronously (best-effort)
                     try:

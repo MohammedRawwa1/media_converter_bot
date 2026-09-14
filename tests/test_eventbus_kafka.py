@@ -11,6 +11,9 @@ import dataclasses
 import logging
 import ssl
 
+import pytest
+from aiokafka import errors as kafka_errors
+
 from utils import eventbus
 from utils.eventbus import kafka, messages
 from utils.eventbus.kafka import KafkaEventBus, progress_allowed
@@ -196,7 +199,7 @@ def test_plaintext_kwargs_are_left_alone(eventbus_env):
     assert kafka.consumer_kwargs(settings)["client_id"].endswith("-reader")
 
 
-def test_cafile_reaches_the_ssl_context(eventbus_env, monkeypatch):
+def test_cafile_reaches_the_ssl_context(eventbus_env, monkeypatch, tmp_path):
     # A broker presenting its own CA (Aiven's project CA) needs the bundle; a
     # publicly-signed one (Confluent, Redpanda) needs nothing and falls back to
     # the system trust store.
@@ -213,10 +216,13 @@ def test_cafile_reaches_the_ssl_context(eventbus_env, monkeypatch):
     assert kafka.ssl_context_for(base) == "context"
     assert seen["cafile"] is None
 
-    # Private CA (e.g. Aiven's project CA): the bundle is passed through.
-    with_ca = dataclasses.replace(base, kafka_ssl_cafile="/etc/ssl/aiven-ca.pem")
+    # Private CA (e.g. Aiven's project CA): the bundle is passed through.  The
+    # path has to exist, or it is treated as unset (see the fallback test below).
+    bundle = tmp_path / "aiven-ca.pem"
+    bundle.write_text("-----BEGIN CERTIFICATE-----\nvalue\n-----END CERTIFICATE-----\n", encoding="utf-8")
+    with_ca = dataclasses.replace(base, kafka_ssl_cafile=str(bundle))
     assert kafka.ssl_context_for(with_ca) == "context"
-    assert seen["cafile"] == "/etc/ssl/aiven-ca.pem"
+    assert seen["cafile"] == str(bundle)
 
 
 def test_aiven_ca_cert_environment_value_reaches_ssl_context(eventbus_env, monkeypatch):
@@ -235,6 +241,50 @@ def test_aiven_ca_cert_environment_value_reaches_ssl_context(eventbus_env, monke
     settings = eventbus_env(EVENTBUS_EVENTS_BACKEND="kafka", KAFKA_SECURITY_PROTOCOL="SASL_SSL")
     assert kafka.ssl_context_for(settings) == "context"
     assert seen["cafile"]
+
+
+def test_missing_cafile_falls_back_to_aiven_ca_cert(eventbus_env, monkeypatch, tmp_path):
+    """A KAFKA_SSL_CAFILE that is not deployed must not hide AIVEN_CA_CERT.
+
+    ``certs/`` is gitignored, so the path is commonly set while the file is
+    absent on the host.  Preferring it made AIVEN_CA_CERT look ignored and the
+    producer die with a bare FileNotFoundError instead of using the PEM that was
+    actually provided.
+    """
+    seen: dict = {}
+
+    def fake_create_ssl_context(*, cafile=None):
+        seen["cafile"] = cafile
+        with open(cafile, encoding="utf-8") as handle:
+            assert handle.read() == "-----BEGIN CERTIFICATE-----\nvalue\n-----END CERTIFICATE-----"
+        return "context"
+
+    monkeypatch.setattr(kafka, "create_ssl_context", fake_create_ssl_context)
+    monkeypatch.setenv("AIVEN_CA_CERT", "-----BEGIN CERTIFICATE-----\\nvalue\\n-----END CERTIFICATE-----")
+
+    missing = str(tmp_path / "not-deployed.pem")
+    settings = eventbus_env(
+        EVENTBUS_EVENTS_BACKEND="kafka",
+        KAFKA_SECURITY_PROTOCOL="SASL_SSL",
+        KAFKA_SSL_CAFILE=missing,
+    )
+    # The setting is still recorded, it just does not win over a usable PEM.
+    assert settings.kafka_ssl_cafile == missing
+    assert kafka.ssl_context_for(settings) == "context"
+    assert seen["cafile"] != missing
+
+
+def test_missing_cafile_without_a_pem_names_the_variable(eventbus_env, monkeypatch, tmp_path):
+    monkeypatch.setattr(kafka, "create_ssl_context", lambda *, cafile=None: "context")
+    monkeypatch.delenv("AIVEN_CA_CERT", raising=False)
+
+    settings = eventbus_env(
+        EVENTBUS_EVENTS_BACKEND="kafka",
+        KAFKA_SECURITY_PROTOCOL="SASL_SSL",
+        KAFKA_SSL_CAFILE=str(tmp_path / "not-deployed.pem"),
+    )
+    with pytest.raises(RuntimeError, match="KAFKA_SSL_CAFILE"):
+        kafka.ssl_context_for(settings)
 
 
 def test_verify_publish_confirms_a_write_is_accepted(eventbus_env):
@@ -312,3 +362,113 @@ def test_startup_verification_raises_when_brokers_are_required(eventbus_env, mon
         raised = exc
     assert raised is not None
     assert "cannot be published" in str(raised)
+
+
+# ── Failure diagnosis (preflight) ────────────────────────────────────
+#
+# Each cause below maps to a *different* fix, so they must not collapse into one
+# "events are dropped" line: a CA, a password, a topic, or an ACL.
+
+
+@pytest.mark.parametrize(
+    ("exc", "expected_cause"),
+    [
+        (ssl.SSLError("certificate verify failed"), "tls"),
+        (kafka_errors.AuthenticationFailedError(), "auth"),
+        (kafka_errors.SaslAuthenticationFailed(), "auth"),
+        (kafka_errors.UnsupportedSaslMechanismError(), "auth"),
+        (kafka_errors.TopicAuthorizationFailedError(), "write_denied"),
+        (kafka_errors.GroupAuthorizationFailedError(), "write_denied"),
+        (kafka_errors.ClusterAuthorizationFailedError(), "cluster_acl"),
+        (kafka_errors.UnknownTopicOrPartitionError(), "topic_missing"),
+        (kafka_errors.KafkaConnectionError(), "unreachable"),
+        (TimeoutError(), "timeout"),
+        (RuntimeError("something else"), "unknown"),
+    ],
+)
+def test_classify_kafka_failure_names_the_cause(exc, expected_cause):
+    cause, remedy = kafka.classify_kafka_failure(exc)
+    assert cause == expected_cause
+    assert remedy, "every cause carries the fix, not just a label"
+
+
+def test_classify_kafka_failure_handles_a_missing_exception():
+    cause, remedy = kafka.classify_kafka_failure(None)
+    assert cause == "unknown"
+    assert remedy
+
+
+def test_preflight_classifies_a_captured_failure_without_reconnecting(eventbus_env, monkeypatch):
+    """The probe already failed: classify it instead of paying for a second round trip."""
+    settings = eventbus_env(EVENTBUS_EVENTS_BACKEND="kafka", KAFKA_BOOTSTRAP_SERVERS="localhost:9092")
+
+    def explode(*_args, **_kwargs):
+        raise AssertionError("preflight must not open a producer when a failure is supplied")
+
+    monkeypatch.setattr(kafka, "AIOKafkaProducer", explode)
+
+    result = asyncio.run(kafka.preflight(settings, failure=kafka_errors.TopicAuthorizationFailedError()))
+
+    assert result["ok"] is False
+    assert result["cause"] == "write_denied"
+    assert "Write" in result["remedy"]
+    assert result["topic"] == settings.kafka_topic
+
+
+def test_preflight_reports_a_forgotten_bootstrap_list(eventbus_env):
+    """An enabled backend without a bootstrap list must not be reported as "disabled"."""
+    settings = eventbus_env(EVENTBUS_EVENTS_BACKEND="kafka")
+    assert settings.events_enabled is False  # the naive check that used to answer first
+
+    result = asyncio.run(kafka.preflight(settings))
+
+    assert result["ok"] is False
+    assert result["cause"] == "not_configured"
+    assert "KAFKA_BOOTSTRAP_SERVERS" in result["detail"]
+
+
+def test_preflight_reports_a_disabled_backend_as_ok(eventbus_env):
+    settings = eventbus_env(EVENTBUS_EVENTS_BACKEND="off")
+
+    result = asyncio.run(kafka.preflight(settings))
+
+    assert result["ok"] is True
+    assert result["cause"] == "disabled"
+
+
+def test_offline_problems_name_the_missing_ca_and_credentials(eventbus_env, tmp_path, monkeypatch):
+    monkeypatch.delenv("AIVEN_CA_CERT", raising=False)
+    settings = eventbus_env(
+        EVENTBUS_EVENTS_BACKEND="kafka",
+        KAFKA_BOOTSTRAP_SERVERS="broker:9092",
+        KAFKA_SECURITY_PROTOCOL="SASL_SSL",
+        KAFKA_SSL_CAFILE=str(tmp_path / "not-deployed.pem"),
+    )
+
+    problems = kafka._offline_problems(settings)
+
+    assert any("KAFKA_SSL_CAFILE" in problem for problem in problems)
+    assert any("SASL" in problem for problem in problems)
+
+
+def test_startup_verification_reports_the_cause(eventbus_env, monkeypatch, caplog):
+    """A denial must be named at startup, not left as "events are dropped"."""
+
+    class DeniedProducer(FakeProducer):
+        async def send_and_wait(self, topic, value=None, key=None):
+            raise kafka_errors.TopicAuthorizationFailedError()
+
+    settings = eventbus_env(EVENTBUS_EVENTS_BACKEND="kafka", KAFKA_BOOTSTRAP_SERVERS="localhost:9092")
+    bus = KafkaEventBus(settings, producer_factory=lambda _settings: DeniedProducer())
+    monkeypatch.setattr(eventbus, "get_bus", lambda: bus)
+
+    with caplog.at_level(logging.ERROR):
+        ok = asyncio.run(eventbus.verify_events_startup())
+
+    assert ok is False
+    message = next(record.getMessage() for record in caplog.records if record.levelno >= logging.ERROR)
+    assert "cannot be published" in message
+    assert "write_denied" in message
+    # The remedy must be the ACL fix, not the cluster one.
+    assert "Write" in message
+    assert "IdempotentWrite" not in message

@@ -532,6 +532,12 @@ def setup_handlers(application: Application) -> None:
                     logger.debug("Could not schedule async index creation for Mongo model")
                 handler_manager.db_model = model
                 application.bot_data["db_model"] = model
+                # Register the model so modules that only receive a ``user_id``
+                # (the userbot downloader/uploader) can resolve sessions from
+                # MongoDB instead of relying solely on the per-user JSON files.
+                from utils.telethon_session import set_db_model
+
+                set_db_model(model)
                 logger.info("✅ MongoDB model initialized for logging conversions")
             except Exception:
                 logger.exception("Failed to initialize MongoDB model (motor)")
@@ -1411,6 +1417,25 @@ async def main(background: bool = False) -> None:
                     logger.info("Startup: persisted Telethon session from MongoDB to per-user JSON file")
     except Exception as exc:
         logger.debug("Startup MongoDB->JSON Telethon persistence skipped: %s", exc)
+
+    # ── Restore per-user JSON session files for ALL users from MongoDB ──
+    # The per-user JSON session files live on an ephemeral filesystem and are
+    # wiped on every redeploy.  Re-materialize each stored user's JSON file from
+    # the durable MongoDB sessions collection so per-user sessions created via
+    # /login or /loginpyro keep working immediately after a deployment, instead
+    # of waiting up to a full healthcheck interval for the recovery to happen.
+    try:
+        from utils.telethon_session import restore_per_user_session_files
+
+        _restore_db_model = application.bot_data.get("db_model")
+        _restored_count = await restore_per_user_session_files(_restore_db_model)
+        if _restored_count:
+            logger.info(
+                "Startup: restored per-user JSON session files for %d user(s) from MongoDB",
+                _restored_count,
+            )
+    except Exception as exc:
+        logger.debug("Startup: per-user session file restore skipped: %s", exc)
 
     # Check FFmpeg (binary) availability and ffmpeg-python binding; warn if missing
     try:

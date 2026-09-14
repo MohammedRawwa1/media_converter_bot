@@ -480,14 +480,17 @@ async def _send_with_telethon(
         return None
 
     from utils.telethon_session import (
+        get_db_model,
         get_telethon_session_string_for_user,
         get_userbot_credentials,
-        has_usable_telethon_session,
+        has_usable_telethon_session_async,
     )
 
     # Fail fast if no usable Telethon session is available — avoids
     # client.start() prompting for a phone number on stdin (EOFError).
-    if not has_usable_telethon_session(user_id=user_id):
+    # The async variant also consults MongoDB, which this path cannot reach
+    # through ``application.bot_data``.
+    if not await has_usable_telethon_session_async(user_id=user_id, db_model=get_db_model()):
         logger.info("userbot: Telethon session not configured; skipping Telethon upload")
         return None
 
@@ -497,7 +500,7 @@ async def _send_with_telethon(
     session_str = None
     if user_id is not None:
         try:
-            session_str = await get_telethon_session_string_for_user(user_id=user_id, db_model=None)
+            session_str = await get_telethon_session_string_for_user(user_id=user_id, db_model=get_db_model())
         except Exception:
             session_str = None
 
@@ -795,14 +798,19 @@ async def _send_with_pyrogram(
     if PyrogramClient is None:
         return None
 
-    from utils.telethon_session import get_pyrogram_session_string, get_userbot_credentials
+    from utils.telethon_session import (
+        get_db_model,
+        get_pyrogram_session_string_for_user,
+        get_userbot_credentials,
+    )
 
     api_id, api_hash = get_userbot_credentials()
 
     # Resolve per-user session string if user_id is provided
     session_str = None
     if user_id is not None:
-        session_str = get_pyrogram_session_string(user_id=user_id)
+        # JSON -> MongoDB -> env, so a session stored only in MongoDB works here.
+        session_str = await get_pyrogram_session_string_for_user(user_id=user_id, db_model=get_db_model())
         if not session_str:
             logger.info("userbot: Pyrogram session not configured for user %s; skipping Pyrogram upload", user_id)
             return None
@@ -1097,9 +1105,11 @@ async def send_file_via_userbot(
             logger.warning("userbot: Pyrogram bot error (%s); trying Telethon fallback", e)
 
     # ── Priority 2: Telethon user account ──
-    from utils.telethon_session import has_usable_telethon_session
+    from utils.telethon_session import get_db_model, has_usable_telethon_session_async
 
-    if TelegramClient is not None and has_usable_telethon_session(user_id=user_id):
+    if TelegramClient is not None and await has_usable_telethon_session_async(
+        user_id=user_id, db_model=get_db_model()
+    ):
         try:
             msg_id = await _send_with_telethon(
                 chat_id,

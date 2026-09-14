@@ -29,12 +29,13 @@ import asyncio
 import contextlib
 import logging
 import os
+import ssl
 import tempfile
 import time
 
 from utils.eventbus import metrics
 from utils.eventbus.config import EventBusSettings, get_settings
-from utils.eventbus.messages import encode
+from utils.eventbus.messages import EVENTS_PROBE, encode, new_event
 
 logger = logging.getLogger(__name__)
 
@@ -58,14 +59,30 @@ def ssl_context_for(settings: EventBusSettings):
     ``KAFKA_SSL_CAFILE`` supplies a private CA file (e.g. Aiven's project CA).
     Deployments can instead provide the PEM contents in ``AIVEN_CA_CERT``;
     that value is written to a temporary file only while the SSL context loads.
-    With both unset the system trust store is used. Hostname checking stays on.
+    A ``KAFKA_SSL_CAFILE`` path that does not exist is treated as unset, so it
+    cannot shadow ``AIVEN_CA_CERT``.  With both unusable the system trust store
+    is used. Hostname checking stays on.
     """
     if settings.kafka_security_protocol not in ("SSL", "SASL_SSL"):
         return None
     if create_ssl_context is None:  # pragma: no cover - aiokafka not installed
         return None
+
     temporary_cafile = None
     cafile = settings.kafka_ssl_cafile or None
+
+    # A configured CA file that is not actually on disk must not win over the
+    # AIVEN_CA_CERT fallback.  ``certs/`` is gitignored, so on a git-based deploy
+    # KAFKA_SSL_CAFILE is commonly set (copied from .env) while the file itself is
+    # never shipped; silently preferring it made AIVEN_CA_CERT look ignored and
+    # the producer die with a bare FileNotFoundError.
+    if cafile is not None and not os.path.exists(cafile):
+        logger.warning(
+            "eventbus: KAFKA_SSL_CAFILE=%r does not exist; falling back to AIVEN_CA_CERT",
+            cafile,
+        )
+        cafile = None
+
     if cafile is None:
         certificate = os.getenv("AIVEN_CA_CERT", "").strip()
         if certificate:
@@ -73,6 +90,14 @@ def ssl_context_for(settings: EventBusSettings):
                 handle.write(certificate.replace("\\n", "\n"))
                 temporary_cafile = handle.name
             cafile = temporary_cafile
+        elif settings.kafka_ssl_cafile:
+            # Neither the file nor the PEM contents are usable: say which
+            # variable is wrong instead of failing later with a bare errno.
+            raise RuntimeError(
+                f"eventbus: KAFKA_SSL_CAFILE={settings.kafka_ssl_cafile!r} does not exist and "
+                "AIVEN_CA_CERT is not set, so TLS verification cannot be configured"
+            )
+
     try:
         return create_ssl_context(cafile=cafile)
     finally:
@@ -142,6 +167,9 @@ class KafkaEventBus:
         self.published = 0
         self.failed = 0
         self.suppressed = 0
+        # The last broker-side exception, kept so a caller can ask *why* a publish
+        # failed without repeating the round trip (see ``preflight``).
+        self.last_failure: BaseException | None = None
 
     @property
     def settings(self) -> EventBusSettings:
@@ -175,6 +203,7 @@ class KafkaEventBus:
                 )
                 return True
             except Exception as exc:
+                self.last_failure = exc
                 logger.warning("eventbus: Kafka producer unavailable (%s); events are dropped", exc)
                 self._producer = None
                 return False
@@ -202,10 +231,13 @@ class KafkaEventBus:
                 self._producer.send_and_wait(self.settings.kafka_topic, value=encode(event), key=None),
                 timeout=timeout_s,
             )
-        except TimeoutError:
+        except TimeoutError as exc:
+            self.last_failure = exc
             return False, f"publishing to {self.settings.kafka_topic!r} timed out after {timeout_s:.0f}s"
         except Exception as exc:
+            self.last_failure = exc
             return False, f"publishing to {self.settings.kafka_topic!r} failed: {type(exc).__name__}: {exc}"
+        self.last_failure = None
         self.published += 1
         return True, f"probe accepted by {self.settings.kafka_topic!r}"
 
@@ -313,3 +345,237 @@ async def close_bus() -> None:
     if _BUS is not None:
         await _BUS.close()
         _BUS = None
+
+
+# ── Failure diagnosis ─────────────────────────────────────────────
+#
+# Every Kafka failure below collapses into one operational symptom: "events are
+# dropped".  These mappings - and ``preflight`` - turn that into the single change
+# that fixes it: a CA, a password, a topic, or an ACL.
+
+_TLS_REMEDY = (
+    "TLS verification failed. Set AIVEN_CA_CERT to the broker's CA in PEM form "
+    "(the contents, not a path), or point KAFKA_SSL_CAFILE at a file that is "
+    "actually deployed."
+)
+
+
+def _cause_table() -> tuple[tuple[type, str, str], ...]:
+    """``(exception type, cause, remedy)`` rows, most specific first.
+
+    Built lazily because the aiokafka error classes only exist when the optional
+    dependency is installed, and referencing them at import time would make this
+    module unimportable without aiokafka.
+    """
+    if AIOKafkaProducer is None:  # pragma: no cover - optional dependency
+        return ()
+    from aiokafka.errors import (  # noqa: PLC0415
+        AuthenticationFailedError,
+        AuthenticationMethodNotSupported,
+        ClusterAuthorizationFailedError,
+        GroupAuthorizationFailedError,
+        IllegalSaslStateError,
+        InvalidTopicError,
+        KafkaConfigurationError,
+        LeaderNotAvailableError,
+        SaslAuthenticationFailed,
+        TopicAuthorizationFailedError,
+        UnknownTopicOrPartitionError,
+        UnsupportedSaslMechanismError,
+    )
+
+    return (
+        (
+            AuthenticationFailedError,
+            "auth",
+            "The broker rejected the SASL credentials. Re-check KAFKA_SASL_USERNAME / "
+            "KAFKA_SASL_PASSWORD, and that KAFKA_SASL_MECHANISM is how that user was "
+            "created (SCRAM-SHA-256 and SCRAM-SHA-512 are different credentials).",
+        ),
+        (SaslAuthenticationFailed, "auth", "SASL authentication failed at the broker; re-check the credentials."),
+        (
+            UnsupportedSaslMechanismError,
+            "auth",
+            "The broker does not offer KAFKA_SASL_MECHANISM; use the mechanism the broker provisioned.",
+        ),
+        (IllegalSaslStateError, "auth", "The SASL handshake was rejected; check the mechanism and credentials."),
+        (AuthenticationMethodNotSupported, "auth", "The broker rejects the configured SASL mechanism."),
+        (
+            TopicAuthorizationFailedError,
+            "write_denied",
+            "The principal may not write to this topic. Grant Write (and Describe) on "
+            "exactly this topic to the SASL principal.",
+        ),
+        (
+            GroupAuthorizationFailedError,
+            "write_denied",
+            "The consumer group is not authorised. Grant Read on the group resource.",
+        ),
+        (
+            ClusterAuthorizationFailedError,
+            "cluster_acl",
+            "A cluster-level ACL is missing: an idempotent producer needs IdempotentWrite "
+            "on the cluster resource.",
+        ),
+        (
+            UnknownTopicOrPartitionError,
+            "topic_missing",
+            "The topic does not exist and auto-create is off. Create it on the broker, or "
+            "grant Create on the cluster resource.",
+        ),
+        (LeaderNotAvailableError, "topic_missing", "The topic has no leader; if it was just created, retry once it has one."),
+        (InvalidTopicError, "config", "The topic name is not valid for this broker."),
+        (KafkaConfigurationError, "config", "The client configuration was rejected; check the KAFKA_* variables."),
+    )
+
+
+def _connection_error_types() -> tuple[type, ...]:
+    """Connection-ish error types, or an empty tuple when aiokafka is absent."""
+    if AIOKafkaProducer is None:  # pragma: no cover - optional dependency
+        return ()
+    from aiokafka.errors import KafkaConnectionError  # noqa: PLC0415
+
+    return (KafkaConnectionError, OSError)
+
+
+def classify_kafka_failure(exc: BaseException | None) -> tuple[str, str]:
+    """Return ``(cause, remedy)`` for an exception raised by a Kafka client call.
+
+    The causes are deliberately coarse but distinguishable, because each one maps
+    to a different fix: ``tls``, ``auth``, ``topic_missing``, ``write_denied``,
+    ``cluster_acl``, ``unreachable``, ``timeout``, ``config`` or ``unknown``.
+    """
+    if exc is None:
+        return "unknown", "No broker error was captured, so the cause cannot be attributed."
+    if isinstance(exc, ssl.SSLError):
+        return "tls", _TLS_REMEDY
+    for error_type, cause, remedy in _cause_table():
+        if isinstance(exc, error_type):
+            return cause, remedy
+    text = f"{type(exc).__name__} {exc}".lower()
+    if "ssl" in text or "certificat" in text:
+        # aiokafka wraps some handshake failures in its own connection error.
+        return "tls", _TLS_REMEDY
+    # TimeoutError is an OSError subclass, so it has to be tested before the
+    # connection branch or every timeout would be reported as "unreachable".
+    if isinstance(exc, TimeoutError):
+        return "timeout", "The broker did not answer in time; check reachability and broker load."
+    if isinstance(exc, _connection_error_types()):
+        return "unreachable", (
+            "Could not reach the bootstrap servers. Check KAFKA_BOOTSTRAP_SERVERS "
+            "(host:port), outbound access, and the listener's security protocol."
+        )
+    return "unknown", f"Unclassified Kafka failure ({type(exc).__name__}); see the detail."
+
+
+def _offline_problems(settings: EventBusSettings) -> list[str]:
+    """Misconfigurations that are visible without contacting the broker."""
+    problems: list[str] = []
+    protocol = settings.kafka_security_protocol
+    has_pem = bool(os.getenv("AIVEN_CA_CERT", "").strip())
+
+    if protocol in ("SSL", "SASL_SSL"):
+        if settings.kafka_ssl_cafile and not os.path.exists(settings.kafka_ssl_cafile) and not has_pem:
+            problems.append(
+                f"KAFKA_SSL_CAFILE={settings.kafka_ssl_cafile!r} does not exist and AIVEN_CA_CERT is not set"
+            )
+        elif not settings.kafka_ssl_cafile and not has_pem:
+            problems.append(
+                "no CA configured (KAFKA_SSL_CAFILE / AIVEN_CA_CERT); only correct for a publicly-signed broker"
+            )
+    if protocol in ("SASL_SSL", "SASL_PLAINTEXT") and not (
+        settings.kafka_sasl_username and settings.kafka_sasl_password
+    ):
+        problems.append("SASL is selected but KAFKA_SASL_USERNAME / KAFKA_SASL_PASSWORD are not both set")
+    return problems
+
+
+async def preflight(
+    settings: EventBusSettings | None = None,
+    *,
+    failure: BaseException | None = None,
+    probe_timeout_s: float = 10.0,
+) -> dict:
+    """Report *why* the event log is unusable, in one call.
+
+    Checks what is visible without a broker first (security protocol versus
+    credentials, CA availability), then classifies ``failure`` when the caller
+    already has one.  With no ``failure`` it opens its own producer and proves a
+    write is accepted, which is what surfaces a missing topic or a write-ACL
+    denial.
+
+    Returns ``{"ok", "cause", "detail", "remedy", "problems", "topic"}`` and never
+    raises.  ``problems`` lists the offline misconfigurations found.
+    """
+    settings = settings or get_settings()
+    result: dict = {
+        "ok": False,
+        "cause": "unknown",
+        "detail": "",
+        "remedy": "",
+        "problems": [],
+        "topic": settings.kafka_topic,
+    }
+
+    # Order matters here.  ``events_enabled`` is itself false when the bootstrap
+    # list is empty, so testing it first reported "disabled" for the very common
+    # "backend enabled, KAFKA_BOOTSTRAP_SERVERS forgotten" case.
+    if settings.events_backend != "kafka":
+        result.update(ok=True, cause="disabled", detail=f"the event backend is {settings.events_backend!r}")
+        return result
+    if not settings.kafka_bootstrap_servers:
+        result.update(
+            cause="not_configured",
+            detail="the event backend is 'kafka' but KAFKA_BOOTSTRAP_SERVERS is empty",
+            remedy="Set KAFKA_BOOTSTRAP_SERVERS (host:port), or turn the event backend off.",
+        )
+        return result
+    if AIOKafkaProducer is None:
+        result.update(
+            cause="library_missing",
+            detail="aiokafka is not installed",
+            remedy="Install it: pip install -r requirements.txt",
+        )
+        return result
+
+    problems = _offline_problems(settings)
+    result["problems"] = problems
+
+    # The caller already observed a broker error: classify it instead of opening a
+    # second connection, which would double the wait and bury the first failure.
+    if failure is not None:
+        cause, remedy = classify_kafka_failure(failure)
+        result.update(cause=cause, detail=f"{type(failure).__name__}: {failure}", remedy=remedy)
+        return result
+
+    try:
+        kwargs = producer_kwargs(settings)
+    except Exception as exc:  # TLS material is resolved while building the kwargs
+        cause, remedy = classify_kafka_failure(exc)
+        result.update(cause=cause, detail=f"{type(exc).__name__}: {exc}", remedy=remedy)
+        return result
+
+    producer = AIOKafkaProducer(**kwargs)
+    try:
+        await asyncio.wait_for(producer.start(), timeout=probe_timeout_s)
+    except Exception as exc:
+        cause, remedy = classify_kafka_failure(exc)
+        result.update(cause=cause, detail=f"producer start failed: {type(exc).__name__}: {exc}", remedy=remedy)
+        return result
+
+    try:
+        probe = new_event(EVENTS_PROBE, source="preflight")
+        await asyncio.wait_for(
+            producer.send_and_wait(settings.kafka_topic, value=encode(probe)),
+            timeout=probe_timeout_s,
+        )
+    except Exception as exc:
+        cause, remedy = classify_kafka_failure(exc)
+        result.update(cause=cause, detail=f"write rejected: {type(exc).__name__}: {exc}", remedy=remedy)
+        return result
+    finally:
+        with contextlib.suppress(Exception):
+            await producer.stop()
+
+    result.update(ok=True, cause="ok", detail=f"probe accepted by {settings.kafka_topic!r}")
+    return result

@@ -2,15 +2,19 @@
 
 Prints the resolved configuration, then - only for the parts that are enabled -
 connects to the broker, declares/looks at the topology and reports what it found.
-Nothing here mutates jobs; the one write it offers (``--publish-test``) publishes
-a throwaway message with a ``check.`` job id so it can be confirmed end to end.
+Nothing here mutates jobs. Two writes are offered, neither of which is a job:
+the Kafka check always publishes one probe event (``eventbus.probe``, no job id)
+so a missing topic or a write-ACL denial is reported instead of a clean-looking
+start, and ``--publish-test`` additionally publishes a throwaway message with a
+``check.`` job id so RabbitMQ can be confirmed end to end.
 
     python scripts/check_eventbus.py                     # config + connectivity
     python scripts/check_eventbus.py --publish-test      # also send one test job
     python scripts/check_eventbus.py --replay <job_id>   # read a job's events back
 
-Exit codes: 0 when every *enabled* component is reachable, 1 otherwise. A
-disabled component is not a failure - it is reported as disabled.
+Exit codes: 0 when every *enabled* component is reachable - and, for Kafka,
+writable - 1 otherwise. A disabled component is not a failure: it is reported as
+disabled.
 
 Configuration is read from the process environment, falling back to ``.env``
 (loaded here exactly the way the application loads it). An exported variable
@@ -98,25 +102,50 @@ async def _check_kafka(replay_job_id: str | None) -> bool:
     from utils.eventbus.kafka import get_bus
 
     bus = get_bus()
-    try:
-        started = await bus.start()
-    except Exception as exc:
-        print(f"\n--- Kafka ---\n  UNREACHABLE: {exc}\n")
-        return False
     print("\n--- Kafka ---")
     print(f"  bootstrap: {settings.kafka_bootstrap_servers}")
     print(f"  topic: {settings.kafka_topic} (partitions/keyed by job id)")
+    try:
+        started = await bus.start()
+    except Exception as exc:
+        print(f"  UNREACHABLE: {exc}\n")
+        return False
     if not started:
-        print("  producer could not be started\n")
+        print("  producer could not be started")
+        print("  ! check KAFKA_BOOTSTRAP_SERVERS, KAFKA_SECURITY_PROTOCOL, KAFKA_SASL_*,")
+        print("    and the CA (KAFKA_SSL_CAFILE or AIVEN_CA_CERT)\n")
         return False
     print("  producer: started (acks=all, idempotent)")
+
+    # A started producer only proves the bootstrap/TLS/SASL handshake went
+    # through. A topic that does not exist or a write-ACL denial shows up only
+    # when a message is actually sent and acked, so confirm the write here -
+    # otherwise this check reports a clean start while every event is dropped.
+    ok = True
+    probe = eventbus.new_event(eventbus.EVENTS_PROBE, source="check")
+    write_ok, detail = await bus.verify_publish(probe)
+    print(f"  write probe: {detail}")
+    if not write_ok:
+        ok = False
+        # Name the exact cause (TLS / auth / topic missing / write denied) rather
+        # than leaving it to be inferred from the error string.  The probe's own
+        # exception is classified, so this does not contact the broker again.
+        from utils.eventbus.kafka import preflight
+
+        diagnosis = await preflight(settings, failure=bus.last_failure)
+        print(f"  ! write rejected - {diagnosis['cause']}: {diagnosis['detail']}")
+        if diagnosis["remedy"]:
+            print(f"    fix: {diagnosis['remedy']}")
+        for problem in diagnosis["problems"]:
+            print(f"    config: {problem}")
+
     if replay_job_id:
         events = await bus.read_events(job_id=replay_job_id, limit=50)
         print(f"  replay for job {replay_job_id}: {len(events)} event(s)")
         for event in events:
             print(f"    {event.get('type')} @ {event.get('ts')} payload={json.dumps(event.get('payload'))[:120]}")
     await bus.close()
-    return True
+    return ok
 
 
 async def _main(args) -> int:

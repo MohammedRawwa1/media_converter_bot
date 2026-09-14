@@ -61,6 +61,9 @@ class SessionHealth:
         self.error: str | None = None
         self.phone: str | None = None
         self.dc_id: int | None = None
+        # Label of the source the session was resolved from (json / mongodb /
+        # env / global-json / file ...), useful for diagnostics.
+        self.source: str | None = None
 
     @property
     def ok(self) -> bool:
@@ -74,6 +77,7 @@ class SessionHealth:
             "error": self.error,
             "phone": self.phone,
             "dc_id": self.dc_id,
+            "source": self.source,
         }
 
 
@@ -376,18 +380,20 @@ class SessionHealthChecker:
     async def _check_pyrogram(self, user_id: int | None = None) -> SessionHealth:
         """Check if the Pyrogram session string is still valid.
 
-        When ``user_id`` is provided, per-user session files are checked
-        before falling back to the global file or admin user's session.
+        Resolution order (per-user JSON → MongoDB → env → global JSON) means a
+        freshly logged-in session is used in preference to a possibly stale
+        environment session string.  When ``user_id`` is provided, only that
+        user's persisted data is considered; the any-user MongoDB fallback is
+        reserved for the unscoped background check.
 
-        On success, persists the current session string to MongoDB so that
-        long-lived sessions survive restarts (see ``_save_pyrogram_session``).
+        On success, persists the current session string so that long-lived
+        sessions survive restarts (see ``_save_pyrogram_session``).
         """
         h = SessionHealth("pyrogram")
 
         try:
             from utils.telethon_session import (
-                _get_env_value,
-                _load_session_string_from_file_async,
+                _resolve_pyrogram_session_with_source,
                 build_pyrogram_client,
                 get_userbot_credentials,
             )
@@ -395,49 +401,29 @@ class SessionHealthChecker:
             h.error = f"import failed: {exc}"
             return h
 
-        # Check env vars first (fast, no I/O)
-        env_str = _get_env_value(
-            "PYROGRAM_SESSION",
-            "pyrogram_session",
-            "USERBOT_PYROGRAM_SESSION",
-            "userbot_pyrogram_session",
-        )
         # Resolve which user_id to use: caller-specified, then admin, then None
         check_user_id = user_id or self.admin_user_id
 
-        if env_str:
-            session_str = env_str
-        else:
-            # Read per-user JSON first (for the resolved user), then fall back to global
-            if check_user_id is not None:
-                try:
-                    session_str = await _load_session_string_from_file_async(
-                        client_type="pyrogram", user_id=check_user_id
-                    )
-                except Exception:
-                    session_str = None
-            if not session_str:
-                try:
-                    session_str = await _load_session_string_from_file_async(client_type="pyrogram")
-                except Exception:
-                    session_str = None
+        # Unified resolution (per-user JSON -> MongoDB -> env -> global JSON).
+        try:
+            session_str, source = await _resolve_pyrogram_session_with_source(
+                user_id=check_user_id, db_model=self.db_model
+            )
+        except Exception as exc:
+            h.source = "unknown"
+            h.error = f"config check failed: {exc}"
+            return h
+        h.source = source
 
-        # If still nothing, check MongoDB (for sessions saved by /loginpyro)
-        if not session_str and self.db_model is not None and check_user_id is not None:
-            try:
-                from utils.telethon_session import get_pyrogram_session_string_for_user
-
-                session_str = await get_pyrogram_session_string_for_user(user_id=check_user_id, db_model=self.db_model)
-            except Exception as exc:
-                logger.debug("SessionHealthChecker: MongoDB Pyrogram check failed: %s", exc)
-
-        # Fall back to the most recent session stored for ANY user. The periodic
-        # check doesn't know which user owns a /login or /loginpyro session, so
-        # when per-user lookups miss, scan MongoDB for the latest document before
-        # declaring the session unconfigured (avoids false UNHEALTHY warnings).
-        if not session_str:
+        # Only for unscoped background checks: fall back to the most recent
+        # session stored for ANY user. The periodic check doesn't know which user
+        # owns a /login or /loginpyro session, so it scans MongoDB before declaring
+        # the session unconfigured (avoids false UNHEALTHY warnings).  Scoped
+        # (per-user) lookups must never pick up another user's session.
+        if not session_str and user_id is None:
             session_str = await self._load_any_session("pyrogram_session")
             if session_str:
+                h.source = "any-user-mongodb"
                 logger.info("SessionHealthChecker: Pyrogram session found via latest-Mongo fallback")
 
         if not session_str:
@@ -473,8 +459,14 @@ class SessionHealthChecker:
                         if asyncio.iscoroutine(dc):
                             dc = await dc
                         h.dc_id = dc
-                # Persist session string to MongoDB for long-term survival
-                await self._save_pyrogram_session(client, user_id=check_user_id)
+                # Persist the live session string for long-term survival.  For a
+                # scoped (per-user) check only refresh a session that has not been
+                # replaced since it was resolved, so a newer session is never
+                # overwritten by an older one.  Unscoped background checks always
+                # persist — that is what keeps MongoDB/JSON fresh.
+                stored = await self._stored_session_for_user(user_id, "pyrogram")
+                if (stored and session_str == stored) or user_id is None:
+                    await self._save_pyrogram_session(client, user_id=check_user_id)
             else:
                 h.error = "get_me() returned None (not authorized)"
         except Exception as exc:
@@ -492,80 +484,57 @@ class SessionHealthChecker:
     async def _check_telethon(self, user_id: int | None = None) -> SessionHealth:
         """Check if the Telethon session is still valid.
 
-        When ``user_id`` is provided, per-user session files are checked
-        before falling back to the global file or admin user's session.
+        Resolution order (per-user JSON → MongoDB → env → global JSON) means a
+        freshly logged-in session is used in preference to a possibly stale
+        environment session string.  When ``user_id`` is provided, only that
+        user's persisted data is considered; the any-user MongoDB fallback is
+        reserved for the unscoped background check.
 
-        On success, persists the current session string to MongoDB so that
-        long-lived sessions survive restarts (see ``_save_telethon_session``).
+        On success, persists the current session string so that long-lived
+        sessions survive restarts (see ``_save_telethon_session``).
         """
         h = SessionHealth("telethon")
 
         from utils.telethon_session import (
-            _get_env_value,
-            _load_session_string_from_file_async,
+            _resolve_telethon_session_with_source,
             build_telethon_client,
             get_telethon_session_path,
             get_userbot_credentials,
         )
 
-        # Check env vars first (fast, no I/O)
-        env_str = _get_env_value(
-            "API_SESSION",
-            "SESSION",
-            "api_session",
-            "USERBOT_SESSION",
-            "userbot_session",
-            "TELETHON_SESSION",
-            "telethon_session",
-        )
         # Resolve which user_id to use: caller-specified, then admin, then None
         check_user_id = user_id or self.admin_user_id
 
-        if env_str:
-            session_str = env_str
-        else:
-            # Check per-user JSON file first (if check_user_id is available), then global
-            if check_user_id is not None:
-                try:
-                    session_str = await _load_session_string_from_file_async(
-                        client_type="telethon", user_id=check_user_id
-                    )
-                except Exception as exc:
-                    logger.debug("SessionHealthChecker: per-user Telethon check failed: %s", exc)
+        # Unified resolution (per-user JSON -> MongoDB -> env -> global JSON).
+        try:
+            session_str, source = await _resolve_telethon_session_with_source(
+                user_id=check_user_id, db_model=self.db_model
+            )
+        except Exception as exc:
+            h.source = "unknown"
+            h.error = f"config check failed: {exc}"
+            return h
+        h.source = source
 
-            if not session_str:
-                # Read the persisted global JSON file
-                try:
-                    session_str = await _load_session_string_from_file_async(client_type="telethon")
-                except Exception as exc:
-                    h.error = f"config check failed: {exc}"
-                    return h
+        # Only for unscoped background checks: fall back to the most recent
+        # session stored for ANY user.  Scoped (per-user) lookups must never pick
+        # up another user's session.
+        if not session_str and user_id is None:
+            session_str = await self._load_any_session("telethon_session")
+            if session_str:
+                h.source = "any-user-mongodb"
+                logger.info("SessionHealthChecker: Telethon session found via latest-Mongo fallback")
 
-            # If still nothing, check MongoDB (sessions saved by /login persist there)
-            if not session_str and self.db_model is not None:
-                if check_user_id is not None:
-                    try:
-                        from utils.telethon_session import get_telethon_session_string_for_user
-
-                        session_str = await get_telethon_session_string_for_user(
-                            user_id=check_user_id, db_model=self.db_model
-                        )
-                    except Exception as exc:
-                        logger.debug("SessionHealthChecker: per-user Mongo Telethon check failed: %s", exc)
-                if not session_str:
-                    session_str = await self._load_any_session("telethon_session")
-                    if session_str:
-                        logger.info("SessionHealthChecker: Telethon session found via latest-Mongo fallback")
-
-            if not session_str:
-                # Fall back to checking for a file-based .session on disk
-                session_path = get_telethon_session_path()
-                if os.path.exists(session_path) or os.path.exists(session_path + ".session"):
-                    # File-based session exists — let build_telethon_client find it
-                    pass  # proceed with build below (session_str stays None)
-                else:
-                    h.error = "Telethon session not configured"
-                    return h
+        if not session_str:
+            # Fall back to checking for a file-based .session on disk
+            session_path = get_telethon_session_path()
+            if os.path.exists(session_path) or os.path.exists(session_path + ".session"):
+                # File-based session exists — let build_telethon_client find it
+                h.source = "file"
+                pass  # proceed with build below (session_str stays None)
+            else:
+                h.error = "Telethon session not configured"
+                return h
 
         try:
             api_id, api_hash = get_userbot_credentials()
@@ -595,8 +564,11 @@ class SessionHealthChecker:
                     logger.debug("SessionHealthChecker: failed to get Telethon user info")
                 with contextlib.suppress(Exception):
                     h.dc_id = client.session.dc_id if hasattr(client.session, "dc_id") else None
-                # Persist session string to MongoDB for long-term survival
-                await self._save_telethon_session(client, user_id=check_user_id)
+                # Persist the live session string for long-term survival (see the
+                # guard comment in ``_check_pyrogram`` for the rationale).
+                stored = await self._stored_session_for_user(user_id, "telethon")
+                if (stored and session_str == stored) or user_id is None:
+                    await self._save_telethon_session(client, user_id=check_user_id)
             else:
                 h.error = "Session exists but user is not authorized"
         except Exception as exc:
@@ -739,6 +711,33 @@ class SessionHealthChecker:
                 exc,
             )
 
+    async def _stored_session_for_user(self, user_id: int | None, client_type: str) -> str | None:
+        """Return the session string currently persisted for a user, if any.
+
+        Checks the per-user JSON file first, then MongoDB.  Used as a guard so a
+        scoped health check never overwrites a newer session with an older one.
+        """
+        if user_id is None:
+            return None
+        key = "telethon_session" if client_type == "telethon" else "pyrogram_session"
+        try:
+            from utils.telethon_session import _load_all_sessions_from_file_async
+
+            data = await _load_all_sessions_from_file_async(user_id=user_id)
+            if data and data.get(key):
+                return str(data[key])
+        except Exception:
+            logger.debug("SessionHealthChecker: failed to read stored %s session from JSON", client_type)
+
+        if self.db_model is not None and hasattr(self.db_model, "load_session"):
+            try:
+                doc = await self.db_model.load_session(user_id)
+                if isinstance(doc, dict) and doc.get(key):
+                    return str(doc[key])
+            except Exception:
+                logger.debug("SessionHealthChecker: failed to read stored %s session from MongoDB", client_type)
+        return None
+
     async def _load_any_session(self, key: str) -> str | None:
         """Return the most recent session string of a given type for ANY user.
 
@@ -853,6 +852,8 @@ class SessionHealthChecker:
             lines.append(f"{status_emoji} *{name.capitalize()}*")
             lines.append(f"   Alive: `{r.get('alive')}`")
             lines.append(f"   Latency: `{r.get('latency_ms', 'N/A')} ms`")
+            if r.get("source"):
+                lines.append(f"   Source: `{r['source']}`")
             if r.get("phone"):
                 lines.append(f"   Phone: `{r['phone']}`")
             if r.get("dc_id"):

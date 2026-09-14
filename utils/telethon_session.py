@@ -378,8 +378,22 @@ async def _load_session_string_from_file_async(client_type: str = "telethon", us
 
 
 def _get_configured_session_string(user_id: int | None = None) -> str | None:
-    """Return a Telethon session string from env var or per-user JSON."""
-    # 1. Check env vars first (highest priority)
+    """Return a Telethon session string, preferring persisted over env.
+
+    Resolution order (matches the reference header-extractor flow):
+    1. Per-user JSON file — a session written by ``/login`` or the healthcheck
+       must outrank a possibly stale environment session string.
+    2. Environment variable (admin-configured, e.g. ``API_SESSION``).
+    3. Legacy global JSON file — only when no ``user_id`` is scoped, so one
+       user's session is never served to another.
+    """
+    # 1. Per-user JSON file first (freshest persisted session)
+    if user_id is not None:
+        file_str = _load_session_string_from_file(client_type="telethon", user_id=user_id)
+        if file_str:
+            return file_str
+
+    # 2. Environment variable (admin-configured fallback)
     env_str = _get_env_value(
         "API_SESSION",
         "SESSION",
@@ -392,13 +406,129 @@ def _get_configured_session_string(user_id: int | None = None) -> str | None:
     if env_str:
         return env_str
 
-    # 2. Try per-user JSON file (when user_id is known)
-    if user_id is not None:
-        file_str = _load_session_string_from_file(client_type="telethon", user_id=user_id)
+    # 3. Legacy global JSON file (unscoped/admin path only)
+    if user_id is None:
+        file_str = _load_session_string_from_file(client_type="telethon")
         if file_str:
             return file_str
 
     return None
+
+
+def _extract_session_value(saved_session: object, keys: tuple[str, ...]) -> str | None:
+    """Return the first non-empty session string from a stored MongoDB document.
+
+    ``keys`` is ordered by preference; the first key holding a truthy value wins.
+    """
+    if not isinstance(saved_session, dict):
+        return None
+    for key in keys:
+        value = saved_session.get(key)
+        if value:
+            return str(value)
+    return None
+
+
+# ── Registered MongoDB model ────────────────────────────────────────
+#
+# The downloader/uploader run in code paths that only receive a ``user_id``
+# (a conversion worker/task, not a PTB handler holding ``application.bot_data``),
+# so they cannot look up ``bot_data["db_model"]`` themselves.  Registering the
+# model once at startup lets every session-resolution path consult MongoDB
+# instead of relying solely on the per-user JSON files.
+_REGISTERED_DB_MODEL: object | None = None
+
+
+def set_db_model(db_model: object | None) -> None:
+    """Register the bot's MongoDB model so session resolution can reach MongoDB."""
+    global _REGISTERED_DB_MODEL
+    _REGISTERED_DB_MODEL = db_model
+
+
+def get_db_model() -> object | None:
+    """Return the model registered via :func:`set_db_model`, if any."""
+    return _REGISTERED_DB_MODEL
+
+
+async def _load_mongo_session(db_model: object | None, user_id: int | None) -> object | None:
+    """Best-effort load of a user's stored session document from MongoDB.
+
+    Prefers ``db_model.load_session()`` (the bot's ``MediaConversionModel``) and
+    falls back to the reference repo's ``utils.db.get_user_session()`` when that
+    module is available.  When ``db_model`` is ``None`` the model registered via
+    :func:`set_db_model` is used, so callers that only hold a ``user_id`` still
+    reach MongoDB. Returns ``None`` on any failure.
+    """
+    if user_id is None:
+        return None
+    if db_model is None:
+        db_model = get_db_model()
+    if db_model is None:
+        return None
+    if hasattr(db_model, "load_session"):
+        try:
+            return await db_model.load_session(user_id)
+        except Exception as exc:
+            logger.warning("Failed to inspect MongoDB session for user %s: %s", user_id, exc)
+            return None
+    try:
+        from utils.db import get_user_session  # noqa: PLC0415
+
+        return await get_user_session(user_id)
+    except Exception as exc:
+        logger.warning("Failed to inspect MongoDB session for user %s: %s", user_id, exc)
+        return None
+
+
+async def _resolve_telethon_session_with_source(
+    user_id: int | None = None, db_model: object | None = None
+) -> tuple[str | None, str]:
+    """Resolve a Telethon session string and label the source it came from.
+
+    Resolution order (the reference header-extractor flow):
+    1. ``json``         per-user JSON file — freshest, written on login/healthcheck
+    2. ``mongodb``      per-user session document
+    3. ``env``          ``API_SESSION`` / ``TELETHON_SESSION`` env var
+    4. ``global-json``  legacy shared JSON file (unscoped lookups only)
+
+    Persisted sessions deliberately outrank the environment variable: a stale
+    env session string must never mask a freshly logged-in session (that is what
+    produced ``AUTH_KEY_UNREGISTERED`` after a successful re-login).
+    """
+    # 1. Per-user JSON file (strictly scoped to this user)
+    if user_id is not None:
+        file_str = _load_session_string_from_file(client_type="telethon", user_id=user_id)
+        if file_str:
+            return file_str, "json"
+
+    # 2. MongoDB-persisted session for the given user
+    saved_session = await _load_mongo_session(db_model, user_id)
+    session_value = _extract_session_value(saved_session, ("telethon_session", "string_session", "session_string"))
+    if session_value:
+        logger.info("session: loaded Telethon session string from MongoDB for user %s", user_id)
+        return session_value, "mongodb"
+
+    # 3. Environment variable
+    env_str = _get_env_value(
+        "API_SESSION",
+        "SESSION",
+        "api_session",
+        "USERBOT_SESSION",
+        "userbot_session",
+        "TELETHON_SESSION",
+        "telethon_session",
+    )
+    if env_str:
+        return env_str, "env"
+
+    # 4. Legacy global JSON file — unscoped lookups only (isolation safety)
+    if user_id is None:
+        file_str = _load_session_string_from_file(client_type="telethon")
+        if file_str:
+            return file_str, "global-json"
+
+    logger.debug("session: no Telethon session string found for user %s", user_id)
+    return None, "missing"
 
 
 async def get_telethon_session_string_for_user(
@@ -406,77 +536,35 @@ async def get_telethon_session_string_for_user(
 ) -> str | None:
     """Return a usable Telethon session string for the given user, if available.
 
-    Resolution order (SAFE: never falls through to the global JSON file):
-    1. Environment variable (admin-configured)
-    2. Per-user JSON file (when ``user_id`` is provided, strictly scoped)
-    3. MongoDB-persisted session (when ``db_model`` is supplied, per-user)
-
-    The global (legacy) JSON file is intentionally NOT checked here to
-    prevent user A's session from being served to user B in a multi-user
-    bot.  Use ``_get_configured_session_string()`` directly only in contexts
-    where no user isolation is needed (single-admin / builder).
+    Delegates to :func:`_resolve_telethon_session_with_source` so a freshly
+    logged-in per-user or MongoDB session always outranks a stale env var.  The
+    legacy global JSON file is only consulted for unscoped lookups, so user A's
+    session can never be served to user B in a multi-user bot.
     """
-    # 1. Check env vars first (admin-configured session, top priority)
-    env_str = _get_env_value(
-        "API_SESSION",
-        "SESSION",
-        "api_session",
-        "USERBOT_SESSION",
-        "userbot_session",
-        "TELETHON_SESSION",
-        "telethon_session",
-    )
-    if env_str:
-        return env_str
-
-    # 2. Check per-user JSON file (strictly scoped to this user)
-    if user_id is not None:
-        file_str = _load_session_string_from_file(client_type="telethon", user_id=user_id)
-        if file_str:
-            return file_str
-
-    # 3. Check MongoDB-persisted session for the given user
-    if user_id is not None and db_model is not None:
-        try:
-            saved_session = await db_model.load_session(user_id)
-        except Exception as exc:
-            logger.warning("Failed to inspect MongoDB Telethon session for user %s: %s", user_id, exc)
-            saved_session = None
-
-        if isinstance(saved_session, dict):
-            session_value = saved_session.get("telethon_session") or saved_session.get("string_session")
-            if session_value:
-                logger.info(
-                    "session: loaded Telethon session string from MongoDB for user %s",
-                    user_id,
-                )
-                return str(session_value)
-
-    logger.debug("session: no Telethon session string found for user %s", user_id)
-    return None
+    value, _source = await _resolve_telethon_session_with_source(user_id, db_model)
+    return value
 
 
 async def get_telethon_session_status(user_id: int | None = None, db_model: object | None = None) -> dict:
     """Return a diagnostic summary for Telethon session availability.
 
-    Checks the same sources the bot can actually use for login fallback:
-    - explicit session string in env vars
+    Reports the same sources the bot can actually use for login fallback:
+    - the per-user JSON file
+    - a MongoDB-persisted session for a specific user
+    - an explicit session string in env vars
     - a local .session file on disk
-    - a MongoDB-persisted session for a specific user when db_model is provided
     """
     session_path = get_telethon_session_path()
-    session_str = await get_telethon_session_string_for_user(user_id=user_id, db_model=db_model)
+    session_str, source = await _resolve_telethon_session_with_source(user_id=user_id, db_model=db_model)
 
     if session_str:
-        env_session = _get_configured_session_string()
-        return {
-            "ready": True,
-            "source": "env" if env_session else "mongodb",
-            "session_path": session_path,
-            "details": "Telethon session string configured in environment"
-            if env_session
-            else "Telethon session string persisted in MongoDB",
-        }
+        details = {
+            "json": "Telethon session persisted in the per-user JSON file",
+            "mongodb": "Telethon session persisted in MongoDB",
+            "env": "Telethon session string configured in environment",
+            "global-json": "Telethon session persisted in the legacy global JSON file",
+        }.get(source, "Telethon session string available")
+        return {"ready": True, "source": source, "session_path": session_path, "details": details}
 
     if os.path.exists(session_path) or os.path.exists(session_path + ".session"):
         return {
@@ -485,21 +573,6 @@ async def get_telethon_session_status(user_id: int | None = None, db_model: obje
             "session_path": session_path,
             "details": "Telethon session file exists on disk",
         }
-
-    if user_id is not None and db_model is not None:
-        try:
-            saved_session = await db_model.load_session(user_id)
-        except Exception as exc:
-            logger.warning("Failed to inspect MongoDB Telethon session for user %s: %s", user_id, exc)
-            saved_session = None
-
-        if isinstance(saved_session, dict) and saved_session.get("string_session"):
-            return {
-                "ready": True,
-                "source": "mongodb",
-                "session_path": session_path,
-                "details": "Telethon session persisted in MongoDB",
-            }
 
     return {
         "ready": False,
@@ -514,7 +587,8 @@ def build_telethon_client(api_id: int, api_hash: str, session_str: str | None = 
 
     Session resolution order:
     1. ``session_str`` parameter (explicit call-site override, e.g. from MongoDB)
-    2. ``TELETHON_SESSION`` / ``API_SESSION`` env var (StringSession)
+    2. ``_get_configured_session_string()``: per-user JSON file, then
+       ``TELETHON_SESSION`` / ``API_SESSION`` env var, then the global JSON file
     3. File-based ``.session`` file on disk (persistent, auto-saved by Telethon)
 
     When a StringSession is explicitly configured but fails to load, the
@@ -600,8 +674,23 @@ def build_telethon_client(api_id: int, api_hash: str, session_str: str | None = 
 
 
 def get_pyrogram_session_string(user_id: int | None = None) -> str | None:
-    """Return a Pyrogram session string from env var, per-user JSON, or in-memory cache."""
-    # 1. Check env vars first (highest priority)
+    """Return a Pyrogram session string, preferring persisted over env.
+
+    Resolution order (matches ``_resolve_pyrogram_session_with_source``):
+    1. Per-user JSON file (freshest persisted session)
+    2. Environment variable (``PYROGRAM_SESSION``, admin-configured)
+    3. In-memory MongoDB cache / legacy global JSON file (unscoped only)
+
+    The legacy global JSON file is only consulted when ``user_id`` is ``None``,
+    so one user's session is never served to another.
+    """
+    # 1. Per-user JSON file first (freshest persisted session)
+    if user_id is not None:
+        file_str = _load_session_string_from_file(client_type="pyrogram", user_id=user_id)
+        if file_str:
+            return file_str
+
+    # 2. Environment variable (admin-configured fallback)
     env_str = _get_env_value(
         "PYROGRAM_SESSION",
         "pyrogram_session",
@@ -611,19 +700,66 @@ def get_pyrogram_session_string(user_id: int | None = None) -> str | None:
     if env_str:
         return env_str
 
-    # 2. Try per-user JSON file (when user_id is known)
+    # 3. Unscoped-only fallbacks: in-memory MongoDB cache, then global JSON
+    if user_id is None:
+        mongo_str = _get_pyrogram_mongo_cache()
+        if mongo_str:
+            return mongo_str
+        return _load_session_string_from_file(client_type="pyrogram")
+
+    return None
+
+
+async def _resolve_pyrogram_session_with_source(
+    user_id: int | None = None, db_model: object | None = None
+) -> tuple[str | None, str]:
+    """Resolve a Pyrogram session string and label the source it came from.
+
+    Resolution order (the reference header-extractor flow):
+    1. ``json``          per-user JSON file — freshest, written on login/healthcheck
+    2. ``mongodb``       per-user session document (also cached for the sync path)
+    3. ``env``           ``PYROGRAM_SESSION`` env var
+    4. ``mongodb-cache`` / ``global-json`` — unscoped lookups only
+
+    Persisted sessions deliberately outrank the environment variable so a stale
+    env session string cannot mask a freshly logged-in session.
+    """
+    # 1. Per-user JSON file (strictly scoped to this user)
     if user_id is not None:
         file_str = _load_session_string_from_file(client_type="pyrogram", user_id=user_id)
         if file_str:
-            return file_str
-        return None
+            return file_str, "json"
 
-    # 3. Fall back to the in-memory cache (only when no user_id)
-    mongo_str = _get_pyrogram_mongo_cache()
-    if mongo_str:
-        return mongo_str
+    # 2. MongoDB-persisted session for the given user
+    saved_session = await _load_mongo_session(db_model, user_id)
+    session_value = _extract_session_value(saved_session, ("pyrogram_session",))
+    if session_value:
+        logger.info("session: loaded Pyrogram session string from MongoDB for user %s", user_id)
+        # Cache it so the synchronous ``get_pyrogram_session_string()`` can use it.
+        _set_pyrogram_mongo_cache(session_value)
+        return session_value, "mongodb"
 
-    return None
+    # 3. Environment variable
+    env_str = _get_env_value(
+        "PYROGRAM_SESSION",
+        "pyrogram_session",
+        "USERBOT_PYROGRAM_SESSION",
+        "userbot_pyrogram_session",
+    )
+    if env_str:
+        return env_str, "env"
+
+    # 4. Unscoped-only fallbacks (isolation safety)
+    if user_id is None:
+        cached = _get_pyrogram_mongo_cache()
+        if cached:
+            return cached, "mongodb-cache"
+        file_str = _load_session_string_from_file(client_type="pyrogram")
+        if file_str:
+            return file_str, "global-json"
+
+    logger.debug("session: no Pyrogram session string found for user %s", user_id)
+    return None, "missing"
 
 
 async def get_pyrogram_session_string_for_user(
@@ -631,58 +767,127 @@ async def get_pyrogram_session_string_for_user(
 ) -> str | None:
     """Return a usable Pyrogram session string for the given user, if available.
 
-    Resolution order (SAFE: never falls through to the global JSON file):
-    1. Environment variable (``PYROGRAM_SESSION`` etc. — admin-configured)
-    2. Per-user JSON file (when ``user_id`` is provided, strictly scoped)
-    3. MongoDB-persisted session (when ``db_model`` is supplied, per-user)
-
-    The global (legacy) JSON file is intentionally NOT checked here to
-    prevent user A's session from being served to user B in a multi-user
-    bot.  Use ``get_pyrogram_session_string()`` directly only in contexts
-    where no user isolation is needed (single-admin / healthchecker).
-
-    When a session is found in MongoDB, it is also cached in-memory via
-    ``_set_pyrogram_mongo_cache()`` so that the sync
-    ``get_pyrogram_session_string()`` can benefit from it without an
+    Delegates to :func:`_resolve_pyrogram_session_with_source` so a freshly
+    logged-in per-user or MongoDB session outranks a stale env var.  The legacy
+    global JSON file is only consulted for unscoped lookups.  When a session is
+    found in MongoDB it is also cached in-memory via ``_set_pyrogram_mongo_cache``
+    so the sync ``get_pyrogram_session_string()`` can benefit from it without an
     async MongoDB call.
     """
-    # 1. Check env vars first (admin-configured session, top priority)
-    env_str = _get_env_value(
-        "PYROGRAM_SESSION",
-        "pyrogram_session",
-        "USERBOT_PYROGRAM_SESSION",
-        "userbot_pyrogram_session",
-    )
-    if env_str:
-        return env_str
+    value, _source = await _resolve_pyrogram_session_with_source(user_id, db_model)
+    return value
 
-    # 2. Check per-user JSON file (strictly scoped to this user)
-    if user_id is not None:
-        file_str = _load_session_string_from_file(client_type="pyrogram", user_id=user_id)
-        if file_str:
-            return file_str
 
-    # 3. Check MongoDB-persisted session for the given user
-    if user_id is not None and db_model is not None:
-        try:
-            saved_session = await db_model.load_session(user_id)
-        except Exception as exc:
-            logger.warning("Failed to inspect MongoDB Pyrogram session for user %s: %s", user_id, exc)
-            saved_session = None
+async def resolve_session_string(
+    client_type: str,
+    session_str: str | None = None,
+    user_id: int | None = None,
+    db_model: object | None = None,
+) -> str | None:
+    """Resolve a session string for either client, honouring an explicit override."""
+    if session_str is not None:
+        return session_str
+    if client_type == "telethon":
+        return await get_telethon_session_string_for_user(user_id=user_id, db_model=db_model)
+    if client_type == "pyrogram":
+        return await get_pyrogram_session_string_for_user(user_id=user_id, db_model=db_model)
+    raise ValueError(f"Unknown client_type: {client_type!r}")
 
-        if isinstance(saved_session, dict):
-            session_value = saved_session.get("pyrogram_session")
-            if session_value:
-                logger.info(
-                    "session: loaded Pyrogram session string from MongoDB for user %s",
-                    user_id,
-                )
-                session_str = str(session_value)
-                _set_pyrogram_mongo_cache(session_str)
-                return session_str
 
-    logger.debug("session: no Pyrogram session string found for user %s", user_id)
-    return None
+async def restore_per_user_session_files(db_model: object | None = None) -> int:
+    """Re-materialize per-user JSON session files from the durable store.
+
+    The per-user JSON session files live on an ephemeral filesystem and are
+    wiped on every redeploy.  This walks the MongoDB session documents and
+    rewrites each user's JSON file so sessions created via ``/login`` or
+    ``/loginpyro`` keep working immediately after a deployment instead of
+    waiting for the healthchecker to notice.
+
+    ``db_model`` is the bot's ``MediaConversionModel`` (or any object exposing a
+    ``_sessions_coll`` raw collection / ``sessions`` QueryBuilder).  Only session
+    keys missing from a user's local JSON file are written, so a fresher local
+    file is never clobbered by an older MongoDB document.  Returns the number of
+    users restored; best-effort and never raises.
+    """
+    if db_model is None:
+        return 0
+
+    restored = 0
+    try:
+        # Prefer the raw motor collection (supports a plain find over all docs).
+        coll = getattr(db_model, "_sessions_coll", None)
+        if coll is None or not hasattr(coll, "find"):
+            qb = getattr(db_model, "sessions", None)
+            coll = getattr(qb, "collection", None)
+        if coll is None or not hasattr(coll, "find"):
+            logger.debug("session: no MongoDB sessions collection available to restore from")
+            return 0
+
+        query: dict = {}
+        bot_id = getattr(db_model, "bot_id", None)
+        if bot_id is not None:
+            query["bot_id"] = bot_id
+
+        projection = {"_id": 0, "user_id": 1, "session": 1}
+        cursor = coll.find(query, projection).sort("updated_at", -1)
+        docs = await cursor.to_list(length=None)
+
+        seen: set[int] = set()
+        for doc in docs or []:
+            if not isinstance(doc, dict):
+                continue
+            uid = doc.get("user_id")
+            try:
+                uid = int(uid)
+            except (TypeError, ValueError):
+                continue
+            if uid in seen:
+                continue
+
+            sess = doc.get("session")
+            if not isinstance(sess, dict):
+                continue
+
+            tele = sess.get("telethon_session")
+            pyro = sess.get("pyrogram_session")
+            if not tele and not pyro:
+                # Legacy documents that predate the typed-key split.
+                tele = sess.get("string_session")
+            if not tele and not pyro:
+                continue
+
+            # Mark as handled only once we actually found a session, so an older
+            # document can still backfill a user whose newest doc has no session.
+            seen.add(uid)
+
+            # Only fill keys that are MISSING locally.  On a persistent volume the
+            # local JSON can be fresher than MongoDB (e.g. a login whose Mongo
+            # write failed), and clobbering it would reintroduce the very
+            # "not authorized" breakage this restore exists to prevent.
+            local = await _load_all_sessions_from_file_async(user_id=uid)
+            local = local if isinstance(local, dict) else {}
+
+            written = False
+            if tele and not local.get(_KEY_TELETHON):
+                written = (
+                    await save_session_string_to_file_async(str(tele), client_type="telethon", user_id=uid)
+                ) or written
+            if pyro and not local.get(_KEY_PYROGRAM):
+                written = (
+                    await save_session_string_to_file_async(str(pyro), client_type="pyrogram", user_id=uid)
+                ) or written
+            if written:
+                restored += 1
+
+        if restored:
+            logger.info(
+                "session: restored per-user JSON session files for %d user(s) from MongoDB",
+                restored,
+            )
+        return restored
+    except Exception as exc:
+        logger.debug("session: restore per-user session files from MongoDB failed: %s", exc)
+        return 0
 
 
 def build_pyrogram_client(api_id: int, api_hash: str, session_str: str | None = None) -> object | None:
@@ -696,7 +901,7 @@ def build_pyrogram_client(api_id: int, api_hash: str, session_str: str | None = 
         Telegram API hash.
     session_str:
         Optional explicit session string.  If not provided, the function
-        resolves the session from env vars -> persisted JSON file
+        resolves the session from the per-user JSON file, then env vars
         (same resolution as ``get_pyrogram_session_string()``).
 
     When ``session_str`` is provided explicitly, the internal resolution
@@ -704,8 +909,8 @@ def build_pyrogram_client(api_id: int, api_hash: str, session_str: str | None = 
     caller has already loaded the session string asynchronously.
 
     For async callers that need MongoDB fallback too, prefer
-    ``build_pyrogram_client_async()`` which first checks env → JSON →
-    MongoDB before building the client.
+    ``build_pyrogram_client_async()`` which first checks per-user JSON →
+    MongoDB → env before building the client.
 
     Reads the following env vars for retry/timeout configuration:
       - PYROGRAM_SLEEP_THRESHOLD (default 30): seconds to sleep before retrying
@@ -792,27 +997,35 @@ async def build_pyrogram_client_async(
     return build_pyrogram_client(api_id, api_hash, session_str=session_str)
 
 
-def is_pyrogram_available() -> bool:
+def is_pyrogram_available(user_id: int | None = None) -> bool:
     """Return True if Pyrogram is installed and a session string is configured.
 
-    Checks env vars first, then the persisted JSON file written by the
-    healthchecker.
+    Checks the per-user JSON file first, then env vars, then the persisted
+    global JSON file written by the healthchecker.
     """
     if PyrogramClient is None:
         return False
-    return bool(get_pyrogram_session_string())
+    return bool(get_pyrogram_session_string(user_id=user_id))
 
 
 def has_usable_telethon_session(user_id: int | None = None) -> bool:
     """Return True when Telethon can use a pre-existing session without prompting for login.
 
-    When ``user_id`` is provided, per-user JSON files and per-user ``.session``
-    files are also checked, enabling per-phone session isolation.
+    Resolution order matches the session resolvers: per-user JSON file, then env
+    vars, then file-based sessions.  When ``user_id`` is provided, only that
+    user's persisted data and ``.session`` file are considered (per-phone
+    isolation); the legacy global files are used for unscoped lookups only.
     """
     if TelegramClient is None:
         return False
 
-    # 1. Check env vars
+    # 1. Per-user JSON file (freshest persisted session)
+    if user_id is not None:
+        file_str = _load_session_string_from_file(client_type="telethon", user_id=user_id)
+        if file_str:
+            return True
+
+    # 2. Environment variable
     session_str = _get_env_value(
         "API_SESSION",
         "SESSION",
@@ -825,28 +1038,39 @@ def has_usable_telethon_session(user_id: int | None = None) -> bool:
     if session_str:
         return True
 
-    # 2. Check per-user JSON file (when user_id is known)
+    # 3. File-based .session files on disk
     if user_id is not None:
-        file_str = _load_session_string_from_file(client_type="telethon", user_id=user_id)
-        if file_str:
-            return True
-        # Still check per-user .session file
         per_user_path = get_telethon_session_path() + f".{user_id}.session"
         return bool(os.path.exists(per_user_path))
 
-    # 3. Check file-based .session files on disk (only when no user_id)
     session_path = get_telethon_session_path()
     return os.path.exists(session_path) or os.path.exists(session_path + ".session")
 
 
-def is_telethon_available() -> bool:
+async def has_usable_telethon_session_async(
+    user_id: int | None = None, db_model: object | None = None
+) -> bool:
+    """Async ``has_usable_telethon_session`` that also consults MongoDB.
+
+    The synchronous variant can only inspect the JSON files, env vars and
+    ``.session`` files, so a session that lives only in MongoDB looks
+    "unconfigured" to it.  This checks MongoDB as well, which is what the
+    downloader/uploader need outside the healthcheck.
+    """
+    if has_usable_telethon_session(user_id=user_id):
+        return True
+    session_str = await get_telethon_session_string_for_user(user_id=user_id, db_model=db_model)
+    return bool(session_str)
+
+
+def is_telethon_available(user_id: int | None = None) -> bool:
     """Return True if Telethon is installed and configured."""
-    return has_usable_telethon_session()
+    return has_usable_telethon_session(user_id=user_id)
 
 
-def get_preferred_client_type() -> str:
+def get_preferred_client_type(user_id: int | None = None) -> str:
     """Return 'pyrogram' if Pyrogram session is available, else 'telethon'."""
-    if is_pyrogram_available():
+    if is_pyrogram_available(user_id=user_id):
         return "pyrogram"
     return "telethon"
 
