@@ -100,6 +100,9 @@ class BigFilePipeline:
         output_ext: str | None = None,
         caption: str | None = None,
         progress_callback: Callable[[int, int], None] | None = None,
+        batch_id: str | None = None,
+        batch_seq: int = 0,
+        batch_total: int = 0,
     ) -> IngestResult:
         """Download a large file via Pyrogram userbot, upload to S3, enqueue a processing job.
 
@@ -360,6 +363,11 @@ class BigFilePipeline:
                 _streams_dir = os.path.join(_out_base, f"{job_id}_streams")
                 job["output_dir"] = _streams_dir
                 job["archive_path"] = f"{_streams_dir}.zip"
+
+            if batch_id:
+                from utils.batch_pipeline import tag_batch_job
+
+                tag_batch_job(job, batch_id, batch_seq, batch_total)
 
             # Enqueue the job first — enqueue_job creates the Redis hash
             # with its own mapping (status=queued, progress=0, ...).

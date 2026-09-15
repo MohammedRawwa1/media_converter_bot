@@ -1693,9 +1693,16 @@ class EnhancedMediaHandler:
 
         had_current = "current_file" in session
         previous = session.get("current_file")
+        pipeline_job_before = file_info.get("_pipeline_job_id")
         session["current_file"] = file_info
         try:
             await self._ensure_current_file_downloaded(update, context, session)
+            pipeline_job_id = file_info.get("_pipeline_job_id")
+            if pipeline_job_id and pipeline_job_id != pipeline_job_before:
+                query = getattr(update, "callback_query", None)
+                if query is not None:
+                    await self._watch_job_progress(query, pipeline_job_id, bot=context.bot)
+                file_info["_bulk_pipeline_completed"] = True
         finally:
             if had_current:
                 session["current_file"] = previous
@@ -2078,6 +2085,9 @@ class EnhancedMediaHandler:
                             output_ext=current_file.get("_pipeline_output_ext"),
                             caption=current_file.get("_pipeline_caption"),
                             progress_callback=_pipeline_progress_cb,
+                            batch_id=current_file.get("_pipeline_batch_id"),
+                            batch_seq=int(current_file.get("_pipeline_batch_seq") or 0),
+                            batch_total=int(current_file.get("_pipeline_batch_total") or 0),
                         )
                         if _ingest.ok:
                             logger.info(
@@ -5005,6 +5015,17 @@ class EnhancedMediaHandler:
                             # Each entry may need its own download — the session's
                             # current_file is not necessarily this file.
                             try:
+                                f["_pipeline_ffmpeg_args"] = list(_bulk_args)
+                                f["_pipeline_conversion_type"] = _plan["convert_type"]
+                                f["_pipeline_output_ext"] = _bulk_ext
+                                f["_pipeline_caption"] = (
+                                    f"✅ Audio extracted ({_plan['extract_bitrate']})"
+                                    if _bulk_ext == ".mp3"
+                                    else f"Bulk conversion finished for {f.get('name') or f.get('id')}"
+                                )
+                                f["_pipeline_batch_id"] = _batch_id
+                                f["_pipeline_batch_seq"] = _batch_seq
+                                f["_pipeline_batch_total"] = _batch_total
                                 _file_path = await self._ensure_bulk_file_downloaded(
                                     update, context, sess, f
                                 )
@@ -5017,6 +5038,12 @@ class EnhancedMediaHandler:
                             if not _file_path and not f.get("input_key"):
                                 skipped += 1
                                 results.append((_bulk_display_name(f), "❌ could not fetch"))
+                                continue
+
+                            if f.pop("_bulk_pipeline_completed", False):
+                                enqueued += 1
+                                results.append((_bulk_display_name(f), f"✅ completed · {f.get('_pipeline_job_id')}"))
+                                _batch_seq += 1
                                 continue
 
                             job_id = str(uuid.uuid4()) if uuid else None
@@ -5071,6 +5098,10 @@ class EnhancedMediaHandler:
                                     await enqueue_job(job)
                                     enqueued += 1
                                     results.append((_bulk_display_name(f), f"📋 queued · {job_id}"))
+                                    # Keep bulk ingestion serial: do not download the next
+                                    # source until this job has finished and delivered its
+                                    # result. The watcher returns on every terminal state.
+                                    await self._watch_job_progress(query, job_id, bot=context.bot)
                                 except Exception:
                                     logger.exception("Failed to enqueue bulk job for %s", f.get("id"))
                                     failed += 1
