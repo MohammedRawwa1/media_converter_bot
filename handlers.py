@@ -2039,7 +2039,13 @@ class EnhancedMediaHandler:
                     _pipeline_loop = None
                     try:
                         _dl_text = f"⬇️ Downloading via pipeline ({file_size // (1024 * 1024)} MB)..."
-                        if update and update.message:
+                        _batch_message = getattr(query, "message", None)
+                        if _batch_message is not None:
+                            _pipeline_progress_msg = _batch_message
+                            await _pipeline_progress_msg.edit_text(
+                                f"▶️ Batch `{current_file.get('_pipeline_batch_id')}`\n{_dl_text}"
+                            )
+                        elif update and update.message:
                             _pipeline_progress_msg = await update.message.reply_text(_dl_text)
                         elif update and update.effective_user and context and context.bot:
                             _pipeline_progress_msg = await context.bot.send_message(
@@ -2052,9 +2058,36 @@ class EnhancedMediaHandler:
 
                     _pl_last_pct = [-1]
                     _pl_last_time = [0.0]
+                    _pipeline_cancelled = [False]
+                    _pipeline_cancel_task = None
+
+                    async def _watch_pipeline_cancel():
+                        batch_id = current_file.get("_pipeline_batch_id")
+                        if not batch_id:
+                            return
+                        try:
+                            from utils.job_queue import get_redis
+                            while True:
+                                redis = await get_redis()
+                                try:
+                                    from utils.batch_pipeline import is_batch_cancelled
+
+                                    if await is_batch_cancelled(redis, batch_id):
+                                        _pipeline_cancelled[0] = True
+                                        return
+                                finally:
+                                    with contextlib.suppress(Exception):
+                                        await redis.close()
+                                await asyncio.sleep(0.5)
+                        except asyncio.CancelledError:
+                            raise
+                        except Exception:
+                            logger.debug("bulk: pipeline cancellation watcher stopped")
 
                     def _pipeline_progress_cb(sent: int, total: int):
                         """Sync callback for pipeline download progress."""
+                        if _pipeline_cancelled[0]:
+                            raise asyncio.CancelledError("batch cancelled during pipeline download")
                         if not _pipeline_progress_msg or not _pipeline_loop or total <= 0:
                             return
                         try:
@@ -2066,7 +2099,9 @@ class EnhancedMediaHandler:
                             _pl_last_time[0] = now
                             mb_sent = sent // (1024 * 1024)
                             mb_total = total // (1024 * 1024)
-                            text = f"⬇️ Pipeline download: {pct}% ({mb_sent}MB / {mb_total}MB)"
+                            batch_label = current_file.get("_pipeline_batch_id")
+                            prefix = f"▶️ Batch `{batch_label}`\n" if batch_label else ""
+                            text = f"{prefix}⬇️ Pipeline download: {pct}% ({mb_sent}MB / {mb_total}MB)"
                             asyncio.run_coroutine_threadsafe(
                                 _pipeline_progress_msg.edit_text(text),
                                 _pipeline_loop,
@@ -2075,6 +2110,7 @@ class EnhancedMediaHandler:
                             pass
 
                     try:
+                        _pipeline_cancel_task = asyncio.create_task(_watch_pipeline_cancel())
                         _ingest = await _bigfile_pipeline.ingest_large_file(
                             chat_id=_pipeline_chat,
                             message_id=_pipeline_msg,
@@ -2090,7 +2126,14 @@ class EnhancedMediaHandler:
                             batch_id=current_file.get("_pipeline_batch_id"),
                             batch_seq=int(current_file.get("_pipeline_batch_seq") or 0),
                             batch_total=int(current_file.get("_pipeline_batch_total") or 0),
+                            cancel_check=lambda: _pipeline_cancelled[0],
                         )
+                        if _ingest.error == "batch cancelled":
+                            with contextlib.suppress(Exception):
+                                if _pipeline_progress_msg:
+                                    await _pipeline_progress_msg.edit_text("⏹️ Batch download cancelled.")
+                            await self._cleanup_dedup_key(_dedup_key)
+                            return
                         if _ingest.ok:
                             logger.info(
                                 "Big files pipeline: job %s queued for %s/%s (%dMB)",
@@ -2210,6 +2253,11 @@ class EnhancedMediaHandler:
                         )
                         # ── Clean up the "pending" dedup key so future retries aren't blocked ──
                         await self._cleanup_dedup_key(_dedup_key)
+                    finally:
+                        if _pipeline_cancel_task is not None:
+                            _pipeline_cancel_task.cancel()
+                            with contextlib.suppress(asyncio.CancelledError, Exception):
+                                await _pipeline_cancel_task
 
             # ── Clean early error: file > Bot API download limit but no fallback available ──
             if file_size and file_size > bot_api_max_mb * 1024 * 1024 and _bigfile_pipeline is None:
@@ -4920,6 +4968,25 @@ class EnhancedMediaHandler:
                                 f"▶️ Batch started: `{_batch_id}`\n"
                                 f"Use `/cancelbatch {_batch_id}` to stop the remaining files.",
                             )
+                        # Register the first message before any source download.
+                        # The worker and the pipeline will edit this same message.
+                        with contextlib.suppress(Exception):
+                            _batch_message = getattr(query, "message", None)
+                            _batch_chat = getattr(_batch_message, "chat_id", None)
+                            _batch_message_id = getattr(_batch_message, "message_id", None)
+                            if _batch_chat and _batch_message_id:
+                                from utils.batch_pipeline import batch_message_key
+                                from utils.job_queue import get_redis
+
+                                _batch_redis = await get_redis()
+                                try:
+                                    await _batch_redis.set(
+                                        batch_message_key(_batch_id),
+                                        f"{_batch_chat}:{_batch_message_id}",
+                                        ex=86400,
+                                    )
+                                finally:
+                                    await _batch_redis.close()
                         # Publish the expected count before the first job is
                         # queued. The worker can then render batch progress
                         # immediately, even while this handler waits for job 1.

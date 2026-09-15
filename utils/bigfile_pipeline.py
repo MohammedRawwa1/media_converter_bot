@@ -103,6 +103,7 @@ class BigFilePipeline:
         batch_id: str | None = None,
         batch_seq: int = 0,
         batch_total: int = 0,
+        cancel_check: Callable[[], bool] | None = None,
     ) -> IngestResult:
         """Download a large file via Pyrogram userbot, upload to S3, enqueue a processing job.
 
@@ -209,11 +210,17 @@ class BigFilePipeline:
                     temp_path,
                 )
 
+                def _download_progress(sent: int, total: int):
+                    if cancel_check and cancel_check():
+                        raise asyncio.CancelledError("batch cancelled during pipeline download")
+                    if progress_callback:
+                        progress_callback(sent, total)
+
                 download_ok = await self._download_via_pyrogram(
                     chat_id,
                     message_id,
                     temp_path,
-                    progress_callback=progress_callback,
+                    progress_callback=_download_progress,
                     user_id=user_id,
                 )
                 if not download_ok or not os.path.exists(temp_path) or os.path.getsize(temp_path) == 0:
@@ -257,9 +264,17 @@ class BigFilePipeline:
                 # media_cache.remember() below - it carries the storage key the
                 # reuse path needs, which this legacy write did not.
 
+            except asyncio.CancelledError:
+                with contextlib.suppress(OSError):
+                    if os.path.exists(temp_path):
+                        os.remove(temp_path)
+                return IngestResult(ok=False, error="batch cancelled")
             except Exception as e:
                 logger.exception("BigFilePipeline: Pyrogram download error: %s", e)
                 return IngestResult(ok=False, error=f"Download error: {e}")
+
+            if cancel_check and cancel_check():
+                return IngestResult(ok=False, error="batch cancelled")
 
             # Upload to S3 (the shared media key when caching is on)
             try:
@@ -371,6 +386,8 @@ class BigFilePipeline:
 
             # Enqueue the job first — enqueue_job creates the Redis hash
             # with its own mapping (status=queued, progress=0, ...).
+            if cancel_check and cancel_check():
+                return IngestResult(ok=False, error="batch cancelled")
             await enqueue_job(job)
 
             # Write source metadata to the same Redis hash in a single atomic
