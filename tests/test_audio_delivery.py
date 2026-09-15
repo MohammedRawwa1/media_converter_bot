@@ -70,6 +70,14 @@ class AudioDetectionTests(unittest.TestCase):
         current_file = {"name": "My Video.mp4", "_source_metadata": {"title": "My Song", "performer": "Some Artist"}}
         self.assertEqual(_metadata_caption(current_file, "✅ Audio extracted"), "My Song — Some Artist")
 
+    def test_metadata_caption_accepts_artists_alias(self):
+        current_file = {"name": "My Video.mp4", "_source_metadata": {"title": "My Song", "artists": "Some Artist"}}
+        self.assertEqual(_metadata_caption(current_file, "✅ Audio extracted"), "My Song — Some Artist")
+
+    def test_metadata_caption_accepts_author_alias(self):
+        current_file = {"name": "My Video.mp4", "_source_metadata": {"title": "My Song", "author": "Some Artist"}}
+        self.assertEqual(_metadata_caption(current_file, "✅ Audio extracted"), "My Song — Some Artist")
+
     def test_audio_extensions_are_detected(self):
         for name in ("a.mp3", "a.M4A", "a.flac", "a.opus", "a.ogg"):
             self.assertTrue(mod.is_audio_delivery_output(os.path.join(TMP, name)), msg=name)

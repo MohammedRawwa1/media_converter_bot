@@ -274,7 +274,7 @@ async def _probe_audio_metadata(path: str) -> dict:
             "-print_format",
             "json",
             "-show_entries",
-            "format=duration:format_tags=title,artist",
+            "format=duration:format_tags=title,artist,artists,album_artist,performer,author",
             path,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
@@ -297,7 +297,7 @@ async def _probe_audio_metadata(path: str) -> dict:
         lowered = str(key).lower()
         if lowered == "title" and value:
             meta["title"] = str(value)[:64]
-        elif lowered in ("artist", "album_artist", "performer") and value:
+        elif lowered in ("artist", "artists", "album_artist", "performer", "author") and value:
             meta.setdefault("performer", str(value)[:64])
     return meta
 

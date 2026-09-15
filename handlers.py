@@ -281,7 +281,7 @@ def _metadata_caption(current_file: dict | None, fallback: str | None = None) ->
         return ""
 
     title = _first("title", "source_title")
-    performer = _first("performer", "artist", "album_artist", "author")
+    performer = _first("performer", "artist", "artists", "album_artist", "author")
 
     if title and performer:
         return f"{title} — {performer}"
@@ -660,6 +660,7 @@ class EnhancedMediaHandler:
         job_id: str,
         poll_interval: float = 1.0,
         progress_msg=None,
+        bot=None,
     ):
         """Background task: poll Redis job hash for progress and update the progress message.
 
@@ -982,8 +983,25 @@ class EnhancedMediaHandler:
                     _queued_chat_id = info.get("queued_message_chat_id")
                     _queued_message_id = info.get("queued_message_id")
                     if _queued_chat_id and _queued_message_id:
-                        _queue_bot = getattr(query, "bot", None)
-                        if _queue_bot is not None:
+                        _queue_bot = bot
+                        _msg = getattr(query, "message", None)
+                        for _candidate in (
+                            _queue_bot,
+                            getattr(query, "bot", None),
+                            getattr(_msg, "bot", None),
+                            getattr(_msg, "_bot", None),
+                            getattr(_msg, "_client", None),
+                            getattr(getattr(_msg, "chat", None), "bot", None),
+                        ):
+                            if _candidate is not None:
+                                _queue_bot = _candidate
+                                break
+                        if _queue_bot is None:
+                            logger.debug(
+                                "handlers: no bot object available to delete queued pipeline notification for %s",
+                                job_id,
+                            )
+                        else:
                             with contextlib.suppress(Exception):
                                 await _queue_bot.delete_message(
                                     chat_id=int(_queued_chat_id),
@@ -2450,7 +2468,7 @@ class EnhancedMediaHandler:
                         if q is not None:
                             await self.safe_edit(q, f"✅ Fetched forwarded media and queued conversion (job {job_id}).")
                             with contextlib.suppress(RuntimeError):
-                                asyncio.create_task(self._watch_job_progress(q, job_id))
+                                asyncio.create_task(self._watch_job_progress(q, job_id, bot=context.bot))
                         else:
                             # fallback to replying in chat when no callback_query
                             if getattr(update, "message", None):
@@ -2718,7 +2736,7 @@ class EnhancedMediaHandler:
                         reply_markup=kb,
                     )
                     with contextlib.suppress(RuntimeError):
-                        asyncio.create_task(self._watch_job_progress(query, _pipeline_job_id))
+                        asyncio.create_task(self._watch_job_progress(query, _pipeline_job_id, bot=context.bot))
                     return
             except Exception as e:
                 await self.safe_edit(query, f"❌ Failed to download file: {e}")
@@ -2768,7 +2786,7 @@ class EnhancedMediaHandler:
                 query, f"✅ Job queued (ID: {job_id}). I'll send the file when ready.", reply_markup=kb
             )
             with contextlib.suppress(RuntimeError):
-                asyncio.create_task(self._watch_job_progress(query, job_id))
+                asyncio.create_task(self._watch_job_progress(query, job_id, bot=context.bot))
         except Exception:
             await self.safe_edit(query, f"✅ Job queued (ID: {job_id}). I'll send the file when ready.")
         return
@@ -4750,7 +4768,7 @@ class EnhancedMediaHandler:
                         reply_markup=kb,
                     )
                     with contextlib.suppress(RuntimeError):
-                        asyncio.create_task(self._watch_job_progress(query, _pipeline_job_id))
+                        asyncio.create_task(self._watch_job_progress(query, _pipeline_job_id, bot=context.bot))
                     return
             except Exception as e:
                 await self.safe_edit(query, f"❌ Failed to download file: {e}")
@@ -4794,7 +4812,7 @@ class EnhancedMediaHandler:
         kb = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data=f"cancel_job:{job_id}")]])
         await self.safe_edit(query, f"✅ Job queued (ID: {job_id}). I'll send the video when ready.", reply_markup=kb)
         with contextlib.suppress(RuntimeError):
-            asyncio.create_task(self._watch_job_progress(query, job_id))
+            asyncio.create_task(self._watch_job_progress(query, job_id, bot=context.bot))
 
     async def convert_to_mp3(
         self,
@@ -4948,7 +4966,7 @@ class EnhancedMediaHandler:
                     # Progress can only be watched when we own the callback message.
                     if query is not None:
                         with contextlib.suppress(RuntimeError):
-                            asyncio.create_task(self._watch_job_progress(query, _pipeline_job_id))
+                            asyncio.create_task(self._watch_job_progress(query, _pipeline_job_id, bot=context.bot))
                     return
             except Exception as e:
                 await notify(f"❌ Failed to download file: {e}")
@@ -5084,7 +5102,7 @@ class EnhancedMediaHandler:
                         reply_markup=kb,
                     )
                     with contextlib.suppress(RuntimeError):
-                        asyncio.create_task(self._watch_job_progress(query, _pipeline_job_id))
+                        asyncio.create_task(self._watch_job_progress(query, _pipeline_job_id, bot=context.bot))
                     return
             except Exception as e:
                 await self.safe_edit(query, f"❌ Failed to download file: {e}")
@@ -5385,7 +5403,7 @@ class EnhancedMediaHandler:
                         reply_markup=kb,
                     )
                     with contextlib.suppress(RuntimeError):
-                        asyncio.create_task(self._watch_job_progress(query, _pipeline_job_id))
+                        asyncio.create_task(self._watch_job_progress(query, _pipeline_job_id, bot=context.bot))
                     return
             except Exception as e:
                 await self.safe_edit(query, f"❌ Failed to download file: {e}")
@@ -5453,7 +5471,7 @@ class EnhancedMediaHandler:
                     query, f"✅ Optimization job queued (ID: {job_id}). I'll update you with progress.", reply_markup=kb
                 )
                 with contextlib.suppress(RuntimeError):
-                    asyncio.create_task(self._watch_job_progress(query, job_id))
+                    asyncio.create_task(self._watch_job_progress(query, job_id, bot=context.bot))
             except Exception:
                 await self.safe_edit(query, f"✅ Optimization job queued (ID: {job_id}).")
             return
@@ -5512,7 +5530,7 @@ class EnhancedMediaHandler:
                         reply_markup=kb,
                     )
                     with contextlib.suppress(RuntimeError):
-                        asyncio.create_task(self._watch_job_progress(query, _pipeline_job_id))
+                        asyncio.create_task(self._watch_job_progress(query, _pipeline_job_id, bot=context.bot))
                     return
             except Exception as e:
                 await self.safe_edit(query, f"❌ Failed to download file: {e}")
@@ -5553,7 +5571,7 @@ class EnhancedMediaHandler:
             await enqueue_job(job)
             await self.safe_edit(query, f"✅ Repair job queued (ID: {job_id}). I'll send the file when ready.")
             with contextlib.suppress(RuntimeError):
-                asyncio.create_task(self._watch_job_progress(query, job_id))
+                asyncio.create_task(self._watch_job_progress(query, job_id, bot=context.bot))
         except Exception:
             logger.exception("Failed to enqueue repair job")
             await self.safe_edit(query, "❌ Failed to queue repair job.")
@@ -5828,7 +5846,7 @@ class EnhancedMediaHandler:
                         reply_markup=kb,
                     )
                     with contextlib.suppress(RuntimeError):
-                        asyncio.create_task(self._watch_job_progress(query, _pipeline_job_id))
+                        asyncio.create_task(self._watch_job_progress(query, _pipeline_job_id, bot=context.bot))
                     return
             except Exception as e:
                 await self.safe_edit(query, f"❌ Failed to download file: {e}")
@@ -5879,7 +5897,7 @@ class EnhancedMediaHandler:
         kb = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data=f"cancel_job:{job_id}")]])
         await self.safe_edit(query, f"⏳ Job queued: {job_id} — extracting streams", reply_markup=kb)
         with contextlib.suppress(RuntimeError):
-            asyncio.create_task(self._watch_job_progress(query, job_id))
+            asyncio.create_task(self._watch_job_progress(query, job_id, bot=context.bot))
         return
 
     async def convert_audio_format(
@@ -5940,7 +5958,7 @@ class EnhancedMediaHandler:
                         reply_markup=kb,
                     )
                     with contextlib.suppress(RuntimeError):
-                        asyncio.create_task(self._watch_job_progress(query, _pipeline_job_id))
+                        asyncio.create_task(self._watch_job_progress(query, _pipeline_job_id, bot=context.bot))
                     return
             except Exception as e:
                 await self.safe_edit(query, f"❌ Failed to download file: {e}")
@@ -6290,7 +6308,7 @@ class EnhancedMediaHandler:
         kb = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data=f"cancel_job:{job_id}")]])
         await self.safe_edit(query, f"⏳ Job queued: {job_id} — creating archive", reply_markup=kb)
         with contextlib.suppress(RuntimeError):
-            asyncio.create_task(self._watch_job_progress(query, job_id))
+            asyncio.create_task(self._watch_job_progress(query, job_id, bot=context.bot))
 
     async def show_media_info(self, update: Update, context: ContextTypes.DEFAULT_TYPE, session: dict):
         """Show basic media information."""

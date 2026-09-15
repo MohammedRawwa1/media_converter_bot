@@ -218,6 +218,23 @@ async def probe_media(path: str) -> dict:
         result["sar"] = sar
         result["dar"] = dar
 
+        # Video stream tags can carry title/artist metadata for video files.
+        video_tags = vs.get("tags", {}) or {}
+        if not result.get("title"):
+            video_title = video_tags.get("title") or video_tags.get("TITLE") or video_tags.get("filename")
+            if video_title:
+                result["title"] = str(video_title)[:128]
+        if not result.get("performer"):
+            video_performer = (
+                video_tags.get("artist")
+                or video_tags.get("artists")
+                or video_tags.get("album_artist")
+                or video_tags.get("performer")
+                or video_tags.get("author")
+            )
+            if video_performer:
+                result["performer"] = str(video_performer)[:128]
+
         # Color metadata
         result["color_space"] = vs.get("color_space", "")
         result["color_primaries"] = vs.get("color_primaries", "")
@@ -260,6 +277,7 @@ async def probe_media(path: str) -> dict:
         if not result.get("performer"):
             performer = (
                 audio_tags.get("artist")
+                or audio_tags.get("artists")
                 or audio_tags.get("album_artist")
                 or audio_tags.get("performer")
                 or audio_tags.get("author")
@@ -282,7 +300,9 @@ async def probe_media(path: str) -> dict:
         lowered = str(tag_key).lower()
         if lowered in ("title", "filename") and tag_value and not result.get("title"):
             result["title"] = str(tag_value)[:128]
-        elif lowered in ("artist", "album_artist", "performer", "author") and tag_value and not result.get("performer"):
+        elif lowered in ("artist", "artists", "album_artist", "performer", "author") and tag_value and not result.get(
+            "performer"
+        ):
             result["performer"] = str(tag_value)[:128]
 
     logger.info(
