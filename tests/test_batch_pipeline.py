@@ -1236,71 +1236,99 @@ class BulkPipelineWatchTests(unittest.IsolatedAsyncioTestCase):
         with open(os.path.join(PROJECT_ROOT, "handlers.py"), encoding="utf-8") as fh:
             return fh.read()
 
-    def test_a_batch_file_gets_its_own_pipeline_progress_message(self):
+    def test_a_batch_files_stages_render_on_the_applys_message(self):
         src = self._src()
-        self.assertIn("if _batch_message is not None and not _pipeline_batch_id:", src)
-        self.assertIn("elif _batch_message is not None and _pipeline_batch_id:", src)
-        # The batch message is only ever replied to, never edited, for a batch.
-        branch = src.index("elif _batch_message is not None and _pipeline_batch_id:")
-        self.assertIn("await _batch_message.reply_text(_dl_text)", src[branch:])
+        # One message per batch: whoever knows the current stage edits the message
+        # the apply owns, always re-attaching the batch id and the Stop button.
+        self.assertIn("_pipeline_progress_msg = _batch_message", src)
+        self.assertIn("reply_markup=_batch_stop_markup(_pipeline_batch_id)", src)
+        self.assertIn("_batch_member_text(", src)
 
-    def test_the_progress_message_is_handed_to_the_job_by_id(self):
+    def test_a_batch_posts_no_per_file_message(self):
         src = self._src()
-        self.assertIn("_pipeline_batch_progress_msgs[_ingest.job_id] = _pipeline_progress_msg", src)
+        # The branch a menu press takes: a batch always arrives with the apply's
+        # message, and that branch may only edit it.
+        branch = src[src.index("if _batch_message is not None:") : src.index("elif update and update.message:")]
+        self.assertNotIn("reply_text", branch)
+        self.assertNotIn("send_message", branch)
+        self.assertIn("edit_text", branch)
+        # Nothing hands a per-file message to another watcher any more.
+        self.assertNotIn("_pipeline_batch_progress_msgs", src)
 
     def test_the_job_wait_is_outside_the_fetch_bound(self):
         src = self._src()
         bound = src.index("timeout=_BULK_FETCH_TIMEOUT_SECONDS")
-        wait = src.index("await self._await_bulk_pipeline_job(context, f)")
+        wait = src.index("await self._await_bulk_pipeline_job(")
         self.assertLess(bound, wait)
+
+    def test_the_stage_tracks_the_workers_own_vocabulary(self):
+        from handlers import _batch_member_stage
+
+        self.assertEqual(_batch_member_stage({"status": "queued", "message": "queued"}), ("⏳", "queued"))
+        self.assertEqual(
+            _batch_member_stage({"status": "processing", "message": "fetching source from storage (812 MB)"}),
+            ("⬇️", "Fetching source from storage"),
+        )
+        self.assertEqual(
+            _batch_member_stage({"status": "processing", "message": "encoding 42.0%", "progress": "42"}),
+            ("🎬", "Encoding — 42%"),
+        )
+        self.assertEqual(
+            _batch_member_stage({"status": "uploading", "message": "Uploading to Telegram: 10%", "progress": "10"}),
+            ("📤", "Sending to Telegram — 10%"),
+        )
+        self.assertEqual(_batch_member_stage({"status": "done"}), ("✅", "delivered"))
+        self.assertEqual(_batch_member_stage({"status": "error", "message": "boom"}), ("❌", "boom"))
+        self.assertEqual(
+            _batch_member_stage({"status": "waiting", "message": "waiting for batch lock"}),
+            ("⏳", "waiting for batch lock"),
+        )
+        # An unknown state is never mistaken for an ending.
+        self.assertEqual(_batch_member_stage(None), ("⏳", "queued"))
 
     def test_the_fetch_no_longer_waits_for_the_whole_conversion(self):
         src = self._src()
         fetch = src.index("async def _ensure_bulk_file_downloaded(")
-        wait_method = src.index("async def _await_bulk_pipeline_job(")
-        body = src[fetch:wait_method]
+        body = src[fetch : src.index("async def _watch_batch_member(")]
         self.assertNotIn("_await_job_finished(", body)
         self.assertIn('file_info["_bulk_pipeline_job_pending"] = pipeline_job_id', body)
 
-    def test_a_batch_pipeline_job_gets_the_live_watchdog(self):
+    def test_a_batch_member_gets_the_stage_watcher(self):
         src = self._src()
-        self.assertIn("_watch_msg = _pipeline_batch_progress_msgs.pop(job_id, None)", src)
-        self.assertIn("progress_msg=_watch_msg", src)
-        # The watchdog is given no query: the message it edits and deletes is the
-        # file's own, so the apply's batch message can never be taken down by it.
-        watchdog = src.index("async def _await_bulk_pipeline_job(")
-        self.assertIn("None,\n                        job_id,", src[watchdog:])
+        # The wait helper starts it, so every member the apply waits on is covered.
+        waiter = src.index("async def _await_member_job(")
+        body = src[waiter : src.index("async def _await_bulk_pipeline_job(")]
+        self.assertIn("self._watch_batch_member(", body)
+        self.assertIn("await self._await_job_finished(job_id)", body)
+        # The stage watcher never posts or deletes: the apply's message outlives it.
+        watch_body = src[src.index("async def _watch_batch_member(") : waiter]
+        self.assertNotIn("send_message", watch_body)
+        self.assertNotIn(".delete()", watch_body)
+        self.assertIn("_batch_stop_markup(batch_id)", watch_body)
 
-    async def _wait(self, file_info, status, *, message=None, watched=None):
-        import handlers as handlers_module
+    async def _wait(self, file_info, status, *, query=None, watched=None):
         from handlers import EnhancedMediaHandler
 
         calls = []
-        pending = file_info.get("_bulk_pipeline_job_pending")
-        if message is not None:
-            handlers_module._pipeline_batch_progress_msgs[pending] = message
 
         async def _finished(_self, job_id, **kwargs):
             calls.append(job_id)
             return status
 
-        async def _watch(_self, query, job_id, **kwargs):
+        async def _watch(_self, query, **kwargs):
             if watched is not None:
-                watched.append((query, job_id, kwargs.get("progress_msg")))
+                watched.append(kwargs)
 
         # An instance without __init__: the method only ever reads Redis through
         # `self`, and the class-level patches are what it must resolve.
         handler = object.__new__(EnhancedMediaHandler)
-        try:
-            with (
-                patch.object(EnhancedMediaHandler, "_await_job_finished", _finished),
-                patch.object(EnhancedMediaHandler, "_watch_job_progress", _watch),
-            ):
-                await handler._await_bulk_pipeline_job(object(), file_info)
-                # The watchdog is a task; give it the shortest yield there is.
-                await asyncio.sleep(0)
-        finally:
-            handlers_module._pipeline_batch_progress_msgs.clear()
+        with (
+            patch.object(EnhancedMediaHandler, "_await_job_finished", _finished),
+            patch.object(EnhancedMediaHandler, "_watch_batch_member", _watch),
+        ):
+            await handler._await_bulk_pipeline_job(file_info, query=query, index=1, total=9)
+            # The watcher is a task; give it the shortest yield there is.
+            await asyncio.sleep(0)
         return calls
 
     async def test_a_finished_pipeline_job_counts_as_completed(self):
@@ -1332,18 +1360,148 @@ class BulkPipelineWatchTests(unittest.IsolatedAsyncioTestCase):
         calls = await self._wait({}, "done")
         self.assertEqual(calls, [])
 
-    async def test_the_progress_message_is_consumed_by_the_watchdog(self):
-        import handlers as handlers_module
-
+    async def test_the_stage_watcher_is_bound_to_the_batch_message(self):
         watched = []
-        message = object()
-        info = {"_bulk_pipeline_job_pending": "job-1"}
-        await self._wait(info, "done", message=message, watched=watched)
+        info = {"_bulk_pipeline_job_pending": "job-1", "_pipeline_batch_id": "batch-a", "name": "clip.mp4"}
+        await self._wait(info, "done", query=object(), watched=watched)
 
-        self.assertEqual(watched, [(None, "job-1", message)])
-        # Consumed by id: a stale reference must not be left behind for the next
-        # file's watchdog to edit.
-        self.assertNotIn("job-1", handlers_module._pipeline_batch_progress_msgs)
+        self.assertEqual(
+            watched,
+            [{"batch_id": "batch-a", "job_id": "job-1", "index": 1, "total": 9, "name": "clip.mp4"}],
+        )
+
+    async def test_no_watcher_is_started_without_a_batch_message(self):
+        # A pipeline job somebody else owns (a single-file run, or a batch whose
+        # entries never produced a message) must not spawn a watcher with no
+        # message to render onto.
+        watched = []
+        info = {"_bulk_pipeline_job_pending": "job-1"}
+        await self._wait(info, "done", query=None, watched=watched)
+
+        self.assertEqual(watched, [])
+
+    async def test_the_stage_watcher_renders_each_stage_then_stops(self):
+        import handlers as handlers_module
+        from handlers import EnhancedMediaHandler
+        from utils import job_queue
+
+        edited = []
+
+        class _Query:
+            async def edit_message_text(self, text, **kwargs):
+                edited.append(text)
+                return None
+
+        class _Redis:
+            def __init__(self, rows):
+                self.rows = list(rows)
+
+            async def hgetall(self, key):
+                return self.rows.pop(0) if self.rows else {"status": "done"}
+
+            async def close(self):
+                return None
+
+        rows = [
+            {"status": "processing", "message": "encoding 42.0%", "progress": "42"},
+            {"status": "done", "message": "delivered", "progress": "100"},
+        ]
+
+        async def _get_redis():
+            return _Redis(rows)
+
+        handler = object.__new__(EnhancedMediaHandler)
+        with (
+            patch.object(job_queue, "get_redis", _get_redis),
+            patch.object(handlers_module, "_BATCH_MEMBER_POLL_SECONDS", 0),
+        ):
+            await handler._watch_batch_member(
+                _Query(), batch_id="batch-a", job_id="job-1", index=1, total=9, name="clip.mp4"
+            )
+
+        self.assertEqual(len(edited), 2)
+        self.assertIn("▶️ Batch `batch-a`", edited[0])
+        self.assertIn("File 1 of 9 — clip.mp4", edited[0])
+        self.assertIn("🎬 Encoding — 42%", edited[0])
+        self.assertIn("✅ delivered", edited[1])
+
+
+class SourceFetchTests(unittest.IsolatedAsyncioTestCase):
+    """A member fetching its source from storage must be legible and bounded.
+
+    The first thing a pipeline job does is pull its source out of storage, minutes
+    of transfer for a large video. That used to leave the job hash on the "queued"
+    that ``enqueue_job`` wrote (so an in-flight fetch looked exactly like a member
+    nobody had picked up - the watchdog sat on "queued / Progress: 0%") and had no
+    timeout at all, so a stalled transfer held the batch lock and the only
+    conversion slot for good and froze every later member of its batch.
+    """
+
+    def _src(self):
+        with open(os.path.join(PROJECT_ROOT, "workers", "ffmpeg_worker.py"), encoding="utf-8") as fh:
+            return fh.read()
+
+    def test_the_fetch_is_reported_and_bounded(self):
+        src = self._src()
+        self.assertIn('_set_job_state(job_id, "processing", _fetch_note', src)
+        self.assertIn("timeout=download_timeout", src)
+        # A timeout is a failed attempt, so the retries below it still apply.
+        self.assertIn("except TimeoutError:", src)
+
+    def test_the_reported_bound_grows_with_the_source(self):
+        from workers import ffmpeg_worker as worker
+
+        floor = worker.STORAGE_DOWNLOAD_TIMEOUT_SECONDS
+        self.assertEqual(worker._storage_download_timeout_seconds(0), floor)
+        self.assertEqual(worker._storage_download_timeout_seconds(None), floor)
+        self.assertEqual(worker._storage_download_timeout_seconds("nope"), floor)
+        self.assertEqual(worker._storage_download_timeout_seconds(-5), floor)
+        # A size that fits inside the floor keeps the floor; a bigger one gets more
+        # room, and never more than the cap.
+        self.assertEqual(worker._storage_download_timeout_seconds(2 * 1024**3), 8192)
+        cap = worker.STORAGE_DOWNLOAD_MAX_SECONDS
+        self.assertEqual(worker._storage_download_timeout_seconds(cap * 256 * 1024 * 4), cap)
+
+    async def test_every_terminal_failure_reaches_the_hash(self):
+        """The hash is what the bot polls; Mongo and the channel are not enough."""
+        from workers import ffmpeg_worker as worker
+
+        written = []
+
+        class _Redis:
+            async def hset(self, key, mapping=None, **kwargs):
+                written.append((key, dict(mapping or {})))
+                return 1
+
+            async def close(self):
+                return None
+
+        async def _get_redis():
+            return _Redis()
+
+        with patch.object(worker, "get_redis", _get_redis):
+            await worker._set_job_state("job-1", "error", "the source is missing from storage", progress=0)
+            await worker._set_job_state("", "error", "ignored")
+
+        self.assertEqual(
+            written,
+            [
+                (
+                    "ffmpeg:job:job-1",
+                    {"status": "error", "message": "the source is missing from storage", "progress": "0"},
+                )
+            ],
+        )
+
+    def test_the_give_up_paths_write_the_hash(self):
+        src = self._src()
+        # The two source-fetch failures and the two give-up paths inside
+        # handle_job's retry loop, plus the helper's own definition.
+        self.assertGreaterEqual(src.count("_set_job_state("), 5)
+        self.assertIn('_set_job_state(job_id, "error", "the source is missing from storage"', src)
+        self.assertIn('_set_job_state(job_id, "error", "could not fetch the source from storage"', src)
+        self.assertIn('"processing failed", progress=0, channel=progress_channel', src)
+        self.assertIn('str(info or "conversion failed"),', src)
 
 
 if __name__ == "__main__":

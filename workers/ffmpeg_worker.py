@@ -96,6 +96,43 @@ LAST_FORWARD_NOTIFICATION: dict | None = None
 # Keyed by output file path; values are (video_meta, thumb_path).
 _output_probe_cache: dict[str, tuple[dict | None, str | None]] = {}
 
+# How long one source download from storage may take before it is abandoned.
+#
+# A single fixed number cannot fit both a 20 MB clip and a 2 GB video, so the
+# bound grows with the size the job already records: at least
+# STORAGE_DOWNLOAD_TIMEOUT_SECONDS, or one second per
+# STORAGE_DOWNLOAD_MIN_BYTES_PER_SECOND bytes, capped at
+# STORAGE_DOWNLOAD_MAX_SECONDS. Bounded on purpose - this transfer had no bound
+# at all, so a stalled one held the batch lock and the only conversion slot for
+# good, freezing every later member of its batch with nothing reported anywhere.
+STORAGE_DOWNLOAD_TIMEOUT_SECONDS = float(os.environ.get("STORAGE_DOWNLOAD_TIMEOUT_SECONDS", "900"))
+STORAGE_DOWNLOAD_MIN_BYTES_PER_SECOND = float(
+    os.environ.get("STORAGE_DOWNLOAD_MIN_BYTES_PER_SECOND", str(256 * 1024))
+)
+STORAGE_DOWNLOAD_MAX_SECONDS = float(os.environ.get("STORAGE_DOWNLOAD_MAX_SECONDS", str(6 * 3600)))
+
+
+def _storage_download_timeout_seconds(size_bytes) -> float:
+    """The bound for one source download, derived from the size it should carry."""
+    try:
+        size = float(size_bytes or 0)
+    except (TypeError, ValueError):
+        size = 0.0
+    if size <= 0 or STORAGE_DOWNLOAD_MIN_BYTES_PER_SECOND <= 0:
+        return STORAGE_DOWNLOAD_TIMEOUT_SECONDS
+    return min(
+        STORAGE_DOWNLOAD_MAX_SECONDS,
+        max(STORAGE_DOWNLOAD_TIMEOUT_SECONDS, size / STORAGE_DOWNLOAD_MIN_BYTES_PER_SECOND),
+    )
+
+
+def _job_source_bytes(job: dict) -> int:
+    """The source size a job recorded, or 0 when it did not record one."""
+    try:
+        return max(0, int(job.get("file_size") or 0))
+    except (TypeError, ValueError):
+        return 0
+
 
 async def _check_upload_cancelled(job_id: str) -> bool:
     """Quick Redis check: return True if this job has been cancelled."""
@@ -139,6 +176,45 @@ async def _update_upload_progress(job_id: str, progress_channel: str, pct: int, 
                 await r.close()
     except Exception:
         logger.debug("ffmpeg worker: operation failed")
+
+
+async def _set_job_state(
+    job_id: str, status: str, message: str, *, progress: int | None = None, channel: str | None = None
+) -> None:
+    """Write a job's state where the bot's watchers actually read it: the hash.
+
+    ``_watch_job_progress`` in the bot and the bulk apply's wait both poll
+    ``ffmpeg:job:<id>`` in Redis. A state that is only published on the progress
+    channel, or only written to Mongo, is invisible to them - which is how a job
+    could end in failure while its watchdog kept showing the last non-terminal
+    text and its batch waited out the full ``BULK_JOB_WAIT_SECONDS`` budget for
+    work that was already over.
+    """
+    if not job_id:
+        return
+    mapping = {"status": str(status), "message": str(message)}
+    if progress is not None:
+        mapping["progress"] = str(progress)
+    try:
+        r = await get_redis()
+        try:
+            await r.hset(f"ffmpeg:job:{job_id}", mapping=mapping)
+        finally:
+            with contextlib.suppress(Exception):
+                await r.close()
+    except Exception:
+        logger.debug("ffmpeg worker: could not write the status of job %s", job_id)
+    if channel:
+        with contextlib.suppress(Exception):
+            await publish_update(
+                channel,
+                {
+                    "job_id": job_id,
+                    "progress": progress if progress is not None else 0,
+                    "status": str(status),
+                    "message": str(message),
+                },
+            )
 
 
 def _make_upload_progress_callback(job_id: str, progress_channel: str):
@@ -611,6 +687,8 @@ async def handle_job(job: dict):
                     )
                 with contextlib.suppress(Exception):
                     await job_store.update_job(job_id, {"status": "error", "error": "remote_key_missing_permanent"})
+                # Terminal state in the hash too: it is what every watcher reads.
+                await _set_job_state(job_id, "error", "the source is missing from storage", progress=0)
                 if r2 is not None:
                     try:
                         aclose = getattr(r2, "aclose", None)
@@ -622,18 +700,49 @@ async def handle_job(job: dict):
                         logger.debug("ffmpeg worker: operation failed")
                 return
 
+        # A source held in storage is the first thing this job does, and for a
+        # large video that is minutes of transfer before ffmpeg ever starts. Both
+        # facts are handled here because of how a stuck member presents itself:
+        # the job hash kept the "queued" that enqueue_job wrote until ffmpeg
+        # started, so a file fetching its source looked exactly like one nobody had
+        # picked up - the watchdog sat on "queued / Progress: 0%" - and the
+        # transfer had no bound, so a stalled one held the batch lock and the only
+        # conversion slot for good.
+        source_bytes = _job_source_bytes(job)
+        _fetch_note = (
+            f"fetching source from storage ({source_bytes // (1024 * 1024)} MB)"
+            if source_bytes
+            else "fetching source from storage"
+        )
+        await _set_job_state(job_id, "processing", _fetch_note, progress=0, channel=progress_channel)
+
         # retry/backoff for transient storage/download issues
         download_retries = int(os.environ.get("DOWNLOAD_RETRIES", "3"))
         backoff_base = float(os.environ.get("DOWNLOAD_BACKOFF_BASE", "1"))
+        download_timeout = _storage_download_timeout_seconds(source_bytes)
         download_success = False
         last_exc = None
         for attempt in range(1, download_retries + 1):
             try:
-                await backend.download_file(input_key, temp_input_path)
+                await asyncio.wait_for(
+                    backend.download_file(input_key, temp_input_path), timeout=download_timeout
+                )
                 # confirm file exists and has data
                 if os.path.exists(temp_input_path) and (os.path.getsize(temp_input_path) > 0):
                     download_success = True
                     break
+            except TimeoutError:
+                # ``asyncio.wait_for`` raises the builtin (the alias of
+                # ``asyncio.TimeoutError`` on 3.11+).
+                last_exc = TimeoutError(f"storage download exceeded {download_timeout:.0f}s")
+                logger.warning(
+                    "Source download for job %s timed out after %.0fs (%s); attempt %d/%d",
+                    job_id,
+                    download_timeout,
+                    input_key,
+                    attempt,
+                    download_retries,
+                )
             except Exception as e:
                 last_exc = e
             # backoff before next attempt
@@ -678,6 +787,11 @@ async def handle_job(job: dict):
                 )
             with contextlib.suppress(Exception):
                 await job_store.update_job(job_id, {"status": "error", "error": "remote_download_failed"})
+            # The watchers read the job hash; the publish above and Mongo are not
+            # enough. Without this the job stayed "processing" for the rest of its
+            # TTL, so its watchdog never showed the failure and a bulk apply waited
+            # out its whole job budget for a member that was already over.
+            await _set_job_state(job_id, "error", "could not fetch the source from storage", progress=0)
             return
     # (re)use any job-provided retry count
     retries = int(job.get("retries", 0))
@@ -2358,6 +2472,15 @@ async def handle_job(job: dict):
                             payload={"status": "error", "error": info, "attempt": attempt},
                             source="worker",
                         )
+                        # Terminal in the hash as well, or the bot's watchdog keeps
+                        # polling a job the worker has already given up on.
+                        await _set_job_state(
+                            job_id,
+                            "error",
+                            str(info or "conversion failed"),
+                            progress=0,
+                            channel=progress_channel,
+                        )
                         return
 
             except asyncio.CancelledError:
@@ -2387,6 +2510,10 @@ async def handle_job(job: dict):
                         job=job,
                         payload={"status": "error", "error": "processing_failed", "attempt": attempt},
                         source="worker",
+                    )
+                    # Same reason as above: the hash is what the bot reads.
+                    await _set_job_state(
+                        job_id, "error", "processing failed", progress=0, channel=progress_channel
                     )
                     return
             finally:

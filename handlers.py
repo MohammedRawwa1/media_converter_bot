@@ -108,16 +108,16 @@ logger = logging.getLogger(__name__)
 # Used by _try_userbot_download() progress callback and the cancel_dl: callback handler.
 _download_cancel_flags: dict[str, list] = {}
 
-# Per-file pipeline progress messages a *batch* apply owns, keyed by job id.
-#
-# The apply's own message is reserved: it carries the batch id and the Stop
-# button for the whole run, and the apply rewrites it with "Fetching file X of
-# Y". The pipeline used to edit that same message with its download progress and
-# then replace it with "Large file (N MB) queued for processing" - which is how
-# the batch id and the Stop button disappeared mid-download. A batch file's
-# pipeline progress therefore goes to its own message, registered here so the
-# job's watchdog can edit it live and delete it once the job is over.
-_pipeline_batch_progress_msgs: dict[str, object] = {}
+# How often the apply's message is refreshed with the stage of the file it is
+# currently working on. Above the single-file watcher's 2s floor (which exists to
+# stay clear of Telegram's edit rate) and coarse enough that a long conversion is
+# not a stream of edits.
+_BATCH_MEMBER_POLL_SECONDS = 3.0
+
+# Job statuses that mean the worker is done with a file, one way or another.
+# Anything else - including a status this build has never heard of - keeps the
+# stage watcher polling, so an unfamiliar state is never mistaken for an ending.
+_TERMINAL_JOB_STATUSES = frozenset({"done", "completed", "error", "failed", "cancelled", "canceled"})
 
 
 def _extract_large_file_source(current_file: dict | None) -> tuple[int | None, int | None]:
@@ -615,6 +615,70 @@ def _bulk_display_name(file_info: dict | None) -> str:
         keep = max(1, _BULK_NAME_MAX - len(ext) - 1)
         name = f"{stem[:keep]}…{ext}" if ext else f"{name[:_BULK_NAME_MAX - 1]}…"
     return name
+
+
+def _batch_stop_markup(batch_id):
+    """The one button a running apply needs, or None when there is no batch."""
+    if not batch_id:
+        return None
+    try:
+        return InlineKeyboardMarkup(
+            [[InlineKeyboardButton("⏹️ Stop batch", callback_data=f"batch_cancel:{batch_id}")]]
+        )
+    except Exception:
+        return None
+
+
+# A job status/message pair as the stage it represents in the chat. Keyed off the
+# worker's own vocabulary (see workers/ffmpeg_worker.py and run_ffmpeg) so the
+# apply never has to know which worker is running the file.
+def _batch_member_stage(info: dict | None) -> tuple[str, str]:
+    """``(emoji, stage)`` for one member, from its job hash."""
+    data = info or {}
+    status = str(data.get("status") or "queued").strip().lower()
+    message = str(data.get("message") or "").strip()
+    progress = str(data.get("progress") or "0").strip()
+    low = f"{status} {message}".lower()
+    if status in ("done", "completed"):
+        return "✅", "delivered"
+    if status in ("error", "failed"):
+        return "❌", message or "failed"
+    if status in ("cancelled", "canceled"):
+        return "⏹️", "stopped"
+    if "upload" in low or "sending" in low:
+        return "📤", f"Sending to Telegram — {progress}%"
+    if "encod" in low:
+        return "🎬", f"Encoding — {progress}%"
+    if "waiting" in low:
+        return "⏳", message or "waiting for the worker"
+    if "fetch" in low or "download" in low or "storag" in low:
+        if progress not in ("", "0", "0.0"):
+            return "⬇️", f"Fetching source from storage — {progress}%"
+        return "⬇️", "Fetching source from storage"
+    if status == "queued":
+        return "⏳", "queued"
+    return "🔄", message or status
+
+
+def _batch_member_text(batch_id, index, total, name, info: dict | None = None) -> str:
+    """The apply's whole message while one file is being fetched, coded and sent.
+
+    One apply shows one message. The pipeline's download progress, the worker's
+    queueing, its encode percentage and the delivery all render here, so a 29-file
+    batch adds no per-file messages to the chat: the result the worker delivers is
+    the only new message a member produces.
+    """
+    emoji, stage = _batch_member_stage(info)
+    head = f"▶️ Batch `{batch_id}`\n" if batch_id else ""
+    try:
+        label = f"File {int(index)} of {int(total)} — {name}" if index and total else str(name or "")
+    except (TypeError, ValueError):
+        label = str(name or "")
+    body = f"{label}\n{emoji} {stage}" if label else f"{emoji} {stage}"
+    return (
+        f"{head}{body}\n"
+        "Conversions run one file at a time — each result arrives as its job finishes."
+    )
 
 
 def _bulk_batch_lines(entries, limit: int = 12) -> list[str]:
@@ -1421,37 +1485,29 @@ class EnhancedMediaHandler:
                     await r.close()
 
     async def _bulk_show_fetch_progress(self, query, batch_id, index: int, total: int, file_info: dict) -> None:
-        """Say which file the apply is fetching, on the message the handler owns.
+        """Render one file's stage onto the message the handler owns.
 
-        The worker's bar only appears once a job is running, and getting a file
-        there means downloading it first - minutes for a 500 MB source. Without
-        this the only thing an operator can see while a batch is being fed is a
-        message that has not changed since they pressed Apply, which is
-        indistinguishable from a frozen batch.
+        This is the apply's only message for the whole batch: the fetch, the
+        queueing, the encode percentage and the delivery are all written here by
+        whoever knows them at the time (the apply, the pipeline's download
+        callback, the member stage watcher), always with the batch id and the Stop
+        button kept. The worker's batch bar carries the aggregate view.
         """
         if query is None:
             return
         try:
-            name = _bulk_display_name(file_info)
-            header = f"▶️ Batch started: `{batch_id}`\n" if batch_id else ""
-            markup = None
-            if batch_id:
-                markup = InlineKeyboardMarkup(
-                    [
-                        [
-                            InlineKeyboardButton(
-                                "⏹️ Stop batch",
-                                callback_data=f"batch_cancel:{batch_id}",
-                            )
-                        ]
-                    ]
-                )
+            # The same message every stage of this file renders onto, so the batch
+            # keeps one id, one Stop button and one shape from fetch to delivery.
             await self.safe_edit(
                 query,
-                f"{header}⬇️ Fetching file {index} of {total} — {name}\n"
-                "Conversions run one file at a time, so a large source can take a "
-                "while to download. Progress is in the message below.",
-                reply_markup=markup,
+                _batch_member_text(
+                    batch_id,
+                    index,
+                    total,
+                    _bulk_display_name(file_info),
+                    {"status": "fetching", "message": "fetching the source", "progress": 0},
+                ),
+                reply_markup=_batch_stop_markup(batch_id),
             )
         except Exception:
             logger.debug("bulk apply: could not show fetch progress")
@@ -1984,7 +2040,93 @@ class EnhancedMediaHandler:
                 session.pop("current_file", None)
         return file_info.get("path")
 
-    async def _await_bulk_pipeline_job(self, context, file_info: dict) -> None:
+    async def _watch_batch_member(
+        self, query, *, batch_id, job_id, index: int = 0, total: int = 0, name: str = ""
+    ) -> None:
+        """Show one member's stage on the apply's message, start to delivery.
+
+        The apply owns exactly one message per batch, so this renders onto that
+        message instead of posting a second one: the fetch, the queueing, the live
+        encode percentage and the delivery all appear in place, with the batch id
+        and the Stop button kept. Returns when the job reaches a terminal state - a
+        member that finished, failed or was stopped - and never touches anything
+        else, so the apply is free to rewrite the message once the wait is over.
+        """
+        if query is None or not job_id:
+            return
+        try:
+            from utils.job_queue import get_redis as _watch_redis
+
+            r = await _watch_redis()
+        except Exception:
+            return
+        last_text = None
+        try:
+            while True:
+                info: dict = {}
+                with contextlib.suppress(Exception):
+                    data = await r.hgetall(f"ffmpeg:job:{job_id}")
+                    info = {
+                        (k.decode() if isinstance(k, bytes) else k): (
+                            v.decode() if isinstance(v, bytes) else v
+                        )
+                        for k, v in (data or {}).items()
+                    }
+                text = _batch_member_text(batch_id, index, total, name, info)
+                if text != last_text:
+                    with contextlib.suppress(Exception):
+                        await self.safe_edit(query, text, reply_markup=_batch_stop_markup(batch_id))
+                    last_text = text
+                if str(info.get("status") or "").lower() in _TERMINAL_JOB_STATUSES:
+                    return
+                await asyncio.sleep(_BATCH_MEMBER_POLL_SECONDS)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.debug("bulk apply: member stage watcher stopped for %s", job_id)
+        finally:
+            with contextlib.suppress(Exception):
+                aclose = getattr(r, "aclose", None)
+                if aclose is not None:
+                    await aclose()
+                else:
+                    await r.close()
+
+    async def _await_member_job(
+        self, query, job_id: str, *, batch_id=None, index: int = 0, total: int = 0, name: str = ""
+    ) -> str | None:
+        """Wait for one member's job while the apply's message shows its stage.
+
+        Returns the terminal status, or ``None`` when the wait gave up - the same
+        contract as :meth:`_await_job_finished`, which this wraps. Every member the
+        apply waits on goes through here (a pipeline job and a job the apply
+        queued itself alike), so the batch's one message tracks all of them the
+        same way instead of freezing on the last text the apply wrote.
+        """
+        member_task = None
+        if query is not None and batch_id:
+            try:
+                member_task = asyncio.create_task(
+                    self._watch_batch_member(
+                        query, batch_id=batch_id, job_id=job_id, index=index, total=total, name=name
+                    )
+                )
+            except Exception:
+                logger.debug("bulk apply: could not start the stage watcher for %s", job_id)
+        try:
+            return await self._await_job_finished(job_id)
+        finally:
+            # The watcher stops itself on a terminal state; this only bounds how
+            # long the apply waits for its last line before moving on.
+            if member_task is not None:
+                try:
+                    await asyncio.wait_for(member_task, timeout=_BATCH_MEMBER_POLL_SECONDS + 5)
+                except (TimeoutError, asyncio.CancelledError):
+                    member_task.cancel()
+                    with contextlib.suppress(Exception):
+                        await member_task
+
+    async def _await_bulk_pipeline_job(self, file_info: dict, *, query=None, index: int = 0, total: int = 0) -> None:
         """Wait out a pipeline job a bulk fetch just queued - and watch it live.
 
         The fetch that queued this job is bounded by
@@ -1995,32 +2137,23 @@ class EnhancedMediaHandler:
         anyway. Here the wait is bounded only by :data:`_BULK_JOB_WAIT_SECONDS`,
         the same budget the jobs the apply enqueues itself get.
 
-        The job also gets the watchdog every single-file pipeline run gets
-        (:meth:`_watch_job_progress`): the live encode percentage and the delivery
-        announcement, edited on the file's own message - never on the batch
-        message, which belongs to the apply. Nothing watched these jobs before, so
-        a batch file went from "queued" to delivered with no progress in between.
+        While it waits, :meth:`_watch_batch_member` keeps the apply's own message
+        showing which stage the file is in. Nothing watched these jobs before, so a
+        batch file went from "queued" to delivered with nothing in between.
         """
         job_id = (file_info or {}).get("_bulk_pipeline_job_pending")
         if not job_id:
             return
         file_info.pop("_bulk_pipeline_job_pending", None)
 
-        _watch_msg = _pipeline_batch_progress_msgs.pop(job_id, None)
-        if _watch_msg is not None:
-            try:
-                asyncio.create_task(
-                    self._watch_job_progress(
-                        None,
-                        job_id,
-                        progress_msg=_watch_msg,
-                        bot=getattr(context, "bot", None),
-                    )
-                )
-            except Exception:
-                logger.debug("bulk apply: could not start the watchdog for pipeline job %s", job_id)
-
-        _pipeline_status = await self._await_job_finished(job_id)
+        _pipeline_status = await self._await_member_job(
+            query,
+            job_id,
+            batch_id=file_info.get("_pipeline_batch_id"),
+            index=index,
+            total=total,
+            name=file_info.get("name") or "",
+        )
         if _pipeline_status == "done":
             file_info["_bulk_pipeline_completed"] = True
         elif _pipeline_status == "cancelled":
@@ -2389,37 +2522,33 @@ class EnhancedMediaHandler:
                     _pipeline_loop = None
                     try:
                         _dl_text = f"⬇️ Downloading via pipeline ({file_size // (1024 * 1024)} MB)..."
-                        # `query` was never bound in this scope, so this block raised
-                        # NameError and was swallowed by the except below - which is
-                        # why the pipeline's download message never appeared. The
-                        # caller (a menu press) owns the message we should edit.
+                        # The caller (a menu press) owns the message progress belongs
+                        # on. `query` is read from the update rather than the closure,
+                        # because this path is reached from several handlers.
                         _pipeline_batch_id = current_file.get("_pipeline_batch_id")
                         if _pipeline_batch_id:
-                            _dl_text = f"▶️ Batch `{_pipeline_batch_id}`\n{_dl_text}"
+                            # In a batch the apply's message is the only message
+                            # about this file, so the pipeline edits that one - with
+                            # the batch id and the Stop button kept, and the fetch
+                            # line naming the file. (Editing it *without* those used
+                            # to be how the batch id and the button vanished behind
+                            # "Large file (N MB) queued for processing".)
+                            _dl_text = _batch_member_text(
+                                _pipeline_batch_id,
+                                current_file.get("_pipeline_file_index"),
+                                current_file.get("_pipeline_file_total"),
+                                current_file.get("name"),
+                                {"status": "downloading", "message": "downloading from storage", "progress": 0},
+                            )
                         query = getattr(update, "callback_query", None)
                         _batch_message = getattr(query, "message", None) if query else None
-                        if _batch_message is not None and not _pipeline_batch_id:
-                            # A single-file run owns the callback message, so its
-                            # pipeline progress belongs on it.
+                        if _batch_message is not None:
+                            # ``reply_markup=None`` leaves the existing keyboard in
+                            # place, so a batch's Stop button survives every edit.
                             _pipeline_progress_msg = _batch_message
-                            await _pipeline_progress_msg.edit_text(_dl_text)
-                        elif _batch_message is not None and _pipeline_batch_id:
-                            # A batch's message belongs to the apply for the whole
-                            # run: it carries the batch id and the Stop button, and
-                            # the apply keeps rewriting it with "Fetching file X of
-                            # Y". Editing that same message here is what replaced
-                            # both with "Large file (N MB) queued for processing",
-                            # so a batch file gets its own message - posted under the
-                            # batch's - which the job's watchdog edits live and
-                            # deletes once the job is over.
-                            with contextlib.suppress(Exception):
-                                _pipeline_progress_msg = await _batch_message.reply_text(_dl_text)
-                            if _pipeline_progress_msg is None and context and context.bot:
-                                with contextlib.suppress(Exception):
-                                    _pipeline_progress_msg = await context.bot.send_message(
-                                        chat_id=_batch_message.chat_id,
-                                        text=_dl_text,
-                                    )
+                            await _pipeline_progress_msg.edit_text(
+                                _dl_text, reply_markup=_batch_stop_markup(_pipeline_batch_id)
+                            )
                         elif update and update.message:
                             _pipeline_progress_msg = await update.message.reply_text(_dl_text)
                         elif update and update.effective_user and context and context.bot:
@@ -2475,10 +2604,22 @@ class EnhancedMediaHandler:
                             mb_sent = sent // (1024 * 1024)
                             mb_total = total // (1024 * 1024)
                             batch_label = current_file.get("_pipeline_batch_id")
-                            prefix = f"▶️ Batch `{batch_label}`\n" if batch_label else ""
-                            text = f"{prefix}⬇️ Pipeline download: {pct}% ({mb_sent}MB / {mb_total}MB)"
+                            if batch_label:
+                                # Same single message, same shape as every other
+                                # stage of this file - only the state changes.
+                                text = _batch_member_text(
+                                    batch_label,
+                                    current_file.get("_pipeline_file_index"),
+                                    current_file.get("_pipeline_file_total"),
+                                    current_file.get("name"),
+                                    {"status": "downloading", "message": "downloading", "progress": pct},
+                                )
+                            else:
+                                text = f"⬇️ Pipeline download: {pct}% ({mb_sent}MB / {mb_total}MB)"
                             asyncio.run_coroutine_threadsafe(
-                                _pipeline_progress_msg.edit_text(text),
+                                _pipeline_progress_msg.edit_text(
+                                    text, reply_markup=_batch_stop_markup(batch_label)
+                                ),
                                 _pipeline_loop,
                             )
                         except Exception:
@@ -2543,15 +2684,6 @@ class EnhancedMediaHandler:
                                 except Exception:
                                     logger.debug("Could not persist pipeline job flag")
 
-                            # A batch file's own progress message is handed to the
-                            # job's watchdog, which the apply starts once the fetch
-                            # is over: it edits this message live and deletes it when
-                            # the job ends. The batch message is left alone.
-                            if _pipeline_progress_msg is not None and (current_file or {}).get(
-                                "_pipeline_batch_id"
-                            ):
-                                _pipeline_batch_progress_msgs[_ingest.job_id] = _pipeline_progress_msg
-
                             # ── Set Redis dedup flag so the pipeline won't re-run
                             #    even if the session is lost or reloaded. ──
                             if _dedup_key:
@@ -2578,7 +2710,24 @@ class EnhancedMediaHandler:
                                 f"Job: {_ingest.job_id[:8]}... You will receive the result shortly."
                             )
                             _queued_message = None
-                            if _pipeline_progress_msg:
+                            if _pipeline_batch_id:
+                                # The apply's message already names this file and now
+                                # says it is queued, so a batch posts nothing else -
+                                # which also means there is no per-file message left
+                                # for a later watcher to delete out from under it.
+                                if _pipeline_progress_msg:
+                                    with contextlib.suppress(BadRequest):
+                                        await _pipeline_progress_msg.edit_text(
+                                            _batch_member_text(
+                                                _pipeline_batch_id,
+                                                current_file.get("_pipeline_file_index"),
+                                                current_file.get("_pipeline_file_total"),
+                                                current_file.get("name"),
+                                                {"status": "queued", "message": "queued", "progress": 0},
+                                            ),
+                                            reply_markup=_batch_stop_markup(_pipeline_batch_id),
+                                        )
+                            elif _pipeline_progress_msg:
                                 with contextlib.suppress(BadRequest):
                                     await _pipeline_progress_msg.edit_text(_notify_text)
                                 _queued_message = _pipeline_progress_msg
@@ -5586,7 +5735,14 @@ class EnhancedMediaHandler:
                                     # loop could finish (and the batch be closed out)
                                     # while the slideshow was still converting, and
                                     # the batch's counts could never line up.
-                                    if await self._await_job_finished(job_id) == "done":
+                                    if await self._await_member_job(
+                                        query,
+                                        job_id,
+                                        batch_id=_batch_id,
+                                        index=_batch_seq,
+                                        total=_batch_total,
+                                        name=_label,
+                                    ) == "done":
                                         # The photos became this one video, so every
                                         # photo that went into it is done - otherwise a
                                         # resume would rebuild the slideshow.
@@ -5668,6 +5824,11 @@ class EnhancedMediaHandler:
                                 f["_pipeline_batch_id"] = _batch_id
                                 f["_pipeline_batch_seq"] = _batch_seq
                                 f["_pipeline_batch_total"] = _batch_total
+                                # What the apply's message shows while this file is
+                                # fetched, queued, encoded and sent: the same one
+                                # message for the whole batch.
+                                f["_pipeline_file_index"] = _idx + 1
+                                f["_pipeline_file_total"] = len(_bulk_files)
                                 # Bounded on purpose: every step inside has its own
                                 # timeout, but this is what guarantees the loop
                                 # advances even if one of them is added later
@@ -5715,7 +5876,9 @@ class EnhancedMediaHandler:
                             # after the fetch bound, which must never cut a live
                             # conversion short - with its own watchdog showing the
                             # encode instead of a silent poll.
-                            await self._await_bulk_pipeline_job(context, f)
+                            await self._await_bulk_pipeline_job(
+                                f, query=query, index=_idx + 1, total=len(_bulk_files)
+                            )
 
                             # A file the batch stopped before touching reports no
                             # path and no storage key - identical to a real fetch
@@ -5834,8 +5997,17 @@ class EnhancedMediaHandler:
                                     # Keep bulk ingestion serial: do not download the next
                                     # source until this job has reached a terminal state,
                                     # so 30 large sources never pile up on disk or in RAM.
-                                    # Message-free on purpose - see _await_job_finished.
-                                    _job_status = await self._await_job_finished(job_id)
+                                    # The batch's own message shows this member's stage
+                                    # while we wait - the wait itself never writes code
+                                    # into the chat (see _await_job_finished).
+                                    _job_status = await self._await_member_job(
+                                        query,
+                                        job_id,
+                                        batch_id=_batch_id,
+                                        index=_idx + 1,
+                                        total=len(_bulk_files),
+                                        name=_bulk_name,
+                                    )
                                     if _job_status is None:
                                         stalled = True
                                         results.append(
