@@ -273,6 +273,9 @@ async def enqueue_job(job: dict) -> None:
                 "created_at": str(time.time()),
                 "request_id": job.get("request_id") or "",
             }
+            for _batch_field in ("batch_id", "batch_seq", "batch_total"):
+                if job.get(_batch_field) not in (None, ""):
+                    mapping[_batch_field] = str(job[_batch_field])
             output_value = job.get("output_path") or job.get("output") or ""
             if output_value:
                 mapping["output"] = output_value

@@ -2527,6 +2527,11 @@ async def _claim_execution_slot(job: dict):
                 job[batch_pipeline.CEILING_DEFER_FIELD] = defers + 1
                 batch_pipeline.reclaim_memory("memory ceiling")
                 deferred = await batch_pipeline.defer_batch_job(r, job)
+                with contextlib.suppress(Exception):
+                    await r.hset(
+                        f"ffmpeg:job:{job.get('job_id')}",
+                        mapping={"status": "waiting", "progress": "0", "message": "waiting for memory cleanup"},
+                    )
                 logger.warning(
                     "Memory ceiling reached (RSS %.1fMB >= %.1fMB): deferring job %s (%s)",
                     batch_pipeline.rss_bytes() / 1024 / 1024,
@@ -2546,6 +2551,11 @@ async def _claim_execution_slot(job: dict):
         slot = await batch_pipeline.acquire_ffmpeg_slot(r, job.get("job_id"))
         if slot is None:
             deferred = await batch_pipeline.defer_batch_job(r, job)
+            with contextlib.suppress(Exception):
+                await r.hset(
+                    f"ffmpeg:job:{job.get('job_id')}",
+                    mapping={"status": "waiting", "progress": "0", "message": "waiting for another conversion"},
+                )
             logger.info(
                 "ffmpeg slot busy: deferred job %s%s",
                 job.get("job_id"),
@@ -2560,6 +2570,11 @@ async def _claim_execution_slot(job: dict):
             # or a single busy batch would freeze every other conversion.
             await batch_pipeline.release_ffmpeg_slot(r, slot, job.get("job_id"))
             deferred = await batch_pipeline.defer_batch_job(r, job)
+            with contextlib.suppress(Exception):
+                await r.hset(
+                    f"ffmpeg:job:{job.get('job_id')}",
+                    mapping={"status": "waiting", "progress": "0", "message": "waiting for batch lock"},
+                )
             logger.info(
                 "Batch %s busy: deferred job %s%s",
                 batch_id,

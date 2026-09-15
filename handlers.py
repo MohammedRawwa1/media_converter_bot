@@ -986,6 +986,7 @@ class EnhancedMediaHandler:
                     status = info.get("status")
                     progress = info.get("progress")
                     message = info.get("message") or ""
+                    batch_id = info.get("batch_id")
 
                     # Phase-aware emoji prefix based on the message content
                     _emoji = "🔄"
@@ -1000,7 +1001,8 @@ class EnhancedMediaHandler:
                         _emoji = "❌"
                     elif "cancel" in _msg_lower or _msg_lower == "cancelled":
                         _emoji = "⏹️"
-                    text = f"{_emoji} Job {job_id} — {status or 'processing'}\nProgress: {progress or '0'}%\n{message}"
+                    batch_line = f"\nBatch: `{batch_id}` (use /cancelbatch to stop)" if batch_id else ""
+                    text = f"{_emoji} Job {job_id} — {status or 'processing'}\nProgress: {progress or '0'}%\n{message}{batch_line}"
                     # Build an inline keyboard with Cancel and an optional Progress (web) link
                     status_url = None
                     try:
@@ -4918,6 +4920,13 @@ class EnhancedMediaHandler:
                                 f"▶️ Batch started: `{_batch_id}`\n"
                                 f"Use `/cancelbatch {_batch_id}` to stop the remaining files.",
                             )
+                        # Publish the expected count before the first job is
+                        # queued. The worker can then render batch progress
+                        # immediately, even while this handler waits for job 1.
+                        with contextlib.suppress(Exception):
+                            from utils.batch_pipeline import set_batch_total
+
+                            await set_batch_total(batch_id=_batch_id, total=len(files))
 
                     # Photos in the batch become ONE slideshow video instead of a
                     # per-photo still-image encode. A lone photo keeps the normal
