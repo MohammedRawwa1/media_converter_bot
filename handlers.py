@@ -108,6 +108,17 @@ logger = logging.getLogger(__name__)
 # Used by _try_userbot_download() progress callback and the cancel_dl: callback handler.
 _download_cancel_flags: dict[str, list] = {}
 
+# Per-file pipeline progress messages a *batch* apply owns, keyed by job id.
+#
+# The apply's own message is reserved: it carries the batch id and the Stop
+# button for the whole run, and the apply rewrites it with "Fetching file X of
+# Y". The pipeline used to edit that same message with its download progress and
+# then replace it with "Large file (N MB) queued for processing" - which is how
+# the batch id and the Stop button disappeared mid-download. A batch file's
+# pipeline progress therefore goes to its own message, registered here so the
+# job's watchdog can edit it live and delete it once the job is over.
+_pipeline_batch_progress_msgs: dict[str, object] = {}
+
 
 def _extract_large_file_source(current_file: dict | None) -> tuple[int | None, int | None]:
     """Return (chat_id, message_id) for the source message used by the big-file pipeline.
@@ -183,7 +194,9 @@ _BULK_JOB_WAIT_SECONDS = float(os.environ.get("BULK_JOB_WAIT_SECONDS", str(6 * 3
 # this is abandoned, reported per-file, and the batch carries on instead of
 # sitting on file 7 of 30 forever with the remaining files never queued. It is
 # deliberately longer than the download timeout, so a slow-but-working download
-# is never cut short by it.
+# is never cut short by it. It bounds the *fetch* only: the conversion job a
+# pipeline fetch queues is waited out by _await_bulk_pipeline_job, outside this
+# bound, under _BULK_JOB_WAIT_SECONDS like every other job the apply queues.
 _BULK_FETCH_TIMEOUT_SECONDS = float(os.environ.get("BULK_FETCH_TIMEOUT_SECONDS", str(45 * 60)))
 
 
@@ -1958,34 +1971,75 @@ class EnhancedMediaHandler:
             await self._ensure_current_file_downloaded(update, context, session)
             pipeline_job_id = file_info.get("_pipeline_job_id")
             if pipeline_job_id and pipeline_job_id != pipeline_job_before:
-                # Wait for the download/convert pipeline to finish without taking
-                # over the user's message: the batch bar belongs to the worker.
-                _pipeline_status = await self._await_job_finished(pipeline_job_id)
-                if _pipeline_status == "done":
-                    file_info["_bulk_pipeline_completed"] = True
-                elif _pipeline_status == "cancelled":
-                    # Stopped, not finished. Reporting it as completed would count
-                    # a cancelled file as done and keep the batch running.
-                    file_info["_batch_cancelled"] = True
-                elif _pipeline_status is None:
-                    # The job still exists and will deliver, so the file stays
-                    # marked completed - enqueuing a second job for it would be
-                    # worse than waiting on the one already queued.
-                    logger.warning(
-                        "bulk apply: gave up waiting for pipeline job %s; its result arrives on its own",
-                        pipeline_job_id,
-                    )
-                    file_info["_bulk_pipeline_completed"] = True
-                else:
-                    # Errored for real: say so, and never enqueue a second job for
-                    # a file the pipeline already tried and failed to convert.
-                    file_info["_pipeline_failed"] = True
+                # Queued, not waited on here. The wait is not a fetch, so it must
+                # not run under the caller's fetch timeout: it used to, and that
+                # bound (45 min) cut a live conversion off mid-encode and reported
+                # a file the worker was still converting as "could not fetch".
+                # :meth:`_await_bulk_pipeline_job` owns the wait instead.
+                file_info["_bulk_pipeline_job_pending"] = pipeline_job_id
         finally:
             if had_current:
                 session["current_file"] = previous
             else:
                 session.pop("current_file", None)
         return file_info.get("path")
+
+    async def _await_bulk_pipeline_job(self, context, file_info: dict) -> None:
+        """Wait out a pipeline job a bulk fetch just queued - and watch it live.
+
+        The fetch that queued this job is bounded by
+        :data:`_BULK_FETCH_TIMEOUT_SECONDS`; the job it queued is not a fetch. The
+        wait used to live inside that bound, so a conversion that legitimately ran
+        longer than 45 minutes was abandoned mid-encode - the apply reported the
+        file as unfetchable and moved on while the worker finished it and delivered
+        anyway. Here the wait is bounded only by :data:`_BULK_JOB_WAIT_SECONDS`,
+        the same budget the jobs the apply enqueues itself get.
+
+        The job also gets the watchdog every single-file pipeline run gets
+        (:meth:`_watch_job_progress`): the live encode percentage and the delivery
+        announcement, edited on the file's own message - never on the batch
+        message, which belongs to the apply. Nothing watched these jobs before, so
+        a batch file went from "queued" to delivered with no progress in between.
+        """
+        job_id = (file_info or {}).get("_bulk_pipeline_job_pending")
+        if not job_id:
+            return
+        file_info.pop("_bulk_pipeline_job_pending", None)
+
+        _watch_msg = _pipeline_batch_progress_msgs.pop(job_id, None)
+        if _watch_msg is not None:
+            try:
+                asyncio.create_task(
+                    self._watch_job_progress(
+                        None,
+                        job_id,
+                        progress_msg=_watch_msg,
+                        bot=getattr(context, "bot", None),
+                    )
+                )
+            except Exception:
+                logger.debug("bulk apply: could not start the watchdog for pipeline job %s", job_id)
+
+        _pipeline_status = await self._await_job_finished(job_id)
+        if _pipeline_status == "done":
+            file_info["_bulk_pipeline_completed"] = True
+        elif _pipeline_status == "cancelled":
+            # Stopped, not finished. Reporting it as completed would count a
+            # cancelled file as done and keep the batch running.
+            file_info["_batch_cancelled"] = True
+        elif _pipeline_status is None:
+            # The job still exists and will deliver, so the file stays marked
+            # completed - enqueuing a second job for it would be worse than
+            # waiting on the one already queued.
+            logger.warning(
+                "bulk apply: gave up waiting for pipeline job %s; its result arrives on its own",
+                job_id,
+            )
+            file_info["_bulk_pipeline_completed"] = True
+        else:
+            # Errored for real: say so, and never enqueue a second job for a file
+            # the pipeline already tried and failed to convert.
+            file_info["_pipeline_failed"] = True
 
     async def _ensure_current_file_downloaded(self, update: Update, context: ContextTypes.DEFAULT_TYPE, session: dict):
         """Ensure the session's current_file is downloaded locally. Raises Exception on failure."""
@@ -2344,9 +2398,28 @@ class EnhancedMediaHandler:
                             _dl_text = f"▶️ Batch `{_pipeline_batch_id}`\n{_dl_text}"
                         query = getattr(update, "callback_query", None)
                         _batch_message = getattr(query, "message", None) if query else None
-                        if _batch_message is not None:
+                        if _batch_message is not None and not _pipeline_batch_id:
+                            # A single-file run owns the callback message, so its
+                            # pipeline progress belongs on it.
                             _pipeline_progress_msg = _batch_message
                             await _pipeline_progress_msg.edit_text(_dl_text)
+                        elif _batch_message is not None and _pipeline_batch_id:
+                            # A batch's message belongs to the apply for the whole
+                            # run: it carries the batch id and the Stop button, and
+                            # the apply keeps rewriting it with "Fetching file X of
+                            # Y". Editing that same message here is what replaced
+                            # both with "Large file (N MB) queued for processing",
+                            # so a batch file gets its own message - posted under the
+                            # batch's - which the job's watchdog edits live and
+                            # deletes once the job is over.
+                            with contextlib.suppress(Exception):
+                                _pipeline_progress_msg = await _batch_message.reply_text(_dl_text)
+                            if _pipeline_progress_msg is None and context and context.bot:
+                                with contextlib.suppress(Exception):
+                                    _pipeline_progress_msg = await context.bot.send_message(
+                                        chat_id=_batch_message.chat_id,
+                                        text=_dl_text,
+                                    )
                         elif update and update.message:
                             _pipeline_progress_msg = await update.message.reply_text(_dl_text)
                         elif update and update.effective_user and context and context.bot:
@@ -2470,6 +2543,15 @@ class EnhancedMediaHandler:
                                 except Exception:
                                     logger.debug("Could not persist pipeline job flag")
 
+                            # A batch file's own progress message is handed to the
+                            # job's watchdog, which the apply starts once the fetch
+                            # is over: it edits this message live and deletes it when
+                            # the job ends. The batch message is left alone.
+                            if _pipeline_progress_msg is not None and (current_file or {}).get(
+                                "_pipeline_batch_id"
+                            ):
+                                _pipeline_batch_progress_msgs[_ingest.job_id] = _pipeline_progress_msg
+
                             # ── Set Redis dedup flag so the pipeline won't re-run
                             #    even if the session is lost or reloaded. ──
                             if _dedup_key:
@@ -2543,7 +2625,13 @@ class EnhancedMediaHandler:
                             #    caller (convert_video_format, optimize_video, etc.) will
                             #    start its own watcher on the callback message after detecting
                             #    _pipeline_job_id. Starting a second watcher would create
-                            #    duplicate progress messages and make it look like two jobs. ──
+                            #    duplicate progress messages and make it look like two jobs.
+                            #
+                            #    A *batch* caller does start one, but from
+                            #    _await_bulk_pipeline_job and bound to the file's own
+                            #    message instead of the apply's - because while nothing
+                            #    watched those jobs, a batch file showed nothing at all
+                            #    between download and delivery. ──
                             return
                         else:
                             logger.warning(
@@ -5621,6 +5709,13 @@ class EnhancedMediaHandler:
                                     )
                                 )
                                 continue
+
+                            # A pipeline job this file just queued is what fetches,
+                            # converts and delivers it, so it is waited out here -
+                            # after the fetch bound, which must never cut a live
+                            # conversion short - with its own watchdog showing the
+                            # encode instead of a silent poll.
+                            await self._await_bulk_pipeline_job(context, f)
 
                             # A file the batch stopped before touching reports no
                             # path and no storage key - identical to a real fetch

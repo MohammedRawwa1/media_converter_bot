@@ -1,5 +1,6 @@
 """Sequential, memory-safe bulk batches: tagging, the per-batch lock, cleanup."""
 
+import asyncio
 import contextlib
 import json
 import os
@@ -1218,6 +1219,131 @@ class UserbotRelayCleanupTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(
             await _discard_relay_copy(self._Client(fail=True), "pyrogram", -100123, 42)
         )
+
+
+class BulkPipelineWatchTests(unittest.IsolatedAsyncioTestCase):
+    """A batch file's pipeline job is waited out properly *and* watched live.
+
+    Two separate faults are pinned here. The pipeline used to edit the apply's own
+    message with its download progress and then replace it with "Large file (N MB)
+    queued for processing", which is how the batch id and the Stop button vanished
+    mid-batch. And the job the fetch queued was waited for *inside* the fetch
+    bound, with no watchdog at all, so a conversion longer than that bound was
+    abandoned mid-encode and reported as unfetchable while the worker carried on.
+    """
+
+    def _src(self):
+        with open(os.path.join(PROJECT_ROOT, "handlers.py"), encoding="utf-8") as fh:
+            return fh.read()
+
+    def test_a_batch_file_gets_its_own_pipeline_progress_message(self):
+        src = self._src()
+        self.assertIn("if _batch_message is not None and not _pipeline_batch_id:", src)
+        self.assertIn("elif _batch_message is not None and _pipeline_batch_id:", src)
+        # The batch message is only ever replied to, never edited, for a batch.
+        branch = src.index("elif _batch_message is not None and _pipeline_batch_id:")
+        self.assertIn("await _batch_message.reply_text(_dl_text)", src[branch:])
+
+    def test_the_progress_message_is_handed_to_the_job_by_id(self):
+        src = self._src()
+        self.assertIn("_pipeline_batch_progress_msgs[_ingest.job_id] = _pipeline_progress_msg", src)
+
+    def test_the_job_wait_is_outside_the_fetch_bound(self):
+        src = self._src()
+        bound = src.index("timeout=_BULK_FETCH_TIMEOUT_SECONDS")
+        wait = src.index("await self._await_bulk_pipeline_job(context, f)")
+        self.assertLess(bound, wait)
+
+    def test_the_fetch_no_longer_waits_for_the_whole_conversion(self):
+        src = self._src()
+        fetch = src.index("async def _ensure_bulk_file_downloaded(")
+        wait_method = src.index("async def _await_bulk_pipeline_job(")
+        body = src[fetch:wait_method]
+        self.assertNotIn("_await_job_finished(", body)
+        self.assertIn('file_info["_bulk_pipeline_job_pending"] = pipeline_job_id', body)
+
+    def test_a_batch_pipeline_job_gets_the_live_watchdog(self):
+        src = self._src()
+        self.assertIn("_watch_msg = _pipeline_batch_progress_msgs.pop(job_id, None)", src)
+        self.assertIn("progress_msg=_watch_msg", src)
+        # The watchdog is given no query: the message it edits and deletes is the
+        # file's own, so the apply's batch message can never be taken down by it.
+        watchdog = src.index("async def _await_bulk_pipeline_job(")
+        self.assertIn("None,\n                        job_id,", src[watchdog:])
+
+    async def _wait(self, file_info, status, *, message=None, watched=None):
+        import handlers as handlers_module
+        from handlers import EnhancedMediaHandler
+
+        calls = []
+        pending = file_info.get("_bulk_pipeline_job_pending")
+        if message is not None:
+            handlers_module._pipeline_batch_progress_msgs[pending] = message
+
+        async def _finished(_self, job_id, **kwargs):
+            calls.append(job_id)
+            return status
+
+        async def _watch(_self, query, job_id, **kwargs):
+            if watched is not None:
+                watched.append((query, job_id, kwargs.get("progress_msg")))
+
+        # An instance without __init__: the method only ever reads Redis through
+        # `self`, and the class-level patches are what it must resolve.
+        handler = object.__new__(EnhancedMediaHandler)
+        try:
+            with (
+                patch.object(EnhancedMediaHandler, "_await_job_finished", _finished),
+                patch.object(EnhancedMediaHandler, "_watch_job_progress", _watch),
+            ):
+                await handler._await_bulk_pipeline_job(object(), file_info)
+                # The watchdog is a task; give it the shortest yield there is.
+                await asyncio.sleep(0)
+        finally:
+            handlers_module._pipeline_batch_progress_msgs.clear()
+        return calls
+
+    async def test_a_finished_pipeline_job_counts_as_completed(self):
+        info = {"_bulk_pipeline_job_pending": "job-1"}
+        calls = await self._wait(info, "done")
+        self.assertTrue(info["_bulk_pipeline_completed"])
+        self.assertNotIn("_bulk_pipeline_job_pending", info)
+        self.assertEqual(calls, ["job-1"])
+
+    async def test_a_stopped_pipeline_job_stops_the_batch(self):
+        info = {"_bulk_pipeline_job_pending": "job-1"}
+        await self._wait(info, "cancelled")
+        self.assertTrue(info["_batch_cancelled"])
+        self.assertFalse(info.get("_bulk_pipeline_completed"))
+
+    async def test_an_errored_pipeline_job_is_never_enqueued_twice(self):
+        info = {"_bulk_pipeline_job_pending": "job-1"}
+        await self._wait(info, "error")
+        self.assertTrue(info["_pipeline_failed"])
+
+    async def test_a_wait_that_gave_up_still_counts_as_completed(self):
+        # The job still exists and will deliver; queueing a second one for the
+        # same file would be worse than waiting on the one already queued.
+        info = {"_bulk_pipeline_job_pending": "job-1"}
+        await self._wait(info, None)
+        self.assertTrue(info["_bulk_pipeline_completed"])
+
+    async def test_a_file_with_no_pipeline_job_is_left_alone(self):
+        calls = await self._wait({}, "done")
+        self.assertEqual(calls, [])
+
+    async def test_the_progress_message_is_consumed_by_the_watchdog(self):
+        import handlers as handlers_module
+
+        watched = []
+        message = object()
+        info = {"_bulk_pipeline_job_pending": "job-1"}
+        await self._wait(info, "done", message=message, watched=watched)
+
+        self.assertEqual(watched, [(None, "job-1", message)])
+        # Consumed by id: a stale reference must not be left behind for the next
+        # file's watchdog to edit.
+        self.assertNotIn("job-1", handlers_module._pipeline_batch_progress_msgs)
 
 
 if __name__ == "__main__":

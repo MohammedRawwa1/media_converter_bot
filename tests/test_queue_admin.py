@@ -73,6 +73,9 @@ class FakeRedis:
     async def get(self, key):
         return self.strings.get(key)
 
+    async def exists(self, *keys):
+        return sum(1 for key in keys if key in self.strings or key in self.sets or key in self.hashes)
+
     async def ping(self):
         return True
 
@@ -326,6 +329,30 @@ def test_cancel_all_without_a_bot_still_clears_the_batch_state(fake_redis):
     assert report.batch_messages == 0
     assert batch_pipeline.batch_total_key("batch-a") not in r.strings
     assert "Batch keys removed" in "\n".join(report.as_lines())
+
+
+def test_a_second_cancel_all_does_not_reclear_the_batches_it_took_down(fake_redis):
+    """Running /cancelall twice must not keep reporting the same dead batches.
+
+    The sweep leaves every batch it takes down a tombstone on purpose - a worker
+    still finishing one of its members must not put the bar back - and that
+    tombstone sits under the same prefix the sweep scans for batch ids. Treating
+    it as a batch again re-purged a batch that had nothing left *and* rewrote the
+    tombstone, pushing its TTL out another 30 days: the same handful of long-dead
+    batches showed up as "Batches cleared: 2" on every later run, while
+    ``scripts/cleanup_stale_redis.py`` (which deletes the tombstone) cleared them
+    for good.
+    """
+    r = fake_redis
+    _seed_batch(r, "batch-a")
+    _seed_batch(r, "batch-b")
+
+    first = asyncio.run(cancel_all_jobs())
+    second = asyncio.run(cancel_all_jobs())
+
+    assert first.batches == 2
+    assert second.batches == 0
+    assert second.batch_keys == 0
 
 
 def test_cancel_all_flags_the_running_member_before_it_sweeps_the_batch(fake_redis):

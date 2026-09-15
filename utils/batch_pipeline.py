@@ -743,12 +743,36 @@ async def _known_batch_ids(redis) -> set[str]:
                 ids.add(batch_id)
     except Exception:
         logger.debug("batch_pipeline: could not scan for batch keys")
+    listed: set[str] = set()
     with contextlib.suppress(Exception):
         for member in await redis.smembers(ACTIVE_BATCHES_KEY):
             value = member.decode() if isinstance(member, (bytes, bytearray)) else str(member)
             if value:
                 ids.add(value)
+                listed.add(value)
+    # A batch whose only remaining key is its tombstone is one an earlier sweep
+    # already took down - its state, its counters and its message location are all
+    # gone, so purging it again would remove nothing. It must not be swept a
+    # second time either, because purging *rewrites* the tombstone: every later
+    # sweep pushed that tombstone's TTL out another 30 days, so the same handful
+    # of long-dead batches came back as "Batches cleared: N" on every single
+    # /cancelall run for good, and only ``scripts/cleanup_stale_redis.py`` (which
+    # deletes the tombstone itself) ever made the count drop. A batch still listed
+    # in the aggregate view keeps its place - that membership is state to remove.
+    for batch_id in sorted(ids - listed):
+        if not await _batch_state_survives(redis, batch_id):
+            ids.discard(batch_id)
     return ids
+
+
+async def _batch_state_survives(redis, batch_id) -> bool:
+    """Whether any key a batch owns is still there. Its tombstone does not count."""
+    try:
+        return bool(await redis.exists(*batch_state_keys(batch_id)))
+    except Exception:
+        # Unreadable: sweep it. Purging a batch twice is harmless, leaving a live
+        # one behind is not.
+        return True
 
 
 async def _batch_is_live(redis, batch_id, cancelled_job_ids=None) -> bool:

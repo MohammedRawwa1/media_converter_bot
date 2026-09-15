@@ -63,6 +63,9 @@ class FakeRedis:
     async def hget(self, key, field):
         return self.hashes.get(key, {}).get(field)
 
+    async def exists(self, *keys):
+        return sum(1 for key in keys if key in self.strings or key in self.sets or key in self.hashes)
+
     def scan_iter(self, match="*", count=None):
         prefix = match[:-1] if match and match.endswith("*") else match
         keys = sorted(set(self.strings) | set(self.sets) | set(self.hashes))
@@ -229,6 +232,55 @@ def test_sweep_keeps_a_batch_whose_membership_cannot_be_read(monkeypatch):
 
     assert asyncio.run(batch_pipeline.purge_stale_batches(r))["batches"] == []
     assert batch_pipeline.batch_total_key("batch-a") in r.strings
+
+
+def test_sweep_does_not_clear_the_same_dead_batch_twice(monkeypatch):
+    """The tombstone left behind by a sweep must stop the batch coming back.
+
+    Purging rewrites the tombstone with a fresh TTL, so re-sweeping a batch that
+    a previous sweep had already taken down kept it alive for another 30 days:
+    the same long-dead batches came back as "Batches cleared: N" on every later
+    ``/cancelall``, while ``scripts/cleanup_stale_redis.py`` - which deletes the
+    tombstone - cleared them for good.
+    """
+    r = FakeRedis()
+    # Everything an earlier sweep removed is gone; only its tombstone is left.
+    r.strings[batch_pipeline.batch_cancel_key("batch-a")] = "cancelled by admin"
+    _use(monkeypatch, r)
+
+    summary = asyncio.run(batch_pipeline.purge_stale_batches(r))
+
+    assert summary["batches"] == []
+    # Untouched, so its TTL keeps running down instead of being pushed out again.
+    assert r.strings[batch_pipeline.batch_cancel_key("batch-a")] == "cancelled by admin"
+
+
+def test_sweep_still_clears_a_stopped_batch_that_has_state_left(monkeypatch):
+    # /cancelbatch tombstones a batch while its counters and bar are still there,
+    # so a tombstone alone must not exempt a batch that still owns state.
+    r = FakeRedis()
+    _seed_batch(r, "batch-a", members=["j1"], statuses={"j1": FINISHED})
+    r.strings[batch_pipeline.batch_cancel_key("batch-a")] = "7"
+    _use(monkeypatch, r)
+
+    summary = asyncio.run(batch_pipeline.purge_stale_batches(r))
+
+    assert summary["batches"] == ["batch-a"]
+    assert batch_pipeline.batch_total_key("batch-a") not in r.strings
+
+
+def test_sweep_still_clears_a_batch_listed_in_the_aggregate_view(monkeypatch):
+    # Its counters expired but the active set still lists it, and that
+    # membership is itself state to remove.
+    r = FakeRedis()
+    r.sets[batch_pipeline.ACTIVE_BATCHES_KEY] = {"batch-a"}
+    r.strings[batch_pipeline.batch_cancel_key("batch-a")] = "cancelled by admin"
+    _use(monkeypatch, r)
+
+    summary = asyncio.run(batch_pipeline.purge_stale_batches(r))
+
+    assert summary["batches"] == ["batch-a"]
+    assert r.sets[batch_pipeline.ACTIVE_BATCHES_KEY] == set()
 
 
 def test_sweep_never_treats_its_own_bookkeeping_as_a_batch(monkeypatch):
