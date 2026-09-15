@@ -1986,6 +1986,10 @@ async def handle_job(job: dict):
                                         "status": _final_status,
                                         "progress": "100",
                                         "message": _final_msg,
+                                        # The user has the file. A broker redelivery
+                                        # after this point must not convert and send
+                                        # it a second time (see _job_already_delivered).
+                                        "delivered": "1" if sent else "0",
                                     },
                                 )
                                 await publish_update(
@@ -2594,15 +2598,70 @@ async def _claim_execution_slot(job: dict):
 BATCH_PROGRESS_INTERVAL = float(os.environ.get("BATCH_PROGRESS_INTERVAL", "3.0"))
 
 
-def _batch_progress_text(done: int, total: int, *, name: str = "", pct=None) -> str:
-    """The batch's one message: how far the batch is, plus the file in flight."""
+def _batch_view_rows(batches) -> list[str]:
+    """One row per running batch, least-finished first, for the aggregate view.
+
+    This is the whole of "show every batch on one bar": a render over the
+    counters that already exist. Nothing schedules, aggregates or caches it.
+    """
+    rows = []
+    for row in batches or []:
+        try:
+            done, total = int(row.get("done", 0)), int(row.get("total", 0))
+        except (TypeError, ValueError):
+            continue
+        if total <= 0:
+            continue
+        rows.append(
+            f"{batch_pipeline.progress_bar(done, total)} {done}/{total}"
+            f"  #{str(row.get('batch_id', ''))[:8]}"
+        )
+        if len(rows) >= batch_pipeline.BATCH_VIEW_MAX_ROWS:
+            break
+    return rows
+
+
+def _batch_progress_text(done: int, total: int, *, name: str = "", pct=None, batches=None) -> str:
+    """The batch's one message: how far this batch is, plus every other batch.
+
+    ``batches`` is the aggregate view of every batch still running, so a user
+    with several applies in flight reads them from one message instead of
+    juggling one message per batch.
+    """
     text = f"📊 Processing one at a time — {done} of {total} finished"
     if name:
         if pct is None:
             text += f"\n✅ {name}"
         else:
             text += f"\n🔄 {name} — {int(pct)}%"
+    rows = _batch_view_rows(batches)
+    if len(rows) > 1:
+        text += "\n\n🗂 Batches\n" + "\n".join(rows)
     return text
+
+
+def _batch_cancel_keyboard(batch_id):
+    """The one button a batch needs: stop the rest without typing an id.
+
+    The ``batch_id`` travels in the callback data, so the user never has to read
+    it off the message or copy it into ``/cancelbatch``.
+    """
+    try:
+        from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+
+        return InlineKeyboardMarkup(
+            [[InlineKeyboardButton("⏹️ Stop batch", callback_data=f"batch_cancel:{batch_id}")]]
+        )
+    except Exception:
+        return None
+
+
+async def _read_batch_view(r) -> list[dict]:
+    """The aggregate view's input, or an empty list if it cannot be read."""
+    try:
+        return await batch_pipeline.read_active_batches(r)
+    except Exception:
+        return []
 
 
 async def _batch_state(r, batch_id, job) -> dict:
@@ -2618,11 +2677,12 @@ async def _batch_state(r, batch_id, job) -> dict:
         recorded = await r.get(batch_pipeline.batch_total_key(batch_id))
         if recorded is not None:
             total = int(recorded)
-    state = {"total": total, "done": 0, "stored": None}
+    state = {"total": total, "done": 0, "stored": None, "batches": []}
     with contextlib.suppress(Exception):
         state["done"] = int(await r.get(batch_pipeline.batch_progress_key(batch_id)) or 0)
     with contextlib.suppress(Exception):
         state["stored"] = await r.get(batch_pipeline.batch_message_key(batch_id))
+    state["batches"] = await _read_batch_view(r)
     return state
 
 
@@ -2636,10 +2696,13 @@ async def _set_batch_message(bot, r, batch_id, chat_id, stored, text):
     """
     from telegram.error import BadRequest, RetryAfter
 
+    keyboard = _batch_cancel_keyboard(batch_id)
     parsed = _parse_batch_message_ref(stored) if stored else None
     if parsed is not None:
         try:
-            await bot.edit_message_text(chat_id=parsed[0], message_id=parsed[1], text=text)
+            await bot.edit_message_text(
+                chat_id=parsed[0], message_id=parsed[1], text=text, reply_markup=keyboard
+            )
             return stored
         except RetryAfter as exc:
             with contextlib.suppress(Exception):
@@ -2652,13 +2715,21 @@ async def _set_batch_message(bot, r, batch_id, chat_id, stored, text):
             logger.debug("ffmpeg worker: could not edit batch message for %s", batch_id)
             return stored
 
-    sent = await bot.send_message(chat_id=chat_id, text=text)
+    # A batch's message is removed on purpose once the batch is over: the bot
+    # deletes it after waiting for every job it queued, and a stop deletes it
+    # immediately. A report that lands just after that must not post a fresh bar
+    # that nothing will ever take down - so check before creating one.
+    if await batch_pipeline.is_batch_cancelled(r, batch_id):
+        logger.debug("ffmpeg worker: batch %s is over; not reposting its message", batch_id)
+        return stored
+
+    sent = await bot.send_message(chat_id=chat_id, text=text, reply_markup=keyboard)
     ref = f"{chat_id}:{getattr(sent, 'message_id', '')}"
     with contextlib.suppress(Exception):
         await r.set(
             batch_pipeline.batch_message_key(batch_id),
             ref,
-            ex=int(batch_pipeline.BATCH_LOCK_TTL_SECONDS),
+            ex=int(batch_pipeline.BATCH_STATE_TTL_SECONDS),
         )
     return ref
 
@@ -2696,7 +2767,9 @@ async def _batch_live_progress(job: dict) -> None:
                         raw = await r.hget(f"ffmpeg:job:{job_id}", "progress")
                         if raw is not None:
                             pct = float(raw)
-                    text = _batch_progress_text(state["done"], state["total"], name=name, pct=pct)
+                    text = _batch_progress_text(
+                        state["done"], state["total"], name=name, pct=pct, batches=state["batches"]
+                    )
                     if text != last_text:
                         state["stored"] = await _set_batch_message(
                             bot, r, batch_id, chat_id, state["stored"], text
@@ -2735,9 +2808,18 @@ async def _report_batch_progress(job: dict) -> None:
     except Exception:
         return
     try:
-        done = int(await r.incr(done_key))
-        with contextlib.suppress(Exception):
-            await r.expire(done_key, int(batch_pipeline.BATCH_LOCK_TTL_SECONDS))
+        # Count each job exactly once. A retried delivery runs this block again,
+        # and a plain INCR would then count one file twice - finishing the batch
+        # early and removing its bar while files were still queued.
+        if await batch_pipeline.claim_batch_progress_slot(r, batch_id, job.get("job_id")):
+            done = int(await r.incr(done_key))
+            with contextlib.suppress(Exception):
+                await r.expire(done_key, int(batch_pipeline.BATCH_STATE_TTL_SECONDS))
+        else:
+            logger.debug(
+                "ffmpeg worker: job %s already counted toward batch %s", job.get("job_id"), batch_id
+            )
+            done = int(await r.get(done_key) or 0)
         state = await _batch_state(r, batch_id, job)
         total = state["total"]
 
@@ -2749,7 +2831,11 @@ async def _report_batch_progress(job: dict) -> None:
             # Last file (or a replayed counter): the batch is over, so the
             # message has served its purpose and comes down.
             if done >= total:
+                # Only ever deletes here, never posts: a finished batch must not
+                # leave a fresh message behind if the bot already closed it out.
                 await _delete_batch_message(bot, r, msg_key, state["stored"])
+                with contextlib.suppress(Exception):
+                    await batch_pipeline.unregister_active_batch(r, batch_id=batch_id)
                 return
             name = str(job.get("original_filename") or "").strip()
             await _set_batch_message(
@@ -2758,7 +2844,7 @@ async def _report_batch_progress(job: dict) -> None:
                 batch_id,
                 chat_id,
                 state["stored"],
-                _batch_progress_text(done, total, name=name),
+                _batch_progress_text(done, total, name=name, batches=state["batches"]),
             )
     except Exception:
         logger.debug("ffmpeg worker: batch progress update failed for %s", batch_id)
@@ -2769,12 +2855,7 @@ async def _report_batch_progress(job: dict) -> None:
 
 def _parse_batch_message_ref(stored) -> tuple[int, int] | None:
     """Decode the ``chat_id:message_id`` a batch progress message is stored as."""
-    try:
-        text = stored.decode() if isinstance(stored, (bytes, bytearray)) else str(stored)
-        chat, _, message = text.partition(":")
-        return int(chat), int(message)
-    except (TypeError, ValueError):
-        return None
+    return batch_pipeline.parse_batch_message_ref(stored)
 
 
 async def _delete_batch_message(bot, redis, msg_key: str, stored) -> None:
@@ -2785,6 +2866,60 @@ async def _delete_batch_message(bot, redis, msg_key: str, stored) -> None:
             await bot.delete_message(chat_id=parsed[0], message_id=parsed[1])
     with contextlib.suppress(Exception):
         await redis.delete(msg_key)
+
+
+async def _keep_claims_alive(job: dict, slot) -> None:
+    """Re-arm the TTL on this job's conversion slot and batch lock while it runs.
+
+    The TTLs are deliberately short so a worker that dies releases its claims in
+    minutes instead of hours (that short TTL is what stops a redeploy from
+    freezing a batch at 0%). This heartbeat is the other half of that bargain:
+    it is what keeps a legitimately long conversion's slot and batch lock alive
+    for as long as the job actually runs.
+    """
+    job_id = job.get("job_id")
+    batch_id = batch_pipeline.job_batch_id(job)
+    try:
+        r = await get_redis()
+    except Exception:
+        return
+    try:
+        while True:
+            await asyncio.sleep(batch_pipeline.CLAIM_HEARTBEAT_SECONDS)
+            with contextlib.suppress(Exception):
+                await batch_pipeline.refresh_ffmpeg_slot(r, slot, job_id)
+            if batch_id:
+                with contextlib.suppress(Exception):
+                    await batch_pipeline.refresh_batch_lock(r, batch_id, job_id)
+    except asyncio.CancelledError:
+        raise
+    finally:
+        with contextlib.suppress(Exception):
+            await r.close()
+
+
+async def _job_already_delivered(job: dict) -> bool:
+    """Whether a previous attempt at this job already delivered its result.
+
+    The broker redelivers a job whose handler raised. If the failure came *after*
+    the output reached the user - a failed confirmation message, a Redis hiccup
+    while recording the result - then re-running the job would download the source
+    again, convert it again and send a second copy. The delivery is recorded on
+    the job hash, and this is what turns that duplicate into a no-op.
+    """
+    job_id = job.get("job_id")
+    if not job_id:
+        return False
+    try:
+        r = await get_redis()
+    except Exception:
+        return False
+    try:
+        raw = await r.hget(f"ffmpeg:job:{job_id}", "delivered")
+    except Exception:
+        return False
+    value = raw.decode() if isinstance(raw, (bytes, bytearray)) else raw
+    return value in ("1", 1, "true")
 
 
 async def _run_queued_job(job: dict, source: str) -> None:
@@ -2799,6 +2934,15 @@ async def _run_queued_job(job: dict, source: str) -> None:
     cleanup before the worker picks up anything else.
     """
     global _jobs_in_flight
+    # A redelivery of work that is already done is not work. Checked before the
+    # conversion slot is taken, so a duplicate attempt costs nothing at all.
+    if await _job_already_delivered(job):
+        logger.warning(
+            "Job %s was already delivered; skipping the duplicate attempt (via %s)",
+            job.get("job_id"),
+            source,
+        )
+        return
     slot = await _claim_execution_slot(job)
     if slot is None:
         return
@@ -2815,6 +2959,12 @@ async def _run_queued_job(job: dict, source: str) -> None:
     if batch_pipeline.job_batch_id(job):
         with contextlib.suppress(Exception):
             batch_progress_task = asyncio.create_task(_batch_live_progress(job))
+    # Keep the slot (and the batch lock) this job holds from expiring under it.
+    # Started for every job, batch or not: a single 900 MB conversion can run far
+    # longer than BATCH_LOCK_TTL_SECONDS.
+    claims_task = None
+    with contextlib.suppress(Exception):
+        claims_task = asyncio.create_task(_keep_claims_alive(job, slot))
     try:
         await handle_job(job)
     finally:
@@ -2825,6 +2975,12 @@ async def _run_queued_job(job: dict, source: str) -> None:
             batch_progress_task.cancel()
             with contextlib.suppress(Exception):
                 await batch_progress_task
+        # Stop the heartbeat before the claims are released, so a refresh can
+        # never land after finalize_job handed the slot back.
+        if claims_task is not None:
+            claims_task.cancel()
+            with contextlib.suppress(Exception):
+                await claims_task
         # How far into its batch this file got, for the user's progress message.
         with contextlib.suppress(Exception):
             await _report_batch_progress(job)

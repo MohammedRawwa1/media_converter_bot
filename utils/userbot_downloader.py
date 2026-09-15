@@ -675,6 +675,27 @@ async def _recycle_client_session(client) -> bool:
         return False
 
 
+async def _discard_relay_copy(client, client_type: str | None, relay_chat_id, relay_msg_id) -> bool:
+    """Delete a relay copy the fallback forwarded but could not download.
+
+    The forward exists only so this userbot session can reach the media. Once the
+    download has failed the copy has no further use, and a failed 700 MB video
+    left in a shared relay chat is pure clutter. Best-effort: never raises.
+    """
+    if not relay_chat_id or not relay_msg_id:
+        return False
+    try:
+        if client_type == "telethon":
+            await client.delete_messages(relay_chat_id, [relay_msg_id])
+        else:
+            await client.delete_messages(chat_id=relay_chat_id, message_ids=[relay_msg_id])
+        logger.info("userbot: removed the relay copy at %s/%s", relay_chat_id, relay_msg_id)
+        return True
+    except Exception:
+        logger.debug("userbot: could not remove the relay copy at %s/%s", relay_chat_id, relay_msg_id)
+        return False
+
+
 async def _try_relay_fallback(
     client,
     chat_id: int | str,
@@ -701,6 +722,8 @@ async def _try_relay_fallback(
     except (TypeError, ValueError):
         relay_chat_id = str(relay_chat_id)
 
+    # Bound before the try so the failure paths below can clean up the forward.
+    relay_msg_id = None
     try:
         logger.info(
             "userbot: relay fallback trying %s/%s -> relay %s",
@@ -757,8 +780,10 @@ async def _try_relay_fallback(
             relay_chat_id,
             relay_msg_id,
         )
+        await _discard_relay_copy(client, client_type, relay_chat_id, relay_msg_id)
     except Exception as exc:
         logger.warning("userbot: relay fallback failed for %s/%s: %s", chat_id, message_id, exc)
+        await _discard_relay_copy(client, client_type, relay_chat_id, relay_msg_id)
     return False
 
 

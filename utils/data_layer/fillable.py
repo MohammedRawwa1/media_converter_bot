@@ -163,10 +163,21 @@ class FillableModel:
     def sanitize_update_operators(cls, update: dict[str, Any]) -> dict[str, Any]:
         """Ensure update dict only uses safe MongoDB operators.
 
-        Only allows $set, $inc, $push, $pull, $unset.  Prohibits
-        $where, $expr, $accumulator, $function to prevent injection.
+        Only allows $set, $inc, $push, $pull, $unset, $addToSet, $each,
+        $position and $setOnInsert.  Prohibits $where, $expr, $accumulator,
+        $function to prevent injection.
         """
-        allowed_ops = {"$set", "$inc", "$push", "$pull", "$unset", "$addToSet", "$each", "$position"}
+        allowed_ops = {
+            "$set",
+            "$inc",
+            "$push",
+            "$pull",
+            "$unset",
+            "$addToSet",
+            "$each",
+            "$position",
+            "$setOnInsert",
+        }
         for op in update:
             if op.startswith("$") and op not in allowed_ops:
                 raise ValidationError(f"Update operator '{op}' is not allowed")

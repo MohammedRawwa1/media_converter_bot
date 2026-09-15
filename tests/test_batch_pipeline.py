@@ -6,6 +6,7 @@ import os
 import tempfile
 import time
 import unittest
+import uuid
 from unittest.mock import patch
 
 from utils import batch_pipeline
@@ -272,7 +273,31 @@ class _ProgressRedis:
 
     def __init__(self, initial=None):
         self.store = {key: str(value) for key, value in (initial or {}).items()}
+        self.sets = {}
         self.closed = 0
+
+    async def sadd(self, key, *members):
+        # Faithful to Redis: returns only the count of *newly* added members, which
+        # is what makes the batch progress count exactly-once per job.
+        bucket = self.sets.setdefault(key, set())
+        added = 0
+        for member in members:
+            if str(member) not in bucket:
+                bucket.add(str(member))
+                added += 1
+        return added
+
+    async def srem(self, key, *members):
+        bucket = self.sets.get(key, set())
+        removed = 0
+        for member in members:
+            if str(member) in bucket:
+                bucket.discard(str(member))
+                removed += 1
+        return removed
+
+    async def smembers(self, key):
+        return set(self.sets.get(key, set()))
 
     async def incr(self, key):
         self.store[key] = int(self.store.get(key, 0)) + 1
@@ -327,8 +352,15 @@ class BatchProgressMessageTests(unittest.IsolatedAsyncioTestCase):
     """A batch shows one message, edited in place and taken down when it ends."""
 
     def _job(self, total=3, chat_id=5):
+        # A fresh id per call, because every file of a batch is its own job and the
+        # batch count is deduplicated per job id. Reusing one id made the helper
+        # model something the producer never does.
         return batch_pipeline.tag_batch_job(
-            {"job_id": "j1", "chat_id": chat_id, "original_filename": "a.mp4"},
+            {
+                "job_id": f"j-{uuid.uuid4().hex[:8]}",
+                "chat_id": chat_id,
+                "original_filename": "a.mp4",
+            },
             "b1",
             0,
             total,
@@ -707,6 +739,485 @@ class WiringTests(unittest.TestCase):
         src = self._read("workers", "ffmpeg_worker.py")
         self.assertIn("allow_restart=True", src)
         self.assertIn("if batch_pipeline.restart_requested():", src)
+
+
+class ClaimTtlTests(unittest.TestCase):
+    """How fast a dead worker's claim on a batch or a slot self-heals."""
+
+    def test_lock_ttl_is_bounded_and_short(self):
+        # The old value inherited the 6h job ceiling. That is what let a worker
+        # that died holding a batch's lock fence that batch for six hours, with
+        # every remaining job deferring and the bar stuck at "0 of N".
+        self.assertGreater(batch_pipeline.BATCH_LOCK_TTL_SECONDS, 0)
+        self.assertLessEqual(batch_pipeline.BATCH_LOCK_TTL_SECONDS, 3600)
+
+    def test_batch_data_outlives_the_lock_by_a_long_way(self):
+        # Counters must survive however long the batch really takes; only the
+        # lock is short-lived, and only the lock is refreshed.
+        self.assertGreater(
+            batch_pipeline.BATCH_STATE_TTL_SECONDS, batch_pipeline.BATCH_LOCK_TTL_SECONDS * 10
+        )
+
+    def test_heartbeat_is_a_small_fraction_of_the_lock_ttl(self):
+        self.assertLess(
+            batch_pipeline.CLAIM_HEARTBEAT_SECONDS, batch_pipeline.BATCH_LOCK_TTL_SECONDS / 5
+        )
+
+
+class ClaimRefreshTests(unittest.IsolatedAsyncioTestCase):
+    """A running job re-arms its own claims; anything else must not."""
+
+    async def test_refresh_ffmpeg_slot_rearms_only_its_own_claim(self):
+        redis = _FakeRedis()
+        self.assertTrue(await batch_pipeline.refresh_ffmpeg_slot(redis, 1, "job-1"))
+        script, numkeys, args = redis.eval_calls[0]
+        self.assertIn("pexpire", script)
+        self.assertEqual(numkeys, 1)
+        self.assertEqual(args[0], "ffmpeg:slot:1")
+        self.assertEqual(args[1], "job-1")
+
+    async def test_refresh_of_an_unheld_slot_is_a_noop(self):
+        redis = _FakeRedis()
+        self.assertFalse(await batch_pipeline.refresh_ffmpeg_slot(redis, -1, "job-2"))
+        self.assertEqual(redis.eval_calls, [])
+
+    async def test_refresh_batch_lock_targets_the_batch_key(self):
+        redis = _FakeRedis()
+        await batch_pipeline.refresh_batch_lock(redis, "b1", "job-3")
+        _script, _numkeys, args = redis.eval_calls[0]
+        self.assertEqual(args[0], "ffmpeg:batch:b1")
+        self.assertEqual(args[1], "job-3")
+
+
+class ProgressBarTests(unittest.TestCase):
+    def test_bar_is_a_fixed_width(self):
+        for done, total in ((0, 10), (5, 10), (10, 10), (1, 3)):
+            self.assertEqual(len(batch_pipeline.progress_bar(done, total)), 10)
+
+    def test_bar_is_full_at_the_end_and_empty_at_the_start(self):
+        self.assertEqual(batch_pipeline.progress_bar(0, 4), "░" * 10)
+        self.assertEqual(batch_pipeline.progress_bar(4, 4), "█" * 10)
+
+    def test_bar_tolerates_an_unknown_total_and_garbage(self):
+        self.assertEqual(batch_pipeline.progress_bar(3, 0), "░" * 10)
+        self.assertEqual(batch_pipeline.progress_bar("nope", None), "░" * 10)
+
+
+class BatchDoneCounterTests(unittest.IsolatedAsyncioTestCase):
+    """A file finished inside the handler still has to move the batch along."""
+
+    async def test_marking_a_file_done_advances_the_counter(self):
+        redis = _ProgressRedis()
+        self.assertEqual(await batch_pipeline.mark_batch_file_done(redis, batch_id="b1"), 1)
+        self.assertEqual(await batch_pipeline.mark_batch_file_done(redis, batch_id="b1"), 2)
+        self.assertIn(batch_pipeline.batch_progress_key("b1"), redis.store)
+
+    async def test_marking_without_a_batch_is_a_noop(self):
+        self.assertIsNone(await batch_pipeline.mark_batch_file_done(_ProgressRedis(), batch_id=""))
+
+
+class BatchProgressDedupTests(unittest.IsolatedAsyncioTestCase):
+    """A redelivered job must not advance its batch twice.
+
+    The broker retries a job whose handler raised, and every attempt runs the same
+    end-of-job bookkeeping. A plain INCR would count one file twice, finish the
+    batch a file early and take its bar down with work still queued.
+    """
+
+    async def test_first_report_wins_and_a_retry_does_not(self):
+        redis = _ProgressRedis()
+        self.assertTrue(await batch_pipeline.claim_batch_progress_slot(redis, "b1", "job-1"))
+        self.assertFalse(await batch_pipeline.claim_batch_progress_slot(redis, "b1", "job-1"))
+
+    async def test_distinct_jobs_each_get_their_slot(self):
+        redis = _ProgressRedis()
+        self.assertTrue(await batch_pipeline.claim_batch_progress_slot(redis, "b1", "job-1"))
+        self.assertTrue(await batch_pipeline.claim_batch_progress_slot(redis, "b1", "job-2"))
+
+    async def test_missing_identifiers_fail_open(self):
+        # Nothing to deduplicate: count it rather than risk stalling a batch.
+        redis = _ProgressRedis()
+        self.assertTrue(await batch_pipeline.claim_batch_progress_slot(redis, "", "job-1"))
+        self.assertTrue(await batch_pipeline.claim_batch_progress_slot(redis, "b1", None))
+
+    def test_worker_claims_before_it_increments(self):
+        from workers import ffmpeg_worker as worker
+
+        with open(os.path.join(PROJECT_ROOT, "workers", "ffmpeg_worker.py"), encoding="utf-8") as fh:
+            src = fh.read()
+        claim = src.index("claim_batch_progress_slot(r, batch_id, job.get(\"job_id\"))")
+        increment = src.index("done = int(await r.incr(done_key))")
+        self.assertLess(claim, increment)
+        self.assertTrue(hasattr(worker, "_report_batch_progress"))
+
+    def test_a_cancelled_pipeline_job_is_not_reported_as_completed(self):
+        src = BulkFetchReportingTests._src()
+        self.assertIn('_pipeline_status == "cancelled"', src)
+        self.assertIn('file_info["_batch_cancelled"] = True', src)
+        self.assertIn('file_info["_pipeline_failed"] = True', src)
+        self.assertIn('f.get("_pipeline_failed")', src)
+
+
+class BatchResumeTests(unittest.IsolatedAsyncioTestCase):
+    """A batch interrupted by a restart must not redo the files it finished.
+
+    The apply feeds the queue one file at a time (so 30 large sources never land
+    on disk at once), which means a restart abandons the files it had not reached.
+    Those are still in the user's collection - so the ones already finished have to
+    be recorded, or the next Apply converts them all over again.
+    """
+
+    async def test_a_finished_entry_is_recorded_against_its_batch(self):
+        redis = _ProgressRedis()
+        await batch_pipeline.open_batch_resume(redis, batch_id="b1", user_id=7)
+        self.assertTrue(await batch_pipeline.mark_batch_entry_finished(redis, "b1", "file-abc"))
+
+        self.assertEqual(
+            await batch_pipeline.read_finished_entries(redis, 7), {"b1": {"file-abc"}}
+        )
+
+    async def test_an_unfinished_batch_reports_nothing(self):
+        redis = _ProgressRedis()
+        await batch_pipeline.open_batch_resume(redis, batch_id="b1", user_id=7)
+        self.assertEqual(await batch_pipeline.read_finished_entries(redis, 7), {})
+
+    async def test_records_are_keyed_per_user(self):
+        redis = _ProgressRedis()
+        await batch_pipeline.open_batch_resume(redis, batch_id="b1", user_id=7)
+        await batch_pipeline.mark_batch_entry_finished(redis, "b1", "file-abc")
+        self.assertEqual(await batch_pipeline.read_finished_entries(redis, 8), {})
+
+    async def test_entries_of_several_batches_are_merged(self):
+        redis = _ProgressRedis()
+        for batch_id, key in (("b1", "file-a"), ("b2", "file-b")):
+            await batch_pipeline.open_batch_resume(redis, batch_id=batch_id, user_id=7)
+            await batch_pipeline.mark_batch_entry_finished(redis, batch_id, key)
+        self.assertEqual(
+            await batch_pipeline.read_finished_entries(redis, 7),
+            {"b1": {"file-a"}, "b2": {"file-b"}},
+        )
+
+    async def test_consumed_entries_are_forgotten_so_a_resend_is_honoured(self):
+        # Once an entry has been subtracted from the collection it must be
+        # forgotten, or re-sending that same file later would be skipped.
+        redis = _ProgressRedis()
+        await batch_pipeline.open_batch_resume(redis, batch_id="b1", user_id=7)
+        await batch_pipeline.mark_batch_entry_finished(redis, "b1", "file-a")
+        finished = await batch_pipeline.read_finished_entries(redis, 7)
+        await batch_pipeline.forget_finished_entries(redis, finished, {"file-a"})
+        self.assertEqual(await batch_pipeline.read_finished_entries(redis, 7), {})
+
+    async def test_forgetting_leaves_untouched_entries_alone(self):
+        redis = _ProgressRedis()
+        await batch_pipeline.open_batch_resume(redis, batch_id="b1", user_id=7)
+        await batch_pipeline.mark_batch_entry_finished(redis, "b1", "file-a")
+        await batch_pipeline.mark_batch_entry_finished(redis, "b1", "file-b")
+        finished = await batch_pipeline.read_finished_entries(redis, 7)
+        await batch_pipeline.forget_finished_entries(redis, finished, {"file-a"})
+        self.assertEqual(await batch_pipeline.read_finished_entries(redis, 7), {"b1": {"file-b"}})
+
+    async def test_closing_discards_the_record(self):
+        redis = _ProgressRedis()
+        await batch_pipeline.open_batch_resume(redis, batch_id="b1", user_id=7)
+        await batch_pipeline.mark_batch_entry_finished(redis, "b1", "file-a")
+        await batch_pipeline.close_batch_resume(redis, batch_id="b1", user_id=7)
+        self.assertEqual(await batch_pipeline.read_finished_entries(redis, 7), {})
+
+    async def test_missing_identifiers_are_a_noop(self):
+        redis = _ProgressRedis()
+        self.assertFalse(await batch_pipeline.open_batch_resume(redis, batch_id="", user_id=7))
+        self.assertFalse(await batch_pipeline.open_batch_resume(redis, batch_id="b1", user_id=None))
+        self.assertFalse(await batch_pipeline.mark_batch_entry_finished(redis, "b1", None))
+        self.assertEqual(await batch_pipeline.read_finished_entries(redis, None), {})
+
+    def test_entry_key_survives_a_restart(self):
+        from handlers import _bulk_entry_key
+
+        # The file id is what makes the record meaningful after a restart; a
+        # process-local identity would not be.
+        self.assertEqual(_bulk_entry_key({"id": "BAACAgQ"}), "BAACAgQ")
+        self.assertEqual(_bulk_entry_key({"file_unique_id": "uniq"}), "uniq")
+        _path = os.path.join(TMP, "clip.mp4")
+        self.assertEqual(_bulk_entry_key(_path), _path)
+        self.assertIsNone(_bulk_entry_key({}))
+        self.assertIsNone(_bulk_entry_key(None))
+
+
+class DuplicateDeliveryTests(unittest.IsolatedAsyncioTestCase):
+    """A broker redelivery must not convert and send the same file twice."""
+
+    class _JobRedis:
+        def __init__(self, delivered=None):
+            self.hashes = {"ffmpeg:job:j1": {"delivered": delivered} if delivered is not None else {}}
+
+        async def hget(self, key, field):
+            return self.hashes.get(key, {}).get(field)
+
+    async def _delivered(self, job, redis):
+        from workers import ffmpeg_worker as worker
+
+        with patch.object(worker, "get_redis", _returning(redis)):
+            return await worker._job_already_delivered(job)
+
+    async def test_a_delivered_job_is_recognised(self):
+        for value in ("1", b"1"):
+            self.assertTrue(await self._delivered({"job_id": "j1"}, self._JobRedis(value)))
+
+    async def test_an_undelivered_job_is_not(self):
+        for value in (None, "0", b"0"):
+            self.assertFalse(await self._delivered({"job_id": "j1"}, self._JobRedis(value)))
+
+    async def test_an_unknown_job_is_not_treated_as_delivered(self):
+        self.assertFalse(await self._delivered({"job_id": "other"}, self._JobRedis("1")))
+        self.assertFalse(await self._delivered({}, self._JobRedis("1")))
+
+    async def test_redis_trouble_counts_as_not_delivered(self):
+        # Failing closed here would silently drop real work, so it fails open.
+        from workers import ffmpeg_worker as worker
+
+        async def _boom():
+            raise RuntimeError("no redis")
+
+        with patch.object(worker, "get_redis", _boom):
+            self.assertFalse(await worker._job_already_delivered({"job_id": "j1"}))
+
+    def test_delivery_is_recorded_and_checked_before_the_slot_is_taken(self):
+        with open(os.path.join(PROJECT_ROOT, "workers", "ffmpeg_worker.py"), encoding="utf-8") as fh:
+            src = fh.read()
+        self.assertIn('"delivered": "1" if sent else "0"', src)
+        guard = src.index("if await _job_already_delivered(job):")
+        slot = src.index("slot = await _claim_execution_slot(job)")
+        self.assertLess(guard, slot)
+
+
+class ActiveBatchViewTests(unittest.IsolatedAsyncioTestCase):
+    """One bar for every running batch, rendered from the counters that exist."""
+
+    def _redis_with(self, batch_id, done, total):
+        return _ProgressRedis(
+            initial={
+                batch_pipeline.batch_total_key(batch_id): total,
+                batch_pipeline.batch_progress_key(batch_id): done,
+            }
+        )
+
+    async def test_lists_a_registered_batch_with_its_counters(self):
+        redis = self._redis_with("b1", 2, 4)
+        await batch_pipeline.register_active_batch(redis, batch_id="b1")
+        rows = await batch_pipeline.read_active_batches(redis)
+        self.assertEqual(rows, [{"batch_id": "b1", "total": 4, "done": 2}])
+
+    async def test_prunes_a_batch_whose_counters_are_gone(self):
+        # A batch whose worker died must not leave a phantom row behind.
+        redis = _ProgressRedis()
+        await batch_pipeline.register_active_batch(redis, batch_id="gone")
+        self.assertEqual(await batch_pipeline.read_active_batches(redis), [])
+        self.assertEqual(await redis.smembers(batch_pipeline.ACTIVE_BATCHES_KEY), set())
+
+    async def test_least_finished_batch_is_listed_first(self):
+        redis = self._redis_with("ahead", 8, 10)
+        for key, value in self._redis_with("behind", 1, 10).store.items():
+            redis.store[key] = value
+        await batch_pipeline.register_active_batch(redis, batch_id="ahead")
+        await batch_pipeline.register_active_batch(redis, batch_id="behind")
+        self.assertEqual(
+            [row["batch_id"] for row in await batch_pipeline.read_active_batches(redis)],
+            ["behind", "ahead"],
+        )
+
+    async def test_unregistering_removes_a_finished_batch(self):
+        redis = self._redis_with("b1", 4, 4)
+        await batch_pipeline.register_active_batch(redis, batch_id="b1")
+        await batch_pipeline.unregister_active_batch(redis, batch_id="b1")
+        self.assertEqual(await batch_pipeline.read_active_batches(redis), [])
+
+    def test_worker_rows_show_a_bar_and_a_short_id(self):
+        from workers import ffmpeg_worker as worker
+
+        rows = worker._batch_view_rows([{"batch_id": "abcdef123456", "done": 2, "total": 4}])
+        self.assertEqual(len(rows), 1)
+        self.assertIn("2/4", rows[0])
+        self.assertIn("#abcdef12", rows[0])
+
+    def test_worker_rows_skip_a_batch_with_no_total(self):
+        from workers import ffmpeg_worker as worker
+
+        self.assertEqual(worker._batch_view_rows([{"batch_id": "x", "done": 0, "total": 0}]), [])
+
+
+class BatchMessageRefTests(unittest.TestCase):
+    def test_round_trips_chat_and_message(self):
+        self.assertEqual(batch_pipeline.parse_batch_message_ref("5:901"), (5, 901))
+        self.assertEqual(batch_pipeline.parse_batch_message_ref(b"5:901"), (5, 901))
+
+    def test_garbage_is_none(self):
+        self.assertIsNone(batch_pipeline.parse_batch_message_ref(None))
+        self.assertIsNone(batch_pipeline.parse_batch_message_ref("nope"))
+
+
+class BatchCancelReadTests(unittest.IsolatedAsyncioTestCase):
+    async def test_no_batch_is_never_cancelled(self):
+        # Called with no client and no batch, so it must not touch Redis at all.
+        self.assertFalse(await batch_pipeline.is_batch_cancelled(batch_id=""))
+        self.assertFalse(await batch_pipeline.is_batch_cancelled(batch_id=None))
+
+    async def test_reads_the_marker_from_a_supplied_client(self):
+        redis = _FakeRedis(exists_result=1)
+        self.assertTrue(await batch_pipeline.is_batch_cancelled(redis, "b1"))
+        self.assertEqual(redis.exists_calls[0], (batch_pipeline.batch_cancel_key("b1"),))
+
+
+class BulkFetchReportingTests(unittest.TestCase):
+    """A stopped batch must never be summarised as a fetch failure."""
+
+    @staticmethod
+    def _src(name: str = "handlers.py") -> str:
+        with open(os.path.join(PROJECT_ROOT, name), encoding="utf-8") as fh:
+            return fh.read()
+
+    def test_failure_reason_names_the_real_cause(self):
+        from handlers import _bulk_failure_reason
+
+        self.assertEqual(_bulk_failure_reason(Exception("File is too big")), "too large for the Bot API")
+        self.assertEqual(_bulk_failure_reason(Exception("exceeds the limit")), "too large for the Bot API")
+        self.assertEqual(_bulk_failure_reason(Exception("batch cancelled")), "stopped")
+        self.assertEqual(_bulk_failure_reason(Exception("relay fallback failed")), "relay group failed")
+        self.assertEqual(_bulk_failure_reason(Exception("userbot download failed")), "userbot download failed")
+        self.assertEqual(_bulk_failure_reason(Exception("RetryAfter")), "Telegram rate limit")
+        self.assertEqual(_bulk_failure_reason(Exception("timed out")), "timed out")
+        self.assertEqual(_bulk_failure_reason(Exception("")), "download failed")
+
+    def test_a_stopped_file_is_reported_as_stopped_not_unfetchable(self):
+        src = self._src()
+        self.assertIn('if f.get("_batch_cancelled"):', src)
+        self.assertIn("⏹️ stopped with the batch", src)
+
+    def test_completion_is_checked_before_looking_for_a_local_file(self):
+        # A conversion the pipeline already queued has no path and no key of its
+        # own yet, so checking for a path first misreported it as unfetchable and
+        # left it out of the batch count entirely.
+        src = self._src()
+        completed = src.index('if f.pop("_bulk_pipeline_completed", False):')
+        path_check = src.index('if not _file_path and not f.get("input_key"):')
+        self.assertLess(completed, path_check)
+
+    def test_a_cancelled_batch_is_checked_before_the_relay_forward(self):
+        # The relay forward happens before the pipeline ingests, so without a
+        # check here Stop leaves a forwarded copy and processes nothing.
+        src = self._src()
+        self.assertIn('current_file["_batch_cancelled"] = True', src)
+        guard = src.index("_is_cancelled_now(batch_id=_pre_batch_id)")
+        forward = src.index("Relay: forwarding message %s/%s to relay group %s")
+        self.assertLess(guard, forward)
+
+
+class _RelayBot:
+    """Bot stand-in that records (and can fail) delete_message calls."""
+
+    def __init__(self, fail=False):
+        self.fail = fail
+        self.deleted = []
+
+    async def delete_message(self, chat_id=None, message_id=None, **kwargs):
+        if self.fail:
+            raise RuntimeError("no rights")
+        self.deleted.append((chat_id, message_id))
+
+
+class _RelayContext:
+    def __init__(self, bot):
+        self.bot = bot
+
+
+class RelayCopyCleanupTests(unittest.IsolatedAsyncioTestCase):
+    """A relay copy forwarded for a batch is removed when that batch is stopped.
+
+    The relay forward happens *before* the pipeline can refuse a stopped batch, so
+    without this the batch's in-flight file is left sitting in a shared chat.
+    """
+
+    async def test_discards_the_copy(self):
+        from handlers import EnhancedMediaHandler
+
+        bot = _RelayBot()
+        # The method does not touch `self`, so a bare object is enough here.
+        ok = await EnhancedMediaHandler._discard_relay_copy(
+            object(), _RelayContext(bot), -100123, 42, "batch cancelled"
+        )
+        self.assertTrue(ok)
+        self.assertEqual(bot.deleted, [(-100123, 42)])
+
+    async def test_casts_string_ids(self):
+        from handlers import EnhancedMediaHandler
+
+        bot = _RelayBot()
+        await EnhancedMediaHandler._discard_relay_copy(object(), _RelayContext(bot), "-100123", "42")
+        self.assertEqual(bot.deleted, [(-100123, 42)])
+
+    async def test_useless_ids_are_a_noop(self):
+        from handlers import EnhancedMediaHandler
+
+        bot = _RelayBot()
+        for chat, message in ((None, None), ("x", 1), (-100123, None)):
+            self.assertFalse(
+                await EnhancedMediaHandler._discard_relay_copy(object(), _RelayContext(bot), chat, message)
+            )
+        self.assertEqual(bot.deleted, [])
+
+    async def test_a_delete_failure_never_raises(self):
+        from handlers import EnhancedMediaHandler
+
+        ok = await EnhancedMediaHandler._discard_relay_copy(
+            object(), _RelayContext(_RelayBot(fail=True)), -100123, 42
+        )
+        self.assertFalse(ok)
+
+    def test_a_stopped_batch_discards_its_relay_copy(self):
+        src = BulkFetchReportingTests._src()
+        self.assertIn('"batch cancelled"', src)
+        discard = src.index('_discard_relay_copy(\n                                    context, _pipeline_chat, _pipeline_msg')
+        cancelled = src.index('if _ingest.error == "batch cancelled":')
+        self.assertLess(cancelled, discard)
+
+
+class UserbotRelayCleanupTests(unittest.IsolatedAsyncioTestCase):
+    """The userbot's own relay forward is cleaned up when its download fails."""
+
+    class _Client:
+        def __init__(self, fail=False):
+            self.fail = fail
+            self.deleted = []
+
+        async def delete_messages(self, *args, **kwargs):
+            if self.fail:
+                raise RuntimeError("no rights")
+            self.deleted.append((args, kwargs))
+
+    async def test_discards_via_each_client_api(self):
+        from utils.userbot_downloader import _discard_relay_copy
+
+        pyro = self._Client()
+        await _discard_relay_copy(pyro, "pyrogram", -100123, 42)
+        self.assertEqual(pyro.deleted, [((), {"chat_id": -100123, "message_ids": [42]})])
+
+        tele = self._Client()
+        await _discard_relay_copy(tele, "telethon", -100123, 42)
+        self.assertEqual(tele.deleted, [((-100123, [42]), {})])
+
+    async def test_missing_ids_are_a_noop(self):
+        from utils.userbot_downloader import _discard_relay_copy
+
+        client = self._Client()
+        for chat, message in ((None, 1), (-100123, None), (-100123, 0)):
+            self.assertFalse(await _discard_relay_copy(client, "pyrogram", chat, message))
+        self.assertEqual(client.deleted, [])
+
+    async def test_a_delete_failure_never_raises(self):
+        from utils.userbot_downloader import _discard_relay_copy
+
+        self.assertFalse(
+            await _discard_relay_copy(self._Client(fail=True), "pyrogram", -100123, 42)
+        )
 
 
 if __name__ == "__main__":

@@ -441,6 +441,12 @@ class QueryBuilder:
             "$position",
             "$slice",
             "$sort",
+            # Needed by every upsert that seeds fields only on the insert branch
+            # (user stats: user_id / first_seen / bot_id). Without it the whole
+            # update was rejected, so each conversion logged "Error updating
+            # user stats: Update operator '$setOnInsert' is not allowed" and the
+            # counters were silently dropped.
+            "$setOnInsert",
         }
 
         validated = {}
@@ -448,8 +454,11 @@ class QueryBuilder:
             if op.startswith("$") and op not in allowed_ops:
                 raise ValidationError(f"Update operator '{op}' is not allowed")
 
-            if op == "$set":
-                # Validate field names inside $set against fillable
+            if op in ("$set", "$setOnInsert"):
+                # Validate field names inside $set / $setOnInsert against fillable.
+                # $setOnInsert only applies on the insert branch of an upsert, but
+                # its field names are just as writable as $set's, so they get the
+                # same check.
                 safe_set = {}
                 for field, value in fields.items():
                     self._validate_field_name(field)

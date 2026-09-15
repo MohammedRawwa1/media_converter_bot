@@ -74,13 +74,35 @@ BATCH_MAX_JOBS = 30
 # Namespace shared by everything keyed on a batch: the lock (`<id>`) and the
 # finished-file counter (`<id>:done`).
 BATCH_KEY_PREFIX = "ffmpeg:batch:"
-# How long a worker may hold a batch's lock without refreshing it. Defaults to
-# the worker's own maximum job runtime (JOB_MAX_SECONDS, 6h) so a legitimately
-# slow 700 MB+ conversion can never outlive its lock and let a second replica
-# start the next file of the same batch. The lock is released explicitly after
-# every job; the TTL only matters if a worker dies mid-job, and then it is what
-# stops the batch from wedging forever.
-BATCH_LOCK_TTL_SECONDS = _env_number("BATCH_LOCK_TTL_SECONDS", _env_number("JOB_MAX_SECONDS", 6 * 3600))
+# How long a worker may hold a batch's lock without refreshing it, in seconds.
+#
+# This is deliberately *bounded* and short, and refreshed while the job runs (see
+# :func:`refresh_batch_lock`) - so it has to outlive a heartbeat gap, not a whole
+# conversion. It used to inherit the worker's 6h job ceiling, and that was the
+# bug behind "batch frozen at 0%": a worker that died (or was redeployed) while
+# holding `ffmpeg:batch:<id>` fenced that batch for six hours - every remaining
+# job could not take the lock, so it deferred, got promoted, deferred again, and
+# the progress message sat at "0 of N" the whole time. Fifteen minutes is still
+# comfortably longer than any heartbeat gap, and short enough that an orphaned
+# lock cannot outlive the container that dropped it.
+BATCH_LOCK_TTL_SECONDS = max(
+    1,
+    min(
+        _env_number("BATCH_LOCK_TTL_SECONDS", 900),
+        _env_number("JOB_MAX_SECONDS", 6 * 3600),
+    ),
+)
+# How often the owning worker re-arms the TTL on the claims it holds while a job
+# runs. Must stay a small fraction of BATCH_LOCK_TTL_SECONDS.
+CLAIM_HEARTBEAT_SECONDS = max(1.0, _env_number("CLAIM_HEARTBEAT_SECONDS", 60.0))
+# Lifetime of a batch's *data*: its counters, its total, the location of its
+# message, its cancellation marker and its job set. Deliberately independent of
+# BATCH_LOCK_TTL_SECONDS above - the lock is a short-lived claim that a worker
+# refreshes, while these keys have to survive however long the batch really
+# takes. A 30-file Apply Bulk on a 1 GB box can legitimately run for hours, and
+# letting the `:done` counter expire mid-batch would silently restart its
+# progress at zero. This is only a backstop against keys outliving the feature.
+BATCH_STATE_TTL_SECONDS = max(1, _env_number("BATCH_STATE_TTL_SECONDS", 30 * 24 * 3600))
 # How long a job waits before it is offered to the queue again when its batch
 # is busy. Short enough to keep a batch moving, long enough not to spin.
 BATCH_DEFER_SECONDS = _env_number("BATCH_DEFER_SECONDS", 10.0)
@@ -91,6 +113,19 @@ _RELEASE_LOCK_SCRIPT = """
 local current = redis.call('get', KEYS[1])
 if current == ARGV[1] then
     redis.call('del', KEYS[1])
+    return 1
+end
+return 0
+"""
+
+# Compare-and-pexpire: re-arm the TTL, but only for the owner that still holds
+# the claim. This is what lets the TTL above stay short (so a dead worker's
+# claim expires quickly) without a live worker ever losing a long conversion's
+# slot or batch lock mid-job.
+_REFRESH_LOCK_SCRIPT = """
+local current = redis.call('get', KEYS[1])
+if current == ARGV[1] then
+    redis.call('pexpire', KEYS[1], ARGV[2])
     return 1
 end
 return 0
@@ -127,15 +162,212 @@ def batch_jobs_key(batch_id) -> str:
     return f"{BATCH_KEY_PREFIX}{batch_id}:jobs"
 
 
-async def is_batch_cancelled(redis, batch_id) -> bool:
-    """Return whether a batch has been cancelled."""
+async def is_batch_cancelled(redis=None, batch_id=None) -> bool:
+    """Return whether a batch has been cancelled.
+
+    ``redis`` is optional so the *bot* can ask the same question as the worker:
+    the bulk apply checks this between files, which is what stops a stopped batch
+    from carrying on fetching (and relay-forwarding) its remaining sources. The
+    marker is only ever set, never unset, so a second read costs nothing.
+    """
     if not batch_id:
         return False
+    own = redis is None
     try:
+        if own:
+            from utils.job_queue import get_redis
+
+            redis = await get_redis()
         return bool(await redis.exists(batch_cancel_key(batch_id)))
     except Exception:
         logger.debug("batch_pipeline: could not read cancellation marker for %s", batch_id)
         return False
+    finally:
+        if own and redis is not None:
+            with contextlib.suppress(Exception):
+                await redis.close()
+
+
+def batch_done_jobs_key(batch_id) -> str:
+    """Redis set of the job ids already counted toward a batch's progress."""
+    return f"{BATCH_KEY_PREFIX}{batch_id}:done_jobs"
+
+
+async def claim_batch_progress_slot(redis, batch_id, job_id) -> bool:
+    """True the first time this job is counted toward its batch, False after that.
+
+    A job can be delivered more than once - the broker retries a job whose handler
+    raised - and every attempt runs the same end-of-job bookkeeping. Counting with
+    a plain INCR would then count one file twice, finish the batch a file early and
+    take its progress message down while work was still queued. Set membership
+    makes the count exactly-once per job instead.
+
+    Fails open (returns True): under-counting would stall a batch forever, while
+    counting a duplicate once more only misreports by one.
+    """
+    if not batch_id or not job_id:
+        return True
+    try:
+        added = await redis.sadd(batch_done_jobs_key(batch_id), str(job_id))
+        with contextlib.suppress(Exception):
+            await redis.expire(batch_done_jobs_key(batch_id), int(BATCH_STATE_TTL_SECONDS))
+        return bool(added)
+    except Exception:
+        logger.debug("batch_pipeline: could not claim a progress slot for job %s", job_id)
+        return True
+
+
+# ---------------------------------------------------------------------------
+# Resuming a batch that was interrupted
+# ---------------------------------------------------------------------------
+
+# The bulk apply feeds the queue one file at a time, so a restart mid-batch
+# abandons whatever it had not reached yet. Those files are still in the user's
+# persisted collection - but so are the ones that already finished, so on its own
+# a restart makes the next Apply redo completed work. Every finished file is
+# therefore recorded here against its batch, and the bulk menu subtracts those
+# entries the next time it is opened: what is left is exactly what was never
+# processed.
+#
+# The record is keyed per *user* rather than per batch, because that is the
+# question the menu asks: "which of my collected files are already done?".
+
+def batch_finished_keys(batch_id) -> str:
+    """Redis set of the collection entries a batch has already finished."""
+    return f"{BATCH_KEY_PREFIX}{batch_id}:finished"
+
+
+def user_batches_key(user_id) -> str:
+    """Redis set of the batches a user has left unfinished or unclosed."""
+    return f"{BATCH_KEY_PREFIX}resume:{user_id}"
+
+
+async def open_batch_resume(redis=None, *, batch_id, user_id) -> bool:
+    """Register a batch as resumable, before its first file starts."""
+    if not batch_id or not user_id:
+        return False
+    own = redis is None
+    try:
+        if own:
+            from utils.job_queue import get_redis
+
+            redis = await get_redis()
+        await redis.sadd(user_batches_key(user_id), str(batch_id))
+        with contextlib.suppress(Exception):
+            await redis.expire(user_batches_key(user_id), int(BATCH_STATE_TTL_SECONDS))
+        return True
+    except Exception:
+        logger.debug("batch_pipeline: could not open a resume record for %s", batch_id)
+        return False
+    finally:
+        if own and redis is not None:
+            with contextlib.suppress(Exception):
+                await redis.close()
+
+
+async def mark_batch_entry_finished(redis, batch_id, entry_key) -> bool:
+    """Record one collection entry as done, so a later resume will skip it."""
+    if not batch_id or not entry_key:
+        return False
+    try:
+        await redis.sadd(batch_finished_keys(batch_id), str(entry_key))
+        with contextlib.suppress(Exception):
+            await redis.expire(batch_finished_keys(batch_id), int(BATCH_STATE_TTL_SECONDS))
+        return True
+    except Exception:
+        logger.debug("batch_pipeline: could not record a finished entry for %s", batch_id)
+        return False
+
+
+async def read_finished_entries(redis, user_id) -> dict:
+    """``{batch_id: {entry_key, ...}}`` for every batch this user left unfinished."""
+    out: dict = {}
+    if not user_id:
+        return out
+    try:
+        batch_ids = await redis.smembers(user_batches_key(user_id))
+    except Exception:
+        logger.debug("batch_pipeline: could not list unfinished batches for %s", user_id)
+        return out
+    for raw in batch_ids:
+        batch_id = raw.decode() if isinstance(raw, (bytes, bytearray)) else str(raw)
+        try:
+            keys = await redis.smembers(batch_finished_keys(batch_id))
+        except Exception:
+            continue
+        decoded = {k.decode() if isinstance(k, (bytes, bytearray)) else str(k) for k in keys}
+        if decoded:
+            out[batch_id] = decoded
+    return out
+
+
+async def forget_finished_entries(redis, finished: dict, consumed) -> None:
+    """Drop recorded entries once they have been subtracted from a collection.
+
+    Forgetting them is what keeps a *re-sent* file from being skipped later: an
+    entry is only ever removed once it has been accounted for.
+    """
+    for batch_id, keys in (finished or {}).items():
+        victims = [key for key in keys if key in consumed]
+        if not victims:
+            continue
+        with contextlib.suppress(Exception):
+            await redis.srem(batch_finished_keys(batch_id), *victims)
+
+
+async def close_batch_resume(redis=None, *, batch_id, user_id=None) -> bool:
+    """Discard a batch's resume record - it finished, or was stopped."""
+    if not batch_id:
+        return False
+    own = redis is None
+    try:
+        if own:
+            from utils.job_queue import get_redis
+
+            redis = await get_redis()
+        if user_id:
+            with contextlib.suppress(Exception):
+                await redis.srem(user_batches_key(user_id), str(batch_id))
+        with contextlib.suppress(Exception):
+            await redis.delete(batch_finished_keys(batch_id))
+        return True
+    except Exception:
+        logger.debug("batch_pipeline: could not close the resume record for %s", batch_id)
+        return False
+    finally:
+        if own and redis is not None:
+            with contextlib.suppress(Exception):
+                await redis.close()
+
+
+async def mark_batch_file_done(redis=None, *, batch_id) -> int | None:
+    """Count one file of a batch as finished, without a worker job reporting it.
+
+    A file the bot finishes *inside the handler* (the inline pipeline path) never
+    becomes a queued job, so no worker would ever advance the batch's ``:done``
+    counter - yet it is still counted toward the batch total. That left the batch
+    permanently one short: its bar could only ever read "0 of 1" and was never
+    taken down. Returns the new count, or ``None`` if it could not be recorded.
+    """
+    if not batch_id:
+        return None
+    own = redis is None
+    try:
+        if own:
+            from utils.job_queue import get_redis
+
+            redis = await get_redis()
+        done = int(await redis.incr(batch_progress_key(batch_id)))
+        with contextlib.suppress(Exception):
+            await redis.expire(batch_progress_key(batch_id), int(BATCH_STATE_TTL_SECONDS))
+        return done
+    except Exception:
+        logger.debug("batch_pipeline: could not mark a file done for %s", batch_id)
+        return None
+    finally:
+        if own and redis is not None:
+            with contextlib.suppress(Exception):
+                await redis.close()
 
 
 async def cancel_batch(redis=None, *, batch_id, requested_by=None, ttl_seconds=None) -> dict:
@@ -151,7 +383,7 @@ async def cancel_batch(redis=None, *, batch_id, requested_by=None, ttl_seconds=N
         from utils.job_queue import get_redis
 
         redis = await get_redis()
-    ttl = max(1, int(ttl_seconds or BATCH_LOCK_TTL_SECONDS))
+    ttl = max(1, int(ttl_seconds or BATCH_STATE_TTL_SECONDS))
     job_ids = []
     queued = delayed = 0
     try:
@@ -162,7 +394,6 @@ async def cancel_batch(redis=None, *, batch_id, requested_by=None, ttl_seconds=N
         for member in members:
             job_id = member.decode() if isinstance(member, bytes) else str(member)
             key = f"ffmpeg:job:{job_id}"
-            stored = await redis.hgetall(key)
             job_ids.append(job_id)
             await redis.hset(
                 key,
@@ -218,7 +449,7 @@ async def set_batch_total(redis=None, *, batch_id, total) -> bool:
 
             redis = await get_redis()
         await redis.set(
-            batch_total_key(batch_id), int(total), ex=max(1, int(BATCH_LOCK_TTL_SECONDS))
+            batch_total_key(batch_id), int(total), ex=max(1, int(BATCH_STATE_TTL_SECONDS))
         )
         return True
     except Exception:
@@ -235,6 +466,135 @@ def batch_message_key(batch_id) -> str:
     second one.
     """
     return f"{BATCH_KEY_PREFIX}{batch_id}:msg"
+
+
+def parse_batch_message_ref(stored) -> tuple[int, int] | None:
+    """Decode the ``chat_id:message_id`` a batch message location is stored as.
+
+    Shared by the worker (which edits and removes the message) and the bot
+    (which closes the batch out once every job it queued has finished), so the
+    encoding lives in exactly one place.
+    """
+    try:
+        text = stored.decode() if isinstance(stored, (bytes, bytearray)) else str(stored)
+        chat, _, message = text.partition(":")
+        return int(chat), int(message)
+    except (TypeError, ValueError):
+        return None
+
+
+# ---------------------------------------------------------------------------
+# "All my batches" view
+# ---------------------------------------------------------------------------
+
+# The set of batch ids still running, so one message can show every batch at
+# once instead of the user juggling a message per batch. This is a *render*
+# input, not a second state machine: the per-batch ``:done`` and ``:total``
+# counters already hold the truth, and this set only says which ones are worth
+# drawing. Members whose counters have expired are pruned as they are read, so a
+# batch whose worker died can never leave a phantom row behind.
+ACTIVE_BATCHES_KEY = f"{BATCH_KEY_PREFIX}active"
+# Rows the aggregate view draws before it summarises the remainder.
+BATCH_VIEW_MAX_ROWS = max(1, _env_number("BATCH_VIEW_MAX_ROWS", 6))
+
+
+def progress_bar(done, total, width: int = 10) -> str:
+    """A fixed-width text bar, e.g. ``██████░░░░``.
+
+    Width is constant regardless of the batch size so several batches stack into
+    a readable column in the aggregate view.
+    """
+    try:
+        total = int(total)
+        done = int(done)
+    except (TypeError, ValueError):
+        return "░" * width
+    if total <= 0:
+        return "░" * width
+    filled = int(round(max(0, min(done, total)) / total * width))
+    return "█" * filled + "░" * (width - filled)
+
+
+async def register_active_batch(redis=None, *, batch_id, ttl_seconds=None) -> bool:
+    """Mark a batch as worth drawing in the aggregate view."""
+    if not batch_id:
+        return False
+    own = redis is None
+    try:
+        if own:
+            from utils.job_queue import get_redis
+
+            redis = await get_redis()
+        await redis.sadd(ACTIVE_BATCHES_KEY, str(batch_id))
+        with contextlib.suppress(Exception):
+            await redis.expire(ACTIVE_BATCHES_KEY, int(ttl_seconds or BATCH_STATE_TTL_SECONDS))
+        return True
+    except Exception:
+        logger.debug("batch_pipeline: could not register active batch %s", batch_id)
+        return False
+    finally:
+        if own and redis is not None:
+            with contextlib.suppress(Exception):
+                await redis.close()
+
+
+async def unregister_active_batch(redis=None, *, batch_id) -> bool:
+    """Stop drawing a batch - it finished, or was cancelled."""
+    if not batch_id:
+        return False
+    own = redis is None
+    try:
+        if own:
+            from utils.job_queue import get_redis
+
+            redis = await get_redis()
+        await redis.srem(ACTIVE_BATCHES_KEY, str(batch_id))
+        return True
+    except Exception:
+        logger.debug("batch_pipeline: could not unregister active batch %s", batch_id)
+        return False
+    finally:
+        if own and redis is not None:
+            with contextlib.suppress(Exception):
+                await redis.close()
+
+
+async def read_batch_counters(redis, batch_id) -> dict:
+    """``{total, done}`` for one batch, with ``total`` preferring the recorded
+    exact enqueued count (see :func:`set_batch_total`)."""
+    out = {"batch_id": str(batch_id), "total": 0, "done": 0}
+    with contextlib.suppress(Exception):
+        recorded = await redis.get(batch_total_key(batch_id))
+        if recorded is not None:
+            out["total"] = int(recorded)
+    with contextlib.suppress(Exception):
+        out["done"] = int(await redis.get(batch_progress_key(batch_id)) or 0)
+    return out
+
+
+async def read_active_batches(redis) -> list[dict]:
+    """Every batch still worth drawing, with its counters.
+
+    Prunes members as a side effect: a batch whose counters are gone (expired,
+    or never written) is removed from the set rather than rendered as ``0/0``.
+    """
+    rows: list[dict] = []
+    try:
+        members = await redis.smembers(ACTIVE_BATCHES_KEY)
+    except Exception:
+        logger.debug("batch_pipeline: could not list active batches")
+        return rows
+    for member in members:
+        batch_id = member.decode() if isinstance(member, (bytes, bytearray)) else str(member)
+        counters = await read_batch_counters(redis, batch_id)
+        if counters["total"] <= 0:
+            with contextlib.suppress(Exception):
+                await redis.srem(ACTIVE_BATCHES_KEY, batch_id)
+            continue
+        rows.append(counters)
+    rows.sort(key=lambda row: row["done"] / max(row["total"], 1))
+    return rows
+
 
 
 def tag_batch_job(job: dict, batch_id, seq: int = 0, total: int = 0) -> dict:
@@ -291,6 +651,44 @@ async def release_batch_lock(redis, batch_id, job_id) -> bool:
     except Exception:
         logger.debug("batch_pipeline: failed to release lock %s", key)
         return False
+
+
+async def refresh_lock(redis, key, owner, ttl_seconds=None) -> bool:
+    """Re-arm the TTL on a claim we still own; no-op once we no longer hold it.
+
+    Called periodically by the worker for as long as its job runs. Without it
+    the TTL would have to cover an entire conversion (hence the old 6h value and
+    hence the freeze); with it, the TTL only has to cover the gap between two
+    heartbeats and an orphaned claim self-heals in minutes.
+    """
+    ttl = BATCH_LOCK_TTL_SECONDS if ttl_seconds is None else ttl_seconds
+    try:
+        ttl_ms = int(max(1.0, float(ttl)) * 1000)
+    except (TypeError, ValueError):
+        ttl_ms = int(BATCH_LOCK_TTL_SECONDS * 1000)
+    try:
+        return bool(await redis.eval(_REFRESH_LOCK_SCRIPT, 1, key, str(owner or ""), ttl_ms))
+    except Exception:
+        logger.debug("batch_pipeline: could not refresh %s", key)
+        return False
+
+
+async def refresh_batch_lock(redis, batch_id, job_id, ttl_seconds=None) -> bool:
+    """Keep this job's claim on its batch from expiring while the job runs."""
+    return await refresh_lock(redis, batch_lock_key(batch_id), job_id, ttl_seconds)
+
+
+async def refresh_ffmpeg_slot(redis, index, job_id, ttl_seconds=None) -> bool:
+    """Keep this job's conversion slot from expiring while the job runs."""
+    if index is None:
+        return False
+    try:
+        index = int(index)
+    except (TypeError, ValueError):
+        return False
+    if index < 0:
+        return False  # ran without a slot (Redis was unavailable) - nothing to keep
+    return await refresh_lock(redis, ffmpeg_slot_key(index), job_id, ttl_seconds)
 
 
 async def defer_batch_job(redis, job: dict, delay: float | None = None) -> bool:

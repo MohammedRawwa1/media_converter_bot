@@ -162,6 +162,19 @@ _DEFAULT_AUDIO_BITRATE = "128k"
 _AUDIO_BITRATE_MIN_KBPS = 32
 _AUDIO_BITRATE_MAX_KBPS = 320
 
+# A bulk apply holds the collected list until it finishes, so pressing Apply
+# again while the first run is still going would process every file twice. The
+# guard is time-bounded so a crashed apply can never lock a user out of their own
+# batch until it expires.
+_BULK_APPLY_GUARD_SECONDS = 12 * 3600
+
+# How long a bulk apply waits for one job to reach a terminal state before it
+# gives up and says so. Generous - a 900 MB conversion legitimately takes hours -
+# but not infinite: an unresponsive worker used to hang the whole apply silently,
+# which the user experiences as a batch frozen forever with no explanation.
+_BULK_JOB_WAIT_SECONDS = float(os.environ.get("BULK_JOB_WAIT_SECONDS", str(6 * 3600)))
+
+
 # ── Bulk mode ────────────────────────────────────────────────────────────────
 # Each toggle maps to the same encoding the matching single-file action uses, so
 # bulk results look like the ones produced from the per-file menus.
@@ -550,6 +563,23 @@ def _bulk_item_key(item: dict) -> object:
     return item.get("id") or item.get("file_unique_id") or item.get("path")
 
 
+def _bulk_entry_key(entry) -> str | None:
+    """Identity for one collected entry, as a string, for resume bookkeeping.
+
+    Survives a restart, because it is the Telegram file id rather than anything
+    process-local: that is what lets the next Apply tell which files an
+    interrupted run had already finished.
+    """
+    try:
+        if isinstance(entry, dict):
+            key = _bulk_item_key(entry)
+            return str(key) if key else None
+        text = str(entry or "").strip()
+        return text or None
+    except Exception:
+        return None
+
+
 def _bulk_display_name(file_info: dict | None) -> str:
     """Short, human label for one batch entry in the per-file Apply summary."""
     info = file_info or {}
@@ -605,6 +635,32 @@ def _normalize_bulk_item(item):
     return None
 
 
+def _bulk_failure_reason(exc: BaseException) -> str:
+    """Condense a bulk fetch failure into the few words the user needs.
+
+    The per-file summary used to say only "could not fetch" for every outcome,
+    which hid whether the file was too large for the Bot API, whether the
+    userbot or relay fallback failed, or whether Telegram throttled us. Those
+    have completely different fixes, so the reason belongs in the message the
+    user already reads.
+    """
+    text = str(exc or "").strip()
+    lowered = text.lower()
+    if "too big" in lowered or "exceeds" in lowered:
+        return "too large for the Bot API"
+    if "cancel" in lowered:
+        return "stopped"
+    if "relay" in lowered:
+        return "relay group failed"
+    if "userbot" in lowered:
+        return "userbot download failed"
+    if "flood" in lowered or "too many requests" in lowered or "retryafter" in lowered:
+        return "Telegram rate limit"
+    if "timeout" in lowered or "timed out" in lowered:
+        return "timed out"
+    return (text[:60] or "download failed").replace("\n", " ")
+
+
 def _register_bulk_file(session: dict | None, file_info: dict | None) -> bool:
     """Auto-collect a just-sent file for the next bulk Apply.
 
@@ -622,7 +678,15 @@ def _register_bulk_file(session: dict | None, file_info: dict | None) -> bool:
             if isinstance(item, dict) and _bulk_item_key(item) == key:
                 return False
         if len(queue) >= _BULK_LIST_LIMIT:
-            queue.pop(0)
+            # The cap is a hard limit on one apply, and silently dropping the
+            # oldest file is the sort of thing a user only discovers by counting.
+            # Name what was dropped; the bulk menu warns about the cap as well.
+            _dropped = queue.pop(0)
+            logger.warning(
+                "bulk: batch is full (%d files); dropped the oldest entry %s",
+                _BULK_LIST_LIMIT,
+                _bulk_display_name(_dropped) if isinstance(_dropped, dict) else _dropped,
+            )
         queue.append(file_info)
         return True
     except Exception:
@@ -1278,6 +1342,87 @@ class EnhancedMediaHandler:
         except Exception:
             logger.exception("_watch_job_progress failed for %s", job_id)
 
+    async def _await_job_finished(
+        self, job_id: str, poll_interval: float = 2.0, timeout: float = 0.0
+    ) -> str | None:
+        """Wait for a queued job to reach a terminal state **without editing Telegram**.
+
+        The bulk pipeline has to know when a file is done before it fetches the
+        next source (30 x ~500 MB must never land on disk at once), but it must
+        not own the user's message while it waits. :meth:`_watch_job_progress`
+        edits the message it is handed and then *deletes* it on terminal status -
+        and the batch progress bar used to live on that same message, which is why
+        a batch could sit frozen at "0 of N" while its bar was deleted and
+        reposted underneath it.
+
+        This polls Redis only. The worker stays the single writer of the batch's
+        progress message. Returns the terminal status, or ``None`` when Redis is
+        unreachable or the wait times out. The wait is always bounded
+        (:data:`_BULK_JOB_WAIT_SECONDS`): an unresponsive worker used to hang the
+        apply silently and for good, which the user just sees as a batch frozen
+        forever with nobody told anything.
+        """
+        timeout = _BULK_JOB_WAIT_SECONDS if not timeout else float(timeout)
+        if not job_id:
+            # Nothing to track. Returning straight away matters: the wait is
+            # bounded but long, and a job with no id would otherwise hold the
+            # apply for the whole timeout for no reason.
+            return None
+        try:
+            from utils.job_queue import get_redis
+
+            r = await get_redis()
+        except Exception:
+            logger.debug("_await_job_finished: no redis for %s", job_id)
+            return None
+        try:
+            deadline = time.time() + timeout
+            while True:
+                with contextlib.suppress(Exception):
+                    raw = await r.hget(f"ffmpeg:job:{job_id}", "status")
+                    status = raw.decode() if isinstance(raw, (bytes, bytearray)) else raw
+                    if status in ("done", "error", "cancelled"):
+                        return status
+                if deadline is not None and time.time() >= deadline:
+                    logger.warning("_await_job_finished: timed out waiting for %s", job_id)
+                    return None
+                await asyncio.sleep(poll_interval)
+        finally:
+            with contextlib.suppress(Exception):
+                aclose = getattr(r, "aclose", None)
+                if aclose is not None:
+                    await aclose()
+                else:
+                    await r.close()
+
+    async def _close_batch_message(self, context, batch_id: str) -> None:
+        """Delete a finished batch's progress message and stop tracking it.
+
+        The worker takes the message down itself whenever its counter matches the
+        batch total. When files were skipped at enqueue time the total it saw was
+        the higher estimate, so this closes the batch out once the handler has
+        waited for every job it queued.
+        """
+        from utils.batch_pipeline import batch_message_key, parse_batch_message_ref
+        from utils.job_queue import get_redis
+
+        r = await get_redis()
+        try:
+            stored = await r.get(batch_message_key(batch_id))
+            if stored:
+                ref = parse_batch_message_ref(stored)
+                if ref:
+                    with contextlib.suppress(Exception):
+                        await context.bot.delete_message(chat_id=ref[0], message_id=ref[1])
+                await r.delete(batch_message_key(batch_id))
+        finally:
+            with contextlib.suppress(Exception):
+                aclose = getattr(r, "aclose", None)
+                if aclose is not None:
+                    await aclose()
+                else:
+                    await r.close()
+
     # ---------- Session persistence helpers (simple JSON store) ----------
     def _session_file(self, user_id: int) -> str:
         return os.path.join(self._session_store_dir, f"session_{user_id}.json")
@@ -1533,6 +1678,33 @@ class EnhancedMediaHandler:
             logger.debug("Conversion quota check failed, allowing conversion")
         return True
 
+    async def _discard_relay_copy(self, context, chat_id, message_id, reason: str = "") -> bool:
+        """Delete a relay-group copy we forwarded but are not going to use.
+
+        The relay group exists so the userbot can reach a file the bot itself
+        cannot fetch. Once the reason for forwarding is gone - the batch was
+        stopped, or the download that the copy was for failed - the copy is dead
+        weight in a shared chat, and for a long video a lot of it. Best-effort:
+        a failure here is logged and never fails the caller.
+        """
+        try:
+            chat_id = int(chat_id)
+            message_id = int(message_id)
+        except (TypeError, ValueError):
+            return False
+        try:
+            await context.bot.delete_message(chat_id=chat_id, message_id=message_id)
+            logger.info(
+                "Relay: removed the copy at %s/%s%s",
+                chat_id,
+                message_id,
+                f" ({reason})" if reason else "",
+            )
+            return True
+        except Exception:
+            logger.debug("Relay: could not remove the copy at %s/%s", chat_id, message_id)
+            return False
+
     async def _cleanup_dedup_key(self, dedup_key: str | None) -> None:
         """Delete a pipeline dedup key from Redis (best-effort, fire-and-forget).
 
@@ -1701,10 +1873,28 @@ class EnhancedMediaHandler:
             await self._ensure_current_file_downloaded(update, context, session)
             pipeline_job_id = file_info.get("_pipeline_job_id")
             if pipeline_job_id and pipeline_job_id != pipeline_job_before:
-                query = getattr(update, "callback_query", None)
-                if query is not None:
-                    await self._watch_job_progress(query, pipeline_job_id, bot=context.bot)
-                file_info["_bulk_pipeline_completed"] = True
+                # Wait for the download/convert pipeline to finish without taking
+                # over the user's message: the batch bar belongs to the worker.
+                _pipeline_status = await self._await_job_finished(pipeline_job_id)
+                if _pipeline_status == "done":
+                    file_info["_bulk_pipeline_completed"] = True
+                elif _pipeline_status == "cancelled":
+                    # Stopped, not finished. Reporting it as completed would count
+                    # a cancelled file as done and keep the batch running.
+                    file_info["_batch_cancelled"] = True
+                elif _pipeline_status is None:
+                    # The job still exists and will deliver, so the file stays
+                    # marked completed - enqueuing a second job for it would be
+                    # worse than waiting on the one already queued.
+                    logger.warning(
+                        "bulk apply: gave up waiting for pipeline job %s; its result arrives on its own",
+                        pipeline_job_id,
+                    )
+                    file_info["_bulk_pipeline_completed"] = True
+                else:
+                    # Errored for real: say so, and never enqueue a second job for
+                    # a file the pipeline already tried and failed to convert.
+                    file_info["_pipeline_failed"] = True
         finally:
             if had_current:
                 session["current_file"] = previous
@@ -1889,6 +2079,27 @@ class EnhancedMediaHandler:
             if file_size and file_size > bot_api_max_mb * 1024 * 1024 and _bigfile_pipeline is not None:
                 _bot_chat, _bot_msg = _extract_large_file_source(current_file)
                 if _bot_chat and _bot_msg:
+                    # A batch that is already stopped must not reach the relay
+                    # forward further down. Order matters: that forward happens
+                    # *before* the pipeline ingests, so without this check pressing
+                    # Stop mid-file leaves a copy of that file in the relay group
+                    # and the ingest is then refused as "batch cancelled" - i.e. a
+                    # forward with nothing processed.
+                    _pre_batch_id = current_file.get("_pipeline_batch_id")
+                    if _pre_batch_id:
+                        with contextlib.suppress(Exception):
+                            from utils.batch_pipeline import is_batch_cancelled as _is_cancelled_now
+
+                            if await _is_cancelled_now(batch_id=_pre_batch_id):
+                                current_file["_batch_cancelled"] = True
+                                session["current_file"] = current_file
+                                logger.info(
+                                    "Batch %s is stopped: skipping fetch of %s",
+                                    _pre_batch_id,
+                                    current_file.get("name"),
+                                )
+                                return
+
                     # ── Redis-based pipeline dedup: if this file_unique_id was already
                     #    pipelined (e.g. from a previous callback where the session didn't
                     #    persist _pipeline_job_id), skip the pipeline entirely. This prevents
@@ -2039,12 +2250,18 @@ class EnhancedMediaHandler:
                     _pipeline_loop = None
                     try:
                         _dl_text = f"⬇️ Downloading via pipeline ({file_size // (1024 * 1024)} MB)..."
-                        _batch_message = getattr(query, "message", None)
+                        # `query` was never bound in this scope, so this block raised
+                        # NameError and was swallowed by the except below - which is
+                        # why the pipeline's download message never appeared. The
+                        # caller (a menu press) owns the message we should edit.
+                        _pipeline_batch_id = current_file.get("_pipeline_batch_id")
+                        if _pipeline_batch_id:
+                            _dl_text = f"▶️ Batch `{_pipeline_batch_id}`\n{_dl_text}"
+                        query = getattr(update, "callback_query", None)
+                        _batch_message = getattr(query, "message", None) if query else None
                         if _batch_message is not None:
                             _pipeline_progress_msg = _batch_message
-                            await _pipeline_progress_msg.edit_text(
-                                f"▶️ Batch `{current_file.get('_pipeline_batch_id')}`\n{_dl_text}"
-                            )
+                            await _pipeline_progress_msg.edit_text(_dl_text)
                         elif update and update.message:
                             _pipeline_progress_msg = await update.message.reply_text(_dl_text)
                         elif update and update.effective_user and context and context.bot:
@@ -2132,6 +2349,14 @@ class EnhancedMediaHandler:
                             with contextlib.suppress(Exception):
                                 if _pipeline_progress_msg:
                                     await _pipeline_progress_msg.edit_text("⏹️ Batch download cancelled.")
+                            # The relay forward for this file ran *before* the
+                            # pipeline could refuse it, so the copy is now dead
+                            # weight - remove it instead of leaving the batch's
+                            # in-flight file sitting in the relay group.
+                            if _relay_forwarded_already:
+                                await self._discard_relay_copy(
+                                    context, _pipeline_chat, _pipeline_msg, "batch cancelled"
+                                )
                             await self._cleanup_dedup_key(_dedup_key)
                             return
                         if _ingest.ok:
@@ -2456,12 +2681,15 @@ class EnhancedMediaHandler:
                             )
                             if await _try_userbot_download(_relay_chat_id, _relay_msg_id, "relay_group"):
                                 return
-                            else:
-                                logger.warning(
-                                    "Relay: userbot download from %s/%s failed",
-                                    _relay_chat_id,
-                                    _relay_msg_id,
-                                )
+                            logger.warning(
+                                "Relay: userbot download from %s/%s failed",
+                                _relay_chat_id,
+                                _relay_msg_id,
+                            )
+                            # The copy was forwarded for that download only.
+                            await self._discard_relay_copy(
+                                context, _relay_chat_id, _relay_msg_id, "download failed"
+                            )
                     except Exception as _relay_exc:
                         logger.exception("Relay: forwarding/download failed: %s", _relay_exc)
 
@@ -3042,6 +3270,32 @@ class EnhancedMediaHandler:
         preset = _sanitize_bulk_preset(s.get("bulk_optimize_preset"))
         bitrate = _sanitize_bulk_extract_bitrate(s.get("bulk_extract_bitrate"))
         sess = self.user_sessions.get(user_id) or {}
+        # Subtract anything an interrupted earlier run already finished, so the
+        # count here and the next Apply agree and neither redoes completed work.
+        _recovered = 0
+        try:
+            from utils.batch_pipeline import forget_finished_entries, read_finished_entries
+            from utils.job_queue import get_redis as _get_redis_here
+
+            _r_here = await _get_redis_here()
+            _finished_here = await read_finished_entries(_r_here, user_id)
+            if _finished_here:
+                _done_here = set().union(*_finished_here.values())
+                _entries_here = sess.get("bulk_list") or []
+                _kept_here = [e for e in _entries_here if _bulk_entry_key(e) not in _done_here]
+                _recovered = len(_entries_here) - len(_kept_here)
+                if _recovered:
+                    sess["bulk_list"] = _kept_here
+                    await forget_finished_entries(_r_here, _finished_here, _done_here)
+                    with contextlib.suppress(Exception):
+                        self._persist_session(user_id)
+                    logger.info(
+                        "bulk menu: recovered %d already-finished file(s) for user %s",
+                        _recovered,
+                        user_id,
+                    )
+        except Exception:
+            logger.debug("show_bulk_menu: could not reconcile the resume record")
         entries = sess.get("bulk_list") or sess.get("merge_list") or []
         queued = len(entries)
         seconds = _sanitize_bulk_slideshow_seconds(s.get("bulk_slideshow_seconds"))
@@ -3054,6 +3308,16 @@ class EnhancedMediaHandler:
         _batch_block = ""
         if entries:
             _batch_block = "🗂 <b>Batch</b>\n" + "\n".join(_bulk_batch_lines(entries)) + "\n\n"
+        if _recovered:
+            _batch_block += (
+                f"↩️ {_recovered} file(s) here were already finished by an interrupted run "
+                "and were removed from this list.\n\n"
+            )
+        if queued >= _BULK_LIST_LIMIT:
+            _batch_block += (
+                f"⚠️ The batch holds its maximum of {_BULK_LIST_LIMIT} files — "
+                "sending another drops the oldest. Apply or Clear the list before adding more.\n\n"
+            )
         text = (
             f"📦 <b>Bulk Mode Actions</b>\n\n"
             f"Files queued : {queued}\n"
@@ -4920,6 +5184,65 @@ class EnhancedMediaHandler:
                         )
                         return
 
+                    # One apply at a time per account: the list is only cleared when
+                    # a run finishes, so a second press would queue the whole batch
+                    # again while the first is still working through it.
+                    try:
+                        _apply_started = float(sess.get("_bulk_apply_started_at") or 0)
+                    except (TypeError, ValueError):
+                        _apply_started = 0
+                    if _apply_started and (time.time() - _apply_started) < _BULK_APPLY_GUARD_SECONDS:
+                        await self.safe_edit(
+                            query,
+                            "⏳ A bulk apply is already running for your account.\n"
+                            "Open its progress message and press ⏹️ Stop batch to end it first.",
+                        )
+                        return
+                    sess["_bulk_apply_started_at"] = time.time()
+
+                    # Ask the resume record which of these files an interrupted
+                    # earlier run already finished, and drop them. Without this a
+                    # restart mid-batch would silently redo every file it had
+                    # already converted. Runs here rather than in the menu so a
+                    # direct Apply gets it too.
+                    _reclaimed = 0
+                    try:
+                        from utils.batch_pipeline import forget_finished_entries, read_finished_entries
+                        from utils.job_queue import get_redis as _get_redis_resume
+
+                        _r_resume = await _get_redis_resume()
+                        _finished = await read_finished_entries(_r_resume, user_id)
+                        if _finished:
+                            _done_keys = set().union(*_finished.values())
+                            _kept = [e for e in files if _bulk_entry_key(e) not in _done_keys]
+                            _reclaimed = len(files) - len(_kept)
+                            if _reclaimed:
+                                files = _kept
+                                await forget_finished_entries(_r_resume, _finished, _done_keys)
+                                # Keep the stored collection in step with what is
+                                # actually left, now that those keys are consumed
+                                # and would no longer be pruned by a later resume.
+                                sess["bulk_list"] = _kept
+                                with contextlib.suppress(Exception):
+                                    self._persist_session(user_id)
+                                logger.info(
+                                    "bulk apply: recovered %d already-finished file(s) for user %s",
+                                    _reclaimed,
+                                    user_id,
+                                )
+                    except Exception:
+                        logger.debug("bulk apply: could not read the resume record")
+
+                    if not files:
+                        await self.safe_edit(
+                            query,
+                            "✅ Nothing left to do — every file collected here was already "
+                            "finished by an earlier run.",
+                        )
+                        with contextlib.suppress(Exception):
+                            sess.pop("_bulk_apply_started_at", None)
+                        return
+
                     # Honor every bulk toggle (convert / compress / extract audio /
                     # remove audio / rename / optimize) and tell the user which
                     # ones could not fit into the single pass, so nothing is
@@ -4962,38 +5285,47 @@ class EnhancedMediaHandler:
                         logger.debug("bulk apply: sequential batch tagging unavailable")
 
                     if _batch_id:
+                        # This message stays the handler's: it carries the batch
+                        # id and the Stop button for the duration of the apply
+                        # and becomes the per-file summary at the end. The batch's
+                        # own progress message is posted and owned by the worker,
+                        # so exactly one writer ever touches either message. (The
+                        # handler used to hand this message to the worker as the
+                        # batch message as well, and the single-file progress
+                        # watcher deleted it out from under the batch bar.)
                         with contextlib.suppress(Exception):
                             await self.safe_edit(
                                 query,
                                 f"▶️ Batch started: `{_batch_id}`\n"
-                                f"Use `/cancelbatch {_batch_id}` to stop the remaining files.",
+                                "Progress for this batch, and for every other batch you "
+                                "have running, is in the message below.\n"
+                                f"`/cancelbatch {_batch_id}` also works.",
+                                reply_markup=InlineKeyboardMarkup(
+                                    [
+                                        [
+                                            InlineKeyboardButton(
+                                                "⏹️ Stop batch",
+                                                callback_data=f"batch_cancel:{_batch_id}",
+                                            )
+                                        ]
+                                    ]
+                                ),
                             )
-                        # Register the first message before any source download.
-                        # The worker and the pipeline will edit this same message.
+                        # Make the batch visible to the aggregate view, and publish
+                        # the expected count before the first job is queued so the
+                        # worker can render its bar from the first second.
                         with contextlib.suppress(Exception):
-                            _batch_message = getattr(query, "message", None)
-                            _batch_chat = getattr(_batch_message, "chat_id", None)
-                            _batch_message_id = getattr(_batch_message, "message_id", None)
-                            if _batch_chat and _batch_message_id:
-                                from utils.batch_pipeline import batch_message_key
-                                from utils.job_queue import get_redis
-
-                                _batch_redis = await get_redis()
-                                try:
-                                    await _batch_redis.set(
-                                        batch_message_key(_batch_id),
-                                        f"{_batch_chat}:{_batch_message_id}",
-                                        ex=86400,
-                                    )
-                                finally:
-                                    await _batch_redis.close()
-                        # Publish the expected count before the first job is
-                        # queued. The worker can then render batch progress
-                        # immediately, even while this handler waits for job 1.
-                        with contextlib.suppress(Exception):
-                            from utils.batch_pipeline import set_batch_total
+                            from utils.batch_pipeline import (
+                                open_batch_resume,
+                                register_active_batch,
+                                set_batch_total,
+                            )
 
                             await set_batch_total(batch_id=_batch_id, total=len(files))
+                            await register_active_batch(batch_id=_batch_id)
+                            # Make the apply resumable before the first file starts,
+                            # so a restart cannot leave finished work to be redone.
+                            await open_batch_resume(batch_id=_batch_id, user_id=user_id)
 
                     # Photos in the batch become ONE slideshow video instead of a
                     # per-photo still-image encode. A lone photo keeps the normal
@@ -5076,6 +5408,24 @@ class EnhancedMediaHandler:
                                     await enqueue_job(_ss_job)
                                     enqueued += 1
                                     results.append((_label, f"📋 queued · {job_id}"))
+                                    # This loop is what paces the batch, so it has to
+                                    # wait for the slideshow too. Without that the
+                                    # loop could finish (and the batch be closed out)
+                                    # while the slideshow was still converting, and
+                                    # the batch's counts could never line up.
+                                    if await self._await_job_finished(job_id) == "done":
+                                        # The photos became this one video, so every
+                                        # photo that went into it is done - otherwise a
+                                        # resume would rebuild the slideshow.
+                                        with contextlib.suppress(Exception):
+                                            from utils.batch_pipeline import mark_batch_entry_finished
+                                            from utils.job_queue import get_redis as _get_redis_ss
+
+                                            _r_ss = await _get_redis_ss()
+                                            for _photo_entry in _slideshow_photos:
+                                                await mark_batch_entry_finished(
+                                                    _r_ss, _batch_id, _bulk_entry_key(_photo_entry)
+                                                )
                                 except Exception:
                                     logger.exception("Failed to enqueue bulk slideshow")
                                     failed += 1
@@ -5089,8 +5439,33 @@ class EnhancedMediaHandler:
                         _slideshow_ids = {id(f) for f in _slideshow_photos}
                         files = [f for f in files if id(f) not in _slideshow_ids]
 
-                    for f in list(files):
+                    stopped = False
+                    stalled = False
+                    _bulk_files = list(files)
+                    for _idx, f in enumerate(_bulk_files):
                         try:
+                            # Honour Stop between files, not just between jobs. The
+                            # worker checks this marker before starting a job, but
+                            # nothing used to check it here - so after pressing Stop
+                            # the apply carried on fetching, which for a file over the
+                            # Bot API limit means forwarding it to the relay group and
+                            # downloading it with the userbot, only for the job it was
+                            # for to be discarded. Stop should stop the fetching too.
+                            if _batch_id:
+                                try:
+                                    from utils.batch_pipeline import is_batch_cancelled
+
+                                    if await is_batch_cancelled(batch_id=_batch_id):
+                                        stopped = True
+                                        _remaining = len(_bulk_files) - _idx - 1
+                                        if _remaining:
+                                            results.append(
+                                                (f"+{_remaining} remaining file(s)", "⏹️ batch stopped")
+                                            )
+                                        break
+                                except Exception:
+                                    logger.debug("bulk apply: could not read the cancel marker")
+
                             if f.get("type") == "photo" and not _photo_ok:
                                 photo_skipped += 1
                                 results.append((_bulk_display_name(f), "⏭️ skipped — needs audio/video"))
@@ -5113,21 +5488,76 @@ class EnhancedMediaHandler:
                                 _file_path = await self._ensure_bulk_file_downloaded(
                                     update, context, sess, f
                                 )
-                            except Exception:
-                                logger.debug("bulk: download failed for %s", f.get("id"))
+                            except Exception as _fetch_exc:
+                                logger.warning(
+                                    "bulk apply: could not fetch %s: %s",
+                                    _bulk_display_name(f),
+                                    _fetch_exc,
+                                )
                                 skipped += 1
-                                results.append((_bulk_display_name(f), "❌ could not fetch"))
+                                results.append(
+                                    (
+                                        _bulk_display_name(f),
+                                        f"❌ could not fetch — {_bulk_failure_reason(_fetch_exc)}",
+                                    )
+                                )
+                                continue
+
+                            # A file the batch stopped before touching reports no
+                            # path and no storage key - identical to a real fetch
+                            # failure - which is why a stopped batch summarised as
+                            # "Could not fetch N file(s)". Say what actually happened.
+                            if f.get("_batch_cancelled"):
+                                # Not a skipped file: the batch was stopped before
+                                # this one was ever attempted, so it must not be
+                                # counted or reported as a fetch failure.
+                                stopped = True
+                                results.append((_bulk_display_name(f), "⏹️ stopped with the batch"))
+                                break
+
+                            if f.get("_pipeline_failed"):
+                                # The pipeline already had this file and could not
+                                # convert it, so queueing another job for it would
+                                # just fail twice.
+                                failed += 1
+                                results.append((_bulk_display_name(f), "❌ conversion failed"))
+                                continue
+
+                            # Check completion *before* looking for a local file: a
+                            # conversion the pipeline already queued has neither a
+                            # path nor a key of its own yet - its job is what fetches
+                            # it. Checking for a path first reported those files as
+                            # "could not fetch" and left them out of the batch count.
+                            if f.pop("_bulk_pipeline_completed", False):
+                                enqueued += 1
+                                _batch_seq += 1
+                                # This file was converted and delivered inside this
+                                # handler by the inline pipeline, so no worker job
+                                # exists to advance the batch's counter - yet it is
+                                # counted in the batch total. Count it here as well,
+                                # or the batch is permanently one short of its total
+                                # and its progress message is never taken down (the
+                                # bar that sits at "0 of 1" forever).
+                                if _batch_id:
+                                    with contextlib.suppress(Exception):
+                                        from utils.batch_pipeline import mark_batch_file_done
+
+                                        await mark_batch_file_done(batch_id=_batch_id)
+                                    with contextlib.suppress(Exception):
+                                        from utils.batch_pipeline import mark_batch_entry_finished
+                                        from utils.job_queue import get_redis as _get_redis_mark
+
+                                        await mark_batch_entry_finished(
+                                            await _get_redis_mark(), _batch_id, _bulk_entry_key(f)
+                                        )
+                                results.append((_bulk_display_name(f), f"✅ completed · {f.get('_pipeline_job_id')}"))
                                 continue
 
                             if not _file_path and not f.get("input_key"):
                                 skipped += 1
-                                results.append((_bulk_display_name(f), "❌ could not fetch"))
-                                continue
-
-                            if f.pop("_bulk_pipeline_completed", False):
-                                enqueued += 1
-                                results.append((_bulk_display_name(f), f"✅ completed · {f.get('_pipeline_job_id')}"))
-                                _batch_seq += 1
+                                results.append(
+                                    (_bulk_display_name(f), "❌ could not fetch — no file or storage key")
+                                )
                                 continue
 
                             job_id = str(uuid.uuid4()) if uuid else None
@@ -5183,9 +5613,26 @@ class EnhancedMediaHandler:
                                     enqueued += 1
                                     results.append((_bulk_display_name(f), f"📋 queued · {job_id}"))
                                     # Keep bulk ingestion serial: do not download the next
-                                    # source until this job has finished and delivered its
-                                    # result. The watcher returns on every terminal state.
-                                    await self._watch_job_progress(query, job_id, bot=context.bot)
+                                    # source until this job has reached a terminal state,
+                                    # so 30 large sources never pile up on disk or in RAM.
+                                    # Message-free on purpose - see _await_job_finished.
+                                    _job_status = await self._await_job_finished(job_id)
+                                    if _job_status is None:
+                                        stalled = True
+                                        results.append(
+                                            (_bulk_display_name(f), "⏱️ worker did not finish this job")
+                                        )
+                                        break
+                                    if _job_status == "done" and _batch_id:
+                                        # This file is genuinely finished, so a later
+                                        # resume must not convert it again.
+                                        with contextlib.suppress(Exception):
+                                            from utils.batch_pipeline import mark_batch_entry_finished
+                                            from utils.job_queue import get_redis as _get_redis_mark
+
+                                            await mark_batch_entry_finished(
+                                                await _get_redis_mark(), _batch_id, _bulk_entry_key(f)
+                                            )
                                 except Exception:
                                     logger.exception("Failed to enqueue bulk job for %s", f.get("id"))
                                     failed += 1
@@ -5210,9 +5657,33 @@ class EnhancedMediaHandler:
                             await set_batch_total(batch_id=_batch_id, total=enqueued)
                         except Exception:
                             logger.debug("bulk apply: could not record the batch total")
+                        # The loop above waited on every job it queued, so the
+                        # batch is over. The worker already removed its message
+                        # whenever its counter matched the total; this covers the
+                        # case where files were skipped at enqueue and the total
+                        # the worker saw was the higher estimate.
+                        with contextlib.suppress(Exception):
+                            await self._close_batch_message(context, _batch_id)
+                        with contextlib.suppress(Exception):
+                            from utils.batch_pipeline import unregister_active_batch
+
+                            await unregister_active_batch(batch_id=_batch_id)
+                        # A run that finished keeps no resume record: its collection
+                        # is cleared, so there is nothing left to skip. A stopped or
+                        # stalled run keeps its record deliberately - the finished
+                        # files are still in the collection, and pressing Apply again
+                        # should continue from where it stopped rather than convert
+                        # them a second time.
+                        if not (stopped or stalled):
+                            with contextlib.suppress(Exception):
+                                from utils.batch_pipeline import close_batch_resume
+
+                                await close_batch_resume(batch_id=_batch_id, user_id=user_id)
 
                     # Batch consumed — start fresh for the next round.
                     sess["bulk_list"] = []
+                    with contextlib.suppress(Exception):
+                        sess.pop("_bulk_apply_started_at", None)
                     try:
                         self._persist_session(user_id)
                     except Exception:
@@ -5222,18 +5693,50 @@ class EnhancedMediaHandler:
                     _quality = _bulk_quality_label(_plan)
                     if _quality:
                         _applied = f"{_applied} ({_quality})"
-                    _head = f"✅ Bulk apply finished — queued {enqueued} file(s).\n• Applied: {_applied}"
-                    if _batch_id:
+                    if stalled:
+                        _head = (
+                            f"⏱️ Bulk apply stalled — {enqueued} file(s) were handled, then a job "
+                            f"did not finish in time.\n• Applied: {_applied}"
+                        )
+                    elif stopped:
+                        # You stopped this batch, so "finished" and "could not
+                        # fetch" are both wrong: the files the stop prevented were
+                        # never attempted. Say so plainly instead of dressing an
+                        # abandoned batch up as a completed one with failures.
+                        _head = (
+                            f"⏹️ Bulk apply stopped — {enqueued} file(s) were already handled "
+                            f"before the stop.\n• Applied: {_applied}"
+                        )
+                    else:
+                        _head = f"✅ Bulk apply finished — queued {enqueued} file(s).\n• Applied: {_applied}"
+                    _halted = stopped or stalled
+                    if _batch_id and not _halted:
                         _head += f"\n• Batch ID: `{_batch_id}`\nUse `/cancelbatch {_batch_id}` to stop the remaining jobs."
-                    if enqueued:
+                    if enqueued and not _halted:
                         _head += (
                             "\n🐢 Processing one file at a time (memory-safe) — "
                             "each result arrives as its job finishes."
                         )
+                    if stopped:
+                        _head += "\n⏹️ The remaining files were not fetched or queued."
+                    if stalled:
+                        _head += (
+                            "\n⏱️ Gave up waiting after "
+                            f"{int(_BULK_JOB_WAIT_SECONDS // 3600)}h — the worker may be down. "
+                            "Check `/session_status`. The remaining files were not queued."
+                        )
                     if skipped:
+                        # Only genuine failures land here now; stopped files have
+                        # their own line and are counted separately.
                         _head += f"\n⚠️ Could not fetch {skipped} file(s)."
                     if failed:
-                        _head += f"\n❗ {failed} file(s) failed to queue."
+                        # Covers both outcomes: a file that could not be queued and
+                        # one the pipeline already tried and failed to convert.
+                        _head += f"\n❗ {failed} file(s) failed."
+                    if _reclaimed:
+                        _head += (
+                            f"\n↩️ Skipped {_reclaimed} file(s) an earlier run had already finished."
+                        )
                     if photo_skipped:
                         _head += (
                             f"\n⚠️ Skipped {photo_skipped} photo(s) — “{_applied}” needs an audio/video stream."
@@ -5247,19 +5750,50 @@ class EnhancedMediaHandler:
                         if len(results) > _BULK_SUMMARY_MAX_LINES:
                             _lines.append(f"… +{len(results) - _BULK_SUMMARY_MAX_LINES} more")
                         _head += "\n\n🗂 Per-file:\n" + "\n".join(_lines)
-                    await self.safe_edit(query, _head)
+                    # The batch is over, so its Stop button goes with it.
+                    await self.safe_edit(query, _head, reply_markup=None)
                 except Exception:
                     logger.exception("bulk_apply failed")
+                    # Release the apply guard, or a failed run would lock the user
+                    # out of their own batch until the guard's window expires.
+                    with contextlib.suppress(Exception):
+                        (session or self.user_sessions.get(user_id, {})).pop("_bulk_apply_started_at", None)
                     await self.safe_edit(query, "⚠️ Failed to apply bulk actions.")
 
             elif data == "bulk_clear":
-                # Drop the auto-collected batch without processing it
+                # Drop the collected batch without processing it.
+                #
+                # This has to clear the merge list too. Apply Bulk reads
+                # `bulk_list or merge_list`, and the menu counts the same way, so
+                # clearing only `bulk_list` left everything in `merge_list` still
+                # queued and still counted - which is why the button looked like it
+                # did nothing. It also confirms what it removed, because a silent
+                # re-render of an identical menu is indistinguishable from a
+                # broken button.
                 sess = session or self.user_sessions.get(user_id, {})
+                # Count distinct entries: the same file can sit in both lists
+                # (photos are added to each), and reporting it twice would be as
+                # confusing as the silent button was.
+                _seen = set()
+                for _item in (sess.get("bulk_list") or []) + (sess.get("merge_list") or []):
+                    _key = _bulk_item_key(_item) if isinstance(_item, dict) else str(_item)
+                    if _key:
+                        _seen.add(_key)
+                total_cleared = len(_seen)
                 sess["bulk_list"] = []
+                sess["merge_list"] = []
                 try:
                     self._persist_session(user_id)
                 except Exception:
                     logger.debug("Could not persist session after bulk_clear")
+
+                if total_cleared:
+                    _toast = f"🗑️ Cleared {total_cleared} file(s)"
+                    logger.info("bulk_clear: cleared %s file(s) for user %s", total_cleared, user_id)
+                else:
+                    _toast = "List was already empty"
+                with contextlib.suppress(BadRequest):
+                    await query.answer(_toast, show_alert=False)
                 await self.show_bulk_menu(update, context)
 
             elif data == "video_reorder":
@@ -5400,6 +5934,59 @@ class EnhancedMediaHandler:
                 except Exception:
                     logger.exception("Failed to cancel job %s", job_id)
                     await self.safe_edit(query, "⚠️ Failed to cancel job.")
+
+            elif isinstance(data, str) and data.startswith("batch_cancel:"):
+                # Stop button on a batch's progress message. The batch id rides in
+                # the callback data, so the user never has to read it off a
+                # message or type /cancelbatch to stop a batch.
+                try:
+                    batch_id = data.split(":", 1)[1]
+                except Exception:
+                    await self.safe_edit(query, "⚠️ Invalid batch cancel request.")
+                    return
+
+                try:
+                    from utils.batch_pipeline import (
+                        batch_message_key,
+                        cancel_batch,
+                        parse_batch_message_ref,
+                        unregister_active_batch,
+                    )
+                    from utils.job_queue import get_redis
+
+                    report = await cancel_batch(batch_id=batch_id, requested_by=user_id)
+                    await unregister_active_batch(batch_id=batch_id)
+
+                    # A batch can show two stoppable messages - the bot's summary and
+                    # the worker's progress bar - and each carries its own Stop
+                    # button. Stopping from one used to leave the other behind as a
+                    # stale bar that nothing would ever remove, which reads exactly
+                    # like a batch frozen at its last percentage. Take the batch's
+                    # own progress message down as well, unless it is the one the
+                    # user just pressed (that becomes the confirmation below).
+                    with contextlib.suppress(Exception):
+                        _pressed_id = getattr(getattr(query, "message", None), "message_id", None)
+                        _r_stop = await get_redis()
+                        _stored = await _r_stop.get(batch_message_key(batch_id))
+                        _ref = parse_batch_message_ref(_stored) if _stored else None
+                        if _ref and _ref[1] != _pressed_id:
+                            with contextlib.suppress(Exception):
+                                await context.bot.delete_message(chat_id=_ref[0], message_id=_ref[1])
+                        if _stored:
+                            # Forget it, so nothing edits or reposts a removed bar.
+                            await _r_stop.delete(batch_message_key(batch_id))
+
+                    await self.safe_edit(
+                        query,
+                        "⏹️ Batch stopped.\n"
+                        f"• Flagged {report['jobs']} job(s)\n"
+                        f"• Removed {report['queued']} queued and {report['delayed']} waiting job(s)",
+                    )
+                    with contextlib.suppress(BadRequest):
+                        await query.answer("Batch stopped")
+                except Exception:
+                    logger.exception("Failed to cancel batch %s", batch_id)
+                    await self.safe_edit(query, "⚠️ Failed to stop the batch.")
 
             elif isinstance(data, str) and data.startswith("cancel_dl:"):
                 # User pressed the Cancel button during a userbot download
