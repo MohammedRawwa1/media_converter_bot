@@ -4884,6 +4884,23 @@ class EnhancedMediaHandler:
                     # (label, status) pairs — one per queued file/group — shown below.
                     results: list[tuple[str, str]] = []
 
+                    # One identity for the whole apply. The worker uses it to run
+                    # the batch strictly one file at a time (a per-batch Redis
+                    # lock) and to force a memory cleanup between jobs, so 30
+                    # videos never overlap in RAM. Redis holds the backlog; only
+                    # one member of this batch runs at a time no matter how many
+                    # worker replicas are up.
+                    _batch_id = None
+                    _batch_total = 0
+                    _batch_seq = 0
+                    try:
+                        from utils.batch_pipeline import new_batch_id, tag_batch_job
+
+                        _batch_id = new_batch_id()
+                        _batch_total = len(files)
+                    except Exception:
+                        logger.debug("bulk apply: sequential batch tagging unavailable")
+
                     # Photos in the batch become ONE slideshow video instead of a
                     # per-photo still-image encode. A lone photo keeps the normal
                     # single-file path in the loop below.
@@ -4950,6 +4967,12 @@ class EnhancedMediaHandler:
                                 "cleanup_input": True,
                                 "cleanup_output": False,
                             }
+                            if _batch_id:
+                                try:
+                                    tag_batch_job(_ss_job, _batch_id, _batch_seq, _batch_total)
+                                    _batch_seq += 1
+                                except Exception:
+                                    logger.debug("bulk apply: could not tag slideshow job")
                             if enqueue_job:
                                 try:
                                     try:
@@ -5032,6 +5055,12 @@ class EnhancedMediaHandler:
                                 "cleanup_input": True,
                                 "cleanup_output": False,
                             }
+                            if _batch_id:
+                                try:
+                                    tag_batch_job(job, _batch_id, _batch_seq, _batch_total)
+                                    _batch_seq += 1
+                                except Exception:
+                                    logger.debug("bulk apply: could not tag job %s", job_id)
 
                             if enqueue_job:
                                 try:
@@ -5055,6 +5084,18 @@ class EnhancedMediaHandler:
                             failed += 1
                             results.append((_bulk_display_name(f), "❌ failed"))
 
+                    # Record how many jobs this apply really enqueued. The worker
+                    # uses it to know when the batch is finished and to take its
+                    # single progress message down; the payload total is only the
+                    # number of collected files, and some can be skipped above.
+                    if _batch_id:
+                        try:
+                            from utils.batch_pipeline import set_batch_total
+
+                            await set_batch_total(batch_id=_batch_id, total=enqueued)
+                        except Exception:
+                            logger.debug("bulk apply: could not record the batch total")
+
                     # Batch consumed — start fresh for the next round.
                     sess["bulk_list"] = []
                     try:
@@ -5067,6 +5108,11 @@ class EnhancedMediaHandler:
                     if _quality:
                         _applied = f"{_applied} ({_quality})"
                     _head = f"✅ Bulk apply finished — queued {enqueued} file(s).\n• Applied: {_applied}"
+                    if enqueued:
+                        _head += (
+                            "\n🐢 Processing one file at a time (memory-safe) — "
+                            "each result arrives as its job finishes."
+                        )
                     if skipped:
                         _head += f"\n⚠️ Could not fetch {skipped} file(s)."
                     if failed:

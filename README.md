@@ -188,6 +188,29 @@ Supported operations: Format conversion, compression, resolution change, framera
 
 Every video, audio, document, or photo you send is collected into a batch automatically (deduped by file id, capped at 30). Sending an **album** collects it as a group and announces it once instead of once per file. Open `/bulkmenu`, toggle the actions and quality, then press **▶️ Apply Bulk** to run the whole batch; **🗑️ Clear List** drops it and the batch clears itself after a successful apply. Two or more queued photos are combined into a single **slideshow video** (3 s per photo, letterboxed onto a 1280x720 canvas); a lone photo is encoded with the selected video action, and audio-only actions skip it. The Apply summary lists every queued file next to the job id it became.
 
+#### Sequential, memory-safe processing
+
+An Apply Bulk run does **not** process its files in parallel. Every job of the run is tagged with one `batch_id`, and a worker must hold that batch's Redis lock (`ffmpeg:batch:<id>`) before it runs one — so a 30-file batch works through a single file at a time even when several worker replicas are up. Redis holds the backlog, not the container's RAM; a job whose batch is busy is returned to the delayed set and retried, never dropped.
+
+A second, global gate sits in front of that: conversion slots in Redis (`ffmpeg:slot:<n>`, `SET NX PX`) cap **total** concurrent ffmpeg processes at `MAX_CONCURRENT_FFMPEG` (default `1`). Because the slots are in Redis, the cap holds across replicas *and* across services — including the background worker the bot host runs — so two conversions never run at once anywhere. A worker that cannot take a slot defers its job and picks up other work.
+
+After **every** finished job the worker runs an explicit cleanup — release the conversion slot and batch lock, drop the ffmpeg probe caches, `gc.collect()`, `malloc_trim(0)` and sweep leftover temp artifacts — and logs the RSS drop, so each file's memory is handed back before the next file starts ("finish → clean → next"). A batch keeps the chat tidy with a **single** progress message, edited in place for the whole run and deleted as soon as the last file is done — whether it succeeded, failed or was cancelled. While a file converts it shows that file's live percentage, so per-file progress costs no extra message:
+
+```
+📊 Processing one at a time — 3 of 12 finished
+🔄 clip.mp4 — 47%
+```
+
+The worker is the only writer (it knows both the batch count and the running file), so the message never flaps. Its location lives in Redis (`ffmpeg:batch:<id>:msg`) so a worker that restarts mid-batch keeps editing the same one, and the count it aims for is the number of jobs the apply actually enqueued (`ffmpeg:batch:<id>:total`), not the number of collected files. `BATCH_PROGRESS_INTERVAL` (default `3`) paces the live refreshes.
+
+A `WORKER_MEMORY_CEILING_BYTES` ceiling makes the worker refuse to start a conversion while the process is still above it (after a few bounded deferrals it runs anyway, so a mis-set ceiling degrades throughput rather than stalling the queue). `WORKER_RESTART_AFTER_JOB_BYTES` additionally makes the standalone worker exit for a clean container restart when it is still above the ceiling after cleanup; the worker's `restartPolicyMaxRetries` is `10` so those planned restarts cannot exhaust the budget and leave the worker down.
+
+`/session_status` (admin) shows a **Capacity** block with this state: how many conversion slots are in use against `MAX_CONCURRENT_FFMPEG`, and the peak worker RSS against the ceiling with its remaining headroom. Workers publish their RSS to `ffmpeg:worker:rss:<host:pid>` (TTL'd, refreshed after every job and on a slow idle timer), so the figure is live even when the dashboard runs in a different service.
+
+`/worker_restart` (admin) recycles the standalone worker on demand: it writes a request to `ffmpeg:worker:restart`, the worker consumes it at its next safe point — right after the job it is running, or while idle — and exits so the platform brings it back with an empty heap. Running work is never interrupted and the queue is untouched. Use it when memory does not come back down after a large file; the bot-hosted worker ignores the request, since exiting there would take the bot with it.
+
+For Railway's 1 GB box the shipped `.env.example` is tuned to: `MAX_CONCURRENT_FFMPEG=1`, `JOB_MAX_SECONDS=3600`, `BATCH_LOCK_TTL_SECONDS` empty (it inherits `JOB_MAX_SECONDS`, so a slot can never expire mid-job), `WORKER_MEMORY_CEILING_BYTES=805306368` and `WORKER_RESTART_AFTER_JOB_BYTES=805306368` (~75% of the container). Production `numReplicas` is `1` for both the worker and the bot host.
+
 ---
 
 ## 🔧 Environment Variables

@@ -13,12 +13,13 @@ import json
 import pytest
 
 import utils.eventbus as eventbus
-from utils import job_queue, presence
+from utils import batch_pipeline, job_queue, presence
 from utils.queue_admin import JOB_HASH_PREFIX
 from utils.session_status import (
     collect_session_status,
     format_status,
     summarize,
+    summarize_capacity,
 )
 
 
@@ -66,7 +67,14 @@ class FakeRedis:
     async def get(self, key):
         return self.strings.get(key)
 
+    async def exists(self, *keys):
+        return sum(1 for key in keys if key in self.strings)
+
     async def setex(self, key, ttl, value):
+        self.strings[key] = str(value)
+        return True
+
+    async def set(self, key, value, nx=False, px=None, ex=None):
         self.strings[key] = str(value)
         return True
 
@@ -243,6 +251,83 @@ def test_format_says_so_when_redis_is_down():
     assert "degraded" in text
 
 
+# ── capacity (ffmpeg concurrency + memory headroom) ─────────────────────
+
+
+def test_capacity_reports_peak_rss_and_headroom(monkeypatch):
+    monkeypatch.setattr(batch_pipeline, "MEMORY_CEILING_BYTES", 800)
+    monkeypatch.setattr(batch_pipeline, "MAX_CONCURRENT_FFMPEG", 1)
+
+    capacity = summarize_capacity(slots_used=1, worker_rss={"w1": 300, "w2": "500"})
+
+    assert capacity["ffmpeg_running"] == 1
+    assert capacity["ffmpeg_limit"] == 1
+    assert capacity["workers_reporting"] == 2
+    # The *busiest* worker is what decides the headroom - the others are not at risk.
+    assert capacity["peak_rss_bytes"] == 500
+    assert capacity["headroom_bytes"] == 300
+
+
+def test_capacity_says_no_data_rather_than_zero(monkeypatch):
+    monkeypatch.setattr(batch_pipeline, "MEMORY_CEILING_BYTES", 800)
+    capacity = summarize_capacity(slots_used=None, worker_rss={})
+    assert capacity["peak_rss_bytes"] is None
+    assert capacity["headroom_bytes"] is None
+
+
+def test_capacity_headroom_is_negative_over_the_ceiling(monkeypatch):
+    monkeypatch.setattr(batch_pipeline, "MEMORY_CEILING_BYTES", 400)
+    capacity = summarize_capacity(slots_used=0, worker_rss={"w1": 900})
+    assert capacity["headroom_bytes"] == -500
+
+
+def test_format_shows_capacity_on_the_admin_dashboard(monkeypatch):
+    monkeypatch.setattr(batch_pipeline, "MEMORY_CEILING_BYTES", 800 * 1024 * 1024)
+    monkeypatch.setattr(batch_pipeline, "MAX_CONCURRENT_FFMPEG", 1)
+    payload = summarize(jobs=[], queued=[], waiting=0, delayed=0, online_ids=[])
+    payload["redis"] = {"connected": True, "ping_ms": 1.0, "error": None}
+    payload["capacity"] = summarize_capacity(
+        slots_used=1, worker_rss={"w1": 300 * 1024 * 1024}
+    )
+
+    text = format_status(payload, is_admin=True)
+
+    assert "Capacity" in text
+    assert "ffmpeg running: <b>1/1</b>" in text
+    assert "headroom <b>500.0 MB</b>" in text
+
+
+def test_format_warns_when_a_worker_is_over_the_ceiling(monkeypatch):
+    monkeypatch.setattr(batch_pipeline, "MEMORY_CEILING_BYTES", 100 * 1024 * 1024)
+    payload = summarize(jobs=[], queued=[], waiting=0, delayed=0, online_ids=[])
+    payload["redis"] = {"connected": True, "ping_ms": 1.0, "error": None}
+    payload["capacity"] = summarize_capacity(
+        slots_used=1, worker_rss={"w1": 150 * 1024 * 1024}
+    )
+
+    text = format_status(payload, is_admin=True)
+    assert "over ceiling by <b>50.0 MB</b>" in text
+
+
+def test_personal_view_does_not_leak_capacity(monkeypatch):
+    monkeypatch.setattr(batch_pipeline, "MEMORY_CEILING_BYTES", 800)
+    payload = summarize(jobs=[], queued=[], waiting=0, delayed=0, online_ids=[8], me_id=8)
+    payload["redis"] = {"connected": True, "ping_ms": 1.0, "error": None}
+    payload["capacity"] = summarize_capacity(slots_used=1, worker_rss={"w1": 10})
+
+    text = format_status(payload, is_admin=False)
+    assert "Capacity" not in text
+    assert "ffmpeg running" not in text
+
+
+def test_capacity_is_hidden_when_redis_is_down(monkeypatch):
+    payload = summarize(jobs=[], queued=[], waiting=None, delayed=None, online_ids=[])
+    payload["redis"] = {"connected": False, "ping_ms": None, "error": "boom"}
+    payload["capacity"] = summarize_capacity(slots_used=None, worker_rss={})
+
+    assert "Capacity" not in format_status(payload, is_admin=True)
+
+
 # ── collect_session_status ──────────────────────────────────────────────
 
 
@@ -266,6 +351,23 @@ def test_collect_reads_queue_turn_and_online_users(fake_redis):
     assert payload["users"]["source"] == "redis"
     assert payload["me"]["turn"] == 1
     assert payload["status"] == "ok"
+
+
+def test_collect_reads_slots_and_worker_memory(fake_redis, monkeypatch):
+    monkeypatch.setattr(batch_pipeline, "MEMORY_CEILING_BYTES", 1000)
+    monkeypatch.setattr(batch_pipeline, "MAX_CONCURRENT_FFMPEG", 1)
+    r = fake_redis
+    # One of the one global conversion slots is taken...
+    r.strings["ffmpeg:slot:0"] = "job-1"
+    # ...and a worker has reported its RSS.
+    r.strings["ffmpeg:worker:rss:host:1"] = "400"
+
+    payload = asyncio.run(collect_session_status(is_admin=True))
+
+    assert payload["capacity"]["ffmpeg_running"] == 1
+    assert payload["capacity"]["peak_rss_bytes"] == 400
+    assert payload["capacity"]["headroom_bytes"] == 600
+    assert "Capacity" in format_status(payload, is_admin=True)
 
 
 def test_collect_degrades_when_redis_is_unreachable(monkeypatch, eventbus_env):

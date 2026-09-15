@@ -1174,6 +1174,8 @@ def setup_handlers(application: Application) -> None:
         try:
             if action == "cancelall":
                 await _perform_cancelall(reply)
+            elif action == "worker_restart":
+                await _perform_worker_restart(reply, update)
             elif action == "clear_cache":
                 await _perform_clear_cache(reply, payload == "storage")
             elif action == "canceljob":
@@ -1266,6 +1268,54 @@ def setup_handlers(application: Application) -> None:
     application.add_handler(
         CommandHandler("sessionstatus", latency_wrapper(session_status_command, "session_status_command"))
     )
+
+    async def worker_restart_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Recycle the standalone ffmpeg worker so it comes back with a clean heap.
+
+        The worker finished job after job returns memory to the OS, so this is for
+        the case memory does *not* come back down (a pathologically large file, or
+        a leak) and you would rather hand the next job a fresh process than keep
+        building on a dirty one.
+        """
+        if not _admin_only(update):
+            await update.message.reply_text("Unauthorized: admin only")
+            return
+
+        await update.message.reply_text(
+            "♻️ *Restart the ffmpeg worker?*\n"
+            "• The worker exits at its next safe point — right after the job it is "
+            "running, or while idle\n"
+            "• Running work is *not* interrupted; it finishes first\n"
+            "• Nothing is lost — `ffmpeg:jobs` and `ffmpeg:delayed` survive the "
+            "restart\n"
+            "• The platform starts the worker again with an empty heap\n\n"
+            "Use this when memory does not come back down after a large file.",
+            parse_mode="Markdown",
+            reply_markup=confirm_keyboard("worker_restart"),
+        )
+
+    application.add_handler(
+        CommandHandler("worker_restart", latency_wrapper(worker_restart_command, "worker_restart_command"))
+    )
+
+    async def _perform_worker_restart(reply, update):
+        await reply.pending("♻️ Asking the worker to recycle...")
+        try:
+            from utils.batch_pipeline import request_worker_restart
+
+            user = getattr(update, "effective_user", None)
+            requested = await request_worker_restart(requested_by=getattr(user, "id", None))
+        except Exception:
+            logger.exception("/worker_restart failed")
+            requested = False
+        if not requested:
+            await reply.say("❌ Could not reach Redis to request a restart.")
+            return
+        await reply.say(
+            "✅ Restart requested.\n"
+            "The worker exits once the job it is running finishes. Watch the worker "
+            "logs for `Exiting (1) for a memory-clean worker restart`."
+        )
 
     # Store handler manager in bot_data for access in other handlers
     application.bot_data["handler_manager"] = handler_manager

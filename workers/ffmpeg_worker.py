@@ -7,6 +7,7 @@ import logging
 import os
 import signal
 import subprocess
+import sys
 import time
 
 from utils.ffmpeg_runner import run_ffmpeg
@@ -36,7 +37,7 @@ from tasks import (
     merge_videos,
     trim_media,
 )
-from utils import eventbus, file_utils, job_store
+from utils import batch_pipeline, eventbus, file_utils, job_store
 from utils.eventbus import (
     JOB_CANCELLED,
     JOB_COMPLETED,
@@ -68,6 +69,23 @@ JOBS_SUCCEEDED = Counter("media_jobs_succeeded", "Total ffmpeg jobs succeeded")
 JOB_DURATION = Histogram("media_job_duration_seconds", "Duration of ffmpeg jobs")
 ACTIVE_JOBS = Gauge("media_jobs_active", "Number of active ffmpeg jobs")
 LOCKS_CLEANED = Counter("media_locks_cleaned_total", "Input locks released (cleaned up) after job completion")
+# Resident memory sampled after each job's cleanup. The drop between jobs is the
+# signal that the "finish -> clean -> next" contract is actually working.
+WORKER_RSS = Gauge("media_worker_rss_bytes", "Worker resident memory after the last job cleanup")
+
+# How often an idle worker republishes its RSS to Redis for the dashboard's
+# capacity view. Tied to the heartbeat TTL so a live worker never looks stale.
+_RSS_HEARTBEAT_SECONDS = max(5.0, batch_pipeline.WORKER_RSS_TTL_SECONDS / 3.0)
+_last_rss_publish = 0.0
+
+# Jobs this process is processing right now. A restart must not cut one short,
+# so the loop only exits when this is zero - which also covers a job running on
+# the RabbitMQ consumer while the Redis loop sits idle.
+_jobs_in_flight = 0
+# How often an idle worker looks for an admin-requested restart. Cheap, but not
+# on every 0.2s poll: a restart is not a sub-second operation.
+_RESTART_PROBE_SECONDS = 10.0
+_last_restart_probe = 0.0
 
 # Forward notification event (set by background pubsub listener)
 FORWARD_NOTIFY_EVENT: asyncio.Event | None = None
@@ -2410,19 +2428,406 @@ async def _start_healthcheck_server():
         return None
 
 
+async def _publish_worker_rss(rss=None, *, force: bool = False) -> None:
+    """Record this worker's RSS for the dashboard's capacity view.
+
+    Called with a fresh, post-cleanup number after every job, and on a slow timer
+    while idle, so the dashboard shows a live figure rather than a stale one.
+    """
+    global _last_rss_publish
+    now = time.time()
+    if not force and now - _last_rss_publish < _RSS_HEARTBEAT_SECONDS:
+        return
+    _last_rss_publish = now
+    with contextlib.suppress(Exception):
+        await batch_pipeline.publish_worker_rss(rss=rss)
+
+
+async def _consume_forced_restart(*, force: bool = False) -> bool:
+    """Honour an admin-requested restart, if one is pending.
+
+    Consumes the Redis request, so it is acted on once and a worker that comes
+    back up does not restart again in a loop. Only the standalone worker ever
+    calls this with ``allow_restart`` set - the bot-hosted worker must not exit.
+    """
+    global _last_restart_probe
+    now = time.time()
+    if not force and now - _last_restart_probe < _RESTART_PROBE_SECONDS:
+        return False
+    _last_restart_probe = now
+    try:
+        r = await get_redis()
+    except Exception:
+        return False
+    try:
+        token = await batch_pipeline.consume_worker_restart(r)
+    except Exception:
+        token = None
+    finally:
+        with contextlib.suppress(Exception):
+            await r.close()
+    if token is None:
+        return False
+    batch_pipeline.request_restart(f"requested by {token}")
+    return True
+
+
+async def _maybe_stop_for_restart(allow_restart: bool, *, force: bool = False) -> bool:
+    """Check for a restart at a safe point and report whether to exit now.
+
+    Guarded on :data:`_jobs_in_flight` so a planned restart never truncates work
+    that is already running; the next idle moment picks the request up instead.
+    """
+    if not allow_restart or _jobs_in_flight:
+        return False
+    await _consume_forced_restart(force=force)
+    if batch_pipeline.restart_requested():
+        logger.warning(
+            "Exiting so the container restarts with a clean heap (no job in flight)"
+        )
+        return True
+    return False
+
+
+async def _claim_execution_slot(job: dict):
+    """Reserve the one global ffmpeg slot (and the batch lock) for this job.
+
+    Returns the slot index to hand to
+    :func:`~utils.batch_pipeline.finalize_job` when this worker may run the job
+    (``-1`` when Redis could not be checked and the job runs unfenced), or
+    ``None`` when it may not - in which case the job has been returned to the
+    delayed set and the worker moves on to other work.
+
+    This is the gate the "only one ffmpeg ever runs" guarantee rests on:
+    however many replicas or services are up, Redis hands out one conversion
+    slot, so two ffmpeg processes never overlap and their memory peaks cannot
+    compound. A job that belongs to a bulk batch additionally has to hold that
+    batch's lock, which keeps a 30-file Apply Bulk strictly sequential.
+    """
+    try:
+        r = await get_redis()
+    except Exception:
+        # No Redis means no fencing is possible; running beats dropping.
+        return -1
+    try:
+        # 1. Memory ceiling: do not start a conversion on a process that is
+        #    still holding a previous job's memory. A bounded number of defers
+        #    keeps a mis-set ceiling from stalling the queue forever.
+        if batch_pipeline.over_memory_ceiling():
+            defers = int(job.get(batch_pipeline.CEILING_DEFER_FIELD) or 0)
+            if defers < batch_pipeline.MEMORY_CEILING_MAX_DEFERS:
+                job[batch_pipeline.CEILING_DEFER_FIELD] = defers + 1
+                batch_pipeline.reclaim_memory("memory ceiling")
+                deferred = await batch_pipeline.defer_batch_job(r, job)
+                logger.warning(
+                    "Memory ceiling reached (RSS %.1fMB >= %.1fMB): deferring job %s (%s)",
+                    batch_pipeline.rss_bytes() / 1024 / 1024,
+                    batch_pipeline.MEMORY_CEILING_BYTES / 1024 / 1024,
+                    job.get("job_id"),
+                    "requeued" if deferred else "defer failed",
+                )
+                return None
+            batch_pipeline.request_restart_if_pressured()
+            logger.warning(
+                "Memory ceiling still exceeded after %d deferrals; running job %s anyway",
+                defers,
+                job.get("job_id"),
+            )
+
+        # 2. The global conversion slot - one ffmpeg at a time, everywhere.
+        slot = await batch_pipeline.acquire_ffmpeg_slot(r, job.get("job_id"))
+        if slot is None:
+            deferred = await batch_pipeline.defer_batch_job(r, job)
+            logger.info(
+                "ffmpeg slot busy: deferred job %s%s",
+                job.get("job_id"),
+                "" if deferred else " (defer failed)",
+            )
+            return None
+
+        # 3. One job per batch, so an Apply Bulk stays in order and never runs
+        #    two of its own files at once.
+        batch_id = batch_pipeline.job_batch_id(job)
+        if batch_id and not await batch_pipeline.try_acquire_batch_lock(r, batch_id, job.get("job_id")):
+            # This job must not hold the global slot while it waits on its batch,
+            # or a single busy batch would freeze every other conversion.
+            await batch_pipeline.release_ffmpeg_slot(r, slot, job.get("job_id"))
+            deferred = await batch_pipeline.defer_batch_job(r, job)
+            logger.info(
+                "Batch %s busy: deferred job %s%s",
+                batch_id,
+                job.get("job_id"),
+                "" if deferred else " (defer failed)",
+            )
+            return None
+        return slot
+    finally:
+        with contextlib.suppress(Exception):
+            await r.close()
+
+
+# How often the batch message refreshes with the running file's progress. Kept
+# above Telegram's comfortable edit rate (and the 2s the single-file watcher
+# uses) so a long conversion does not trip a 429.
+BATCH_PROGRESS_INTERVAL = float(os.environ.get("BATCH_PROGRESS_INTERVAL", "3.0"))
+
+
+def _batch_progress_text(done: int, total: int, *, name: str = "", pct=None) -> str:
+    """The batch's one message: how far the batch is, plus the file in flight."""
+    text = f"📊 Processing one at a time — {done} of {total} finished"
+    if name:
+        if pct is None:
+            text += f"\n✅ {name}"
+        else:
+            text += f"\n🔄 {name} — {int(pct)}%"
+    return text
+
+
+async def _batch_state(r, batch_id, job) -> dict:
+    """Read a batch's counters and the location of its single progress message."""
+    try:
+        total = int(job.get(batch_pipeline.BATCH_TOTAL_FIELD) or 0)
+    except (TypeError, ValueError):
+        total = 0
+    # Prefer the exact enqueued count the bot recorded: the payload total is the
+    # number of collected files, and files skipped at enqueue time would
+    # otherwise leave the batch looking unfinished forever.
+    with contextlib.suppress(Exception):
+        recorded = await r.get(batch_pipeline.batch_total_key(batch_id))
+        if recorded is not None:
+            total = int(recorded)
+    state = {"total": total, "done": 0, "stored": None}
+    with contextlib.suppress(Exception):
+        state["done"] = int(await r.get(batch_pipeline.batch_progress_key(batch_id)) or 0)
+    with contextlib.suppress(Exception):
+        state["stored"] = await r.get(batch_pipeline.batch_message_key(batch_id))
+    return state
+
+
+async def _set_batch_message(bot, r, batch_id, chat_id, stored, text):
+    """Set the batch's single progress message, editing it in place.
+
+    Returns the ``chat_id:message_id`` reference now holding the text. A message
+    that has been deleted (or is too old to edit) is replaced with a fresh one,
+    but a rate limit or transient error keeps the existing message instead of
+    spraying duplicates.
+    """
+    from telegram.error import BadRequest, RetryAfter
+
+    parsed = _parse_batch_message_ref(stored) if stored else None
+    if parsed is not None:
+        try:
+            await bot.edit_message_text(chat_id=parsed[0], message_id=parsed[1], text=text)
+            return stored
+        except RetryAfter as exc:
+            with contextlib.suppress(Exception):
+                await asyncio.sleep((getattr(exc, "retry_after", None) or 5) + 0.5)
+            return stored
+        except BadRequest:
+            # Gone (deleted, or past the edit window) - post a replacement below.
+            logger.debug("ffmpeg worker: batch message for %s is gone, reposting", batch_id)
+        except Exception:
+            logger.debug("ffmpeg worker: could not edit batch message for %s", batch_id)
+            return stored
+
+    sent = await bot.send_message(chat_id=chat_id, text=text)
+    ref = f"{chat_id}:{getattr(sent, 'message_id', '')}"
+    with contextlib.suppress(Exception):
+        await r.set(
+            batch_pipeline.batch_message_key(batch_id),
+            ref,
+            ex=int(batch_pipeline.BATCH_LOCK_TTL_SECONDS),
+        )
+    return ref
+
+
+async def _batch_live_progress(job: dict) -> None:
+    """Keep the batch's message showing the file currently being converted.
+
+    Runs for as long as the job does (the caller cancels it when the job ends)
+    and reads the live percentage ``run_ffmpeg`` writes into the job hash - the
+    same number the single-file progress watcher shows. This is why the batch
+    message can carry per-file progress without a second message: the worker is
+    already the one place that knows both the batch count and the running file.
+    """
+    batch_id = batch_pipeline.job_batch_id(job)
+    chat_id = job.get("chat_id")
+    bot_token = getattr(config, "BOT_TOKEN", None)
+    if not batch_id or not chat_id or not bot_token:
+        return
+    job_id = job.get("job_id")
+    name = str(job.get("original_filename") or "").strip()
+    try:
+        r = await get_redis()
+    except Exception:
+        return
+    last_text = None
+    try:
+        async with Bot(token=bot_token) as bot:
+            while True:
+                try:
+                    state = await _batch_state(r, batch_id, job)
+                    if state["total"] <= 0:
+                        return
+                    pct = None
+                    with contextlib.suppress(Exception):
+                        raw = await r.hget(f"ffmpeg:job:{job_id}", "progress")
+                        if raw is not None:
+                            pct = float(raw)
+                    text = _batch_progress_text(state["done"], state["total"], name=name, pct=pct)
+                    if text != last_text:
+                        state["stored"] = await _set_batch_message(
+                            bot, r, batch_id, chat_id, state["stored"], text
+                        )
+                        last_text = text
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    logger.debug("ffmpeg worker: batch live progress tick failed for %s", batch_id)
+                await asyncio.sleep(BATCH_PROGRESS_INTERVAL)
+    finally:
+        with contextlib.suppress(Exception):
+            await r.close()
+
+
+async def _report_batch_progress(job: dict) -> None:
+    """Advance the batch's one message when a file finishes, or take it down.
+
+    A batch shows exactly **one** message, edited in place while files run and
+    as they finish, so a 30-file apply cannot flood the chat. The message is
+    deleted as soon as the last file finishes - whether it finished well or
+    badly - and the counter is written before the reply is touched, so a
+    Telegram failure never loses the batch's position.
+
+    Every step is best-effort: progress reporting must never fail a job.
+    """
+    batch_id = batch_pipeline.job_batch_id(job)
+    chat_id = job.get("chat_id")
+    if not batch_id or not chat_id:
+        return
+
+    done_key = batch_pipeline.batch_progress_key(batch_id)
+    msg_key = batch_pipeline.batch_message_key(batch_id)
+    try:
+        r = await get_redis()
+    except Exception:
+        return
+    try:
+        done = int(await r.incr(done_key))
+        with contextlib.suppress(Exception):
+            await r.expire(done_key, int(batch_pipeline.BATCH_LOCK_TTL_SECONDS))
+        state = await _batch_state(r, batch_id, job)
+        total = state["total"]
+
+        bot_token = getattr(config, "BOT_TOKEN", None)
+        if not bot_token or total <= 0:
+            return
+
+        async with Bot(token=bot_token) as bot:
+            # Last file (or a replayed counter): the batch is over, so the
+            # message has served its purpose and comes down.
+            if done >= total:
+                await _delete_batch_message(bot, r, msg_key, state["stored"])
+                return
+            name = str(job.get("original_filename") or "").strip()
+            await _set_batch_message(
+                bot,
+                r,
+                batch_id,
+                chat_id,
+                state["stored"],
+                _batch_progress_text(done, total, name=name),
+            )
+    except Exception:
+        logger.debug("ffmpeg worker: batch progress update failed for %s", batch_id)
+    finally:
+        with contextlib.suppress(Exception):
+            await r.close()
+
+
+def _parse_batch_message_ref(stored) -> tuple[int, int] | None:
+    """Decode the ``chat_id:message_id`` a batch progress message is stored as."""
+    try:
+        text = stored.decode() if isinstance(stored, (bytes, bytearray)) else str(stored)
+        chat, _, message = text.partition(":")
+        return int(chat), int(message)
+    except (TypeError, ValueError):
+        return None
+
+
+async def _delete_batch_message(bot, redis, msg_key: str, stored) -> None:
+    """Remove a batch's progress message and stop tracking it."""
+    parsed = _parse_batch_message_ref(stored) if stored else None
+    if parsed is not None:
+        with contextlib.suppress(Exception):
+            await bot.delete_message(chat_id=parsed[0], message_id=parsed[1])
+    with contextlib.suppress(Exception):
+        await redis.delete(msg_key)
+
+
 async def _run_queued_job(job: dict, source: str) -> None:
     """Process one job that came off a queue, whichever queue that was.
 
     Kept separate so the Redis list and the RabbitMQ consumer share exactly the
     same job path: the difference between them is where a job is taken from and
     what happens when processing raises, not what processing does.
+
+    A job for a batch that is already running elsewhere is deferred rather than
+    processed, and every job that does run is followed by an explicit memory
+    cleanup before the worker picks up anything else.
     """
+    global _jobs_in_flight
+    slot = await _claim_execution_slot(job)
+    if slot is None:
+        return
     logger.info("Picked job: %s (via %s)", job.get("job_id"), source)
     # ensure persisted
     with contextlib.suppress(Exception):
         await job_store.save_job(job)
     await emit_event(JOB_STARTED, job=job, source=source)
-    await handle_job(job)
+    _jobs_in_flight += 1
+    # Show the file being converted inside the batch's single message. Started
+    # before the job so progress is visible from the first second, not only once
+    # a file has finished.
+    batch_progress_task = None
+    if batch_pipeline.job_batch_id(job):
+        with contextlib.suppress(Exception):
+            batch_progress_task = asyncio.create_task(_batch_live_progress(job))
+    try:
+        await handle_job(job)
+    finally:
+        _jobs_in_flight = max(0, _jobs_in_flight - 1)
+        # Stop the live ticker before writing the final figure, so two writers
+        # never race on the same message.
+        if batch_progress_task is not None:
+            batch_progress_task.cancel()
+            with contextlib.suppress(Exception):
+                await batch_progress_task
+        # How far into its batch this file got, for the user's progress message.
+        with contextlib.suppress(Exception):
+            await _report_batch_progress(job)
+        # Finish -> clean -> next: release the ffmpeg slot and batch lock, drop caches, gc and
+        # return freed heap pages to the OS so the next job does not pile onto
+        # the previous one's memory. Never raises.
+        try:
+            summary = await batch_pipeline.finalize_job(job, source=source, ffmpeg_slot=slot)
+            memory = summary.get("memory") or {}
+            rss = memory.get("after") or batch_pipeline.rss_bytes()
+            if rss:
+                WORKER_RSS.set(rss)
+            logger.info(
+                "Job %s cleaned up: RSS %.1fMB, %d object(s) collected, allocator %s",
+                job.get("job_id"),
+                (rss or 0) / 1024 / 1024,
+                memory.get("collected", 0),
+                "trimmed" if memory.get("trimmed") else "not trimmed",
+            )
+            # Refresh the heartbeat with the number we just measured, so the
+            # dashboard's headroom figure matches this job's cleanup.
+            await _publish_worker_rss(rss, force=True)
+            batch_pipeline.request_restart_if_pressured()
+        except Exception:
+            logger.debug("ffmpeg worker: post-job cleanup failed for %s", job.get("job_id"))
 
 
 async def _rabbitmq_consumer_task(stop_event: asyncio.Event | None = None) -> None:
@@ -2431,7 +2836,7 @@ async def _rabbitmq_consumer_task(stop_event: asyncio.Event | None = None) -> No
     await queue.consume(lambda job: _run_queued_job(job, "rabbitmq"), stop_event=stop_event)
 
 
-async def worker_loop(stop_event: asyncio.Event | None = None):
+async def worker_loop(stop_event: asyncio.Event | None = None, *, allow_restart: bool = False):
     """Main worker loop: pop jobs from the queue(s), process them, deliver results.
 
     The Redis list is always drained - it holds jobs queued before a broker
@@ -2446,6 +2851,9 @@ async def worker_loop(stop_event: asyncio.Event | None = None):
 
     # Start healthcheck server for Railway
     await _start_healthcheck_server()
+
+    # Announce this worker's memory so the dashboard has a figure from the start.
+    await _publish_worker_rss(force=True)
 
     # Prove the event log is writable before accepting work. A misconfigured
     # Kafka previously only showed up as a debug line per dropped event, so the
@@ -2501,9 +2909,19 @@ async def worker_loop(stop_event: asyncio.Event | None = None):
             try:
                 job = await pop_job(timeout=5)
                 if not job:
+                    # Keep the dashboard's capacity view fresh while idle, and pick
+                    # up an admin restart request that arrived in the meantime.
+                    await _publish_worker_rss()
+                    if await _maybe_stop_for_restart(allow_restart):
+                        break
                     await asyncio.sleep(0.2)
                     continue
                 await _run_queued_job(job, "redis")
+                # A finished job is the best moment to act on a pending restart:
+                # memory was just cleaned up, and nothing is in flight. Covers
+                # both the memory ceiling and an admin request.
+                if await _maybe_stop_for_restart(allow_restart, force=True):
+                    break
             except asyncio.CancelledError:
                 logger.info("Worker cancelled, exiting")
                 break
@@ -2621,7 +3039,7 @@ def main():
         logger.exception("Failed to start Prometheus metrics server")
 
     try:
-        loop.run_until_complete(worker_loop(stop_event))
+        loop.run_until_complete(worker_loop(stop_event, allow_restart=True))
     finally:
         with contextlib.suppress(Exception):
             # Close job store (Mongo) if used
@@ -2636,10 +3054,15 @@ def main():
             # Close shared Redis client used across utils
             loop.run_until_complete(close_redis())
         except Exception:
-            logger.debug("ffmpeg worker: operation failed")
-        except Exception:
-            logger.debug("ffmpeg worker: in _signal_handler()")
+            logger.debug("ffmpeg worker: failed to close the shared Redis client")
         loop.close()
+
+    # A clean-slate restart is requested when a finished job left memory above
+    # the configured ceiling. Exit non-zero so the platform's restart policy
+    # (Railway: ON_FAILURE) brings the container back with an empty heap.
+    if batch_pipeline.restart_requested():
+        logger.warning("Exiting (1) for a memory-clean worker restart")
+        sys.exit(1)
 
 
 if __name__ == "__main__":

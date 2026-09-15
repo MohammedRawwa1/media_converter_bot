@@ -7,6 +7,11 @@ Answers the three questions the existing ``/loginstatus`` does not:
 3. When does my work run?    -> the queue turn, i.e. the position of a user's
                                 oldest waiting job in the FIFO job list
 
+The admin view also carries a **Capacity** block: how many of the global
+conversion slots (``ffmpeg:slot:*``, see ``utils.batch_pipeline``) are in use
+against ``MAX_CONCURRENT_FFMPEG``, and how much headroom the busiest worker has
+under ``WORKER_MEMORY_CEILING_BYTES`` before it stops taking new work.
+
 The same contract as ``utils.health`` applies: every probe is bounded by a
 timeout and nothing here raises, so a dead Redis degrades one section of the
 report instead of leaving the command hanging. Session health is read from the
@@ -28,7 +33,7 @@ import os
 import time
 from collections import Counter
 
-from utils import presence
+from utils import batch_pipeline, presence
 from utils.queue_admin import JOB_HASH_PREFIX, TERMINAL_STATUSES
 
 logger = logging.getLogger(__name__)
@@ -91,6 +96,10 @@ async def collect_session_status(*, user_id=None, is_admin=False, live_sessions=
         "error": redis_snapshot["error"],
     }
     payload["queues"]["broker"] = broker_snapshot
+    payload["capacity"] = summarize_capacity(
+        slots_used=redis_snapshot["slots_used"],
+        worker_rss=redis_snapshot["worker_rss"],
+    )
     payload["users"]["source"] = online_snapshot.get("source")
     payload["users"]["error"] = online_snapshot.get("error")
     payload["sessions"] = sessions
@@ -113,6 +122,8 @@ async def _redis_snapshot() -> dict:
         "jobs": [],
         "queue_truncated": False,
         "jobs_truncated": False,
+        "slots_used": None,
+        "worker_rss": {},
     }
     try:
         client = await asyncio.wait_for(get_redis(), timeout=PROBE_TIMEOUT_SECONDS)
@@ -139,6 +150,19 @@ async def _redis_snapshot() -> dict:
         snapshot["queued"] = [_parse_queue_entry(entry) for entry in raw]
 
         snapshot["jobs"], snapshot["jobs_truncated"] = await _scan_job_hashes(client)
+
+        # Capacity: how much of the ffmpeg pool and the memory ceiling is in use.
+        # Probed in its own try so a slow or older client leaves these two
+        # fields empty instead of taking the whole snapshot down with it.
+        try:
+            snapshot["slots_used"] = await asyncio.wait_for(
+                batch_pipeline.read_used_slots(client), timeout=PROBE_TIMEOUT_SECONDS
+            )
+            snapshot["worker_rss"] = await asyncio.wait_for(
+                batch_pipeline.read_worker_rss(client), timeout=PROBE_TIMEOUT_SECONDS
+            )
+        except Exception as exc:
+            logger.debug("session_status: capacity probe fell over: %s", exc)
     except Exception as exc:
         snapshot["error"] = f"{type(exc).__name__}: {exc}"
         logger.debug("session_status: redis probe fell over: %s", exc)
@@ -266,6 +290,29 @@ def _overall_status(redis_snapshot: dict, broker_snapshot: dict) -> str:
 
 
 # ── Aggregation (pure) ──────────────────────────────────────────────────
+
+
+def summarize_capacity(*, slots_used, worker_rss=None) -> dict:
+    """Fold the slot count and worker heartbeats into the capacity view.
+
+    Pure, so the dashboard's numbers can be explained without a live Redis: the
+    caller passes the raw reads and this does the arithmetic (peak RSS, headroom
+    against the ceiling). ``peak_rss_bytes`` is ``None`` when no worker has
+    reported, and stays ``None`` - rather than zero - so "no data" is never
+    mistaken for "using no memory".
+    """
+    readings = [parsed for parsed in (_int_or_none(value) for value in (worker_rss or {}).values()) if parsed]
+    peak = max(readings) if readings else None
+    ceiling = int(batch_pipeline.MEMORY_CEILING_BYTES)
+    headroom = ceiling - peak if ceiling > 0 and peak is not None else None
+    return {
+        "ffmpeg_running": slots_used,
+        "ffmpeg_limit": int(batch_pipeline.MAX_CONCURRENT_FFMPEG),
+        "workers_reporting": len(readings),
+        "peak_rss_bytes": peak,
+        "ceiling_bytes": ceiling,
+        "headroom_bytes": headroom,
+    }
 
 
 def summarize(
@@ -424,6 +471,10 @@ def _admin_sections(payload: dict) -> list[str]:
     if queues.get("queue_truncated") or queues.get("jobs_truncated"):
         lines.append("<i>⚠️ counts truncated at the scan cap</i>")
 
+    capacity = payload.get("capacity") or {}
+    if capacity and (payload.get("redis") or {}).get("connected"):
+        lines.extend(_capacity_section(capacity))
+
     lines.append("")
     lines.append("🧮 <b>Recent jobs</b> (hash window)")
     lines.append(
@@ -446,6 +497,39 @@ def _admin_sections(payload: dict) -> list[str]:
         lines.append(f"<i>…and {len(active) - ACTIVE_LIST_LIMIT} more</i>")
     if not active:
         lines.append("<i>No active users in the heartbeat window.</i>")
+    return lines
+
+
+def _capacity_section(capacity: dict) -> list[str]:
+    """Render ffmpeg concurrency and memory-ceiling headroom."""
+    lines = ["", "⚙️ <b>Capacity</b>"]
+    limit = capacity.get("ffmpeg_limit")
+    used = capacity.get("ffmpeg_running")
+    if limit:
+        lines.append(f"• ffmpeg running: <b>{_num(used) if used is not None else '?'}/{limit}</b>")
+
+    peak = capacity.get("peak_rss_bytes")
+    ceiling = capacity.get("ceiling_bytes") or 0
+    if peak is None:
+        lines.append("• Worker memory: <i>no worker heartbeat yet</i>")
+    elif ceiling > 0:
+        headroom = capacity.get("headroom_bytes")
+        if headroom is not None and headroom < 0:
+            lines.append(
+                f"• Worker RSS: <b>{_mb(peak)}</b> of {_mb(ceiling)}"
+                f" — ⚠️ over ceiling by <b>{_mb(-headroom)}</b>"
+            )
+        else:
+            lines.append(
+                f"• Worker RSS: <b>{_mb(peak)}</b> of {_mb(ceiling)}"
+                f" — headroom <b>{_mb(headroom)}</b>"
+            )
+    else:
+        lines.append(f"• Worker RSS: <b>{_mb(peak)}</b> (no memory ceiling set)")
+
+    workers = capacity.get("workers_reporting") or 0
+    if workers > 1:
+        lines.append(f"<i>{workers} workers reporting</i>")
     return lines
 
 
@@ -488,6 +572,16 @@ def _num(value) -> str:
     if value is None:
         return "?"
     return str(value)
+
+
+def _mb(value) -> str:
+    """Render a byte count as a short MB string (``?`` when unknown)."""
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        return "?"
+    sign = "-" if number < 0 else ""
+    return f"{sign}{abs(number) / 1024 / 1024:.1f} MB"
 
 
 def _esc(value) -> str:
