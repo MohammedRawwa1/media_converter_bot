@@ -1,6 +1,12 @@
 #!/usr/bin/env python3
 """Preview or remove stale Redis state for the media conversion pipeline.
 
+The bot now does this itself: ``/cancelall`` cancels every job and then takes
+down every batch left without a live member, deleting the batches' progress
+messages from the chat as well (see ``utils.queue_admin`` and
+``utils.batch_pipeline.purge_stale_batches``). Run this script only to *preview*
+what is stale, or to clean up offline when the bot is not running.
+
 Dry-run is the default. Use --apply to delete only state that is no longer
 owned by an active job. Active jobs and their input/ffmpeg locks are preserved.
 
@@ -15,17 +21,15 @@ The REDIS_URL environment variable must be set.
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import os
-import sys
 from collections import Counter
 
 try:
     import redis
 except ImportError:
     print("ERROR: redis package is required")
-    raise SystemExit(2)
+    raise SystemExit(2) from None
 
 ACTIVE_STATUSES = frozenset({
     "queued", "processing", "waiting", "started", "uploading", "sending",
@@ -35,6 +39,22 @@ TERMINAL_STATUSES = frozenset({
 })
 JOB_PREFIX = "ffmpeg:job:"
 BATCH_PREFIX = "ffmpeg:batch:"
+# Keys under the batch prefix that are not a batch id themselves.
+BATCH_NON_ID_SUFFIXES = frozenset({"active", "resume"})
+BATCH_ACTIVE_SET = f"{BATCH_PREFIX}active"
+BATCH_RESUME_PREFIX = f"{BATCH_PREFIX}resume:"
+# Everything one batch owns, apart from its lock. Must stay in step with
+# ``utils.batch_pipeline.batch_state_keys``.
+BATCH_STATE_SUFFIXES = (
+    ":jobs",
+    ":total",
+    ":done",
+    ":done_jobs",
+    ":msg",
+    ":finished",
+    ":started",
+    ":cancelled",
+)
 DEDUPE_PREFIX = "ffmpeg:pipeline_dedup:"
 LOCK_PREFIX = "ffmpeg:lock:"
 JOB_LIST = "ffmpeg:jobs"
@@ -155,8 +175,12 @@ def main() -> int:
         key = text(raw_key)
         suffix = key[len(BATCH_PREFIX):]
         batch_id = suffix.split(":", 1)[0]
-        if batch_id:
+        if batch_id and batch_id not in BATCH_NON_ID_SUFFIXES:
             batch_ids.add(batch_id)
+    # A batch whose keys expired but which is still in the aggregate view.
+    for raw in r.smembers(BATCH_ACTIVE_SET):
+        if text(raw):
+            batch_ids.add(text(raw))
 
     for batch_id in sorted(batch_ids):
         if args.batch and batch_id != args.batch:
@@ -164,10 +188,22 @@ def main() -> int:
         members = {text(x) for x in r.smembers(f"{BATCH_PREFIX}{batch_id}:jobs")}
         if members & active:
             continue
-        for suffix in (":jobs", ":total", ":done", ":msg", ":cancelled"):
+        for suffix in BATCH_STATE_SUFFIXES:
             key = f"{BATCH_PREFIX}{batch_id}{suffix}"
             if r.exists(key):
                 report_or_delete(r, key, apply=args.apply, reason="batch", count=counts)
+        # Membership outside the batch's own keys: the aggregate view, and every
+        # user's resume record. Left behind, both keep pointing at a batch whose
+        # state is gone. (/cancelall keeps the ``:cancelled`` tombstone instead of
+        # deleting it, because a worker may still be finishing a member; this
+        # script only runs where nothing is.)
+        if r.srem(BATCH_ACTIVE_SET, batch_id):
+            counts["batch"] += 1
+            print(f"  {'DELETE' if args.apply else 'STALE'} {BATCH_ACTIVE_SET} member {batch_id}")
+        for resume_key in scan(r, f"{BATCH_RESUME_PREFIX}*"):
+            if r.srem(resume_key, batch_id):
+                counts["batch"] += 1
+                print(f"  {'DELETE' if args.apply else 'STALE'} resume member {batch_id} of {text(resume_key)}")
 
     print("Summary:")
     for name in ("queue", "delayed", "lock", "dedup", "batch"):

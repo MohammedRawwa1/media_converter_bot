@@ -13,13 +13,18 @@ import json
 import pytest
 
 import utils.eventbus as eventbus
-from utils import batch_pipeline, job_queue, presence
+from utils import batch_pipeline, job_queue, presence, session_status, storage
 from utils.queue_admin import JOB_HASH_PREFIX
 from utils.session_status import (
     collect_session_status,
     format_status,
+    parse_status_callback,
+    refresh_data,
+    restart_data,
+    status_keyboard,
     summarize,
     summarize_capacity,
+    summarize_memory,
 )
 
 
@@ -328,6 +333,350 @@ def test_capacity_is_hidden_when_redis_is_down(monkeypatch):
     assert "Capacity" not in format_status(payload, is_admin=True)
 
 
+# ── memory (this process + the box it runs on) ──────────────────────────
+
+
+MB = 1024 * 1024
+GB = 1024 * 1024 * 1024
+
+
+def test_memory_prefers_the_container_limit_over_the_host():
+    # The cgroup limit is what kills the process, so it wins over the host total.
+    memory = summarize_memory(
+        {
+            "cgroup_limit_bytes": 1000,
+            "cgroup_used_bytes": 250,
+            "host_total_bytes": 9000,
+            "host_used_bytes": 8000,
+        }
+    )
+
+    assert memory["total_bytes"] == 1000
+    assert memory["used_bytes"] == 250
+    assert memory["free_bytes"] == 750
+    assert memory["scope"] == "container"
+    assert memory["percent"] == 25.0
+    assert memory["pressure"] == "ok"
+
+
+def test_memory_falls_back_to_the_host_without_a_cgroup():
+    memory = summarize_memory({"host_total_bytes": 1000, "host_used_bytes": 900})
+
+    assert memory["scope"] == "host"
+    assert memory["percent"] == 90.0
+    assert memory["pressure"] == "high"
+
+
+def test_memory_flags_critical_pressure():
+    memory = summarize_memory({"host_total_bytes": 100, "host_used_bytes": 97})
+    assert memory["pressure"] == "critical"
+
+
+def test_memory_never_pairs_a_cgroup_limit_with_the_hosts_usage():
+    memory = summarize_memory({"cgroup_limit_bytes": 1000, "host_used_bytes": 900})
+
+    assert memory["total_bytes"] == 1000
+    assert memory["used_bytes"] is None
+    assert memory["percent"] is None
+    assert memory["pressure"] == "unknown"
+
+
+def test_memory_is_unknown_rather_than_zero_without_readings():
+    memory = summarize_memory({})
+
+    assert memory["self_rss_bytes"] is None
+    assert memory["total_bytes"] is None
+    assert memory["percent"] is None
+    assert memory["pressure"] == "unknown"
+
+
+def test_format_shows_memory_on_the_admin_dashboard():
+    payload = summarize(jobs=[], queued=[], waiting=0, delayed=0, online_ids=[])
+    payload["redis"] = {"connected": True, "ping_ms": 1.0, "error": None}
+    payload["memory"] = summarize_memory(
+        {
+            "self_rss_bytes": 200 * MB,
+            "self_peak_bytes": 640 * MB,
+            "cgroup_limit_bytes": 2 * GB,
+            "cgroup_used_bytes": 1 * GB,
+        }
+    )
+
+    text = format_status(payload, is_admin=True)
+
+    assert "🧠 <b>Memory</b>" in text
+    assert "Bot process: <b>200.0 MB</b> (peak 640.0 MB)" in text
+    assert "Container: <b>1.0 GB</b> of 2.0 GB — <b>50%</b> used" in text
+    assert "Free: <b>1.0 GB</b>" in text
+
+
+def test_format_warns_when_memory_pressure_is_high():
+    payload = summarize(jobs=[], queued=[], waiting=0, delayed=0, online_ids=[])
+    payload["redis"] = {"connected": True, "ping_ms": 1.0, "error": None}
+    payload["memory"] = summarize_memory({"host_total_bytes": 1000, "host_used_bytes": 950})
+
+    text = format_status(payload, is_admin=True)
+
+    assert "<b>95%</b> used 🔴" in text
+
+
+def test_personal_view_does_not_leak_memory():
+    payload = summarize(jobs=[], queued=[], waiting=0, delayed=0, online_ids=[8], me_id=8)
+    payload["redis"] = {"connected": True, "ping_ms": 1.0, "error": None}
+    payload["memory"] = summarize_memory({"self_rss_bytes": 10 * MB, "host_total_bytes": 100})
+
+    assert "Memory" not in format_status(payload, is_admin=False)
+
+
+# ── storage (object count + bytes) ──────────────────────────────────────
+
+
+# The scan itself is exercised by the tests below; everything else only needs it
+# to be hermetic, so the autouse stub stands in for it and the storage tests call
+# the captured original explicitly.
+_REAL_STORAGE_SNAPSHOT = session_status._storage_snapshot
+
+
+@pytest.fixture(autouse=True)
+def stub_storage_scan(monkeypatch):
+    """Keep every test off the real storage backend."""
+
+    async def _stub(*, force=False):
+        return {
+            "backend": "local",
+            "location": "storage",
+            "objects": 0,
+            "bytes": 0,
+            "groups": {},
+            "truncated": False,
+            "cached": False,
+            "scanned_at": None,
+            "error": None,
+        }
+
+    monkeypatch.setattr(session_status, "_storage_snapshot", _stub)
+    yield
+
+
+class _StubBackend:
+    """A storage backend that reports whatever a test tells it to."""
+
+    def __init__(self, readings=None, error=None):
+        self.bucket = "stub-bucket"
+        self._readings = readings
+        self._error = error
+        self.calls = 0
+
+    async def usage(self, *, max_objects=5000):
+        self.calls += 1
+        if self._error is not None:
+            raise self._error
+        return self._readings
+
+
+async def _no_cache():
+    return None
+
+
+async def _no_write(*args, **kwargs):
+    return None
+
+
+def _patch_backend(monkeypatch, backend):
+    async def _get_backend():
+        return backend
+
+    monkeypatch.setattr(storage, "get_storage_backend", _get_backend)
+
+
+def test_storage_snapshot_reads_the_backend(monkeypatch):
+    backend = _StubBackend(
+        {
+            "backend": "s3",
+            "location": "stub-bucket",
+            "objects": 3,
+            "bytes": 2048,
+            "groups": {"uploads/": {"objects": 3, "bytes": 2048}},
+            "truncated": False,
+        }
+    )
+    _patch_backend(monkeypatch, backend)
+    monkeypatch.setattr(session_status, "_read_storage_cache", _no_cache)
+    monkeypatch.setattr(session_status, "_write_storage_cache", _no_write)
+
+    snapshot = asyncio.run(_REAL_STORAGE_SNAPSHOT())
+
+    assert snapshot["backend"] == "s3"
+    assert snapshot["location"] == "stub-bucket"
+    assert snapshot["objects"] == 3
+    assert snapshot["bytes"] == 2048
+    assert snapshot["cached"] is False
+    assert snapshot["scanned_at"]
+    assert snapshot["error"] is None
+
+
+def test_storage_snapshot_reuses_a_cached_scan(monkeypatch):
+    backend = _StubBackend({"backend": "s3", "objects": 99, "bytes": 99, "groups": {}})
+    _patch_backend(monkeypatch, backend)
+
+    async def _cached():
+        return {
+            "backend": "s3",
+            "location": "bucket",
+            "objects": 7,
+            "bytes": 700,
+            "groups": {},
+            "truncated": False,
+            "scanned_at": 1.0,
+        }
+
+    monkeypatch.setattr(session_status, "_read_storage_cache", _cached)
+
+    snapshot = asyncio.run(_REAL_STORAGE_SNAPSHOT())
+
+    assert snapshot["cached"] is True
+    assert snapshot["objects"] == 7
+    assert backend.calls == 0
+
+
+def test_storage_snapshot_forces_a_fresh_scan(monkeypatch):
+    backend = _StubBackend({"backend": "s3", "objects": 99, "bytes": 99, "groups": {}})
+    _patch_backend(monkeypatch, backend)
+
+    async def _cached():
+        return {"objects": 7}
+
+    monkeypatch.setattr(session_status, "_read_storage_cache", _cached)
+    monkeypatch.setattr(session_status, "_write_storage_cache", _no_write)
+
+    snapshot = asyncio.run(_REAL_STORAGE_SNAPSHOT(force=True))
+
+    # The Refresh button must never answer with the cached number.
+    assert backend.calls == 1
+    assert snapshot["cached"] is False
+    assert snapshot["objects"] == 99
+
+
+def test_storage_snapshot_reports_a_failed_scan(monkeypatch):
+    _patch_backend(monkeypatch, _StubBackend(error=RuntimeError("AccessDenied")))
+    monkeypatch.setattr(session_status, "_read_storage_cache", _no_cache)
+
+    snapshot = asyncio.run(_REAL_STORAGE_SNAPSHOT())
+
+    assert "AccessDenied" in snapshot["error"]
+    assert snapshot["objects"] is None
+
+
+def test_storage_snapshot_explains_a_backend_that_cannot_count(monkeypatch):
+    class _Opaque:
+        base = "storage"
+
+    _patch_backend(monkeypatch, _Opaque())
+    monkeypatch.setattr(session_status, "_read_storage_cache", _no_cache)
+
+    snapshot = asyncio.run(_REAL_STORAGE_SNAPSHOT())
+
+    assert "cannot report its usage" in snapshot["error"]
+
+
+def test_format_shows_storage_on_the_admin_dashboard():
+    payload = summarize(jobs=[], queued=[], waiting=0, delayed=0, online_ids=[])
+    payload["redis"] = {"connected": True, "ping_ms": 1.0, "error": None}
+    payload["storage"] = {
+        "backend": "s3",
+        "location": "my-bucket",
+        "objects": 42,
+        "bytes": 3 * GB,
+        "groups": {
+            "inputs/": {"objects": 2, "bytes": 1 * GB},
+            "uploads/": {"objects": 40, "bytes": 2 * GB},
+        },
+        "truncated": False,
+        "cached": False,
+        "error": None,
+    }
+
+    text = format_status(payload, is_admin=True)
+
+    assert "🗄 <b>Storage</b>" in text
+    assert "<code>my-bucket</code>" in text
+    assert "Used: <b>3.0 GB</b> in <b>42</b> object(s)" in text
+    # Biggest prefix first - the point is what is eating the space.
+    assert text.index("uploads/") < text.index("inputs/")
+    assert "2.0 GB in 40 object(s)" in text
+
+
+def test_format_says_when_the_storage_scan_was_capped_or_cached():
+    payload = summarize(jobs=[], queued=[], waiting=0, delayed=0, online_ids=[])
+    payload["redis"] = {"connected": True, "ping_ms": 1.0, "error": None}
+    payload["storage"] = {
+        "backend": "s3",
+        "location": "b",
+        "objects": 5000,
+        "bytes": 10,
+        "groups": {},
+        "truncated": True,
+        "cached": True,
+        "error": None,
+    }
+
+    text = format_status(payload, is_admin=True)
+
+    assert "(scan capped)" in text
+    assert "cached scan" in text
+
+
+def test_format_explains_a_storage_error_instead_of_hiding_it():
+    payload = summarize(jobs=[], queued=[], waiting=0, delayed=0, online_ids=[])
+    payload["redis"] = {"connected": True, "ping_ms": 1.0, "error": None}
+    payload["storage"] = {"error": "storage unavailable: boom"}
+
+    text = format_status(payload, is_admin=True)
+
+    assert "🗄 <b>Storage</b>" in text
+    assert "storage unavailable: boom" in text
+
+
+def test_personal_view_does_not_leak_storage():
+    payload = summarize(jobs=[], queued=[], waiting=0, delayed=0, online_ids=[8], me_id=8)
+    payload["redis"] = {"connected": True, "ping_ms": 1.0, "error": None}
+    payload["storage"] = {"backend": "s3", "objects": 1, "bytes": 10, "groups": {}, "error": None}
+
+    assert "Storage" not in format_status(payload, is_admin=False)
+
+
+# ── dashboard buttons ───────────────────────────────────────────────────
+
+
+def _keyboard_rows(keyboard):
+    return [[button.callback_data for button in row] for row in keyboard.inline_keyboard]
+
+
+def test_status_keyboard_offers_refresh_to_everyone():
+    assert _keyboard_rows(status_keyboard(is_admin=False)) == [
+        [refresh_data()]
+    ]
+
+
+def test_status_keyboard_gives_admins_a_separate_restart_row():
+    # Its own row, so a mistimed press cannot land on the recycle button.
+    rows = _keyboard_rows(status_keyboard(is_admin=True))
+
+    assert rows[0] == [refresh_data()]
+    assert rows[1] == [restart_data()]
+
+
+def test_refresh_keeps_the_live_mode_across_a_press():
+    assert parse_status_callback(refresh_data(live=True)) == ("refresh", True)
+    assert parse_status_callback(refresh_data()) == ("refresh", False)
+    assert parse_status_callback(restart_data()) == ("restart", False)
+
+
+def test_parse_status_callback_ignores_everything_else():
+    for data in (None, 5, "cfm:worker_restart", "st:", "st:wipe", "menu_main"):
+        assert parse_status_callback(data) is None
+
+
 # ── collect_session_status ──────────────────────────────────────────────
 
 
@@ -368,6 +717,10 @@ def test_collect_reads_slots_and_worker_memory(fake_redis, monkeypatch):
     assert payload["capacity"]["peak_rss_bytes"] == 400
     assert payload["capacity"]["headroom_bytes"] == 600
     assert "Capacity" in format_status(payload, is_admin=True)
+    # The new blocks are collected alongside it, in the same call.
+    assert payload["storage"]["backend"] == "local"
+    assert payload["memory"]["pressure"] in ("ok", "high", "critical", "unknown")
+    assert "Storage" in format_status(payload, is_admin=True)
 
 
 def test_collect_degrades_when_redis_is_unreachable(monkeypatch, eventbus_env):

@@ -174,6 +174,18 @@ _BULK_APPLY_GUARD_SECONDS = 12 * 3600
 # which the user experiences as a batch frozen forever with no explanation.
 _BULK_JOB_WAIT_SECONDS = float(os.environ.get("BULK_JOB_WAIT_SECONDS", str(6 * 3600)))
 
+# How long the apply waits for ONE file to become available locally before it
+# gives up on that file and moves to the next.
+#
+# Every wait in the fetch path is bounded on its own (the Pyrogram download has
+# PIPELINE_DOWNLOAD_TIMEOUT_SECONDS, the pipeline's cancel watch polls), but this
+# is the backstop that makes the loop itself unable to hang: a fetch that outlives
+# this is abandoned, reported per-file, and the batch carries on instead of
+# sitting on file 7 of 30 forever with the remaining files never queued. It is
+# deliberately longer than the download timeout, so a slow-but-working download
+# is never cut short by it.
+_BULK_FETCH_TIMEOUT_SECONDS = float(os.environ.get("BULK_FETCH_TIMEOUT_SECONDS", str(45 * 60)))
+
 
 # ── Bulk mode ────────────────────────────────────────────────────────────────
 # Each toggle maps to the same encoding the matching single-file action uses, so
@@ -1394,6 +1406,79 @@ class EnhancedMediaHandler:
                     await aclose()
                 else:
                     await r.close()
+
+    async def _bulk_show_fetch_progress(self, query, batch_id, index: int, total: int, file_info: dict) -> None:
+        """Say which file the apply is fetching, on the message the handler owns.
+
+        The worker's bar only appears once a job is running, and getting a file
+        there means downloading it first - minutes for a 500 MB source. Without
+        this the only thing an operator can see while a batch is being fed is a
+        message that has not changed since they pressed Apply, which is
+        indistinguishable from a frozen batch.
+        """
+        if query is None:
+            return
+        try:
+            name = _bulk_display_name(file_info)
+            header = f"▶️ Batch started: `{batch_id}`\n" if batch_id else ""
+            markup = None
+            if batch_id:
+                markup = InlineKeyboardMarkup(
+                    [
+                        [
+                            InlineKeyboardButton(
+                                "⏹️ Stop batch",
+                                callback_data=f"batch_cancel:{batch_id}",
+                            )
+                        ]
+                    ]
+                )
+            await self.safe_edit(
+                query,
+                f"{header}⬇️ Fetching file {index} of {total} — {name}\n"
+                "Conversions run one file at a time, so a large source can take a "
+                "while to download. Progress is in the message below.",
+                reply_markup=markup,
+            )
+        except Exception:
+            logger.debug("bulk apply: could not show fetch progress")
+
+    async def _batch_worker_counts_job(self, batch_id, job_id) -> bool:
+        """Whether the worker will count this job toward the batch's progress.
+
+        A job stamped with the batch id advances the batch counter when the
+        worker finishes it running. A job created outside the batch (a pipeline
+        job the user already had in flight) carries no such tag and stays
+        invisible to that counter, so the handler has to count it instead.
+        Counting a job both ways finished the batch at half its files and took
+        its progress message down while files were still queued.
+        """
+        if not batch_id or not job_id:
+            return False
+        try:
+            from utils.job_queue import get_redis
+
+            r = await get_redis()
+        except Exception:
+            # Saved by the caller's own failure handling: with no Redis the
+            # counter cannot be advanced either way.
+            return False
+        try:
+            raw = await r.hget(f"ffmpeg:job:{job_id}", "batch_id")
+        except Exception:
+            logger.debug("bulk apply: could not read the batch tag of job %s", job_id)
+            # Fails towards the worker: it is the primary counter, and assuming
+            # otherwise would leave the bar one short forever.
+            return True
+        finally:
+            with contextlib.suppress(Exception):
+                aclose = getattr(r, "aclose", None)
+                if aclose is not None:
+                    await aclose()
+                else:
+                    await r.close()
+        value = raw.decode() if isinstance(raw, (bytes, bytearray)) else raw
+        return bool(value) and str(value) == str(batch_id)
 
     async def _close_batch_message(self, context, batch_id: str) -> None:
         """Delete a finished batch's progress message and stop tracking it.
@@ -5471,6 +5556,16 @@ class EnhancedMediaHandler:
                                 results.append((_bulk_display_name(f), "⏭️ skipped — needs audio/video"))
                                 continue
 
+                            # Say which file is being fetched, on the handler's
+                            # own message. Downloading a 500 MB source takes
+                            # minutes and the worker's bar only appears once a job
+                            # is running, so without this the one thing the user
+                            # stares at while a batch is being fed is a message
+                            # that has not changed since they pressed Apply.
+                            await self._bulk_show_fetch_progress(
+                                query, _batch_id, _idx + 1, len(_bulk_files), f
+                            )
+
                             # Each entry may need its own download — the session's
                             # current_file is not necessarily this file.
                             try:
@@ -5485,9 +5580,33 @@ class EnhancedMediaHandler:
                                 f["_pipeline_batch_id"] = _batch_id
                                 f["_pipeline_batch_seq"] = _batch_seq
                                 f["_pipeline_batch_total"] = _batch_total
-                                _file_path = await self._ensure_bulk_file_downloaded(
-                                    update, context, sess, f
+                                # Bounded on purpose: every step inside has its own
+                                # timeout, but this is what guarantees the loop
+                                # advances even if one of them is added later
+                                # without one. Without it a single dead transfer
+                                # stopped the apply dead - no next file queued, no
+                                # bar moving, nothing said.
+                                _file_path = await asyncio.wait_for(
+                                    self._ensure_bulk_file_downloaded(update, context, sess, f),
+                                    timeout=_BULK_FETCH_TIMEOUT_SECONDS,
                                 )
+                            except TimeoutError:
+                                # ``asyncio.wait_for`` raises the builtin (the alias
+                                # of ``asyncio.TimeoutError`` on 3.11+).
+                                logger.warning(
+                                    "bulk apply: fetching %s exceeded %.0fs; skipping it",
+                                    _bulk_display_name(f),
+                                    _BULK_FETCH_TIMEOUT_SECONDS,
+                                )
+                                skipped += 1
+                                results.append(
+                                    (
+                                        _bulk_display_name(f),
+                                        f"❌ could not fetch — timed out after "
+                                        f"{int(_BULK_FETCH_TIMEOUT_SECONDS // 60)}m",
+                                    )
+                                )
+                                continue
                             except Exception as _fetch_exc:
                                 logger.warning(
                                     "bulk apply: could not fetch %s: %s",
@@ -5531,18 +5650,23 @@ class EnhancedMediaHandler:
                             if f.pop("_bulk_pipeline_completed", False):
                                 enqueued += 1
                                 _batch_seq += 1
-                                # This file was converted and delivered inside this
-                                # handler by the inline pipeline, so no worker job
-                                # exists to advance the batch's counter - yet it is
-                                # counted in the batch total. Count it here as well,
-                                # or the batch is permanently one short of its total
-                                # and its progress message is never taken down (the
-                                # bar that sits at "0 of 1" forever).
-                                if _batch_id:
+                                # The pipeline already queued this file's conversion,
+                                # and that job is what fetches, converts and
+                                # delivers - so it is a real worker job, not an
+                                # inline one. Count it here *only* when the job is
+                                # not tagged with this batch, because a tagged job
+                                # is counted by the worker that runs it: counting
+                                # both ways finished the batch at half its files
+                                # and took the progress message down with files
+                                # still queued.
+                                if _batch_id and not await self._batch_worker_counts_job(
+                                    _batch_id, f.get("_pipeline_job_id")
+                                ):
                                     with contextlib.suppress(Exception):
                                         from utils.batch_pipeline import mark_batch_file_done
 
                                         await mark_batch_file_done(batch_id=_batch_id)
+                                if _batch_id:
                                     with contextlib.suppress(Exception):
                                         from utils.batch_pipeline import mark_batch_entry_finished
                                         from utils.job_queue import get_redis as _get_redis_mark

@@ -6,8 +6,10 @@ these tests run in CI where neither service exists.
 
 What is covered here: that a cancel-all drains *both* pipes (the Redis list, the
 delayed zset, the job hashes a worker may already have popped, plus the broker
-queues) while leaving finished jobs and live per-job keys alone, and that the
-cache wipe covers every prefix the app writes but never touches job state.
+queues) while leaving finished jobs and live per-job keys alone, that it takes
+the cancelled batches down with it (state, resume record and progress bar - which
+is what used to need ``scripts/cleanup_stale_redis.py``), and that the cache wipe
+covers every prefix the app writes but never touches job state.
 """
 
 import asyncio
@@ -17,7 +19,7 @@ import pytest
 
 import utils.eventbus as eventbus  # patched by stub_broker: settings + queue lookup
 import utils.storage as storage_module
-from utils import job_queue, media_cache
+from utils import batch_pipeline, job_queue, media_cache
 from utils.eventbus import rabbit as rabbit_module
 from utils.queue_admin import (
     DEDUP_PREFIX,
@@ -38,6 +40,27 @@ class FakeRedis:
         self.lists: dict[str, list[str]] = {}
         self.zsets: dict[str, list[str]] = {}
         self.hashes: dict[str, dict[str, str]] = {}
+        self.sets: dict[str, set[str]] = {}
+
+    async def sadd(self, key, *values):
+        self.sets.setdefault(key, set()).update(str(value) for value in values)
+        return len(values)
+
+    async def srem(self, key, *values):
+        members = self.sets.get(key, set())
+        before = len(members)
+        members -= {str(value) for value in values}
+        return before - len(members)
+
+    async def smembers(self, key):
+        return set(self.sets.get(key, set()))
+
+    async def hget(self, key, field):
+        return self.hashes.get(key, {}).get(field)
+
+    async def set(self, key, value, nx=False, px=None, ex=None):
+        self.strings[key] = str(value)
+        return True
 
     async def lrange(self, key, start, stop):
         values = self.lists.get(key, [])
@@ -70,7 +93,7 @@ class FakeRedis:
     async def delete(self, *keys):
         removed = 0
         for key in keys:
-            for store in (self.strings, self.lists, self.zsets, self.hashes):
+            for store in (self.strings, self.lists, self.zsets, self.hashes, self.sets):
                 if key in store:
                     del store[key]
                     removed += 1
@@ -78,7 +101,7 @@ class FakeRedis:
 
     def scan_iter(self, match="*", count=100):
         prefix = match[:-1] if match.endswith("*") else match
-        keys = sorted(set(self.strings) | set(self.lists) | set(self.zsets) | set(self.hashes))
+        keys = sorted(set(self.strings) | set(self.lists) | set(self.zsets) | set(self.hashes) | set(self.sets))
         matched = [key for key in keys if key.startswith(prefix)]
 
         async def _gen():
@@ -217,6 +240,105 @@ def test_cancel_all_leaves_locks_owned_by_live_jobs_alone(fake_redis):
     assert report.in_flight == 1
     assert report.locks_released == 1
     assert r.strings == {}
+
+
+class _StubBot:
+    """Records the batch progress messages a cancel-all removes from the chat."""
+
+    def __init__(self, *, fail=False):
+        self.deleted: list[tuple[int, int]] = []
+        self.fail = fail
+
+    async def delete_message(self, chat_id, message_id):
+        if self.fail:
+            raise RuntimeError("not enough rights")
+        self.deleted.append((chat_id, message_id))
+
+
+def _seed_batch(r, batch_id, *, status="processing", msg="-100:777", owner=42):
+    r.hashes[f"{JOB_HASH_PREFIX}member-1"] = {"status": status, "batch_id": batch_id}
+    r.sets[batch_pipeline.batch_jobs_key(batch_id)] = {"member-1"}
+    r.strings[batch_pipeline.batch_total_key(batch_id)] = "3"
+    r.strings[batch_pipeline.batch_progress_key(batch_id)] = "1"
+    if msg is not None:
+        r.strings[batch_pipeline.batch_message_key(batch_id)] = msg
+    r.sets.setdefault(batch_pipeline.ACTIVE_BATCHES_KEY, set()).add(batch_id)
+    if owner is not None:
+        r.sets.setdefault(f"ffmpeg:batch:resume:{owner}", set()).add(batch_id)
+
+
+def test_cancel_all_takes_the_batches_down_and_deletes_their_bars(fake_redis):
+    r = fake_redis
+    _seed_batch(r, "batch-a")
+    bot = _StubBot()
+
+    report = asyncio.run(cancel_all_jobs(bot=bot))
+
+    assert report.batches == 1
+    assert report.batch_messages == 1
+    assert bot.deleted == [(-100, 777)]
+    # State, location and index all go. The tombstone stays: a worker that is
+    # still finishing the flagged member must not repost the bar.
+    assert batch_pipeline.batch_total_key("batch-a") not in r.strings
+    assert batch_pipeline.batch_message_key("batch-a") not in r.strings
+    assert batch_pipeline.batch_jobs_key("batch-a") not in r.sets
+    assert "batch-a" not in r.sets[batch_pipeline.ACTIVE_BATCHES_KEY]
+    assert r.sets["ffmpeg:batch:resume:42"] == set()
+    assert r.strings[batch_pipeline.batch_cancel_key("batch-a")]
+    assert "Batches cleared:     1" in "\n".join(report.as_lines())
+    assert report.errors == []
+
+
+def test_cancel_all_counts_a_batch_whose_bar_is_already_gone(fake_redis):
+    # The worker deletes a batch's message when it finishes, so a batch can be
+    # perfectly stale with no bar left to remove.
+    r = fake_redis
+    _seed_batch(r, "batch-a", msg=None)
+    bot = _StubBot()
+
+    report = asyncio.run(cancel_all_jobs(bot=bot))
+
+    assert report.batches == 1
+    assert report.batch_messages == 0
+    assert bot.deleted == []
+
+
+def test_cancel_all_survives_a_bar_it_cannot_delete(fake_redis):
+    r = fake_redis
+    _seed_batch(r, "batch-a")
+
+    report = asyncio.run(cancel_all_jobs(bot=_StubBot(fail=True)))
+
+    # The count is what actually happened; the state still went.
+    assert report.batches == 1
+    assert report.batch_messages == 0
+    assert batch_pipeline.batch_total_key("batch-a") not in r.strings
+    assert report.errors == []
+
+
+def test_cancel_all_without_a_bot_still_clears_the_batch_state(fake_redis):
+    r = fake_redis
+    _seed_batch(r, "batch-a")
+
+    report = asyncio.run(cancel_all_jobs())
+
+    assert report.batches == 1
+    assert report.batch_messages == 0
+    assert batch_pipeline.batch_total_key("batch-a") not in r.strings
+    assert "Batch keys removed" in "\n".join(report.as_lines())
+
+
+def test_cancel_all_flags_the_running_member_before_it_sweeps_the_batch(fake_redis):
+    """Order matters: the sweep must not see the member as still running."""
+    r = fake_redis
+    _seed_batch(r, "batch-a", status="uploading")
+
+    report = asyncio.run(cancel_all_jobs())
+
+    assert r.hashes[f"{JOB_HASH_PREFIX}member-1"]["status"] == "cancelled"
+    assert report.in_flight == 1
+    assert report.batches_kept == 0
+    assert report.batches == 1
 
 
 def test_cancel_all_purges_broker_queues_when_the_rabbitmq_pipe_is_configured(fake_redis, stub_broker):

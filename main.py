@@ -20,7 +20,7 @@ from urllib.parse import urlparse
 import aiohttp
 import httpx
 from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup, Update
-from telegram.error import Conflict, TelegramError, TimedOut
+from telegram.error import BadRequest, Conflict, TelegramError, TimedOut
 
 # Request location differs across PTB releases; try both locations and
 # fall back to None so the application can continue using default Request.
@@ -83,7 +83,12 @@ from utils.session_healthcheck import (
     start_session_healthcheck,
     stop_session_healthcheck,
 )
-from utils.session_status import collect_session_status, format_status
+from utils.session_status import (
+    collect_session_status,
+    format_status,
+    parse_status_callback,
+    status_keyboard,
+)
 from utils.webhook_monitor import WebhookRecoveryManager
 
 try:
@@ -1112,7 +1117,14 @@ def setup_handlers(application: Application) -> None:
         return is_admin_user(getattr(user, "id", None))
 
     async def cancelall_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Cancel every queued, delayed and running job for every user, on both pipes."""
+        """Cancel every job for every user on both pipes, and clear the batches.
+
+        Cancelling the jobs leaves every batch with no live member, so the batch
+        state (counters, membership, the progress message's location, the resume
+        record) is taken down in the same run and the progress bars are deleted
+        from the chat. That is what used to require
+        ``scripts/cleanup_stale_redis.py`` afterwards.
+        """
         if not _admin_only(update):
             await update.message.reply_text("Unauthorized: admin only")
             return
@@ -1122,7 +1134,8 @@ def setup_handlers(application: Application) -> None:
             "• Redis queue: `ffmpeg:jobs` + `ffmpeg:delayed`\n"
             "• Running jobs: flagged `cancel=1` so workers stop\n"
             "• RabbitMQ: `media.jobs.run` / `.retry` / `.dead` purged\n"
-            "• Progress keys, input locks and stale dedup keys cleared\n\n"
+            "• Progress keys, input locks and stale dedup keys cleared\n"
+            "• Batches cleared, and their progress bars deleted from the chat\n\n"
             "This affects *all users*, not just yours.",
             parse_mode="Markdown",
             reply_markup=confirm_keyboard("cancelall"),
@@ -1133,7 +1146,11 @@ def setup_handlers(application: Application) -> None:
     async def _perform_cancelall(reply):
         await reply.pending("🧹 Draining both pipes, this can take a moment...")
         try:
-            report = await cancel_all_jobs()
+            # The bot goes along so the cancelled batches' progress messages can
+            # be deleted from the chat as well: clearing their Redis state alone
+            # left a bar sitting there claiming work that no longer existed, which
+            # is why the stale batch cleanup used to need the Redis script.
+            report = await cancel_all_jobs(bot=getattr(reply.context, "bot", None))
             await reply.say("\n".join(report.as_lines()))
         except Exception:
             logger.exception("/cancelall failed")
@@ -1280,6 +1297,7 @@ def setup_handlers(application: Application) -> None:
             if live
             else "📊 Collecting status..."
         )
+        keyboard = status_keyboard(is_admin=is_admin, live=live)
         try:
             payload = await collect_session_status(
                 user_id=getattr(update.effective_user, "id", None),
@@ -1290,12 +1308,13 @@ def setup_handlers(application: Application) -> None:
         except Exception:
             logger.exception("/session_status failed")
             text = "❌ /session_status failed — check the logs for details."
+            keyboard = None
 
         try:
-            await note.edit_text(text, parse_mode="HTML")
+            await note.edit_text(text, parse_mode="HTML", reply_markup=keyboard)
         except Exception:
             with contextlib.suppress(Exception):
-                await update.message.reply_text(text, parse_mode="HTML")
+                await update.message.reply_text(text, parse_mode="HTML", reply_markup=keyboard)
 
     application.add_handler(
         CommandHandler("session_status", latency_wrapper(session_status_command, "session_status_command"))
@@ -1351,6 +1370,89 @@ def setup_handlers(application: Application) -> None:
             "The worker exits once the job it is running finishes. Watch the worker "
             "logs for `Exiting (1) for a memory-clean worker restart`."
         )
+
+    async def session_status_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Serve the ``/session_status`` buttons: refresh in place, or recycle the worker.
+
+        Registered in group ``-1`` and stopped afterwards so a dashboard press is
+        never also inspected by the menu callback handler, which is registered
+        without a pattern and accepts every callback.
+        """
+        query = update.callback_query
+        parsed = parse_status_callback(getattr(query, "data", None))
+        if parsed is None:
+            return
+        action, live = parsed
+        is_admin = _admin_only(update)
+        user_id = getattr(update.effective_user, "id", None)
+        note = None
+
+        if action == "restart":
+            if not is_admin:
+                with contextlib.suppress(Exception):
+                    await query.answer("Admin only.", show_alert=True)
+                raise ApplicationHandlerStop
+            try:
+                from utils.batch_pipeline import request_worker_restart
+
+                requested = await request_worker_restart(requested_by=user_id)
+            except Exception:
+                logger.exception("session_status: worker restart request failed")
+                requested = False
+            with contextlib.suppress(Exception):
+                await query.answer(
+                    "✅ Restart requested — the worker exits after the job it is running."
+                    if requested
+                    else "❌ Could not reach Redis to request a restart.",
+                    show_alert=True,
+                )
+            # Answering in a popup keeps the dashboard itself intact, which is the
+            # whole point of having the button here instead of in /worker_restart.
+            note = (
+                "♻️ <b>Worker restart requested</b> — it exits once the job it is "
+                "running finishes; nothing is lost from the queue."
+                if requested
+                else "⚠️ <b>Restart not requested</b> — Redis was unreachable."
+            )
+        else:
+            with contextlib.suppress(Exception):
+                await query.answer("Refreshing...")
+
+        try:
+            payload = await collect_session_status(
+                user_id=user_id,
+                is_admin=is_admin,
+                live_sessions=live,
+                # A button press is a deliberate ask, so it pays for a fresh scan
+                # instead of showing the cached one.
+                force_storage=True,
+            )
+            text = format_status(payload, is_admin=is_admin, note=note)
+        except Exception:
+            logger.exception("/session_status refresh failed")
+            with contextlib.suppress(Exception):
+                await query.answer("Refresh failed — check the logs.", show_alert=True)
+            raise ApplicationHandlerStop from None
+
+        try:
+            await query.edit_message_text(
+                text,
+                parse_mode="HTML",
+                reply_markup=status_keyboard(is_admin=is_admin, live=live),
+            )
+        except BadRequest:
+            # "message is not modified" - Refresh pressed twice in the same second.
+            logger.debug("session_status: dashboard already up to date")
+        except Exception:
+            logger.debug("session_status: could not update the dashboard in place")
+        raise ApplicationHandlerStop
+
+    application.add_handler(
+        CallbackQueryHandler(
+            latency_wrapper(session_status_callback, "session_status_callback"), pattern=r"^st:"
+        ),
+        group=-1,
+    )
 
     # Store handler manager in bot_data for access in other handlers
     application.bot_data["handler_manager"] = handler_manager

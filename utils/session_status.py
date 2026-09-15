@@ -10,7 +10,17 @@ Answers the three questions the existing ``/loginstatus`` does not:
 The admin view also carries a **Capacity** block: how many of the global
 conversion slots (``ffmpeg:slot:*``, see ``utils.batch_pipeline``) are in use
 against ``MAX_CONCURRENT_FFMPEG``, and how much headroom the busiest worker has
-under ``WORKER_MEMORY_CEILING_BYTES`` before it stops taking new work.
+under ``WORKER_MEMORY_CEILING_BYTES`` before it stops taking new work. It is
+followed by a **Memory** block - this process's RSS and its peak, plus what the
+container has left - and a **Storage** block with the object count and total
+bytes in whichever backend holds them (S3/R2 or the local ``storage/`` tree).
+
+The dashboard is served with an inline keyboard: **🔄 Refresh** re-collects and
+edits the same message in place (forcing a fresh storage scan), and admins also
+get **♻️ Restart worker** for the same clean-heap recycle as ``/worker_restart``.
+
+A storage scan costs a request per 1000 objects, so it is cached in Redis for
+``STATUS_STORAGE_CACHE_SECONDS`` and only a button press asks for a fresh one.
 
 The same contract as ``utils.health`` applies: every probe is bounded by a
 timeout and nothing here raises, so a dead Redis degrades one section of the
@@ -30,8 +40,11 @@ import contextlib
 import json
 import logging
 import os
+import sys
 import time
 from collections import Counter
+
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
 from utils import batch_pipeline, presence
 from utils.queue_admin import JOB_HASH_PREFIX, TERMINAL_STATUSES
@@ -54,6 +67,32 @@ HASH_SCAN_LIMIT = int(os.getenv("STATUS_HASH_SCAN_LIMIT", "5000"))
 FETCH_CHUNK = 200
 ACTIVE_LIST_LIMIT = 10
 
+# ── Memory ──────────────────────────────────────────────────────────────
+# Warn while there is still room to act: at 80% the next 1 GB source is a risk,
+# at 92% the OOM killer is the next thing to happen.
+MEMORY_HIGH_PERCENT = float(os.getenv("STATUS_MEMORY_HIGH_PERCENT", "80"))
+MEMORY_CRITICAL_PERCENT = float(os.getenv("STATUS_MEMORY_CRITICAL_PERCENT", "92"))
+# cgroup v1/v2 report "no limit" as a number near 2**63 rather than "max".
+_CGROUP_UNLIMITED_BYTES = 1 << 60
+
+# ── Storage ─────────────────────────────────────────────────────────────
+# A bucket listing costs a request per page, so the scan is cached and only a
+# Refresh press passes ``force=True``.
+STORAGE_CACHE_KEY = "status:storage:usage"
+STORAGE_CACHE_SECONDS = int(os.getenv("STATUS_STORAGE_CACHE_SECONDS", "300"))
+STORAGE_SCAN_MAX_OBJECTS = int(os.getenv("STATUS_STORAGE_SCAN_MAX_OBJECTS", "5000"))
+STORAGE_SCAN_TIMEOUT_SECONDS = float(os.getenv("STATUS_STORAGE_SCAN_TIMEOUT_SECONDS", "20"))
+STORAGE_GROUP_LIMIT = 6
+
+# ── Dashboard buttons ───────────────────────────────────────────────────
+# ``st:`` keeps these away from the menu callback handler, which is registered
+# without a pattern and would otherwise inspect every press (see main.py).
+STATUS_CALLBACK_PREFIX = "st:"
+REFRESH_ACTION = "refresh"
+RESTART_ACTION = "restart"
+REFRESH_LABEL = "🔄 Refresh"
+RESTART_WORKER_LABEL = "♻️ Restart worker"
+
 
 def _text(value) -> str:
     """Return a Redis value as ``str`` whether the client decodes or not."""
@@ -72,12 +111,20 @@ def _int_or_none(value) -> int | None:
 # ── Collection ──────────────────────────────────────────────────────────
 
 
-async def collect_session_status(*, user_id=None, is_admin=False, live_sessions=False) -> dict:
-    """Gather the whole dashboard. Never raises; degrades field by field."""
+async def collect_session_status(
+    *, user_id=None, is_admin=False, live_sessions=False, force_storage=False
+) -> dict:
+    """Gather the whole dashboard. Never raises; degrades field by field.
+
+    ``force_storage`` skips the cached storage scan - the Refresh button passes
+    it so a press always shows a number measured just now.
+    """
     redis_snapshot = await _redis_snapshot()
     broker_snapshot = await _broker_snapshot()
     online_snapshot = await presence.snapshot()
     sessions = await _sessions_snapshot(user_id=user_id, live=live_sessions)
+    memory = summarize_memory(_memory_snapshot())
+    storage = await _storage_snapshot(force=force_storage)
 
     me_id = _int_or_none(user_id)
     payload = summarize(
@@ -103,6 +150,8 @@ async def collect_session_status(*, user_id=None, is_admin=False, live_sessions=
     payload["users"]["source"] = online_snapshot.get("source")
     payload["users"]["error"] = online_snapshot.get("error")
     payload["sessions"] = sessions
+    payload["memory"] = memory
+    payload["storage"] = storage
     payload["generated_at"] = time.time()
     payload["status"] = _overall_status(redis_snapshot, broker_snapshot)
     return payload
@@ -280,6 +329,242 @@ async def _sessions_snapshot(*, user_id, live: bool) -> dict | None:
     }
 
 
+def _memory_snapshot() -> dict:
+    """Raw memory readings for this process and the box it runs on.
+
+    Synchronous and never raising: every source is optional, so a platform that
+    hides ``/proc`` or ships without ``psutil`` still gets whatever the others
+    can report.
+    """
+    raw = {
+        "self_rss_bytes": None,
+        "self_peak_bytes": None,
+        "host_total_bytes": None,
+        "host_used_bytes": None,
+        "cgroup_limit_bytes": None,
+        "cgroup_used_bytes": None,
+        "source": None,
+    }
+
+    try:
+        rss = int(batch_pipeline.rss_bytes() or 0)
+        raw["self_rss_bytes"] = rss or None
+    except Exception:
+        logger.debug("session_status: could not read this process's RSS")
+
+    try:
+        import resource
+
+        peak = int(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
+        if peak > 0:
+            # Linux reports KiB here, macOS bytes.
+            raw["self_peak_bytes"] = peak if sys.platform == "darwin" else peak * 1024
+    except Exception:
+        logger.debug("session_status: could not read the process peak RSS")
+
+    try:
+        import psutil
+
+        vm = psutil.virtual_memory()
+        raw["host_total_bytes"] = int(vm.total)
+        raw["host_used_bytes"] = int(vm.total - vm.available)
+        raw["source"] = "psutil"
+    except Exception:
+        raw.update(_meminfo_fallback())
+
+    limit, used = _cgroup_memory()
+    raw["cgroup_limit_bytes"] = limit
+    raw["cgroup_used_bytes"] = used
+    return raw
+
+
+def _meminfo_fallback() -> dict:
+    """Read ``/proc/meminfo`` when ``psutil`` is unavailable (Linux only)."""
+    out = {"host_total_bytes": None, "host_used_bytes": None, "source": None}
+    try:
+        info: dict[str, str] = {}
+        with open("/proc/meminfo", encoding="ascii") as fh:
+            for line in fh:
+                key, _, rest = line.partition(":")
+                info[key.strip()] = rest.strip()
+        total = _meminfo_bytes(info.get("MemTotal"))
+        available = _meminfo_bytes(info.get("MemAvailable")) or _meminfo_bytes(info.get("MemFree"))
+        if total:
+            out["host_total_bytes"] = total
+            out["host_used_bytes"] = max(0, total - (available or 0))
+            out["source"] = "proc"
+    except Exception:
+        logger.debug("session_status: /proc/meminfo unavailable")
+    return out
+
+
+def _meminfo_bytes(value) -> int | None:
+    """Turn a ``/proc/meminfo`` value (``"8123456 kB"``) into bytes."""
+    if not value:
+        return None
+    parts = str(value).split()
+    try:
+        number = int(parts[0])
+    except (IndexError, ValueError):
+        return None
+    unit = parts[1].lower() if len(parts) > 1 else "kb"
+    factor = {"kb": 1024, "mb": 1024**2, "gb": 1024**3, "b": 1}.get(unit, 1024)
+    return number * factor
+
+
+def _cgroup_memory() -> tuple[int | None, int | None]:
+    """``(limit, used)`` for this container's cgroup, or ``(None, None)``.
+
+    The cgroup limit - not the host's RAM - is what actually kills the process
+    on a container platform, so it is the number worth showing. cgroup v2 is
+    checked first, then v1; a negative or ~2**63 limit means "unlimited".
+    """
+
+    def _read(path: str) -> int | None:
+        try:
+            with open(path, encoding="ascii") as fh:
+                text = fh.read().strip()
+        except OSError:
+            return None
+        if not text or text.lower() == "max":
+            return None
+        try:
+            value = int(text)
+        except ValueError:
+            return None
+        if value <= 0 or value >= _CGROUP_UNLIMITED_BYTES:
+            return None
+        return value
+
+    for limit_path, used_path in (
+        ("/sys/fs/cgroup/memory.max", "/sys/fs/cgroup/memory.current"),
+        ("/sys/fs/cgroup/memory/memory.limit_in_bytes", "/sys/fs/cgroup/memory/memory.usage_in_bytes"),
+    ):
+        limit = _read(limit_path)
+        if limit is not None:
+            return limit, _read(used_path)
+    return None, None
+
+
+async def _storage_snapshot(*, force: bool = False) -> dict:
+    """Object count and total bytes in the configured storage backend.
+
+    Never raises: a storage backend that cannot be reached, or cannot list its
+    contents, reports why in ``error`` so the dashboard still renders.
+    """
+    snapshot = {
+        "backend": None,
+        "location": None,
+        "objects": None,
+        "bytes": None,
+        "groups": {},
+        "truncated": False,
+        "cached": False,
+        "scanned_at": None,
+        "error": None,
+    }
+
+    try:
+        from utils.storage import get_storage_backend
+
+        backend = await get_storage_backend()
+    except Exception as exc:
+        snapshot["error"] = f"storage unavailable: {exc}"
+        return snapshot
+
+    snapshot["backend"] = "s3" if "S3" in type(backend).__name__ else "local"
+    snapshot["location"] = getattr(backend, "bucket", None) or getattr(backend, "base", None)
+
+    scanner = getattr(backend, "usage", None)
+    if not callable(scanner):
+        snapshot["error"] = "this storage backend cannot report its usage"
+        return snapshot
+
+    if not force:
+        cached = await _read_storage_cache()
+        if cached is not None:
+            snapshot.update(cached)
+            snapshot["cached"] = True
+            snapshot["error"] = None
+            return snapshot
+
+    try:
+        readings = await asyncio.wait_for(
+            scanner(max_objects=STORAGE_SCAN_MAX_OBJECTS), timeout=STORAGE_SCAN_TIMEOUT_SECONDS
+        )
+    except Exception as exc:
+        snapshot["error"] = f"{type(exc).__name__}: {exc}"
+        logger.debug("session_status: storage scan failed: %s", exc)
+        return snapshot
+
+    if not isinstance(readings, dict):
+        snapshot["error"] = "storage backend returned no usage data"
+        return snapshot
+
+    snapshot["backend"] = readings.get("backend") or snapshot["backend"]
+    snapshot["location"] = readings.get("location") or snapshot["location"]
+    snapshot["objects"] = _int_or_none(readings.get("objects"))
+    snapshot["bytes"] = _int_or_none(readings.get("bytes"))
+    snapshot["truncated"] = bool(readings.get("truncated"))
+    groups = readings.get("groups")
+    snapshot["groups"] = groups if isinstance(groups, dict) else {}
+    snapshot["scanned_at"] = time.time()
+
+    await _write_storage_cache(snapshot)
+    return snapshot
+
+
+async def _read_storage_cache() -> dict | None:
+    """The last scan, if one is still within its TTL. ``None`` when there is not."""
+    raw = await _storage_cache_get(STORAGE_CACHE_KEY)
+    if not raw:
+        return None
+    try:
+        data = json.loads(_text(raw))
+    except Exception:
+        return None
+    return data if isinstance(data, dict) else None
+
+
+async def _write_storage_cache(snapshot: dict) -> None:
+    """Remember this scan so the next dashboard does not pay for another one."""
+    if STORAGE_CACHE_SECONDS <= 0:
+        return
+    payload = {
+        "backend": snapshot.get("backend"),
+        "location": snapshot.get("location"),
+        "objects": snapshot.get("objects"),
+        "bytes": snapshot.get("bytes"),
+        "groups": snapshot.get("groups") or {},
+        "truncated": snapshot.get("truncated"),
+        "scanned_at": snapshot.get("scanned_at"),
+    }
+    await _storage_cache_set(STORAGE_CACHE_KEY, json.dumps(payload), STORAGE_CACHE_SECONDS)
+
+
+async def _storage_cache_get(key: str):
+    """A cached value, or ``None`` - Redis being down is not an error here."""
+    try:
+        from utils.job_queue import get_redis
+
+        client = await asyncio.wait_for(get_redis(), timeout=PROBE_TIMEOUT_SECONDS)
+        return await asyncio.wait_for(client.get(key), timeout=PROBE_TIMEOUT_SECONDS)
+    except Exception:
+        logger.debug("session_status: storage cache read failed")
+        return None
+
+
+async def _storage_cache_set(key: str, value: str, ttl: int) -> None:
+    """Best-effort cache write; losing it only costs the next scan."""
+    try:
+        from utils.job_queue import get_redis
+
+        client = await asyncio.wait_for(get_redis(), timeout=PROBE_TIMEOUT_SECONDS)
+        await asyncio.wait_for(client.set(key, value, ex=max(1, int(ttl))), timeout=PROBE_TIMEOUT_SECONDS)
+    except Exception:
+        logger.debug("session_status: storage cache write failed")
+
+
 def _overall_status(redis_snapshot: dict, broker_snapshot: dict) -> str:
     """``degraded`` when a pipe that should be serving cannot, else ``ok``."""
     if not redis_snapshot.get("connected"):
@@ -290,6 +575,50 @@ def _overall_status(redis_snapshot: dict, broker_snapshot: dict) -> str:
 
 
 # ── Aggregation (pure) ──────────────────────────────────────────────────
+
+
+def summarize_memory(raw: dict) -> dict:
+    """Fold the raw memory readings into the numbers the dashboard shows.
+
+    Pure, so the arithmetic can be explained without a live box. The cgroup
+    limit is preferred over the host total when both are readable, because on a
+    container platform that limit is what actually ends the process. Every
+    value stays ``None`` rather than zero when it is unknown, so "no data" is
+    never rendered as "using nothing".
+    """
+    raw = raw or {}
+    limit = _int_or_none(raw.get("cgroup_limit_bytes"))
+    cgroup_used = _int_or_none(raw.get("cgroup_used_bytes"))
+    host_total = _int_or_none(raw.get("host_total_bytes"))
+    host_used = _int_or_none(raw.get("host_used_bytes"))
+
+    total = limit or host_total
+    scope = "container" if limit else ("host" if host_total else None)
+    # A cgroup limit without a cgroup reading would report the *host's* use
+    # against the container's limit, which is worse than saying nothing.
+    used = cgroup_used if limit else host_used
+    percent = round(used / total * 100, 1) if used is not None and total else None
+
+    pressure = "unknown"
+    if percent is not None:
+        if percent >= MEMORY_CRITICAL_PERCENT:
+            pressure = "critical"
+        elif percent >= MEMORY_HIGH_PERCENT:
+            pressure = "high"
+        else:
+            pressure = "ok"
+
+    return {
+        "self_rss_bytes": _int_or_none(raw.get("self_rss_bytes")),
+        "self_peak_bytes": _int_or_none(raw.get("self_peak_bytes")),
+        "total_bytes": total,
+        "used_bytes": used,
+        "free_bytes": (total - used) if total is not None and used is not None else None,
+        "percent": percent,
+        "scope": scope,
+        "source": raw.get("source"),
+        "pressure": pressure,
+    }
 
 
 def summarize_capacity(*, slots_used, worker_rss=None) -> dict:
@@ -416,8 +745,12 @@ def summarize(
 # ── Rendering (pure) ────────────────────────────────────────────────────
 
 
-def format_status(payload: dict, *, is_admin: bool) -> str:
-    """Render the dashboard as Telegram HTML."""
+def format_status(payload: dict, *, is_admin: bool, note: str | None = None) -> str:
+    """Render the dashboard as Telegram HTML.
+
+    ``note`` appends one already-formatted line above the timestamp - used by
+    the buttons to report what a press did without replacing the report.
+    """
     lines: list[str] = []
     status = payload.get("status") or "unknown"
     badge = {"ok": "🟢", "degraded": "🟠"}.get(status, "⚪")
@@ -440,6 +773,9 @@ def format_status(payload: dict, *, is_admin: bool) -> str:
         lines.extend(_personal_section(payload))
 
     lines.extend(_session_section(payload))
+    if note:
+        lines.append("")
+        lines.append(note)
     lines.append("")
     lines.append(f"<i>updated {time.strftime('%H:%M:%S')}</i>")
     return "\n".join(lines)
@@ -474,6 +810,14 @@ def _admin_sections(payload: dict) -> list[str]:
     capacity = payload.get("capacity") or {}
     if capacity and (payload.get("redis") or {}).get("connected"):
         lines.extend(_capacity_section(capacity))
+
+    memory = payload.get("memory") or {}
+    if memory.get("self_rss_bytes") is not None or memory.get("total_bytes") is not None:
+        lines.extend(_memory_section(memory))
+
+    storage = payload.get("storage")
+    if isinstance(storage, dict):
+        lines.extend(_storage_section(storage))
 
     lines.append("")
     lines.append("🧮 <b>Recent jobs</b> (hash window)")
@@ -533,6 +877,73 @@ def _capacity_section(capacity: dict) -> list[str]:
     return lines
 
 
+def _memory_section(memory: dict) -> list[str]:
+    """Render this process's RSS and how much room the box has left."""
+    lines = ["", "🧠 <b>Memory</b>"]
+
+    rss = memory.get("self_rss_bytes")
+    peak = memory.get("self_peak_bytes")
+    if rss is None:
+        lines.append("• Bot process: <i>unavailable</i>")
+    elif peak:
+        lines.append(f"• Bot process: <b>{_bytes_human(rss)}</b> (peak {_bytes_human(peak)})")
+    else:
+        lines.append(f"• Bot process: <b>{_bytes_human(rss)}</b>")
+
+    total = memory.get("total_bytes")
+    used = memory.get("used_bytes")
+    if total and used is not None:
+        scope = "Container" if memory.get("scope") == "container" else "System"
+        percent = memory.get("percent")
+        percent_txt = "?" if percent is None else f"{percent:g}"
+        badge = {"high": " ⚠️", "critical": " 🔴"}.get(memory.get("pressure"), "")
+        lines.append(
+            f"• {scope}: <b>{_bytes_human(used)}</b> of {_bytes_human(total)}"
+            f" — <b>{percent_txt}%</b> used{badge}"
+        )
+        free = memory.get("free_bytes")
+        if free is not None:
+            lines.append(f"• Free: <b>{_bytes_human(free)}</b>")
+    else:
+        lines.append("• Total memory: <i>unavailable</i>")
+    return lines
+
+
+def _storage_section(storage: dict) -> list[str]:
+    """Render the object count and bytes held in the storage backend."""
+    lines = ["", "🗄 <b>Storage</b>"]
+    if storage.get("error"):
+        lines.append(f"• ⚠️ {_esc(storage['error'])}")
+        return lines
+
+    backend = storage.get("backend") or "unknown"
+    location = storage.get("location")
+    lines.append(f"• Backend: <b>{_esc(backend)}</b>" + (f" · <code>{_esc(location)}</code>" if location else ""))
+
+    objects = storage.get("objects")
+    if objects is None:
+        lines.append("• Usage: <i>unavailable</i>")
+    else:
+        size = _bytes_human(storage.get("bytes"))
+        capped = " <i>(scan capped)</i>" if storage.get("truncated") else ""
+        lines.append(f"• Used: <b>{size}</b> in <b>{_num(objects)}</b> object(s){capped}")
+
+    groups = {name: row for name, row in (storage.get("groups") or {}).items() if isinstance(row, dict)}
+    # Biggest first: the point of the breakdown is what is eating the space.
+    ranked = sorted(groups.items(), key=lambda item: -(_int_or_none(item[1].get("bytes")) or 0))
+    for name, row in ranked[:STORAGE_GROUP_LIMIT]:
+        lines.append(
+            f"   – <code>{_esc(name)}</code>: {_bytes_human(row.get('bytes'))}"
+            f" in {_num(_int_or_none(row.get('objects')))} object(s)"
+        )
+    if len(ranked) > STORAGE_GROUP_LIMIT:
+        lines.append(f"<i>…and {len(ranked) - STORAGE_GROUP_LIMIT} more prefixes</i>")
+
+    if storage.get("cached"):
+        lines.append(f"<i>cached scan — press {REFRESH_LABEL} for a fresh one</i>")
+    return lines
+
+
 def _personal_section(payload: dict) -> list[str]:
     me = payload.get("me") or {}
     lines = ["", "🙋 <b>Your jobs</b>"]
@@ -568,10 +979,60 @@ def _session_section(payload: dict) -> list[str]:
     return lines
 
 
+def status_keyboard(*, is_admin: bool, live: bool = False) -> InlineKeyboardMarkup:
+    """The dashboard's inline buttons.
+
+    Refresh is always offered; the worker recycle is admin-only, and lives on
+    its own row so a mistimed press cannot land on it.
+    """
+    rows = [[InlineKeyboardButton(REFRESH_LABEL, callback_data=refresh_data(live=live))]]
+    if is_admin:
+        rows.append([InlineKeyboardButton(RESTART_WORKER_LABEL, callback_data=restart_data())])
+    return InlineKeyboardMarkup(rows)
+
+
+def refresh_data(*, live: bool = False) -> str:
+    """Callback data for Refresh, carrying the ``live`` mode across the press."""
+    return f"{STATUS_CALLBACK_PREFIX}{REFRESH_ACTION}" + (":live" if live else "")
+
+
+def restart_data() -> str:
+    """Callback data for the admin Restart-worker button."""
+    return f"{STATUS_CALLBACK_PREFIX}{RESTART_ACTION}"
+
+
+def parse_status_callback(data) -> tuple[str, bool] | None:
+    """Return ``(action, live)`` for a dashboard button press, or ``None``.
+
+    ``live`` is whatever the message was rendered with, so pressing Refresh
+    after ``/session_status live`` keeps running the real session check instead
+    of quietly downgrading to the cached one.
+    """
+    if not isinstance(data, str) or not data.startswith(STATUS_CALLBACK_PREFIX):
+        return None
+    action, _, flag = data[len(STATUS_CALLBACK_PREFIX) :].strip().partition(":")
+    if action not in (REFRESH_ACTION, RESTART_ACTION):
+        return None
+    return action, flag.strip().lower() == "live"
+
+
 def _num(value) -> str:
     if value is None:
         return "?"
     return str(value)
+
+
+def _bytes_human(value) -> str:
+    """Render a byte count with a unit that fits the magnitude (``?`` if unknown)."""
+    number = _int_or_none(value)
+    if number is None:
+        return "?"
+    sign = "-" if number < 0 else ""
+    magnitude = abs(number)
+    for unit, factor in (("GB", 1024**3), ("MB", 1024**2), ("KB", 1024)):
+        if magnitude >= factor:
+            return f"{sign}{magnitude / factor:.1f} {unit}"
+    return f"{sign}{magnitude} B"
 
 
 def _mb(value) -> str:

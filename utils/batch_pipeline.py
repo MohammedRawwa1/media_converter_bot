@@ -255,6 +255,11 @@ async def open_batch_resume(redis=None, *, batch_id, user_id) -> bool:
         await redis.sadd(user_batches_key(user_id), str(batch_id))
         with contextlib.suppress(Exception):
             await redis.expire(user_batches_key(user_id), int(BATCH_STATE_TTL_SECONDS))
+        # Stamp the start. An apply spends minutes fetching its first file before
+        # it has a job to point at, so age is the only thing that can tell a
+        # batch that is still starting up from one abandoned mid-setup.
+        with contextlib.suppress(Exception):
+            await redis.set(batch_started_key(batch_id), time.time(), ex=int(BATCH_STATE_TTL_SECONDS))
         return True
     except Exception:
         logger.debug("batch_pipeline: could not open a resume record for %s", batch_id)
@@ -595,6 +600,224 @@ async def read_active_batches(redis) -> list[dict]:
     rows.sort(key=lambda row: row["done"] / max(row["total"], 1))
     return rows
 
+
+
+# ---------------------------------------------------------------------------
+# Tearing a batch down
+# ---------------------------------------------------------------------------
+
+# A batch with no members yet is protected by age instead, because a fresh apply
+# legitimately spends minutes fetching its first file before the job that owns it
+# exists. Members are the real signal; this only covers that window.
+BATCH_PURGE_GRACE_SECONDS = max(0, _env_number("BATCH_PURGE_GRACE_SECONDS", 900))
+
+# The tombstone written when a batch is taken down. Kept, not deleted: a worker
+# that is still finishing one of its members asks about it before it edits or
+# reposts the progress message, so a batch that is over cannot put its bar back.
+BATCH_TOMBSTONE_REASON = "cancelled by admin"
+
+# Suffixes under ``ffmpeg:batch:`` that are not batch ids themselves.
+_NON_BATCH_SUFFIXES = frozenset({"active", "resume"})
+
+# A job hash that says one of these is not running any more. Anything else -
+# including a status this build has never heard of - counts as live, so a cleanup
+# never tears down work it does not understand.
+_TERMINAL_JOB_STATUSES = frozenset({"done", "completed", "error", "failed", "cancelled", "canceled"})
+
+_JOB_HASH_PREFIX = "ffmpeg:job:"
+_RESUME_KEY_PREFIX = f"{BATCH_KEY_PREFIX}resume:"
+
+
+def batch_started_key(batch_id) -> str:
+    """When a batch began, so a memberless one is not mistaken for stale."""
+    return f"{BATCH_KEY_PREFIX}{batch_id}:started"
+
+
+def batch_state_keys(batch_id) -> tuple[str, ...]:
+    """Every key a batch owns - apart from its lock and its tombstone."""
+    return (
+        batch_jobs_key(batch_id),
+        batch_total_key(batch_id),
+        batch_progress_key(batch_id),
+        batch_done_jobs_key(batch_id),
+        batch_message_key(batch_id),
+        batch_finished_keys(batch_id),
+        batch_started_key(batch_id),
+    )
+
+
+async def purge_batch(redis=None, *, batch_id, reason=BATCH_TOMBSTONE_REASON, ttl_seconds=None) -> dict:
+    """Take one batch down: tombstone it first, then drop everything it owns.
+
+    Order matters. The tombstone stops a worker that is still finishing a member
+    from reposting the progress message, so it has to be written before the
+    message's location is forgotten. The location itself is *returned* rather
+    than deleted from the chat, because removing a Telegram message needs a bot
+    and this module deliberately has none.
+    """
+    result = {"batch_id": str(batch_id or ""), "keys": 0, "message": None}
+    if not batch_id:
+        return result
+    own = redis is None
+    try:
+        if own:
+            from utils.job_queue import get_redis
+
+            redis = await get_redis()
+        ttl = max(1, int(ttl_seconds or BATCH_STATE_TTL_SECONDS))
+        with contextlib.suppress(Exception):
+            await redis.set(batch_cancel_key(batch_id), str(reason), ex=ttl)
+        with contextlib.suppress(Exception):
+            stock = await redis.get(batch_message_key(batch_id))
+            result["message"] = parse_batch_message_ref(stock) if stock else None
+        result["keys"] = int(await redis.delete(*batch_state_keys(batch_id)) or 0)
+        with contextlib.suppress(Exception):
+            await redis.srem(ACTIVE_BATCHES_KEY, str(batch_id))
+        return result
+    except Exception:
+        logger.debug("batch_pipeline: could not purge batch %s", batch_id)
+        return result
+    finally:
+        if own and redis is not None:
+            with contextlib.suppress(Exception):
+                await redis.close()
+
+
+async def purge_stale_batches(
+    redis=None, *, cancelled_job_ids=None, reason=BATCH_TOMBSTONE_REASON, ttl_seconds=None
+) -> dict:
+    """Take down every batch that has no live member left.
+
+    This is what ``/cancelall`` runs, so a stale batch no longer needs
+    ``scripts/cleanup_stale_redis.py``: cancelling everything leaves no job of
+    any batch alive, and every batch therefore looks stale. A batch is *kept*
+    when any member's job hash still looks active (or when its state cannot be
+    read at all), so a batch that is genuinely running - including one started
+    while this ran - is never torn down.
+
+    ``cancelled_job_ids`` is the caller saying "I cancelled these myself": a
+    member on that list cannot keep its batch alive even if its hash still reads
+    active, which is what covers a cancel whose flag write failed.
+
+    Returns ``{batches, keys, messages, kept}``, where ``messages`` are the
+    ``(chat_id, message_id)`` pairs the caller should delete from the chat.
+    """
+    summary: dict = {"batches": [], "keys": 0, "messages": [], "kept": 0}
+    own = redis is None
+    try:
+        if own:
+            from utils.job_queue import get_redis
+
+            redis = await get_redis()
+        for batch_id in sorted(await _known_batch_ids(redis)):
+            if await _batch_is_live(redis, batch_id, cancelled_job_ids):
+                summary["kept"] += 1
+                continue
+            purged = await purge_batch(
+                redis, batch_id=batch_id, reason=reason, ttl_seconds=ttl_seconds
+            )
+            summary["batches"].append(batch_id)
+            summary["keys"] += purged["keys"]
+            if purged["message"]:
+                summary["messages"].append(purged["message"])
+            await _forget_resume_membership(redis, batch_id)
+        return summary
+    except Exception:
+        logger.debug("batch_pipeline: stale batch sweep failed")
+        return summary
+    finally:
+        if own and redis is not None:
+            with contextlib.suppress(Exception):
+                await redis.close()
+
+
+async def _known_batch_ids(redis) -> set[str]:
+    """Every batch id Redis knows about, from its keys and the active set."""
+    ids: set[str] = set()
+    try:
+        async for key in redis.scan_iter(match=f"{BATCH_KEY_PREFIX}*", count=500):
+            text = key.decode() if isinstance(key, (bytes, bytearray)) else str(key)
+            suffix = text[len(BATCH_KEY_PREFIX) :]
+            batch_id = suffix.split(":", 1)[0]
+            if batch_id and batch_id not in _NON_BATCH_SUFFIXES:
+                ids.add(batch_id)
+    except Exception:
+        logger.debug("batch_pipeline: could not scan for batch keys")
+    with contextlib.suppress(Exception):
+        for member in await redis.smembers(ACTIVE_BATCHES_KEY):
+            value = member.decode() if isinstance(member, (bytes, bytearray)) else str(member)
+            if value:
+                ids.add(value)
+    return ids
+
+
+async def _batch_is_live(redis, batch_id, cancelled_job_ids=None) -> bool:
+    """Whether any of a batch's jobs is still running (or might be)."""
+    known_dead = {str(value) for value in (cancelled_job_ids or ())}
+    try:
+        members = {_job_text(value) for value in await redis.smembers(batch_jobs_key(batch_id))}
+    except Exception:
+        # Unreadable membership: keep it. Tearing down a possibly-running batch
+        # is worse than leaving metadata behind for the next sweep.
+        return True
+    if not members:
+        return await _batch_is_fresh(redis, batch_id)
+    for job_id in members:
+        if job_id in known_dead:
+            continue
+        if await _member_is_active(redis, job_id):
+            return True
+    return False
+
+
+async def _member_is_active(redis, job_id) -> bool:
+    """Whether one job hash still looks like running work."""
+    try:
+        status = await redis.hget(f"{_JOB_HASH_PREFIX}{job_id}", "status")
+    except Exception:
+        return True
+    value = _job_text(status)
+    if not value:
+        # No hash at all: the job is gone (expired, or never written), so it is
+        # not running and cannot keep its batch alive.
+        return False
+    return value not in _TERMINAL_JOB_STATUSES
+
+
+async def _batch_is_fresh(redis, batch_id) -> bool:
+    """Whether a memberless batch is young enough to still be starting up."""
+    if BATCH_PURGE_GRACE_SECONDS <= 0:
+        return False
+    try:
+        raw = await redis.get(batch_started_key(batch_id))
+    except Exception:
+        return True
+    if not raw:
+        # No timestamp: a batch from before this bookkeeping existed. Nothing to
+        # age against, and its members would have protected it - so it is stale.
+        return False
+    try:
+        started = float(_job_text(raw))
+    except (TypeError, ValueError):
+        return False
+    return (time.time() - started) < BATCH_PURGE_GRACE_SECONDS
+
+
+async def _forget_resume_membership(redis, batch_id) -> None:
+    """Drop a taken-down batch from every user's resume set."""
+    try:
+        async for key in redis.scan_iter(match=f"{_RESUME_KEY_PREFIX}*", count=200):
+            with contextlib.suppress(Exception):
+                await redis.srem(key, str(batch_id))
+    except Exception:
+        logger.debug("batch_pipeline: could not clear the resume record for %s", batch_id)
+
+
+def _job_text(value) -> str:
+    """A Redis value as ``str``, whether the client decodes or not."""
+    if isinstance(value, (bytes, bytearray)):
+        return value.decode("utf-8", "replace")
+    return "" if value is None else str(value)
 
 
 def tag_batch_job(job: dict, batch_id, seq: int = 0, total: int = 0) -> dict:

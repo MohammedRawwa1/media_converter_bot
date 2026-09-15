@@ -1,0 +1,254 @@
+"""Taking a batch down: the sweep ``/cancelall`` runs after draining jobs.
+
+Cancelling every job leaves no batch with a live member, so the batch state has
+to go too - counters, membership, the progress message's location, the resume
+record. Two things matter and are the reason this has its own file:
+
+* a batch that is *genuinely* running must survive the sweep (a member whose job
+  hash still looks active, or a batch that has not enqueued its first job yet),
+  and
+* a batch that is taken down is tombstoned first, so a worker still finishing one
+  of its members cannot put the progress bar back.
+"""
+
+import asyncio
+import time
+
+from utils import batch_pipeline, job_queue
+
+FINISHED = "done"
+RUNNING = "processing"
+
+
+class FakeRedis:
+    """Only the commands ``purge_batch``/``purge_stale_batches`` issue."""
+
+    def __init__(self):
+        self.strings: dict[str, str] = {}
+        self.sets: dict[str, set[str]] = {}
+        self.hashes: dict[str, dict[str, str]] = {}
+        self.unreadable_sets: set[str] = set()
+
+    async def get(self, key):
+        return self.strings.get(key)
+
+    async def set(self, key, value, nx=False, px=None, ex=None):
+        self.strings[key] = str(value)
+        return True
+
+    async def delete(self, *keys):
+        removed = 0
+        for key in keys:
+            for store in (self.strings, self.sets, self.hashes):
+                if key in store:
+                    del store[key]
+                    removed += 1
+        return removed
+
+    async def sadd(self, key, *values):
+        self.sets.setdefault(key, set()).update(str(value) for value in values)
+        return len(values)
+
+    async def srem(self, key, *values):
+        members = self.sets.get(key, set())
+        before = len(members)
+        members -= {str(value) for value in values}
+        return before - len(members)
+
+    async def smembers(self, key):
+        if key in self.unreadable_sets:
+            raise RuntimeError("membership unavailable")
+        return set(self.sets.get(key, set()))
+
+    async def hget(self, key, field):
+        return self.hashes.get(key, {}).get(field)
+
+    def scan_iter(self, match="*", count=None):
+        prefix = match[:-1] if match and match.endswith("*") else match
+        keys = sorted(set(self.strings) | set(self.sets) | set(self.hashes))
+        matched = [key for key in keys if key.startswith(prefix)]
+
+        async def _gen():
+            for key in matched:
+                yield key
+
+        return _gen()
+
+    async def close(self):
+        return None
+
+
+def _use(monkeypatch, client=None, *, error=None):
+    async def _get_redis():
+        if error is not None:
+            raise error
+        return client
+
+    monkeypatch.setattr(job_queue, "get_redis", _get_redis)
+
+
+def _seed_batch(
+    r,
+    batch_id,
+    *,
+    members=(),
+    statuses=None,
+    total=3,
+    done=1,
+    msg="1:2",
+    started=None,
+    owner=42,
+):
+    if members:
+        r.sets[batch_pipeline.batch_jobs_key(batch_id)] = {str(member) for member in members}
+    r.strings[batch_pipeline.batch_total_key(batch_id)] = str(total)
+    r.strings[batch_pipeline.batch_progress_key(batch_id)] = str(done)
+    r.strings[batch_pipeline.batch_message_key(batch_id)] = msg
+    r.sets[batch_pipeline.batch_finished_keys(batch_id)] = {"entry-1"}
+    r.sets.setdefault(batch_pipeline.ACTIVE_BATCHES_KEY, set()).add(batch_id)
+    if started is not None:
+        r.strings[batch_pipeline.batch_started_key(batch_id)] = str(started)
+    if owner is not None:
+        r.sets.setdefault(f"ffmpeg:batch:resume:{owner}", set()).add(batch_id)
+    for job_id, status in (statuses or {}).items():
+        r.hashes[f"ffmpeg:job:{job_id}"] = {"status": status}
+
+
+# ── one batch ───────────────────────────────────────────────────────────
+
+
+def test_purge_batch_drops_its_state_and_returns_the_message(monkeypatch):
+    r = FakeRedis()
+    _seed_batch(r, "batch-a", members=["j1"], statuses={"j1": FINISHED}, msg="9:88")
+    _use(monkeypatch, r)
+
+    purged = asyncio.run(batch_pipeline.purge_batch(r, batch_id="batch-a"))
+
+    assert purged["message"] == (9, 88)
+    assert purged["keys"] >= 5
+    for key in batch_pipeline.batch_state_keys("batch-a"):
+        assert key not in r.strings
+        assert key not in r.sets
+    assert "batch-a" not in r.sets[batch_pipeline.ACTIVE_BATCHES_KEY]
+
+
+def test_purge_batch_tombstones_before_forgetting_anything(monkeypatch):
+    # The tombstone is what stops a worker that is still finishing a member from
+    # reposting the bar, so it has to outlive the cleanup.
+    r = FakeRedis()
+    _seed_batch(r, "batch-a", members=["j1"], statuses={"j1": FINISHED})
+    _use(monkeypatch, r)
+
+    asyncio.run(batch_pipeline.purge_batch(r, batch_id="batch-a", reason="cancelled by admin"))
+
+    assert r.strings[batch_pipeline.batch_cancel_key("batch-a")] == "cancelled by admin"
+
+
+def test_purge_batch_without_an_id_is_a_no_op(monkeypatch):
+    r = FakeRedis()
+    _use(monkeypatch, r)
+
+    assert asyncio.run(batch_pipeline.purge_batch(r, batch_id=None))["keys"] == 0
+
+
+# ── the sweep ───────────────────────────────────────────────────────────
+
+
+def test_sweep_clears_a_batch_whose_jobs_are_all_finished(monkeypatch):
+    r = FakeRedis()
+    _seed_batch(r, "batch-a", members=["j1", "j2"], statuses={"j1": FINISHED, "j2": "cancelled"})
+    _use(monkeypatch, r)
+
+    summary = asyncio.run(batch_pipeline.purge_stale_batches(r))
+
+    assert summary["batches"] == ["batch-a"]
+    assert summary["messages"] == [(1, 2)]
+    assert summary["keys"] > 0
+    # The resume record must not keep pointing at a batch that no longer exists.
+    assert r.sets.get("ffmpeg:batch:resume:42") == set()
+
+
+def test_sweep_keeps_a_batch_with_a_running_member(monkeypatch):
+    r = FakeRedis()
+    _seed_batch(r, "batch-a", members=["j1", "j2"], statuses={"j1": FINISHED, "j2": RUNNING})
+    _use(monkeypatch, r)
+
+    summary = asyncio.run(batch_pipeline.purge_stale_batches(r))
+
+    assert summary["batches"] == []
+    assert summary["kept"] == 1
+    assert batch_pipeline.batch_total_key("batch-a") in r.strings
+    assert r.strings.get(batch_pipeline.batch_cancel_key("batch-a")) is None
+
+
+def test_sweep_keeps_a_batch_that_has_not_queued_its_first_job_yet(monkeypatch):
+    # An apply spends minutes fetching its first file, so a memberless batch is
+    # not stale while it is still young.
+    r = FakeRedis()
+    _seed_batch(r, "batch-a", members=[], started=time.time())
+    _use(monkeypatch, r)
+
+    assert asyncio.run(batch_pipeline.purge_stale_batches(r))["batches"] == []
+
+
+def test_sweep_clears_an_old_memberless_batch(monkeypatch):
+    r = FakeRedis()
+    _seed_batch(r, "batch-a", members=[], started=time.time() - batch_pipeline.BATCH_PURGE_GRACE_SECONDS - 60)
+    _use(monkeypatch, r)
+
+    assert asyncio.run(batch_pipeline.purge_stale_batches(r))["batches"] == ["batch-a"]
+
+
+def test_sweep_clears_a_memberless_batch_with_no_timestamp(monkeypatch):
+    # A batch from before the timestamp existed: nothing to age, and its members
+    # would have been what protected it.
+    r = FakeRedis()
+    _seed_batch(r, "batch-a", members=[])
+    _use(monkeypatch, r)
+
+    assert asyncio.run(batch_pipeline.purge_stale_batches(r))["batches"] == ["batch-a"]
+
+
+def test_sweep_honours_jobs_the_caller_already_cancelled(monkeypatch):
+    # Covers a cancel whose flag write failed: the caller's word beats the hash.
+    r = FakeRedis()
+    _seed_batch(r, "batch-a", members=["j1"], statuses={"j1": RUNNING})
+    _use(monkeypatch, r)
+
+    summary = asyncio.run(batch_pipeline.purge_stale_batches(r, cancelled_job_ids=["j1"]))
+
+    assert summary["batches"] == ["batch-a"]
+
+
+def test_sweep_keeps_a_batch_whose_membership_cannot_be_read(monkeypatch):
+    # Never tear down something that might be running because Redis hiccuped.
+    r = FakeRedis()
+    _seed_batch(r, "batch-a", members=["j1"], statuses={"j1": FINISHED})
+    r.unreadable_sets.add(batch_pipeline.batch_jobs_key("batch-a"))
+    _use(monkeypatch, r)
+
+    assert asyncio.run(batch_pipeline.purge_stale_batches(r))["batches"] == []
+    assert batch_pipeline.batch_total_key("batch-a") in r.strings
+
+
+def test_sweep_never_treats_its_own_bookkeeping_as_a_batch(monkeypatch):
+    # ``ffmpeg:batch:active`` and ``ffmpeg:batch:resume:<user>`` live under the
+    # same prefix but are not batches.
+    r = FakeRedis()
+    r.sets[batch_pipeline.ACTIVE_BATCHES_KEY] = set()
+    r.sets["ffmpeg:batch:resume:42"] = set()
+    r.strings["ffmpeg:batch:resume:42:started"] = str(time.time())
+    _use(monkeypatch, r)
+
+    summary = asyncio.run(batch_pipeline.purge_stale_batches(r))
+
+    assert summary["batches"] == []
+    assert "ffmpeg:batch:resume:42" in r.sets
+
+
+def test_sweep_survives_an_unreachable_redis(monkeypatch):
+    _use(monkeypatch, error=RuntimeError("no redis"))
+
+    summary = asyncio.run(batch_pipeline.purge_stale_batches())
+
+    assert summary == {"batches": [], "keys": 0, "messages": [], "kept": 0}

@@ -165,11 +165,13 @@ git push origin main
 | `/bulkmenu` | Open bulk/URL processing menu — files you send are collected automatically |
 | `/cancel` | Cancel current operation or login flow |
 | `/canceljob <job_id>` | Request cancellation for a queued/running job |
+| `/cancelbatch <batch_id>` | Stop one bulk batch and drop its remaining files |
+| `/cancelall` | Admin: cancel **every** job on both pipes, clear the cancelled batches and delete their progress bars |
 | `/admin add|remove|list <user_id>` | Manage allowed users (admin only) |
 | `/addthumb` | Set a custom default thumbnail |
 | `/delthumb` | Remove custom default thumbnail |
 | `/loginstatus` | Live session health check (Telethon + Pyrogram) |
-| `/session_status` | Queue depth, online users & session health (`live` arg forces a real check) |
+| `/session_status` | Queue depth, memory, storage, online users & session health (`live` arg forces a real check) — comes with **🔄 Refresh** and **♻️ Restart worker** buttons |
 | `/login [phone]` | Start Telethon login flow |
 | `/loginpyro [phone]` | Start Pyrogram login flow (handles 2FA reliably) |
 | `/logout` | Log out Telethon session (per-user) |
@@ -203,9 +205,34 @@ After **every** finished job the worker runs an explicit cleanup — release the
 
 The worker is the only writer (it knows both the batch count and the running file), so the message never flaps. Its location lives in Redis (`ffmpeg:batch:<id>:msg`) so a worker that restarts mid-batch keeps editing the same one, and the count it aims for is the number of jobs the apply actually enqueued (`ffmpeg:batch:<id>:total`), not the number of collected files. `BATCH_PROGRESS_INTERVAL` (default `3`) paces the live refreshes.
 
+Feeding the batch is serial too, and every wait in it is bounded. The apply fetches one file, queues it, waits for it, then fetches the next — so 30 large sources never land on disk at once. Two timers keep that from becoming a stall: `PIPELINE_DOWNLOAD_TIMEOUT_SECONDS` (default `1800`) abandons a Pyrogram download that outlives it and removes the partial file, and `BULK_FETCH_TIMEOUT_SECONDS` (default `2700`) is the backstop on the whole per-file fetch, so a file that cannot be fetched is reported per-file (`❌ could not fetch — timed out after 45m`) and the apply moves on to the next one instead of sitting on file 7 of 30 with the rest never queued. While it fetches, the apply's own message says which file it is on (`⬇️ Fetching file 7 of 30 — name.mp4`), because a download takes minutes and the worker's bar only appears once a job is running.
+
+Cancelling takes the whole batch with it. Stopping one batch writes a tombstone (`ffmpeg:batch:<id>:cancelled`) *before* it removes anything, because a worker that is still finishing a member asks about that marker before it edits or reposts the progress message — without it, the bar the user just stopped comes back. `/cancelall` does the same for every batch in one run: after it has flagged every queued, delayed and in-flight job, no batch has a live member left, so it tombstones each of them, drops their counters, membership and resume records, removes them from the active set and deletes their progress bars from the chat. That is what used to need `scripts/cleanup_stale_redis.py` run by hand; the script is now a preview/offline tool and says so.
+
+A file that the pipeline already queued is counted toward the batch by the **worker** that runs that job, not by the apply — the apply only counts the job when it carries no tag of this batch (one the user already had in flight). Counting both ways used to finish the batch at half its files and take its progress message down while work was still queued.
+
 A `WORKER_MEMORY_CEILING_BYTES` ceiling makes the worker refuse to start a conversion while the process is still above it (after a few bounded deferrals it runs anyway, so a mis-set ceiling degrades throughput rather than stalling the queue). `WORKER_RESTART_AFTER_JOB_BYTES` additionally makes the standalone worker exit for a clean container restart when it is still above the ceiling after cleanup; the worker's `restartPolicyMaxRetries` is `10` so those planned restarts cannot exhaust the budget and leave the worker down.
 
 `/session_status` (admin) shows a **Capacity** block with this state: how many conversion slots are in use against `MAX_CONCURRENT_FFMPEG`, and the peak worker RSS against the ceiling with its remaining headroom. Workers publish their RSS to `ffmpeg:worker:rss:<host:pid>` (TTL'd, refreshed after every job and on a slow idle timer), so the figure is live even when the dashboard runs in a different service.
+
+Two more blocks sit below it. **Memory** reports this process's RSS and its peak alongside what the container has left — the cgroup limit (`memory.max` / `memory.limit_in_bytes`) wins over the host total when both are readable, because that limit is what actually ends the process, and the percentage is flagged `⚠️` at `STATUS_MEMORY_HIGH_PERCENT` (default `80`) and `🔴` at `STATUS_MEMORY_CRITICAL_PERCENT` (default `92`). **Storage** reports the object count and total bytes in whichever backend holds them, broken down by top-level prefix so the biggest consumer is obvious:
+
+```
+🧠 Memory
+• Bot process: 115.1 MB
+• Container: 612.0 MB of 1.0 GB — 61.2% used
+• Free: 397.1 MB
+
+🗄 Storage
+• Backend: s3 · s3save
+• Used: 1.2 GB in 9 object(s)
+   – inputs/: 1.2 GB in 3 object(s)
+   – outputs/: 35.6 MB in 2 object(s)
+```
+
+A bucket listing costs a request per 1000 keys, so the scan stops at `STATUS_STORAGE_SCAN_MAX_OBJECTS` (default `5000`, reported as _(scan capped)_ when it does) and is cached in Redis for `STATUS_STORAGE_CACHE_SECONDS` (default `300`) — the cached line says so, and pressing **🔄 Refresh** forces a fresh scan. `STATUS_STORAGE_SCAN_TIMEOUT_SECONDS` (default `20`) bounds the whole scan, and a backend that cannot be listed or reached says so in the block rather than reporting zero.
+
+The dashboard is served with an inline keyboard. **🔄 Refresh** re-collects everything and edits the same message in place (a refresh after `/session_status live` stays live), and admins also get **♻️ Restart worker** on its own row — the same clean-heap recycle as `/worker_restart`, confirmed in a popup so the report itself is left intact. Both are non-admin-safe: a non-admin sees only Refresh, and pressing Restart without the right gets an "Admin only." alert.
 
 `/worker_restart` (admin) recycles the standalone worker on demand: it writes a request to `ffmpeg:worker:restart`, the worker consumes it at its next safe point — right after the job it is running, or while idle — and exits so the platform brings it back with an empty heap. Running work is never interrupted and the queue is untouched. Use it when memory does not come back down after a large file; the bot-hosted worker ignores the request, since exiting there would take the bot with it.
 

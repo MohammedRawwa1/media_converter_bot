@@ -38,6 +38,15 @@ logger = logging.getLogger(__name__)
 DEFAULT_BOT_API_MAX_MB = config.BOT_API_MAX_MB
 DEFAULT_BOT_API_MAX_BYTES = config.BOT_API_MAX_BYTES
 
+# How long one Pyrogram download may take before it is treated as failed.
+#
+# This is the only bound on a download that hangs: Pyrogram can sit on a dead
+# connection forever waiting for a chunk that never arrives, and because the
+# caller awaits this inline, an unbounded wait is indistinguishable from a
+# frozen bot. 30 minutes is ~0.6 MB/s for a 1 GB source - slower than that and
+# the file is not going to arrive anyway. 0 disables the bound.
+PIPELINE_DOWNLOAD_TIMEOUT_SECONDS = float(os.getenv("PIPELINE_DOWNLOAD_TIMEOUT_SECONDS", "1800"))
+
 # Files up to this size (200MB) get streamed through memory instead of temp disk
 # Imports — all guarded for optional dependencies
 try:
@@ -49,6 +58,17 @@ try:
     from utils.cache import get_cache
 except Exception:
     get_cache = None
+
+
+def _remove_partial(path: str | None) -> None:
+    """Delete a partially downloaded file, tolerating every failure mode."""
+    if not path:
+        return
+    try:
+        if os.path.exists(path):
+            os.remove(path)
+    except Exception:
+        logger.debug("BigFilePipeline: could not remove partial download %s", path)
 
 
 @dataclass
@@ -431,19 +451,51 @@ class BigFilePipeline:
             progress_callback: Optional callable(current_bytes, total_bytes) for progress.
             user_id: Optional Telegram user ID for per-user session resolution.
 
-        Returns True on success, False on failure.
+        Returns True on success, False on failure. Never raises, and never waits
+        forever: a download that outlives
+        :data:`PIPELINE_DOWNLOAD_TIMEOUT_SECONDS` is abandoned and its partial
+        file removed, so whoever is waiting on this is told it failed instead of
+        being left hanging on a dead connection.
         """
-        try:
+
+        async def _download() -> bool:
             from utils.userbot_downloader import download_forward_via_userbot
 
-            ok = await download_forward_via_userbot(
+            return await download_forward_via_userbot(
                 chat_id=chat_id,
                 message_id=message_id,
                 dest_path=dest_path,
                 progress_callback=progress_callback,
                 user_id=user_id,
             )
-            return ok
+
+        started = time.monotonic()
+        try:
+            if PIPELINE_DOWNLOAD_TIMEOUT_SECONDS > 0:
+                ok = await asyncio.wait_for(_download(), timeout=PIPELINE_DOWNLOAD_TIMEOUT_SECONDS)
+            else:
+                ok = await _download()
+            return bool(ok)
+        except TimeoutError:
+            # ``asyncio.wait_for`` raises the builtin (it is the alias of
+            # ``asyncio.TimeoutError`` on 3.11+).
+            logger.warning(
+                "BigFilePipeline: Pyrogram download timed out after %.0fs (chat=%s msg=%s -> %s); "
+                "treating it as a failed fetch",
+                time.monotonic() - started,
+                chat_id,
+                message_id,
+                dest_path,
+            )
+            _remove_partial(dest_path)
+            return False
+        except asyncio.CancelledError:
+            # The caller gave up (a batch that stopped, or a fetch timeout): drop
+            # whatever was written so a cancelled download cannot leave a
+            # half-file behind for the next file to trip over.
+            _remove_partial(dest_path)
+            raise
         except Exception as e:
             logger.exception("BigFilePipeline: Pyrogram download failed: %s", e)
+            _remove_partial(dest_path)
             return False

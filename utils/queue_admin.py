@@ -13,6 +13,15 @@ has to reason about both or it silently leaves jobs behind:
 2. RabbitMQ pipe (``utils/eventbus/rabbit.py``)
      - ``media.jobs.run`` / ``media.jobs.retry`` / ``media.jobs.dead``
 
+It also takes down the batch state those jobs belong to (``ffmpeg:batch:*``:
+counters, membership, the progress message's location, the resume record and the
+active set). Cancelling every job leaves no batch with a live member, so every
+batch is stale on the way out - which is why this replaces running
+``scripts/cleanup_stale_redis.py`` by hand after a cancel. Each batch is
+tombstoned as it goes so a worker still finishing one member cannot put its
+progress bar back, and the bar itself is deleted from the chat when a bot is
+passed in.
+
 ``cancel_all_jobs`` drains both. It purges the broker even when
 ``EVENTBUS_QUEUE_ROLLOUT_PERCENT`` is 0, because that setting only stops *new*
 jobs from being routed there - anything already queued must still be drained, or
@@ -88,6 +97,10 @@ class QueueReport:
     progress_keys: int = 0
     locks_released: int = 0
     dedup_keys: int = 0
+    batches: int = 0
+    batch_messages: int = 0
+    batch_keys: int = 0
+    batches_kept: int = 0
     job_ids: list[str] = field(default_factory=list)
     broker: dict[str, int | str] = field(default_factory=dict)
     errors: list[str] = field(default_factory=list)
@@ -105,6 +118,11 @@ class QueueReport:
         lines.append(f"• Progress keys:       {self.progress_keys}")
         lines.append(f"• Locks released:      {self.locks_released}")
         lines.append(f"• Dedup keys dropped:  {self.dedup_keys}")
+        lines.append(f"• Batches cleared:     {self.batches}")
+        if self.batches:
+            lines.append(f"• Batch keys removed:  {self.batch_keys}")
+            if self.batch_messages:
+                lines.append(f"• Batch bars deleted:  {self.batch_messages}")
         if self.broker:
             purged = ", ".join(f"{name}={count}" for name, count in sorted(self.broker.items()))
             lines.append(f"• Broker queues:       {purged}")
@@ -325,12 +343,54 @@ async def _purge_broker_queues(report: QueueReport) -> None:
         report.errors.append(f"broker purge: {exc}")
 
 
-async def cancel_all_jobs(*, purge_broker: bool = True) -> QueueReport:
+async def _delete_batch_message(bot, ref) -> bool:
+    """Remove a cancelled batch's progress message from the chat.
+
+    Best-effort on purpose: the message may already be gone (the worker deletes
+    it when a batch finishes), and a failure there must not fail the cancel.
+    """
+    if bot is None or not ref:
+        return False
+    try:
+        chat_id, message_id = ref
+        await bot.delete_message(chat_id=chat_id, message_id=message_id)
+        return True
+    except Exception:
+        logger.debug("cancelall: could not delete a batch progress message %s", ref)
+        return False
+
+
+async def _drop_stale_batches(redis, report: QueueReport, bot=None) -> None:
+    """Take down every batch that no live job belongs to, and its bar.
+
+    Run last: the steps before this one are what make a batch stale - they flag
+    every queued, delayed and in-flight job. A batch whose members are all
+    terminal (or gone) has nothing left to report and would otherwise sit in
+    Redis, and in the chat, until its keys expired.
+    """
+    from utils import batch_pipeline
+
+    summary = await batch_pipeline.purge_stale_batches(
+        redis, cancelled_job_ids=report.job_ids, reason=CANCEL_REASON
+    )
+    report.batches = len(summary["batches"])
+    report.batch_keys = int(summary["keys"])
+    report.batches_kept = int(summary["kept"])
+    for ref in summary["messages"]:
+        if await _delete_batch_message(bot, ref):
+            report.batch_messages += 1
+
+
+async def cancel_all_jobs(*, purge_broker: bool = True, bot=None) -> QueueReport:
     """Cancel every queued, delayed and in-flight job for every user on both pipes.
 
     Each step is isolated: one failing step is recorded in ``report.errors`` and
     the remaining steps still run, so a cancel-all never half-completes because a
     single key misbehaved.
+
+    ``bot`` (optional) is used for the one thing Redis cannot do: deleting the
+    cancelled batches' progress messages from the chat. Without it the batch
+    state is still cleared, and the bars are left for Telegram to keep showing.
     """
     report = QueueReport()
     redis = None
@@ -349,6 +409,8 @@ async def cancel_all_jobs(*, purge_broker: bool = True) -> QueueReport:
             ("progress keys", _drop_progress_keys(redis, report)),
             ("stale locks", _release_stale_locks(redis, report, cancelled)),
             ("dedup keys", _drop_stale_dedup_keys(redis, report)),
+            # Last, because the steps above are what make every batch stale.
+            ("stale batches", _drop_stale_batches(redis, report, bot)),
         )
         for name, step in steps:
             try:
@@ -361,10 +423,12 @@ async def cancel_all_jobs(*, purge_broker: bool = True) -> QueueReport:
         await _purge_broker_queues(report)
 
     logger.info(
-        "cancelall: queued=%s delayed=%s in_flight=%s broker=%s errors=%s",
+        "cancelall: queued=%s delayed=%s in_flight=%s batches=%s kept=%s broker=%s errors=%s",
         report.queued,
         report.delayed,
         report.in_flight,
+        report.batches,
+        report.batches_kept,
         report.broker,
         len(report.errors),
     )

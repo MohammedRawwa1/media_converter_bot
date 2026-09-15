@@ -84,6 +84,39 @@ class AsyncStorageBackend(ABC):
         `delete()` in a loop.  Returns 0 when no keys are provided.
         """
 
+    async def usage(self, *, max_objects: int = 5000, group_depth: int = 1) -> dict[str, Any]:
+        """Count objects and total bytes held by the backend.
+
+        Returns a dict with ``backend``, ``location``, ``objects``, ``bytes``,
+        ``truncated`` and ``groups`` - where ``groups`` attributes the totals to
+        the first ``group_depth`` path segments of each key (``uploads/``,
+        ``inputs/``, ...) so a full bucket can be explained without a second
+        listing. The scan stops after ``max_objects`` so it stays bounded no
+        matter how large the store grows, setting ``truncated`` when it did.
+
+        Backends that cannot list their contents raise ``NotImplementedError`` -
+        callers are expected to catch that rather than treat it as zero usage.
+        """
+        raise NotImplementedError("storage usage is not supported by this backend")
+
+
+def _usage_group(key: str, depth: int) -> str:
+    """The group a key's bytes are attributed to (``uploads/``, ``(root)``)."""
+    parts = str(key).split("/")
+    if len(parts) <= 1:
+        return "(root)"
+    return "/".join(parts[:depth]) + "/"
+
+
+def _usage_add(
+    groups: dict[str, dict[str, int]], key: str, size: int, depth: int
+) -> None:
+    """Fold one object into the group totals."""
+    name = _usage_group(key, depth)
+    row = groups.setdefault(name, {"objects": 0, "bytes": 0})
+    row["objects"] += 1
+    row["bytes"] += size
+
 
 class LocalStorageBackend(AsyncStorageBackend):
     def __init__(self, base_path: str | None = None):
@@ -169,6 +202,40 @@ class LocalStorageBackend(AsyncStorageBackend):
             except Exception:
                 pass
         return deleted
+
+    async def usage(self, *, max_objects: int = 5000, group_depth: int = 1) -> dict[str, Any]:
+        """Count files and bytes under the storage root, bounded by *max_objects*."""
+        cap = max(1, int(max_objects))
+        depth = max(1, int(group_depth))
+        tally = {"objects": 0, "bytes": 0, "truncated": False}
+        groups: dict[str, dict[str, int]] = {}
+
+        def _scan() -> None:
+            # Not following symlinks keeps a stray link from walking the box.
+            for root, _dirs, files in os.walk(self.base, followlinks=False):
+                for name in files:
+                    path = os.path.join(root, name)
+                    try:
+                        size = int(os.path.getsize(path))
+                    except OSError:
+                        continue
+                    key = os.path.relpath(path, self.base).replace("\\", "/")
+                    tally["objects"] += 1
+                    tally["bytes"] += size
+                    _usage_add(groups, key, size, depth)
+                    if tally["objects"] >= cap:
+                        tally["truncated"] = True
+                        return
+
+        await asyncio.to_thread(_scan)
+        return {
+            "backend": "local",
+            "location": self.base,
+            "objects": tally["objects"],
+            "bytes": tally["bytes"],
+            "truncated": tally["truncated"],
+            "groups": groups,
+        }
 
 
 class S3AsyncBackend(AsyncStorageBackend):
@@ -538,6 +605,59 @@ class S3AsyncBackend(AsyncStorageBackend):
     # ─────────────────────────────────────────────────────────────────────────
     # Bulk key listing & deletion (used by periodic S3 cleanup tasks)
     # ─────────────────────────────────────────────────────────────────────────
+
+    async def usage(self, *, max_objects: int = 5000, group_depth: int = 1) -> dict[str, Any]:
+        """Count objects and bytes in the bucket, bounded by *max_objects*.
+
+        Uses the shared paginator (1000 keys per request) and stops as soon as
+        the cap is reached, so a large bucket costs a few requests, not a full
+        walk.
+        """
+        cap = max(1, int(max_objects))
+        depth = max(1, int(group_depth))
+        tally = {"objects": 0, "bytes": 0, "truncated": False}
+        groups: dict[str, dict[str, int]] = {}
+        kwargs: dict[str, Any] = {"Bucket": self.bucket}
+
+        def _accumulate(contents) -> bool:
+            """Fold a page in; return True once the cap is reached."""
+            for obj in contents or []:
+                size = int(obj.get("Size") or 0)
+                tally["objects"] += 1
+                tally["bytes"] += size
+                _usage_add(groups, obj.get("Key") or "", size, depth)
+                if tally["objects"] >= cap:
+                    tally["truncated"] = True
+                    return True
+            return False
+
+        if self._use_aioboto3:
+            async with self._session.client("s3", **self._client_kwargs()) as client:
+                paginator = client.get_paginator("list_objects_v2")
+                async for page in paginator.paginate(**kwargs):
+                    if _accumulate(page.get("Contents")):
+                        break
+        else:
+            if boto3 is None:
+                raise RuntimeError("boto3 is required for S3 operations when aioboto3 is not installed")
+
+            def _sync_usage():
+                client = boto3.client("s3", **self._client_kwargs())
+                paginator = client.get_paginator("list_objects_v2")
+                for page in paginator.paginate(**kwargs):
+                    if _accumulate(page.get("Contents")):
+                        break
+
+            await asyncio.to_thread(_sync_usage)
+
+        return {
+            "backend": "s3",
+            "location": self.bucket,
+            "objects": tally["objects"],
+            "bytes": tally["bytes"],
+            "truncated": tally["truncated"],
+            "groups": groups,
+        }
 
     async def list_keys(self, prefix: str = "") -> list[dict[str, Any]]:
         """List S3 keys under *prefix*, with pagination.
