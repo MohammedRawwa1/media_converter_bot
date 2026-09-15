@@ -210,6 +210,21 @@ async def close_redis():
 async def enqueue_job(job: dict) -> None:
     """Push a job dict to the Redis job list."""
     r = await get_redis()
+    batch_id = job.get("batch_id")
+    if batch_id:
+        try:
+            from utils.batch_pipeline import batch_cancel_key, batch_jobs_key
+
+            if await r.exists(batch_cancel_key(batch_id)):
+                job_id = job.get("job_id")
+                if job_id:
+                    await r.hset(
+                        f"ffmpeg:job:{job_id}",
+                        mapping={"status": "cancelled", "cancel": "1", "message": "batch cancelled"},
+                    )
+                return
+        except Exception:
+            logger.debug("job_queue: batch cancellation check failed")
     # Normalize path separators for any local paths to a portable POSIX style
     try:
         import pathlib
@@ -294,8 +309,32 @@ async def enqueue_job(job: dict) -> None:
             except Exception:
                 logger.debug("job_queue: failed to log job preparation for %s", job_id)
 
+            if batch_id:
+                try:
+                    from utils.batch_pipeline import batch_jobs_key
+
+                    await r.sadd(batch_jobs_key(batch_id), str(job_id))
+                    await r.expire(batch_jobs_key(batch_id), JOB_METADATA_TTL or 86400)
+                except Exception:
+                    logger.debug("job_queue: failed to index batch job %s", job_id)
+
     except Exception:
         logger.debug("job_queue: failed to prepare job hash for %s", job_id)
+
+    if batch_id:
+        try:
+            from utils.batch_pipeline import batch_cancel_key, batch_jobs_key
+
+            if await r.exists(batch_cancel_key(batch_id)):
+                if job_id:
+                    await r.hset(
+                        f"ffmpeg:job:{job_id}",
+                        mapping={"status": "cancelled", "cancel": "1", "message": "batch cancelled"},
+                    )
+                    await r.srem(batch_jobs_key(batch_id), str(job_id))
+                return
+        except Exception:
+            logger.debug("job_queue: final batch cancellation check failed")
 
     # Push the job onto its queue. Which queue is decided per job: with the
     # RabbitMQ backend enabled and a rollout below 100%, only a share of jobs

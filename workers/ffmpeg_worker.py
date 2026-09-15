@@ -2510,6 +2510,14 @@ async def _claim_execution_slot(job: dict):
         # No Redis means no fencing is possible; running beats dropping.
         return -1
     try:
+        batch_id = batch_pipeline.job_batch_id(job)
+        if batch_id and await batch_pipeline.is_batch_cancelled(r, batch_id):
+            with contextlib.suppress(Exception):
+                await r.hset(
+                    f"ffmpeg:job:{job.get('job_id')}",
+                    mapping={"cancel": "1", "status": "cancelled", "message": "batch cancelled"},
+                )
+            return None
         # 1. Memory ceiling: do not start a conversion on a process that is
         #    still holding a previous job's memory. A bounded number of defers
         #    keeps a mis-set ceiling from stalling the queue forever.
@@ -2547,7 +2555,6 @@ async def _claim_execution_slot(job: dict):
 
         # 3. One job per batch, so an Apply Bulk stays in order and never runs
         #    two of its own files at once.
-        batch_id = batch_pipeline.job_batch_id(job)
         if batch_id and not await batch_pipeline.try_acquire_batch_lock(r, batch_id, job.get("job_id")):
             # This job must not hold the global slot while it waits on its batch,
             # or a single busy batch would freeze every other conversion.

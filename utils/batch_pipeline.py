@@ -61,6 +61,7 @@ def _env_number(name: str, default):
 BATCH_ID_FIELD = "batch_id"
 BATCH_SEQ_FIELD = "batch_seq"
 BATCH_TOTAL_FIELD = "batch_total"
+BATCH_CANCELLED_FIELD = "batch_cancelled"
 
 # The bulk menu caps a batch at 30 entries; this is the same ceiling used when
 # sanity-checking a total that arrives off the queue.
@@ -114,6 +115,92 @@ def batch_progress_key(batch_id) -> str:
 def batch_total_key(batch_id) -> str:
     """Redis key holding how many jobs a batch actually enqueued."""
     return f"{BATCH_KEY_PREFIX}{batch_id}:total"
+
+
+def batch_cancel_key(batch_id) -> str:
+    """Redis marker that prevents any remaining member from starting."""
+    return f"{BATCH_KEY_PREFIX}{batch_id}:cancelled"
+
+
+def batch_jobs_key(batch_id) -> str:
+    """Redis set containing the job IDs belonging to one batch."""
+    return f"{BATCH_KEY_PREFIX}{batch_id}:jobs"
+
+
+async def is_batch_cancelled(redis, batch_id) -> bool:
+    """Return whether a batch has been cancelled."""
+    if not batch_id:
+        return False
+    try:
+        return bool(await redis.exists(batch_cancel_key(batch_id)))
+    except Exception:
+        logger.debug("batch_pipeline: could not read cancellation marker for %s", batch_id)
+        return False
+
+
+async def cancel_batch(redis=None, *, batch_id, requested_by=None, ttl_seconds=None) -> dict:
+    """Cancel one batch and remove its queued or delayed members.
+
+    The marker is written first. A worker that already owns one job observes the
+    per-job cancel flag; every later member is discarded before it can acquire a
+    conversion slot or be deferred again.
+    """
+    if not batch_id:
+        return {"batch_id": batch_id, "jobs": 0, "queued": 0, "delayed": 0}
+    if redis is None:
+        from utils.job_queue import get_redis
+
+        redis = await get_redis()
+    ttl = max(1, int(ttl_seconds or BATCH_LOCK_TTL_SECONDS))
+    job_ids = []
+    queued = delayed = 0
+    try:
+        await redis.set(batch_cancel_key(batch_id), str(requested_by or "user"), ex=ttl)
+        from utils.job_queue import DELAYED_SET, JOB_LIST
+
+        members = await redis.smembers(batch_jobs_key(batch_id))
+        for member in members:
+            job_id = member.decode() if isinstance(member, bytes) else str(member)
+            key = f"ffmpeg:job:{job_id}"
+            stored = await redis.hgetall(key)
+            job_ids.append(job_id)
+            await redis.hset(
+                key,
+                mapping={
+                    "cancel": "1",
+                    "status": "cancelled",
+                    "message": "batch cancelled",
+                },
+            )
+
+        prune_script = """
+        local removed = 0
+        local items = redis.call('lrange', KEYS[1], 0, -1)
+        for _, item in ipairs(items) do
+            local ok, parsed = pcall(cjson.decode, item)
+            if ok and type(parsed) == 'table' and tostring(parsed.batch_id) == ARGV[1] then
+                redis.call('lrem', KEYS[1], 1, item)
+                removed = removed + 1
+            end
+        end
+        return removed
+        """
+        queued = int(await redis.eval(prune_script, 1, JOB_LIST, str(batch_id)))
+        delayed_items = await redis.zrange(DELAYED_SET, 0, -1)
+        for item in delayed_items:
+            raw = item.decode() if isinstance(item, bytes) else item
+            try:
+                if str(json.loads(raw).get(BATCH_ID_FIELD, "")) == str(batch_id):
+                    delayed += int(await redis.zrem(DELAYED_SET, item))
+            except Exception:
+                continue
+        with contextlib.suppress(Exception):
+            await redis.delete(batch_jobs_key(batch_id))
+        return {"batch_id": str(batch_id), "jobs": len(job_ids), "queued": queued, "delayed": delayed}
+    finally:
+        if redis is not None:
+            with contextlib.suppress(Exception):
+                await redis.close()
 
 
 async def set_batch_total(redis=None, *, batch_id, total) -> bool:
@@ -213,6 +300,8 @@ async def defer_batch_job(redis, job: dict, delay: float | None = None) -> bool:
     promotes when due, so a deferred batch job re-enters the normal queue path.
     """
     if not job:
+        return False
+    if await is_batch_cancelled(redis, job_batch_id(job)):
         return False
     delay = BATCH_DEFER_SECONDS if delay is None else float(delay)
     try:

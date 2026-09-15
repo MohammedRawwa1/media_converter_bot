@@ -4911,6 +4911,14 @@ class EnhancedMediaHandler:
                     except Exception:
                         logger.debug("bulk apply: sequential batch tagging unavailable")
 
+                    if _batch_id:
+                        with contextlib.suppress(Exception):
+                            await self.safe_edit(
+                                query,
+                                f"▶️ Batch started: `{_batch_id}`\n"
+                                f"Use `/cancelbatch {_batch_id}` to stop the remaining files.",
+                            )
+
                     # Photos in the batch become ONE slideshow video instead of a
                     # per-photo still-image encode. A lone photo keeps the normal
                     # single-file path in the loop below.
@@ -5139,6 +5147,8 @@ class EnhancedMediaHandler:
                     if _quality:
                         _applied = f"{_applied} ({_quality})"
                     _head = f"✅ Bulk apply finished — queued {enqueued} file(s).\n• Applied: {_applied}"
+                    if _batch_id:
+                        _head += f"\n• Batch ID: `{_batch_id}`\nUse `/cancelbatch {_batch_id}` to stop the remaining jobs."
                     if enqueued:
                         _head += (
                             "\n🐢 Processing one file at a time (memory-safe) — "

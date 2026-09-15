@@ -1014,6 +1014,23 @@ def setup_handlers(application: Application) -> None:
 
     application.add_handler(CommandHandler("canceljob", latency_wrapper(canceljob_command, "canceljob_command")))
 
+    async def cancelbatch_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Ask before cancelling one sequential bulk batch."""
+        args = [str(arg).strip() for arg in (context.args or [])]
+        if not args:
+            await update.message.reply_text("Usage: /cancelbatch <batch_id>")
+            return
+        batch_id = args[0]
+        await update.message.reply_text(
+            f"⚠️ *Cancel batch* `{batch_id}`?\n"
+            "The running job will stop at its next checkpoint and remaining jobs "
+            "will be removed without requeueing.",
+            parse_mode="Markdown",
+            reply_markup=confirm_keyboard("cancelbatch", payload=batch_id),
+        )
+
+    application.add_handler(CommandHandler("cancelbatch", latency_wrapper(cancelbatch_command, "cancelbatch_command")))
+
     async def _perform_canceljob(reply, job_id: str):
         try:
             await cancel_job(job_id)
@@ -1021,6 +1038,22 @@ def setup_handlers(application: Application) -> None:
         except Exception as e:
             logger.exception("Failed to request cancel for job %s: %s", job_id, e)
             await reply.say(f"❌ Failed to cancel job {job_id}: {e}")
+
+    async def _perform_cancelbatch(reply, batch_id: str):
+        await reply.pending("⏹️ Cancelling batch and removing remaining jobs...")
+        try:
+            from utils.batch_pipeline import cancel_batch
+
+            report = await cancel_batch(batch_id=batch_id, requested_by=getattr(reply.update.effective_user, "id", None))
+            await reply.say(
+                f"✅ Batch `{report['batch_id']}` cancelled.\n"
+                f"Flagged {report['jobs']} job(s); removed {report['queued']} queued and "
+                f"{report['delayed']} delayed job(s). No remaining member will be requeued.",
+                parse_mode="Markdown",
+            )
+        except Exception:
+            logger.exception("/cancelbatch failed for %s", batch_id)
+            await reply.say("❌ /cancelbatch failed — check the logs for details.")
 
     class _Reply:
         """Send an action's output whether a command or a button triggered it.
@@ -1180,6 +1213,8 @@ def setup_handlers(application: Application) -> None:
                 await _perform_clear_cache(reply, payload == "storage")
             elif action == "canceljob":
                 await _perform_canceljob(reply, payload or "")
+            elif action == "cancelbatch":
+                await _perform_cancelbatch(reply, payload or "")
             elif action == "admin":
                 await _perform_admin(reply, payload or "")
             elif action == "logout":
