@@ -250,9 +250,22 @@ async def probe_media(path: str) -> dict:
         result["audio_channels"] = audio.get("channels", 0)
         result["audio_channel_layout"] = audio.get("channel_layout", "")
 
-        # Audio language from tags
+        # Audio language/title/perfomer from tags
         audio_tags = audio.get("tags", {}) or {}
         result["language"] = audio_tags.get("language", "")
+        if not result.get("title"):
+            title = audio_tags.get("title") or audio_tags.get("TITLE") or audio_tags.get("filename")
+            if title:
+                result["title"] = str(title)[:128]
+        if not result.get("performer"):
+            performer = (
+                audio_tags.get("artist")
+                or audio_tags.get("album_artist")
+                or audio_tags.get("performer")
+                or audio_tags.get("author")
+            )
+            if performer:
+                result["performer"] = str(performer)[:128]
 
         # Audio disposition
         audio_disposition = audio.get("disposition", {}) or {}
@@ -260,9 +273,17 @@ async def probe_media(path: str) -> dict:
         result["audio_forced"] = audio_disposition.get("forced", 0)
 
     # ── Format-level creation_time ──
+    fmt_tags = fmt.get("tags", {}) or {}
     if not result.get("creation_time"):
-        fmt_tags = fmt.get("tags", {}) or {}
         result["creation_time"] = fmt_tags.get("creation_time", "")
+
+    # Preserve media title/performer tags for metadata-driven captions.
+    for tag_key, tag_value in fmt_tags.items():
+        lowered = str(tag_key).lower()
+        if lowered in ("title", "filename") and tag_value and not result.get("title"):
+            result["title"] = str(tag_value)[:128]
+        elif lowered in ("artist", "album_artist", "performer", "author") and tag_value and not result.get("performer"):
+            result["performer"] = str(tag_value)[:128]
 
     logger.info(
         "probe_media: %s — dur=%s codec=%s %sx%s fps=%s rot=%s audio=%s ch=%s lang=%s chapters=%s",

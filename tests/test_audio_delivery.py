@@ -18,6 +18,7 @@ from handlers import (
     _audio_delivery_name,
     _bulk_quality_label,
     _bulk_rename_filename,
+    _metadata_caption,
     _parse_bulk_crf,
     _read_bulk_settings,
     _resolve_bulk_plan,
@@ -65,6 +66,10 @@ class AudioDeliveryNameTests(unittest.TestCase):
 
 
 class AudioDetectionTests(unittest.TestCase):
+    def test_metadata_caption_prefers_source_tags(self):
+        current_file = {"name": "My Video.mp4", "_source_metadata": {"title": "My Song", "performer": "Some Artist"}}
+        self.assertEqual(_metadata_caption(current_file, "✅ Audio extracted"), "My Song — Some Artist")
+
     def test_audio_extensions_are_detected(self):
         for name in ("a.mp3", "a.M4A", "a.flac", "a.opus", "a.ogg"):
             self.assertTrue(mod.is_audio_delivery_output(os.path.join(TMP, name)), msg=name)
@@ -857,6 +862,11 @@ class EnqueueNamingPersistenceTests(unittest.TestCase):
             src = fh.read()
         self.assertIn('"--name"', src)
         self.assertIn("stored_job_naming", src)
+
+    def test_worker_bot_api_audio_send_includes_duration(self):
+        with open(os.path.join(PROJECT_ROOT, "workers", "ffmpeg_worker.py"), encoding="utf-8") as fh:
+            src = fh.read()
+        self.assertIn("duration=int(_vid_duration) if _vid_duration is not None else None", src)
 
 
 class MenuTriggerCoverageTests(unittest.TestCase):

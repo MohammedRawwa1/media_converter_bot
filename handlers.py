@@ -260,6 +260,47 @@ def _audio_delivery_name(name: str | None, fallback_id=None, extension: str = ".
     return f"{stem}{extension}"
 
 
+def _metadata_caption(current_file: dict | None, fallback: str | None = None) -> str:
+    """Build a metadata-derived caption from the captured source metadata.
+
+    Prefer title/performer tags when present, otherwise fall back to the
+    original media filename stem, then the supplied fallback string.
+    """
+    metadata = {}
+    if current_file:
+        metadata = current_file.get("_source_metadata") or current_file.get("source_metadata") or {}
+
+    def _first(*candidates):
+        for candidate in candidates:
+            value = metadata.get(candidate)
+            if value is None:
+                continue
+            value = str(value).strip()
+            if value:
+                return value
+        return ""
+
+    title = _first("title", "source_title")
+    performer = _first("performer", "artist", "album_artist", "author")
+
+    if title and performer:
+        return f"{title} — {performer}"
+    if title:
+        return title
+    if performer:
+        return performer
+
+    if fallback:
+        return fallback
+
+    name = current_file.get("name") or current_file.get("original_filename") or current_file.get("output_filename") or ""
+    stem = os.path.splitext(os.path.basename(name))[0].strip()
+    if stem:
+        return stem
+
+    return "media"
+
+
 def _bulk_rename_filename(filename: str | None, settings: dict | None) -> tuple[str, bool]:
     """Rename ``filename`` using the user's prefix/suffix/words-to-remove settings.
 
@@ -936,6 +977,20 @@ class EnhancedMediaHandler:
                         await _edit(f"⏹️ Job {job_id} was cancelled.")
                 else:
                     await _edit(f"⚠️ Job {job_id} finished with status: {status}")
+
+                try:
+                    _queued_chat_id = info.get("queued_message_chat_id")
+                    _queued_message_id = info.get("queued_message_id")
+                    if _queued_chat_id and _queued_message_id:
+                        _queue_bot = getattr(query, "bot", None)
+                        if _queue_bot is not None:
+                            with contextlib.suppress(Exception):
+                                await _queue_bot.delete_message(
+                                    chat_id=int(_queued_chat_id),
+                                    message_id=int(_queued_message_id),
+                                )
+                except Exception:
+                    logger.debug("handlers: failed to delete queued pipeline notification for %s", job_id)
             except Exception:
                 logger.debug("handlers: final fetch for output or error")
 
@@ -1723,16 +1778,49 @@ class EnhancedMediaHandler:
                                 f"Large file ({file_size // (1024 * 1024)} MB) queued for processing.\n"
                                 f"Job: {_ingest.job_id[:8]}... You will receive the result shortly."
                             )
+                            _queued_message = None
                             if _pipeline_progress_msg:
                                 with contextlib.suppress(BadRequest):
                                     await _pipeline_progress_msg.edit_text(_notify_text)
+                                _queued_message = _pipeline_progress_msg
                             elif update and update.message:
-                                await update.message.reply_text(_notify_text)
+                                _queued_message = await update.message.reply_text(_notify_text)
                             elif update and update.effective_user and context and context.bot:
                                 with contextlib.suppress(Exception):
-                                    await context.bot.send_message(
+                                    _queued_message = await context.bot.send_message(
                                         chat_id=update.effective_user.id,
                                         text=_notify_text,
+                                    )
+
+                            # Persist the queued notification message metadata so the
+                            # background job watcher can remove it automatically once the
+                            # processing job finishes.
+                            if _queued_message is not None:
+                                try:
+                                    _queued_chat_id = getattr(_queued_message, "chat_id", None)
+                                    if _queued_chat_id is None:
+                                        _queued_chat = getattr(_queued_message, "chat", None)
+                                        _queued_chat_id = getattr(_queued_chat, "id", None)
+                                    _queued_message_id = getattr(_queued_message, "message_id", None)
+                                    if _queued_chat_id and _queued_message_id:
+                                        from utils.job_queue import get_redis as _get_r
+
+                                        _r_queue_meta = await _get_r()
+                                        try:
+                                            await _r_queue_meta.hset(
+                                                f"ffmpeg:job:{_ingest.job_id}",
+                                                mapping={
+                                                    "queued_message_chat_id": str(_queued_chat_id),
+                                                    "queued_message_id": str(_queued_message_id),
+                                                },
+                                            )
+                                        finally:
+                                            with contextlib.suppress(Exception):
+                                                await _r_queue_meta.close()
+                                except Exception:
+                                    logger.debug(
+                                        "Big files pipeline: failed to store queued notification metadata for job %s",
+                                        _ingest.job_id,
                                     )
                             # ── NOTE: We do NOT start _watch_job_progress here because the
                             #    caller (convert_video_format, optimize_video, etc.) will
@@ -2609,7 +2697,7 @@ class EnhancedMediaHandler:
         current_file["_pipeline_ffmpeg_args"] = _format_ffmpeg_args.get(target_format)
         current_file["_pipeline_output_ext"] = f".{target_format}"
         current_file["_pipeline_conversion_type"] = "format_video"
-        current_file["_pipeline_caption"] = f"Conversion to {target_format.upper()} finished"
+        current_file["_pipeline_caption"] = _metadata_caption(current_file)
         session["current_file"] = current_file
 
         # Ensure file is available locally (lazy-download)
@@ -2845,6 +2933,7 @@ class EnhancedMediaHandler:
                     if ok and os.path.exists(output_path):
                         # replace current file path
                         current_file["path"] = output_path
+                        current_file["_source_metadata"] = dict(tags)
                         # Deliver the tagged file right away as streamable audio,
                         # otherwise the user never sees the result of this action.
                         delivery_name = _audio_delivery_name(
@@ -2855,9 +2944,9 @@ class EnhancedMediaHandler:
                         with open(output_path, "rb") as audio_file:
                             await update.message.reply_audio(
                                 audio=audio_file,
-                                caption="✅ Tags applied",
+                                caption=_metadata_caption(current_file),
                                 title=tags.get("title") or os.path.splitext(delivery_name)[0],
-                                performer=tags.get("artist") or tags.get("performer") or "Media Bot",
+                                performer=tags.get("artist") or tags.get("performer") or "",
                                 filename=delivery_name,
                             )
                     else:
@@ -3420,10 +3509,10 @@ class EnhancedMediaHandler:
                         await context.bot.send_audio(
                             chat_id=update.effective_chat.id,
                             audio=audio_file,
-                            caption="✅ Fade applied",
+                            caption=_metadata_caption(current_file),
                             title=os.path.splitext(delivery_name)[0],
                             filename=delivery_name,
-                            performer="Media Bot",
+                            performer="",
                         )
                 else:
                     with open(output_path, "rb") as f:
@@ -4641,7 +4730,7 @@ class EnhancedMediaHandler:
         current_file["_pipeline_ffmpeg_args"] = list(_EXTRACT_VIDEO_FFMPEG_ARGS)
         current_file["_pipeline_output_ext"] = ".mp4"
         current_file["_pipeline_conversion_type"] = "extract_video"
-        current_file["_pipeline_caption"] = "✅ Video extracted (audio removed)"
+        current_file["_pipeline_caption"] = _metadata_caption(current_file)
         session["current_file"] = current_file
 
         # Ensure file is available locally (lazy-download)
@@ -4747,7 +4836,7 @@ class EnhancedMediaHandler:
         current_file["audio_bitrate"] = audio_bitrate
         session["current_file"] = current_file
         delivery_name = _audio_delivery_name(current_file.get("name"), current_file.get("id"))
-        caption = f"✅ Audio extracted ({audio_bitrate})"
+        caption = _metadata_caption(current_file)
 
         # Conversion quota enforcement
         if not await self._check_conversion_quota(update, context):
@@ -4800,7 +4889,7 @@ class EnhancedMediaHandler:
                         caption=caption,
                         title=os.path.splitext(delivery_name)[0],
                         filename=delivery_name,
-                        performer="Media Bot",
+                        performer="",
                     )
 
             if AsyncFileLock:
@@ -4952,7 +5041,7 @@ class EnhancedMediaHandler:
                         context.bot,
                         update.effective_chat.id,
                         output_path,
-                        caption=f"✅ Compressed (CRF {crf})",
+                        caption=_metadata_caption(current_file),
                     )
                     os.remove(output_path)
             else:
@@ -4976,7 +5065,7 @@ class EnhancedMediaHandler:
         ]
         current_file["_pipeline_output_ext"] = ".mp4"
         current_file["_pipeline_conversion_type"] = "compress_video"
-        current_file["_pipeline_caption"] = f"✅ Compressed (CRF {crf})"
+        current_file["_pipeline_caption"] = _metadata_caption(current_file)
         session["current_file"] = current_file
 
         # Ensure file downloaded before compression (lazy-download)
@@ -5035,7 +5124,7 @@ class EnhancedMediaHandler:
                 context.bot,
                 update.effective_chat.id,
                 output_path,
-                caption=f"✅ Merged {len(session['merge_list'])} videos",
+                caption=_metadata_caption(session.get("current_file")),
             )
 
             # Cleanup
@@ -5082,10 +5171,10 @@ class EnhancedMediaHandler:
                 await context.bot.send_audio(
                     chat_id=update.effective_chat.id,
                     audio=audio_file,
-                    caption=f"✅ Merged {len(session['merge_list'])} audio files",
+                    caption=_metadata_caption(current_file),
                     title=os.path.splitext(delivery_name)[0],
                     filename=delivery_name,
-                    performer="Media Bot",
+                    performer="",
                 )
 
             # Cleanup
@@ -5133,7 +5222,7 @@ class EnhancedMediaHandler:
                 context.bot,
                 update.effective_chat.id,
                 output_path,
-                caption="✅ Audio removed",
+                caption=_metadata_caption(current_file),
             )
             os.remove(output_path)
         else:
@@ -5207,7 +5296,7 @@ class EnhancedMediaHandler:
                 context.bot,
                 update.effective_chat.id,
                 output_path,
-                caption=f"✅ Resolution: {width}x{height}",
+                caption=_metadata_caption(current_file),
             )
             os.remove(output_path)
         else:
@@ -5274,7 +5363,7 @@ class EnhancedMediaHandler:
         ]
         current_file["_pipeline_output_ext"] = ".mp4"
         current_file["_pipeline_conversion_type"] = "optimize_video"
-        current_file["_pipeline_caption"] = f"⚡ Optimized for {preset}"
+        current_file["_pipeline_caption"] = _metadata_caption(current_file)
         session["current_file"] = current_file
 
         await self.safe_edit(query, f"⚡ Optimizing for {preset}...")
@@ -5377,7 +5466,7 @@ class EnhancedMediaHandler:
                 context.bot,
                 update.effective_chat.id,
                 output_path,
-                caption=f"✅ Optimized for {preset}",
+                caption=_metadata_caption(current_file),
             )
             os.remove(output_path)
         else:
@@ -5402,7 +5491,7 @@ class EnhancedMediaHandler:
         current_file["_pipeline_ffmpeg_args"] = ["-c", "copy"]
         current_file["_pipeline_output_ext"] = ".mp4"
         current_file["_pipeline_conversion_type"] = "repair_video"
-        current_file["_pipeline_caption"] = "✅ Video repaired (if possible)"
+        current_file["_pipeline_caption"] = _metadata_caption(current_file)
         session["current_file"] = current_file
 
         await self.safe_edit(query, "🔧 Attempting to repair video...")
@@ -5539,7 +5628,7 @@ class EnhancedMediaHandler:
                 await context.bot.send_photo(
                     chat_id=update.effective_chat.id,
                     photo=photo_file,
-                    caption=f"✅ Screenshot at {time_str}",
+                    caption=_metadata_caption(current_file),
                 )
             os.remove(output_path)
         else:
@@ -5655,7 +5744,7 @@ class EnhancedMediaHandler:
                 await context.bot.send_photo(
                     chat_id=update.effective_chat.id,
                     photo=photo_file,
-                    caption=f"✅ Screenshot at {time_str}",
+                    caption=_metadata_caption(current_file),
                 )
             os.remove(output_path)
         else:
@@ -5694,7 +5783,7 @@ class EnhancedMediaHandler:
                 await context.bot.send_photo(
                     chat_id=update.effective_chat.id,
                     photo=photo_file,
-                    caption="✅ Thumbnail grid (3x3)",
+                    caption=_metadata_caption(current_file),
                 )
             os.remove(output_path)
         else:
@@ -5719,7 +5808,7 @@ class EnhancedMediaHandler:
         current_file["_pipeline_ffmpeg_args"] = None
         current_file["_pipeline_output_ext"] = ".zip"
         current_file["_pipeline_conversion_type"] = "extract_streams"
-        current_file["_pipeline_caption"] = "🎞️ Streams extracted"
+        current_file["_pipeline_caption"] = _metadata_caption(current_file)
         session["current_file"] = current_file
 
         # Ensure file downloaded (lazy-download)
@@ -5829,7 +5918,7 @@ class EnhancedMediaHandler:
         current_file["_pipeline_ffmpeg_args"] = _format_ffmpeg_args.get(format_type, ["-c:a", "copy"])
         current_file["_pipeline_output_ext"] = f".{format_type}"
         current_file["_pipeline_conversion_type"] = "format_audio"
-        current_file["_pipeline_caption"] = f"✅ Converted to {format_type.upper()}"
+        current_file["_pipeline_caption"] = _metadata_caption(current_file)
         session["current_file"] = current_file
 
         await self.safe_edit(query, f"🔄 Converting to {format_type.upper()}...")
@@ -5879,10 +5968,10 @@ class EnhancedMediaHandler:
                 await context.bot.send_audio(
                     chat_id=update.effective_chat.id,
                     audio=audio_file,
-                    caption=f"✅ Converted to {format_type.upper()}",
+                    caption=_metadata_caption(current_file),
                     title=os.path.splitext(delivery_name)[0],
                     filename=delivery_name,
-                    performer="Media Bot",
+                    performer="",
                 )
             os.remove(output_path)
         else:
@@ -5955,10 +6044,10 @@ class EnhancedMediaHandler:
                 await context.bot.send_audio(
                     chat_id=update.effective_chat.id,
                     audio=audio_file,
-                    caption=f"✅ Bitrate: {audio_bitrate}",
+                    caption=_metadata_caption(current_file),
                     title=os.path.splitext(delivery_name)[0],
                     filename=delivery_name,
-                    performer="Media Bot",
+                    performer="",
                 )
             os.remove(output_path)
         else:
@@ -6013,10 +6102,10 @@ class EnhancedMediaHandler:
                 await context.bot.send_audio(
                     chat_id=update.effective_chat.id,
                     audio=audio_file,
-                    caption="✅ Audio normalized",
+                    caption=_metadata_caption(current_file),
                     title=os.path.splitext(delivery_name)[0],
                     filename=delivery_name,
-                    performer="Media Bot",
+                    performer="",
                 )
             os.remove(output_path)
         else:
@@ -6061,7 +6150,7 @@ class EnhancedMediaHandler:
                 await context.bot.send_document(
                     chat_id=update.effective_chat.id,
                     document=sub_file,
-                    caption="✅ Subtitles extracted",
+                    caption=_metadata_caption(current_file),
                     filename=f"{current_file['name']}_subtitles.srt",
                 )
             os.remove(output_path)
@@ -6354,7 +6443,7 @@ class EnhancedMediaHandler:
                             context.bot,
                             update.effective_chat.id,
                             output_path,
-                            caption=f"✅ Trimmed {start} to {user_input}",
+                            caption=_metadata_caption(current_file),
                         )
                         os.remove(output_path)
                     else:
@@ -6410,7 +6499,7 @@ class EnhancedMediaHandler:
                             context.bot,
                             update.effective_chat.id,
                             output_path,
-                            caption=f"✅ Trimmed {start} + {user_input}",
+                            caption=_metadata_caption(current_file),
                         )
                         os.remove(output_path)
                     else:
@@ -6552,7 +6641,7 @@ class EnhancedMediaHandler:
                             context.bot,
                             update.effective_chat.id,
                             output_path,
-                            caption=f"✅ Resolution: {width}x{height}",
+                            caption=_metadata_caption(current_file),
                         )
                         os.remove(output_path)
                     else:
@@ -6617,7 +6706,7 @@ class EnhancedMediaHandler:
                                         context.bot,
                                         update.effective_chat.id,
                                         out,
-                                        caption="✅ Split part",
+                                        caption=_metadata_caption(current_file),
                                     )
                                     os.remove(out)
                                 else:
@@ -6769,17 +6858,17 @@ class EnhancedMediaHandler:
                         await context.bot.send_audio(
                             chat_id=update.effective_chat.id,
                             audio=audio_file,
-                            caption=f"✅ Trimmed {start_time}-{end_time}",
+                            caption=_metadata_caption(current_file),
                             title=os.path.splitext(delivery_name)[0],
                             filename=delivery_name,
-                            performer="Media Bot",
+                            performer="",
                         )
                 else:
                     await self._send_video_result(
                         context.bot,
                         update.effective_chat.id,
                         output_path,
-                        caption=f"✅ Trimmed {start_time}-{end_time}",
+                        caption=_metadata_caption(current_file),
                     )
                 os.remove(output_path)
             else:
@@ -6803,7 +6892,7 @@ class EnhancedMediaHandler:
                     await context.bot.send_photo(
                         chat_id=update.effective_chat.id,
                         photo=photo_file,
-                        caption=f"✅ Screenshot at {user_input}",
+                        caption=_metadata_caption(current_file),
                     )
                 os.remove(output_path)
             else:
@@ -6863,7 +6952,7 @@ class EnhancedMediaHandler:
                         context.bot,
                         update.effective_chat.id,
                         output_path,
-                        caption=f"✅ Framerate changed to {fps} fps",
+                        caption=_metadata_caption(current_file),
                     )
                     os.remove(output_path)
                 else:
@@ -6928,7 +7017,7 @@ class EnhancedMediaHandler:
                         context.bot,
                         update.effective_chat.id,
                         output_path,
-                        caption="✅ Custom optimization",
+                        caption=_metadata_caption(current_file),
                     )
                     os.remove(output_path)
                 else:
@@ -6956,7 +7045,7 @@ class EnhancedMediaHandler:
                         context.bot,
                         update.effective_chat.id,
                         output_path,
-                        caption="✅ Metadata updated",
+                        caption=_metadata_caption(current_file),
                     )
                     os.remove(output_path)
                 else:

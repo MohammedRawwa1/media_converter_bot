@@ -1676,7 +1676,8 @@ async def handle_job(job: dict):
                                                         caption=caption,
                                                         title=os.path.splitext(_delivery_name)[0],
                                                         filename=_delivery_name,
-                                                        performer="Media Bot",
+                                                        performer="",
+                                                        duration=int(_vid_duration) if _vid_duration is not None else None,
                                                     )
                                             elif kind == "video":
                                                 # Try to attach thumbnail (thumb) when available
