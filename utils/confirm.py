@@ -1,35 +1,64 @@
-"""Argument parsing shared by the commands that require an explicit confirmation.
+"""Inline Yes/No confirmation for every command that destroys something.
 
-``/cancelall``, ``/clear_cache`` and ``/canceljob`` all follow the reference bot's
-rule: the bare command describes what it would destroy and stops; only an
-invocation carrying the word ``confirm`` does the work. Sharing the parser keeps
-those three behaving identically - before this, each one stripped the word in its
-own way, which is how a command can end up accepting ``confirm`` in one place and
-not in another.
+The destructive commands used to stop and ask the user to send the *same command
+again* with the word ``confirm`` appended. That put the burden on the user to
+retype a message from memory, and it meant a stray ``confirm`` in an argument
+could arm a wipe.
+
+Every one of them now sends its warning with two inline buttons instead. The Yes
+button carries the exact action to run, so the confirmation cannot be typed, and a
+button press can never be confused with the originating command.
+
+Callback data is capped at 64 bytes by Telegram, so the encoding stays small:
+``cfm:<action>[:<payload>]`` for Yes and ``cfn`` for No.
 """
 
 from __future__ import annotations
 
-CONFIRM_WORD = "confirm"
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+
+YES_PREFIX = "cfm:"
+NO_DATA = "cfn"
+YES_LABEL = "✅ Yes"
+NO_LABEL = "❌ No"
 
 
-def split_confirm(args) -> tuple[bool, list[str]]:
-    """Split command arguments into ``(confirmed, positional)``.
+def yes_data(action: str, payload: str | None = None) -> str:
+    """Callback data for a Yes button that runs ``action``."""
+    return f"{YES_PREFIX}{action}" + (f":{payload}" if payload else "")
 
-    Every whole argument equal to ``confirm`` (case-insensitive) is removed and
-    sets the confirmation flag. The word may come before or after the positional
-    argument, so ``/canceljob <id> confirm`` and ``/canceljob confirm <id>`` both
-    work and a user following an older prompt is not left guessing the order.
 
-    Only whole arguments count: a job id or file name that merely contains the
-    letters "confirm" is left untouched.
-    """
-    positional: list[str] = []
-    confirmed = False
-    for raw in args or []:
-        token = str(raw).strip()
-        if token.lower() == CONFIRM_WORD:
-            confirmed = True
-            continue
-        positional.append(token)
-    return confirmed, positional
+def confirm_keyboard(
+    action: str,
+    *,
+    payload: str | None = None,
+    yes_label: str = YES_LABEL,
+    no_label: str = NO_LABEL,
+) -> InlineKeyboardMarkup:
+    """A single Yes/No row that runs ``action`` when confirmed."""
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(yes_label, callback_data=yes_data(action, payload)),
+                InlineKeyboardButton(no_label, callback_data=NO_DATA),
+            ]
+        ]
+    )
+
+
+def parse_confirm(data) -> tuple[str, str | None] | None:
+    """Return ``(action, payload)`` for a Yes press, or ``None`` otherwise."""
+    if not isinstance(data, str) or not data.startswith(YES_PREFIX):
+        return None
+    token = data[len(YES_PREFIX) :].strip()
+    if not token:
+        return None
+    action, _, payload = token.partition(":")
+    if not action:
+        return None
+    return action, (payload or None)
+
+
+def is_cancel(data) -> bool:
+    """Whether a callback is the No button."""
+    return isinstance(data, str) and data == NO_DATA

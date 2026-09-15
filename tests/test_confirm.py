@@ -1,52 +1,90 @@
-"""The parser behind every command that demands an explicit confirmation.
+"""The inline Yes/No confirmation behind every destructive command.
 
-``/cancelall``, ``/clear_cache`` and ``/canceljob`` all refuse to act until the
-word ``confirm`` shows up, and they now share one parser so they cannot drift
-apart. Only whole arguments count: a job id containing the letters must not
-confirm anything on its own.
+Commands used to demand a second message containing the word ``confirm``. That is
+gone: the prompt now carries buttons whose Yes is the only thing that can arm the
+action. What matters here is that the callback data round-trips exactly (so the
+button runs the right action with the right payload) and that nothing which is not
+one of our callbacks can be mistaken for a confirmation.
 """
 
 import pytest
 
-from utils.confirm import split_confirm
+from utils.confirm import NO_DATA, confirm_keyboard, is_cancel, parse_confirm, yes_data
+
+
+def _buttons(markup):
+    return [button for row in markup.inline_keyboard for button in row]
+
+
+# ── encoding ────────────────────────────────────────────────────────────
+
+
+def test_keyboard_has_a_yes_and_a_no():
+    buttons = _buttons(confirm_keyboard("cancelall"))
+
+    assert buttons[0].callback_data == "cfm:cancelall"
+    assert buttons[1].callback_data == NO_DATA
+
+
+def test_payload_rides_along_on_the_yes_button():
+    buttons = _buttons(confirm_keyboard("canceljob", payload="job-123"))
+
+    assert buttons[0].callback_data == "cfm:canceljob:job-123"
+
+
+def test_yes_data_is_used_consistently():
+    assert yes_data("clear_cache") == "cfm:clear_cache"
+    assert yes_data("clear_cache", "storage") == "cfm:clear_cache:storage"
+
+
+def test_callback_data_stays_within_telegrams_limit():
+    """Telegram rejects callback data over 64 bytes, so a job id must still fit."""
+    job_id = "12345678-1234-1234-1234-123456789abc"
+    buttons = _buttons(confirm_keyboard("canceljob", payload=job_id))
+
+    assert len(buttons[0].callback_data.encode()) <= 64
+
+
+# ── decoding ────────────────────────────────────────────────────────────
 
 
 @pytest.mark.parametrize(
-    ("args", "expected"),
+    ("data", "expected"),
     [
-        # Confirmed, in either order.
-        (["abc", "confirm"], (True, ["abc"])),
-        (["confirm", "abc"], (True, ["abc"])),
-        (["Confirm"], (True, [])),
-        (["a", "confirm", "b"], (True, ["a", "b"])),
-        # Not confirmed.
-        (["abc"], (False, ["abc"])),
-        ([], (False, [])),
-        (None, (False, [])),
-        (["confirmed"], (False, ["confirmed"])),
-        (["confirmable", "confirm"], (True, ["confirmable"])),
+        ("cfm:cancelall", ("cancelall", None)),
+        ("cfm:canceljob:abc", ("canceljob", "abc")),
+        ("cfm:clear_cache:storage", ("clear_cache", "storage")),
+        ("cfm:delthumb", ("delthumb", None)),
     ],
 )
-def test_split_confirm(args, expected):
-    assert split_confirm(args) == expected
+def test_parse_confirm_round_trips(data, expected):
+    assert parse_confirm(data) == expected
 
 
-def test_whitespace_around_the_word_is_tolerated():
-    """Telegram can hand back padded tokens; a trailing space must still confirm."""
-    assert split_confirm(["  confirm  "]) == (True, [])
-    assert split_confirm([" abc "]) == (False, ["abc"])
+@pytest.mark.parametrize(
+    "data",
+    [
+        None,
+        "",
+        "cfn",
+        "cancelall",  # a stale command-shaped payload
+        "confirm",  # the word that used to arm a wipe
+        "cfm:",  # prefix with no action
+        "menu_main",
+        42,
+    ],
+)
+def test_parse_confirm_rejects_everything_else(data):
+    assert parse_confirm(data) is None
 
 
-def test_a_job_id_containing_the_word_does_not_confirm():
-    """The dangerous case: /canceljob <id-containing-confirm> must still ask."""
-    confirmed, positional = split_confirm(["confirm-job-123"])
-
-    assert confirmed is False
-    assert positional == ["confirm-job-123"]
+def test_a_word_in_an_argument_can_never_confirm():
+    """The old footgun: a job id containing "confirm" must not arm anything."""
+    assert parse_confirm("confirm-job-123") is None
+    assert is_cancel("confirm") is False
 
 
-def test_only_one_confirmation_is_reported_for_repeated_words():
-    confirmed, positional = split_confirm(["confirm", "confirm", "abc"])
-
-    assert confirmed is True
-    assert positional == ["abc"]
+def test_is_cancel_matches_only_the_no_button():
+    assert is_cancel(NO_DATA) is True
+    assert is_cancel("cfm:cancelall") is False
+    assert is_cancel("cancel") is False

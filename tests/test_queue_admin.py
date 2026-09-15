@@ -16,7 +16,8 @@ import json
 import pytest
 
 import utils.eventbus as eventbus  # patched by stub_broker: settings + queue lookup
-from utils import job_queue
+import utils.storage as storage_module
+from utils import job_queue, media_cache
 from utils.eventbus import rabbit as rabbit_module
 from utils.queue_admin import (
     DEDUP_PREFIX,
@@ -266,11 +267,13 @@ def test_clear_cache_deletes_every_cache_prefix_but_never_job_state(fake_redis):
 
     assert report.prefixes == {
         "cache:job:": 1,
-        "cache:file:": 1,
         "cache:user:": 1,
         "cache:meta:": 1,
         "cache:resp:": 1,
     }
+    # The media cache is reported on its own: it is the descriptors *and* the
+    # cached bodies under cache:file:*.
+    assert report.media_cache == 1
     assert report.route_cache_keys == 1
     assert report.total_keys == 6
     assert report.errors == []
@@ -289,6 +292,100 @@ def test_clear_cache_also_empties_the_in_memory_route_cache(fake_redis):
 
     assert route_cache.get("status:j1") is None
     assert report.route_cache_memory >= 1
+
+
+def test_clear_cache_reports_the_media_cache_on_its_own_line(fake_redis):
+    fake_redis.strings["cache:file:some-uid"] = "{}"
+    fake_redis.strings["cache:file:bytes:some-uid"] = "payload"
+
+    report = asyncio.run(clear_cache_keys())
+
+    assert report.media_cache == 2
+    assert any("media cache" in line for line in report.as_lines())
+
+
+def test_clear_cache_leaves_the_media_library_in_storage_by_default(fake_redis, monkeypatch):
+    """Storage objects are not cache keys; a routine wipe must not delete them."""
+    calls: list[str] = []
+
+    class StubBackend:
+        base_path = None
+
+        async def list_keys(self, prefix):
+            calls.append(f"list:{prefix}")
+            return [{"key": "inputs/library/x/source"}]
+
+        async def delete_keys(self, keys):
+            calls.append("delete")
+            return len(keys)
+
+    monkeypatch.setattr(storage_module, "get_storage_backend", _backend(StubBackend()))
+
+    report = asyncio.run(clear_cache_keys())
+
+    assert calls == []
+    assert report.media_storage_keys == 0
+
+
+def test_clear_cache_purges_the_media_library_when_asked(fake_redis, monkeypatch):
+    class StubBackend:
+        base_path = None
+
+        async def list_keys(self, prefix):
+            assert prefix == media_cache.LIBRARY_KEY_PREFIX
+            return [{"key": "inputs/library/a/source"}, {"key": "inputs/library/b/source"}]
+
+        async def delete_keys(self, keys):
+            assert sorted(keys) == ["inputs/library/a/source", "inputs/library/b/source"]
+            return len(keys)
+
+    monkeypatch.setattr(storage_module, "get_storage_backend", _backend(StubBackend()))
+
+    report = asyncio.run(clear_cache_keys(clear_media_storage=True))
+
+    assert report.media_storage_keys == 2
+    assert any("media library objects in storage" in line for line in report.as_lines())
+
+
+def test_clear_cache_walks_the_nested_local_media_library(fake_redis, monkeypatch, tmp_path):
+    """LocalStorageBackend exposes its root as ``base``, and the library nests one
+    level (``<hash>/source``) which a single-level ``list_keys`` cannot see."""
+    import os
+
+    nested = tmp_path / "inputs" / "library" / "abc"
+    nested.mkdir(parents=True)
+    (nested / "source").write_bytes(b"media")
+
+    class LocalStub:
+        base = str(tmp_path)
+
+        async def list_keys(self, prefix):
+            # Mirrors LocalStorageBackend: top-level files only, so the nested
+            # object is invisible to it and only the os.walk fallback finds it.
+            return []
+
+        async def delete_keys(self, keys):
+            removed = 0
+            for key in keys:
+                path = os.path.join(self.base, key)
+                if os.path.exists(path):
+                    os.remove(path)
+                    removed += 1
+            return removed
+
+    monkeypatch.setattr(storage_module, "get_storage_backend", _backend(LocalStub()))
+
+    report = asyncio.run(clear_cache_keys(clear_media_storage=True))
+
+    assert report.media_storage_keys == 1
+    assert not (nested / "source").exists()
+
+
+def _backend(instance):
+    async def _get_storage_backend():
+        return instance
+
+    return _get_storage_backend
 
 
 def test_clear_cache_reports_redis_failure_instead_of_raising(monkeypatch, eventbus_env):

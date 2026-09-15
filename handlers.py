@@ -213,6 +213,27 @@ _BULK_ACTION_LABELS = {
     "bulk_optimize": "Optimize",
 }
 
+# Cap on the files auto-collected for the next "Apply Bulk" so a long-lived
+# session cannot grow without bound. Oldest entries are dropped first.
+_BULK_LIST_LIMIT = 30
+
+# How many per-file result lines the Apply summary lists before truncating.
+_BULK_SUMMARY_MAX_LINES = 20
+
+# Seconds each queued photo is shown in a generated slideshow. The value in
+# utils.callbacks.BULK_SLIDESHOW_DEFAULT is the menu default; these bounds keep a
+# stored pick inside a sane range so it can never reach ffmpeg as free text.
+_BULK_SLIDESHOW_SECONDS = 3.0
+_BULK_SLIDESHOW_MIN = 0.5
+_BULK_SLIDESHOW_MAX = 30.0
+
+# Longest filename shown in the per-file Apply summary before it is elided.
+_BULK_NAME_MAX = 32
+
+# Image extensions: a photo sent uncompressed arrives as a document, and these
+# are the ones ffmpeg can read back out of the slideshow pipeline.
+_IMAGE_EXTS = (".jpg", ".jpeg", ".png", ".webp", ".bmp")
+
 # "Video Only" extraction: keep the first video stream, drop audio/subtitles.
 # Re-encoding to H.264 makes the result playable regardless of the source codec.
 _EXTRACT_VIDEO_FFMPEG_ARGS = [
@@ -364,6 +385,23 @@ def _sanitize_bulk_extract_bitrate(value, default: str = _BULK_EXTRACT_BITRATE_D
     return _sanitize_audio_bitrate(value, default=default)
 
 
+def _sanitize_bulk_slideshow_seconds(value, default: float = _BULK_SLIDESHOW_SECONDS) -> float:
+    """Coerce a stored slideshow seconds-per-photo value into the valid range.
+
+    Anything unusable (missing, non-numeric, out of range) falls back to the
+    default so a stale setting can never reach the ffmpeg command line.
+    """
+    if isinstance(value, bool):
+        return default
+    try:
+        seconds = float(value)
+    except (TypeError, ValueError):
+        return default
+    if not (_BULK_SLIDESHOW_MIN <= seconds <= _BULK_SLIDESHOW_MAX):
+        return default
+    return seconds
+
+
 def _bulk_video_recipe(key: str, settings: dict | None = None) -> tuple[list[str], list[str]]:
     """Video and audio args for one video toggle, honoring the quality picks.
 
@@ -475,6 +513,23 @@ def _resolve_bulk_plan(settings: dict | None) -> dict:
     }
 
 
+_BULK_PHOTO_ACTIONS = ("bulk_convert_mp4", "bulk_compress", "bulk_optimize")
+
+
+def _bulk_photo_supported(plan: dict | None) -> bool:
+    """Whether an image input can run this resolved plan.
+
+    A photo has no audio or video stream, so only an actual video encode
+    (Convert / Compress / Optimize) can produce something from it. Extract
+    Audio (MP3 out) and remove-audio-only (a ``-c:v copy`` stream copy) cannot.
+    """
+    plan = plan or {}
+    if plan.get("output_ext") != ".mp4":
+        return False
+    applied = plan.get("applied") or []
+    return any(key in applied for key in _BULK_PHOTO_ACTIONS)
+
+
 def _read_bulk_settings(user_id, session: dict | None) -> dict:
     """Read the bulk settings the same way Apply does (settings store, else session).
 
@@ -488,6 +543,91 @@ def _read_bulk_settings(user_id, session: dict | None) -> dict:
     except Exception:
         logger.exception("Failed to read bulk settings for %s", user_id)
         return {}
+
+
+def _bulk_item_key(item: dict) -> object:
+    """Stable identity for a collected bulk file (Telegram file id preferred)."""
+    return item.get("id") or item.get("file_unique_id") or item.get("path")
+
+
+def _bulk_display_name(file_info: dict | None) -> str:
+    """Short, human label for one batch entry in the per-file Apply summary."""
+    info = file_info or {}
+    name = info.get("name") or os.path.basename(str(info.get("path") or "")) or str(info.get("id") or "file")
+    name = str(name)
+    if len(name) > _BULK_NAME_MAX:
+        stem, ext = os.path.splitext(name)
+        keep = max(1, _BULK_NAME_MAX - len(ext) - 1)
+        name = f"{stem[:keep]}…{ext}" if ext else f"{name[:_BULK_NAME_MAX - 1]}…"
+    return name
+
+
+def _bulk_batch_lines(entries, limit: int = 12) -> list[str]:
+    """Numbered ``name · type`` lines describing the queued batch.
+
+    Names are HTML-escaped because the menu is rendered with ``parse_mode=HTML``
+    and a filename is user-supplied text.
+    """
+    lines = []
+    for index, entry in enumerate(list(entries or [])[:limit], start=1):
+        item = _normalize_bulk_item(entry)
+        if item is None:
+            continue
+        kind = str(item.get("type") or "file")
+        lines.append(f"{index}. {html.escape(_bulk_display_name(item))} · {html.escape(kind)}")
+    remaining = max(0, len(entries or []) - limit)
+    if remaining:
+        lines.append(f"… +{remaining} more")
+    return lines
+
+
+def _bulk_slideshow_music(entries):
+    """The first queued audio entry — used as the slideshow's background music."""
+    for entry in entries or []:
+        item = _normalize_bulk_item(entry)
+        if item is not None and item.get("type") == "audio":
+            return item
+    return None
+
+
+def _normalize_bulk_item(item):
+    """Coerce a bulk/merge list entry to the file-dict shape Apply expects.
+
+    Entries reach the list two ways: auto-collected sends and album photos store
+    dicts, while the merge menu's "Add File" button stores a bare path string.
+    Normalising here keeps the bulk loop from tripping over either shape.
+    """
+    if isinstance(item, dict):
+        return item
+    if isinstance(item, str) and item:
+        name = os.path.basename(item)
+        return {"path": item, "id": name, "name": name}
+    return None
+
+
+def _register_bulk_file(session: dict | None, file_info: dict | None) -> bool:
+    """Auto-collect a just-sent file for the next bulk Apply.
+
+    Idempotent per file id and capped at ``_BULK_LIST_LIMIT`` so re-sending the
+    same file does not process it twice. Returns True when newly collected.
+    """
+    if session is None or not isinstance(file_info, dict):
+        return False
+    try:
+        queue = session.setdefault("bulk_list", [])
+        key = _bulk_item_key(file_info)
+        if not key:
+            return False
+        for item in queue:
+            if isinstance(item, dict) and _bulk_item_key(item) == key:
+                return False
+        if len(queue) >= _BULK_LIST_LIMIT:
+            queue.pop(0)
+        queue.append(file_info)
+        return True
+    except Exception:
+        logger.exception("Failed to register file for bulk processing")
+        return False
 
 
 def _write_bulk_setting(user_id, session: dict | None, key: str, value) -> None:
@@ -590,10 +730,18 @@ class EnhancedMediaHandler:
                     except Exception as e:
                         logger.error(f"Failed to cleanup {temp_path}: {e}")
 
-            # Clean merge list files
+            # Clean merge list files (entries may be paths, not dicts)
             if "merge_list" in session:
                 for file_info in session["merge_list"]:
-                    temp_path = file_info.get("path")
+                    temp_path = file_info.get("path") if isinstance(file_info, dict) else file_info
+                    if temp_path and os.path.exists(temp_path):
+                        with contextlib.suppress(OSError):
+                            os.remove(temp_path)
+
+            # Clean auto-collected bulk files
+            if "bulk_list" in session:
+                for file_info in session["bulk_list"]:
+                    temp_path = file_info.get("path") if isinstance(file_info, dict) else file_info
                     if temp_path and os.path.exists(temp_path):
                         with contextlib.suppress(OSError):
                             os.remove(temp_path)
@@ -653,6 +801,82 @@ class EnhancedMediaHandler:
             logger.info("Finalized media_group %s for user %s: %d items", media_group_id, user_id, len(items))
         except Exception:
             logger.exception("Failed to finalize media_group %s for user %s", media_group_id, user_id)
+
+    async def _buffer_album_item(
+        self,
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+        session: dict,
+        user_id: int,
+        kind: str,
+    ) -> bool:
+        """Collect an album (media group) item instead of showing a per-file menu.
+
+        Telegram delivers an album as one update per item, so without this a
+        10-video album produced ten "registered - choose an action" menus. The
+        item is already in the bulk batch (the caller registers every sent file),
+        so this only counts it and schedules the album's single announcement.
+
+        Returns True when the item belongs to an album and the caller should skip
+        the per-file menu.
+        """
+        message = getattr(update, "message", None)
+        media_group_id = getattr(message, "media_group_id", None)
+        if not media_group_id:
+            return False
+
+        entry = session.setdefault("album_batch", {}).setdefault(
+            media_group_id, {"count": 0, "kinds": set(), "chat_id": None, "bot": None}
+        )
+        entry["count"] += 1
+        entry["kinds"].add(kind)
+        entry["chat_id"] = getattr(getattr(message, "chat", None), "id", None) or entry["chat_id"]
+        entry["bot"] = getattr(context, "bot", None) or entry["bot"]
+
+        timers = session.setdefault("album_batch_timers", {})
+        if media_group_id not in timers:
+            try:
+                loop = asyncio.get_running_loop()
+                timers[media_group_id] = loop.call_later(
+                    1.5,
+                    lambda: asyncio.create_task(self._flush_album_batch(user_id, media_group_id)),
+                )
+            except RuntimeError:
+                await self._flush_album_batch(user_id, media_group_id)
+        return True
+
+    async def _flush_album_batch(self, user_id: int, media_group_id: str):
+        """Announce an album once, after Telegram has delivered every item."""
+        session = self.user_sessions.get(user_id)
+        if not session:
+            return
+        (session.get("album_batch_timers") or {}).pop(media_group_id, None)
+        entry = (session.get("album_batch") or {}).pop(media_group_id, None)
+        if not entry or not entry.get("count"):
+            return
+
+        try:
+            self._persist_session(user_id)
+        except Exception:
+            logger.debug("Could not persist session after an album batch")
+
+        bot = entry.get("bot")
+        chat_id = entry.get("chat_id")
+        if bot is None or chat_id is None:
+            logger.debug("album batch: no bot/chat to announce %s", media_group_id)
+            return
+
+        queued = len(session.get("bulk_list") or [])
+        kinds = ", ".join(sorted(entry.get("kinds") or []))
+        text = (
+            f"➕ Added {entry['count']} {kinds or 'file'} from the album to the batch.\n"
+            f"📦 Batch size: {queued}\n"
+            "Open /bulkmenu and press ▶️ Apply Bulk when you are ready."
+        )
+        try:
+            await bot.send_message(chat_id=chat_id, text=text)
+        except Exception:
+            logger.debug("album batch: could not announce %s", media_group_id)
 
     async def _watch_job_progress(
         self,
@@ -1070,6 +1294,7 @@ class EnhancedMediaHandler:
             minimal = {
                 "current_file": session.get("current_file"),
                 "merge_list": session.get("merge_list", []),
+                "bulk_list": session.get("bulk_list", []),
             }
             # Write locally for fast local recovery
             try:
@@ -1144,6 +1369,8 @@ class EnhancedMediaHandler:
             # Ensure merge_list present
             if "merge_list" not in data:
                 data["merge_list"] = []
+            if "bulk_list" not in data:
+                data["bulk_list"] = []
             return data
         except Exception:
             logger.exception("Failed to load persisted session for user %s", user_id)
@@ -1445,6 +1672,37 @@ class EnhancedMediaHandler:
                 with contextlib.suppress(Exception):
                     os.remove(_thumb_path)
 
+    async def _ensure_bulk_file_downloaded(
+        self,
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+        session: dict,
+        file_info: dict,
+    ):
+        """Make one bulk-list entry available locally and return its usable path.
+
+        ``_ensure_current_file_downloaded`` only knows about ``session["current_file"]``,
+        so point the session at each entry in turn and restore the previous value
+        afterwards. Files already streamed to storage return their input key.
+        """
+        path = (file_info or {}).get("path")
+        if path and os.path.exists(path):
+            return path
+        if (file_info or {}).get("input_key"):
+            return file_info.get("input_key")
+
+        had_current = "current_file" in session
+        previous = session.get("current_file")
+        session["current_file"] = file_info
+        try:
+            await self._ensure_current_file_downloaded(update, context, session)
+        finally:
+            if had_current:
+                session["current_file"] = previous
+            else:
+                session.pop("current_file", None)
+        return file_info.get("path")
+
     async def _ensure_current_file_downloaded(self, update: Update, context: ContextTypes.DEFAULT_TYPE, session: dict):
         """Ensure the session's current_file is downloaded locally. Raises Exception on failure."""
         user_id = update.effective_user.id if update and update.effective_user else None
@@ -1535,6 +1793,82 @@ class EnhancedMediaHandler:
         # Track whether the BigFilePipeline already forwarded this file to the relay
         # group, so the error handler below can avoid a duplicate forward.
         _relay_forwarded_already = False
+
+        # ── Media cache short-circuit: a media that already entered the pipe
+        #    (same file_unique_id AND same byte size) is reused instead of being
+        #    fetched from Telegram again. Three tiers, cheapest first:
+        #      1. a stored remote key  (already uploaded to S3/R2)
+        #      2. a local file path    (already downloaded to disk)
+        #      3. the raw bytes        (small media kept verbatim in Redis)
+        #    A size mismatch makes ``lookup`` return None, so a different file
+        #    that merely shared an id is never reused.
+        try:
+            from utils import media_cache as _media_cache
+
+            _uid = current_file.get("file_unique_id")
+            if _uid and _media_cache.cache_enabled():
+                _expected = current_file.get("size")
+                _entry = await _media_cache.lookup(_uid, expected_size=_expected)
+
+                # 1) Remote copy already in object storage — reuse the key.
+                _stored_key = (_entry or {}).get("input_key")
+                if _stored_key and config.get_storage_backend_name() in ("s3", "r2"):
+                    _key_ok = True
+                    try:
+                        from utils.storage import get_storage_backend as _gsb_check
+
+                        _check_backend = await _gsb_check()
+                        if _check_backend is not None:
+                            _key_ok = await _check_backend.exists(_stored_key)
+                    except Exception:
+                        # Conservatively treat an unchecked key as valid, matching
+                        # the stale-key guard elsewhere in this function.
+                        _key_ok = True
+                    if _key_ok:
+                        current_file["input_key"] = _stored_key
+                        current_file["path"] = None
+                        session["current_file"] = current_file
+                        with contextlib.suppress(Exception):
+                            self._persist_session(user_id)
+                        logger.info(
+                            "media cache: reused stored input_key for user %s (file_unique_id=%s)",
+                            user_id,
+                            _uid,
+                        )
+                        return
+
+                # 2) Local copy still on disk — reuse the file.
+                _stored_path = (_entry or {}).get("path")
+                if _stored_path and os.path.exists(_stored_path):
+                    current_file["path"] = _stored_path
+                    session["current_file"] = current_file
+                    with contextlib.suppress(Exception):
+                        self._persist_session(user_id)
+                    logger.info(
+                        "media cache: reused local file for user %s (file_unique_id=%s)",
+                        user_id,
+                        _uid,
+                    )
+                    return
+
+                # 3) Small media held verbatim in Redis.
+                _cached = await _media_cache.get_bytes(_uid, expected_size=_expected)
+                if _cached:
+                    with open(file_path, "wb") as _fh:
+                        _fh.write(_cached)
+                    current_file["path"] = file_path
+                    session["current_file"] = current_file
+                    with contextlib.suppress(Exception):
+                        self._persist_session(user_id)
+                    logger.info(
+                        "media cache: reused %d bytes for user %s (file_unique_id=%s)",
+                        len(_cached),
+                        user_id,
+                        _uid,
+                    )
+                    return
+        except Exception:
+            logger.debug("handlers: media cache lookup failed; continuing to download")
 
         # Attempt to fetch file via Telegram API (bot). If Telegram refuses due to
         # file size or access rules, prefer a user-account (userbot) fallback when
@@ -2128,6 +2462,44 @@ class EnhancedMediaHandler:
                 os.makedirs(_temp_dir, exist_ok=True)
             _temp_path = os.path.join(_temp_dir, f"src_{user_id}_{int(time.time())}{ext}")
 
+            # ── Media cache: reuse a copy already in object storage so a repeat of
+            #    the same media skips both the Telegram download and the upload.
+            #    This is the piped (S3/R2) branch, which the local-disk cache
+            #    short-circuit earlier never reaches. ──
+            _cache_uid = current_file.get("file_unique_id")
+            _library_key = None
+            try:
+                from utils import media_cache as _media_cache
+
+                if _cache_uid and _media_cache.cache_enabled():
+                    _library_key = _media_cache.media_library_key(_cache_uid)
+                    _entry = await _media_cache.lookup(
+                        _cache_uid, expected_size=current_file.get("size")
+                    )
+                    _stored_key = (_entry or {}).get("input_key")
+                    if _stored_key:
+                        _stored_ok = True
+                        try:
+                            _stored_ok = await _backend.exists(_stored_key)
+                        except Exception:
+                            _stored_ok = True
+                        if _stored_ok:
+                            current_file["input_key"] = _stored_key
+                            current_file["path"] = None
+                            current_file["_source_metadata"] = {}
+                            session["current_file"] = current_file
+                            with contextlib.suppress(Exception):
+                                self._persist_session(user_id)
+                            logger.info(
+                                "media cache: reused stored input_key=%s for user %s (file_unique_id=%s)",
+                                _stored_key,
+                                user_id,
+                                _cache_uid,
+                            )
+                            return
+            except Exception:
+                logger.debug("handlers: remote media-cache lookup failed for %s", file_id)
+
             # Download to temp file (disk, not bytearray — ffprobe needs a local file)
             await file.download_to_drive(_temp_path)
 
@@ -2140,9 +2512,36 @@ class EnhancedMediaHandler:
             except Exception:
                 logger.debug("handlers: source ffprobe failed for %s", file_id)
 
-            # Upload to S3 with unified inputs/{job_id}/source.ext key
-            _input_key = f"inputs/{_job_id}/source{ext}"
+            # Upload to storage. With the media cache on the key is derived from
+            # the media identity, so the object is reused by the next request for
+            # this file instead of being downloaded and uploaded again.
+            _input_key = _library_key or f"inputs/{_job_id}/source{ext}"
             await _backend.upload_file(_temp_path, _input_key)
+
+            # Record where this media now lives (and its bytes when small enough
+            # for Redis) so the reuse paths can find it. Read the body before the
+            # temp file is removed below.
+            try:
+                from utils import media_cache as _media_cache
+
+                if _cache_uid:
+                    _cached_size = current_file.get("size")
+                    with contextlib.suppress(Exception):
+                        _cached_size = os.path.getsize(_temp_path)
+                    _payload = None
+                    if _cached_size and _cached_size <= _media_cache.bytes_cache_limit():
+                        with contextlib.suppress(Exception), open(_temp_path, "rb") as _fh:
+                            _payload = _fh.read()
+                    await _media_cache.remember(
+                        _cache_uid,
+                        size=_cached_size,
+                        input_key=_input_key,
+                        name=current_file.get("name"),
+                        storage="s3",
+                        data=_payload,
+                    )
+            except Exception:
+                logger.debug("handlers: failed to remember remote media in cache")
 
             # ── Source metadata stored on current_file; the callback handler
             #    will write it to Redis when the user picks an action. ──
@@ -2182,6 +2581,33 @@ class EnhancedMediaHandler:
             except Exception:
                 logger.debug("detect_filename failed after download")
             current_file["path"] = file_path
+
+            # Remember the body so a repeat of this media skips the download.
+            # Only small media are stored in Redis; larger ones are covered by
+            # the shared library key on the big-file pipeline instead.
+            try:
+                from utils import media_cache as _media_cache
+
+                _uid = current_file.get("file_unique_id")
+                if _uid:
+                    _size = os.path.getsize(file_path)
+                    _payload = None
+                    if _size <= _media_cache.bytes_cache_limit():
+                        with open(file_path, "rb") as _fh:
+                            _payload = _fh.read()
+                    await _media_cache.remember(
+                        _uid,
+                        size=_size,
+                        # Record the on-disk location too: it lets a repeat reuse
+                        # the file directly when it is too large for the bytes
+                        # tier, instead of re-fetching it from Telegram.
+                        path=file_path,
+                        name=current_file.get("name"),
+                        storage="local",
+                        data=_payload,
+                    )
+            except Exception:
+                logger.debug("handlers: failed to remember media in cache")
 
         session["current_file"] = current_file
         try:
@@ -2516,22 +2942,13 @@ class EnhancedMediaHandler:
         # Build a two-page settings keyboard with toggle switches
         s = user_settings.get_user_settings(user_id)
 
-        def bool_label(k):
-            return "On" if s.get(k) else "Off"
-
         # If called via callback with page param, the caller will handle; default to page 1
         # Build text and keyboard to match the requested control panel style
         text = "⚙️ <b>Config Bot Settings</b>\n\n"
-        text += f"• Bulk Mode : {bool_label('bulk_mode')}\n"
         text += f"• Thumbnail : {'Yes' if s.get('use_custom_thumbnail') else 'No'}\n"
         text += f"• Rename File : {'Yes' if s.get('prefix') or s.get('suffix') else 'No'}\n"
 
         kb_page1 = [
-            [
-                InlineKeyboardButton(
-                    f"Bulk Mode : {'On' if s.get('bulk_mode') else 'Off'}", callback_data="toggle_bulk_mode"
-                )
-            ],
             [
                 InlineKeyboardButton(
                     f"Thumbnail : {'Yes' if s.get('use_custom_thumbnail') else 'No'}", callback_data="settings_page:2"
@@ -2561,17 +2978,35 @@ class EnhancedMediaHandler:
         """Show the bulk-mode action menu (either as reply or edit)."""
         user_id = update.effective_user.id if update and update.effective_user else None
         s = _read_bulk_settings(user_id, self.user_sessions.get(user_id))
-        status = "On" if s.get("bulk_mode") else "Off"
         crf = _sanitize_bulk_crf(s.get("bulk_crf"))
         preset = _sanitize_bulk_preset(s.get("bulk_optimize_preset"))
         bitrate = _sanitize_bulk_extract_bitrate(s.get("bulk_extract_bitrate"))
+        sess = self.user_sessions.get(user_id) or {}
+        entries = sess.get("bulk_list") or sess.get("merge_list") or []
+        queued = len(entries)
+        seconds = _sanitize_bulk_slideshow_seconds(s.get("bulk_slideshow_seconds"))
+        photos = [e for e in entries if isinstance(e, dict) and e.get("type") == "photo"]
+        music = _bulk_slideshow_music(entries)
+        _slideshow_line = f"Slideshow : {seconds:g}s per photo"
+        if len(photos) >= 2:
+            _slideshow_line += f" → 1 video from {len(photos)} photos"
+        _music_line = html.escape(_bulk_display_name(music)) if music else "none"
+        _batch_block = ""
+        if entries:
+            _batch_block = "🗂 <b>Batch</b>\n" + "\n".join(_bulk_batch_lines(entries)) + "\n\n"
         text = (
             f"📦 <b>Bulk Mode Actions</b>\n\n"
-            f"Current Status >> Bulk Mode : {status}\n"
-            f"Quality >> Compress CRF : {crf} · Optimize preset : {preset} · Extract Audio : {bitrate}\n\n"
+            f"Files queued : {queued}\n"
+            f"Quality >> Compress CRF : {crf} · Optimize preset : {preset} · Extract Audio : {bitrate}\n"
+            f"{_slideshow_line}\n"
+            f"🎵 Slideshow music : {_music_line}\n\n"
+            f"{_batch_block}"
             "Toggle one or more actions, then press ▶️ Apply Bulk.\n"
-            "<i>One encoding pass per file: Extract Audio replaces the video actions, "
-            "Compress wins over Optimize over Convert, and Remove Audio / Rename combine with them.</i>\n\n"
+            "<i>Every file you send is collected here automatically, and Apply runs "
+            "on all of them. One encoding pass per file: Extract Audio replaces the "
+            "video actions, Compress wins over Optimize over Convert, and Remove "
+            "Audio / Rename combine with them. Two or more photos become one "
+            "slideshow video, scored with the first queued audio file.</i>\n\n"
             "Please select your preferred action below 👇"
         )
         # Build keyboard defensively. MediaMenuBuilder may be missing or raise,
@@ -2864,6 +3299,7 @@ class EnhancedMediaHandler:
                 "files": {},
                 "current_file": None,
                 "merge_list": [],
+                "bulk_list": [],
                 "processing": False,
             }
 
@@ -2980,8 +3416,8 @@ class EnhancedMediaHandler:
             logger.exception("Failed to handle awaiting_mp3_tags message")
 
         # If message contains a photo (normal incoming photo, not settings thumbnail),
-        # save it to storage and add to the user's merge_list so multiple pasted
-        # photos are collected automatically.
+        # save it to storage, queue it in the bulk batch, and keep it in the merge
+        # list so multiple pasted photos are collected automatically.
         try:
             if getattr(update.message, "photo", None) and not getattr(context, "user_data", {}).get(
                 "awaiting_settings"
@@ -2990,12 +3426,72 @@ class EnhancedMediaHandler:
                 if photos:
                     # choose largest size variant
                     file_obj = photos[-1]
-                    file = await context.bot.get_file(file_obj.file_id)
                     input_dir = getattr(config, "INPUT_PATH", "storage/input")
                     with contextlib.suppress(OSError):
                         os.makedirs(input_dir, exist_ok=True)
                     photo_path = os.path.join(input_dir, f"{user_id}_{file_obj.file_id}.jpg")
-                    await file.download_to_drive(photo_path)
+                    _photo_uid = getattr(file_obj, "file_unique_id", None)
+                    _photo_size = getattr(file_obj, "file_size", None)
+
+                    # Reuse a photo that already entered the pipe (same id AND
+                    # size) instead of fetching it from Telegram again.
+                    _photo_reused = False
+                    try:
+                        from utils import media_cache as _media_cache
+
+                        if _photo_uid and _media_cache.cache_enabled():
+                            _entry = await _media_cache.lookup(_photo_uid, expected_size=_photo_size)
+                            _stored_path = (_entry or {}).get("path")
+                            if _stored_path and os.path.exists(_stored_path):
+                                photo_path = _stored_path
+                                _photo_reused = True
+                            else:
+                                _cached = await _media_cache.get_bytes(
+                                    _photo_uid, expected_size=_photo_size
+                                )
+                                if _cached:
+                                    with open(photo_path, "wb") as _fh:
+                                        _fh.write(_cached)
+                                    _photo_reused = True
+                    except Exception:
+                        logger.debug("handlers: photo media-cache lookup failed")
+
+                    if not _photo_reused:
+                        file = await context.bot.get_file(file_obj.file_id)
+                        await file.download_to_drive(photo_path)
+                        try:
+                            from utils import media_cache as _media_cache
+
+                            if _photo_uid:
+                                _download_size = os.path.getsize(photo_path)
+                                _payload = None
+                                if _download_size <= _media_cache.bytes_cache_limit():
+                                    with open(photo_path, "rb") as _fh:
+                                        _payload = _fh.read()
+                                await _media_cache.remember(
+                                    _photo_uid,
+                                    size=_download_size,
+                                    path=photo_path,
+                                    name=os.path.basename(photo_path),
+                                    storage="local",
+                                    data=_payload,
+                                )
+                        except Exception:
+                            logger.debug("handlers: failed to remember photo in cache")
+
+                    # Every photo also joins the bulk batch — with videos and
+                    # audio — so a single "Apply Bulk" covers everything sent.
+                    # The bytes are already on disk, so Apply reuses this path
+                    # instead of downloading the photo again.
+                    _photo_entry = {
+                        "id": getattr(file_obj, "file_id", None) or photo_path,
+                        "file_unique_id": getattr(file_obj, "file_unique_id", None),
+                        "name": os.path.basename(photo_path),
+                        "path": photo_path,
+                        "type": "photo",
+                        "size": getattr(file_obj, "file_size", None),
+                    }
+                    _register_bulk_file(session, _photo_entry)
 
                     # If part of an album (media_group_id), collect into temporary group
                     mgid = getattr(update.message, "media_group_id", None)
@@ -3015,11 +3511,12 @@ class EnhancedMediaHandler:
                             except Exception:
                                 # best-effort: finalize immediately
                                 await self._finalize_media_group(user_id, mgid)
-                        # reply lightly that album item saved (silent)
-                        await update.message.reply_text("➕ Photo added to album buffer (media_group).")
+                        # One announcement for the whole album, not one per photo.
+                        await self._buffer_album_item(update, context, session, user_id, "photo")
                         return
 
-                    # Non-album single photo: append directly
+                    # Non-album single photo: keep it for the merger too, but the
+                    # batch is what “Apply Bulk” reads.
                     if "merge_list" not in session:
                         session["merge_list"] = []
                     session["merge_list"].append({"path": photo_path, "type": "photo"})
@@ -3028,7 +3525,8 @@ class EnhancedMediaHandler:
                     except Exception:
                         logger.debug("Could not persist session after photo download")
                     await update.message.reply_text(
-                        f"✅ Photo saved to merge list. Total items: {len(session['merge_list'])}"
+                        f"✅ Photo queued. Batch size: {len(session.get('bulk_list') or [])}\n"
+                        "Open /bulkmenu and press ▶️ Apply Bulk when you are ready."
                     )
                     return
         except Exception:
@@ -3189,6 +3687,8 @@ class EnhancedMediaHandler:
             forward_info,
             video.file_size,
         )
+        # Collect every sent file so "Apply Bulk" can run on the whole batch.
+        _register_bulk_file(session, session["current_file"])
         try:
             self._persist_session(user_id)
         except Exception:
@@ -3196,6 +3696,11 @@ class EnhancedMediaHandler:
 
         # Log to MongoDB if needed
         await self.log_media_to_db(user_id, session["current_file"])
+
+        # An album arrives as one update per video, so show a menu only for a
+        # standalone send; an album is collected and announced as a batch.
+        if await self._buffer_album_item(update, context, session, user_id, "video"):
+            return
 
         # ── Show action menu — let user choose what to do with the video ──
         await update.message.reply_text(
@@ -3283,6 +3788,9 @@ class EnhancedMediaHandler:
             "file_unique_id": file_unique_id,
         }
 
+        # Collect every sent file so "Apply Bulk" can run on the whole batch.
+        _register_bulk_file(session, session["current_file"])
+
         logger.info(
             "registered current_file for user %s id=%s forward=%s size=%s",
             user_id,
@@ -3290,6 +3798,11 @@ class EnhancedMediaHandler:
             forward_info,
             audio.file_size,
         )
+
+        # An album arrives as one update per track: collect it instead of
+        # showing a menu per track.
+        if await self._buffer_album_item(update, context, session, user_id, "audio"):
+            return
 
         # ── Show action menu — let user choose what to do with the audio ──
         await update.message.reply_text(
@@ -3447,6 +3960,13 @@ class EnhancedMediaHandler:
             "file_unique_id": file_unique_id,
         }
 
+        # Collect every sent file so "Apply Bulk" can run on the whole batch.
+        # A photo sent uncompressed arrives as a document; queue it as a photo so
+        # it joins the slideshow instead of being handled as a generic file.
+        if file_ext in _IMAGE_EXTS:
+            _register_bulk_file(session, {**session["current_file"], "type": "photo"})
+        else:
+            _register_bulk_file(session, session["current_file"])
         try:
             self._persist_session(user_id)
         except Exception:
@@ -3459,6 +3979,11 @@ class EnhancedMediaHandler:
             forward_info,
             document.file_size,
         )
+
+        # An album arrives as one update per file: collect it instead of showing
+        # a menu per file.
+        if await self._buffer_album_item(update, context, session, user_id, file_type):
+            return
 
         # ── Show action menu — let user choose what to do with the file ──
         await update.message.reply_text(
@@ -3669,6 +4194,7 @@ class EnhancedMediaHandler:
                         "files": {},
                         "current_file": persisted.get("current_file"),
                         "merge_list": persisted.get("merge_list", []),
+                        "bulk_list": persisted.get("bulk_list", []),
                     }
                 else:
                     self.user_sessions[user_id] = {"files": {}, "current_file": None}
@@ -4228,6 +4754,32 @@ class EnhancedMediaHandler:
                     reply_markup=MediaMenuBuilder.get_bulk_bitrate_menu(current),
                 )
 
+            elif data == "bulk_slideshow_menu":
+                # Slideshow seconds-per-photo picker for the next Apply
+                sess = session or self.user_sessions.setdefault(user_id, {})
+                current = _sanitize_bulk_slideshow_seconds(
+                    _read_bulk_settings(user_id, sess).get("bulk_slideshow_seconds")
+                )
+                await self.safe_edit(
+                    query,
+                    f"🎞️ <b>Slideshow seconds per photo</b>\n\nCurrent: {current:g}s\n"
+                    "<i>Applied when two or more photos are queued — they become one "
+                    "slideshow video.</i>",
+                    reply_markup=MediaMenuBuilder.get_bulk_slideshow_menu(current),
+                )
+
+            elif isinstance(data, str) and data.startswith("bulk_set_slideshow:"):
+                # Store the chosen seconds-per-photo
+                value = data.split(":", 1)[1]
+                sess = session or self.user_sessions.setdefault(user_id, {})
+                seconds = _sanitize_bulk_slideshow_seconds(value, default=0)
+                if not seconds:
+                    await self.safe_edit(query, "⚠️ Invalid slideshow option.")
+                else:
+                    _write_bulk_setting(user_id, sess, "bulk_slideshow_seconds", seconds)
+                    await self.safe_edit(query, f"✅ Slideshow set to {seconds:g}s per photo.")
+                    await self.show_bulk_menu(update, context)
+
             elif isinstance(data, str) and data.startswith("bulk_set_bitrate:"):
                 # Store the chosen Extract Audio bitrate (or arm the custom prompt)
                 value = data.split(":", 1)[1]
@@ -4286,15 +4838,26 @@ class EnhancedMediaHandler:
                     await self.show_bulk_menu(update, context)
 
             elif data == "bulk_apply":
-                # Apply bulk actions to files in session.merge_list or current_file
+                # Apply bulk actions to the files collected for this batch. Sent
+                # files land in bulk_list automatically; older sessions may still
+                # only have a merge list or a single current file.
                 try:
                     sess = session or self.user_sessions.get(user_id, {})
-                    files = sess.get("merge_list") or []
+                    _source = sess.get("bulk_list") or sess.get("merge_list") or []
+                    files = []
+                    for item in _source:
+                        entry = _normalize_bulk_item(item)
+                        if entry is not None and entry not in files:
+                            files.append(entry)
                     if not files and sess.get("current_file"):
                         files = [sess.get("current_file")]
 
                     if not files:
-                        await self.safe_edit(query, "❌ No files selected for bulk processing.")
+                        await self.safe_edit(
+                            query,
+                            "❌ No files to process.\nSend the file(s) first — they are collected "
+                            "automatically — then press ▶️ Apply Bulk.",
+                        )
                         return
 
                     # Honor every bulk toggle (convert / compress / extract audio /
@@ -4307,19 +4870,130 @@ class EnhancedMediaHandler:
                     _bulk_args = _plan["ffmpeg_args"]
                     _bulk_ext = _plan["output_ext"]
 
+                    # A photo has no audio/video stream, so audio-only plans skip
+                    # it (and are reported) instead of enqueuing a job that fails.
+                    _photo_ok = _bulk_photo_supported(_plan)
+                    _slideshow_seconds = _sanitize_bulk_slideshow_seconds(
+                        _bulk_settings.get("bulk_slideshow_seconds")
+                    )
+
                     enqueued = 0
+                    skipped = 0
+                    photo_skipped = 0
+                    failed = 0
+                    # (label, status) pairs — one per queued file/group — shown below.
+                    results: list[tuple[str, str]] = []
+
+                    # Photos in the batch become ONE slideshow video instead of a
+                    # per-photo still-image encode. A lone photo keeps the normal
+                    # single-file path in the loop below.
+                    _photos = [f for f in files if f.get("type") == "photo"]
+                    _slideshow_photos = _photos if len(_photos) >= 2 else []
+                    if _slideshow_photos:
+                        _photo_paths: list[str] = []
+                        for _pf in _slideshow_photos:
+                            try:
+                                _p = await self._ensure_bulk_file_downloaded(update, context, sess, _pf)
+                            except Exception:
+                                logger.debug("bulk: slideshow download failed for %s", _pf.get("id"))
+                                _p = None
+                            if _p and os.path.exists(_p):
+                                _photo_paths.append(_p)
+                            else:
+                                skipped += 1
+
+                        # Background music: the first queued audio file, looped to
+                        # cover the slideshow and cut at the video's end.
+                        _music_path = None
+                        _music_entry = _bulk_slideshow_music(files)
+                        if _music_entry is not None:
+                            try:
+                                _mp = await self._ensure_bulk_file_downloaded(
+                                    update, context, sess, _music_entry
+                                )
+                            except Exception:
+                                logger.debug(
+                                    "bulk: slideshow music download failed for %s", _music_entry.get("id")
+                                )
+                                _mp = None
+                            if _mp and os.path.exists(_mp):
+                                _music_path = _mp
+
+                        if _photo_paths:
+                            _label = f"🎞 slideshow ({len(_photo_paths)} photos)"
+                            job_id = str(uuid.uuid4()) if uuid else None
+                            output_dir = (
+                                getattr(config, "OUTPUT_PATH", "storage/output") if config else "storage/output"
+                            )
+                            with contextlib.suppress(OSError):
+                                os.makedirs(output_dir, exist_ok=True)
+                            _ss_name = "slideshow.mp4"
+                            if _plan["rename"]:
+                                _renamed, _renamed_ok = _bulk_rename_filename(_ss_name, _bulk_settings)
+                                if _renamed_ok:
+                                    _ss_name = _renamed
+                            _ss_job = {
+                                "job_id": job_id,
+                                "type": "slideshow",
+                                "files": _photo_paths,
+                                "output_path": os.path.join(output_dir, f"{job_id}_slideshow.mp4"),
+                                "output_ext": ".mp4",
+                                "original_filename": _ss_name,
+                                "seconds_per_image": _slideshow_seconds,
+                                "music_path": _music_path,
+                                "progress_channel": f"ffmpeg:progress:{job_id}",
+                                "chat_id": update.effective_chat.id
+                                if update and getattr(update, "effective_chat", None)
+                                else None,
+                                "user_id": user_id,
+                                "caption": f"🎞 Slideshow from {len(_photo_paths)} photo(s)",
+                                "cleanup_input": True,
+                                "cleanup_output": False,
+                            }
+                            if enqueue_job:
+                                try:
+                                    try:
+                                        _ss_job["request_id"] = getattr(update, "request_id", None)
+                                    except Exception:
+                                        _ss_job["request_id"] = None
+                                    await enqueue_job(_ss_job)
+                                    enqueued += 1
+                                    results.append((_label, f"📋 queued · {job_id}"))
+                                except Exception:
+                                    logger.exception("Failed to enqueue bulk slideshow")
+                                    failed += 1
+                                    results.append((_label, "❌ enqueue failed"))
+                            else:
+                                sess.setdefault("queued_bulk_jobs", []).append(_ss_job)
+                                enqueued += 1
+                                results.append((_label, f"📋 queued · {job_id}"))
+
+                        # Slideshow photos are handled — keep them out of the loop.
+                        _slideshow_ids = {id(f) for f in _slideshow_photos}
+                        files = [f for f in files if id(f) not in _slideshow_ids]
+
                     for f in list(files):
                         try:
-                            # Ensure file is downloaded locally (best-effort)
-                            if not f.get("path") or not os.path.exists(f.get("path") or ""):
-                                try:
-                                    await self._ensure_current_file_downloaded(update, context, sess)
-                                except Exception:
-                                    # try next file if download failed
-                                    logger.debug("bulk: download failed for %s", f.get("id"))
-                                    continue
+                            if f.get("type") == "photo" and not _photo_ok:
+                                photo_skipped += 1
+                                results.append((_bulk_display_name(f), "⏭️ skipped — needs audio/video"))
+                                continue
 
-                            if not f.get("path"):
+                            # Each entry may need its own download — the session's
+                            # current_file is not necessarily this file.
+                            try:
+                                _file_path = await self._ensure_bulk_file_downloaded(
+                                    update, context, sess, f
+                                )
+                            except Exception:
+                                logger.debug("bulk: download failed for %s", f.get("id"))
+                                skipped += 1
+                                results.append((_bulk_display_name(f), "❌ could not fetch"))
+                                continue
+
+                            if not _file_path and not f.get("input_key"):
+                                skipped += 1
+                                results.append((_bulk_display_name(f), "❌ could not fetch"))
                                 continue
 
                             job_id = str(uuid.uuid4()) if uuid else None
@@ -4367,26 +5041,63 @@ class EnhancedMediaHandler:
                                         job["request_id"] = None
                                     await enqueue_job(job)
                                     enqueued += 1
+                                    results.append((_bulk_display_name(f), f"📋 queued · {job_id}"))
                                 except Exception:
                                     logger.exception("Failed to enqueue bulk job for %s", f.get("id"))
+                                    failed += 1
+                                    results.append((_bulk_display_name(f), "❌ enqueue failed"))
                             else:
                                 sess.setdefault("queued_bulk_jobs", []).append(job)
                                 enqueued += 1
+                                results.append((_bulk_display_name(f), f"📋 queued · {job_id}"))
                         except Exception:
                             logger.exception("Failed processing bulk file %s", f.get("id"))
+                            failed += 1
+                            results.append((_bulk_display_name(f), "❌ failed"))
+
+                    # Batch consumed — start fresh for the next round.
+                    sess["bulk_list"] = []
+                    try:
+                        self._persist_session(user_id)
+                    except Exception:
+                        logger.debug("Could not persist session after bulk apply")
 
                     _applied = ", ".join(_BULK_ACTION_LABELS[key] for key in _plan["applied"])
                     _quality = _bulk_quality_label(_plan)
                     if _quality:
                         _applied = f"{_applied} ({_quality})"
-                    _summary = f"✅ Bulk apply queued for {enqueued} file(s).\n• Applied: {_applied}"
+                    _head = f"✅ Bulk apply finished — queued {enqueued} file(s).\n• Applied: {_applied}"
+                    if skipped:
+                        _head += f"\n⚠️ Could not fetch {skipped} file(s)."
+                    if failed:
+                        _head += f"\n❗ {failed} file(s) failed to queue."
+                    if photo_skipped:
+                        _head += (
+                            f"\n⚠️ Skipped {photo_skipped} photo(s) — “{_applied}” needs an audio/video stream."
+                        )
                     if _plan["ignored"]:
                         _skipped = ", ".join(_BULK_ACTION_LABELS[key] for key in _plan["ignored"])
-                        _summary += f"\n⚠️ Skipped — cannot run in the same pass: {_skipped}"
-                    await self.safe_edit(query, _summary)
+                        _head += f"\n⚠️ Skipped — cannot run in the same pass: {_skipped}"
+
+                    if results:
+                        _lines = [f"• {name} → {status}" for name, status in results[:_BULK_SUMMARY_MAX_LINES]]
+                        if len(results) > _BULK_SUMMARY_MAX_LINES:
+                            _lines.append(f"… +{len(results) - _BULK_SUMMARY_MAX_LINES} more")
+                        _head += "\n\n🗂 Per-file:\n" + "\n".join(_lines)
+                    await self.safe_edit(query, _head)
                 except Exception:
                     logger.exception("bulk_apply failed")
                     await self.safe_edit(query, "⚠️ Failed to apply bulk actions.")
+
+            elif data == "bulk_clear":
+                # Drop the auto-collected batch without processing it
+                sess = session or self.user_sessions.get(user_id, {})
+                sess["bulk_list"] = []
+                try:
+                    self._persist_session(user_id)
+                except Exception:
+                    logger.debug("Could not persist session after bulk_clear")
+                await self.show_bulk_menu(update, context)
 
             elif data == "video_reorder":
                 # Placeholder for video reorder feature
@@ -4446,12 +5157,6 @@ class EnhancedMediaHandler:
                             InlineKeyboardButton(
                                 f"Toggle Save Thumb: {'On' if s.get('save_thumbnail') else 'Off'}",
                                 callback_data="toggle_save_thumbnail",
-                            )
-                        ],
-                        [
-                            InlineKeyboardButton(
-                                f"Toggle Bulk Mode: {'On' if s.get('bulk_mode') else 'Off'}",
-                                callback_data="toggle_bulk_mode",
                             )
                         ],
                         [InlineKeyboardButton("Next ➡️", callback_data="settings_page:2")],
@@ -5189,7 +5894,7 @@ class EnhancedMediaHandler:
                 await context.bot.send_audio(
                     chat_id=update.effective_chat.id,
                     audio=audio_file,
-                    caption=_metadata_caption(current_file),
+                    caption=_metadata_caption(session.get("current_file")),
                     title=os.path.splitext(delivery_name)[0],
                     filename=delivery_name,
                     performer="",
@@ -6596,7 +7301,7 @@ class EnhancedMediaHandler:
                         user_settings.set_user_setting(user_id, "words_remove", [])
                         await update.message.reply_text("✅ Cleared words remover list.")
                     else:
-                        await update.message.reply_text("❓ Unknown settings command. Send /settings for instructions.")
+                        await update.message.reply_text("❓ Unknown settings command. Send /usersettings for instructions.")
                 except Exception:
                     await update.message.reply_text("⚠️ Failed to update settings.")
 

@@ -6,7 +6,7 @@ from telegram import Update
 from telegram.ext import CallbackContext, CommandHandler
 
 import config
-from utils.confirm import split_confirm
+from utils.confirm import confirm_keyboard
 
 
 async def add_thumb(update: Update, context: CallbackContext):
@@ -28,30 +28,31 @@ async def add_thumb(update: Update, context: CallbackContext):
 
 
 async def del_thumb(update: Update, context: CallbackContext):
-    """Delete the caller's custom thumbnail.
+    """Ask before deleting the caller's custom thumbnail.
 
-    Requires an explicit ``confirm``: the file is not recoverable from the bot, so a
-    mistyped command would silently change the thumbnail of every later conversion.
+    The file is not recoverable from the bot, so a stray command would silently
+    change the thumbnail of every later conversion - hence the inline Yes/No
+    rather than an immediate delete.
     """
-    confirmed, _ = split_confirm(context.args if hasattr(context, "args") else [])
-    if not confirmed:
-        await update.message.reply_text(
-            "⚠️ *Delete your custom thumbnail*?\n"
-            "Later conversions will fall back to the default thumbnail.\n"
-            "Reply with `/delthumb confirm` to proceed.",
-            parse_mode="Markdown",
-        )
-        return
+    await update.message.reply_text(
+        "⚠️ *Delete your custom thumbnail*?\n"
+        "Later conversions will fall back to the default thumbnail.",
+        parse_mode="Markdown",
+        reply_markup=confirm_keyboard("delthumb"),
+    )
 
+
+async def perform_del_thumb(reply, update: Update, context: CallbackContext):
+    """Delete the thumbnail once the user has confirmed (via :func:`del_thumb`)."""
     user_id = update.effective_user.id
     thumb_dir = getattr(config, "THUMBNAIL_PATH", "storage/thumbnails")
     thumb_path = os.path.join(thumb_dir, f"{user_id}.jpg")
     if os.path.exists(thumb_path):
         with contextlib.suppress(Exception):
             os.remove(thumb_path)
-        await update.message.reply_text("Thumbnail deleted successfully!")
+        await reply.say("✅ Thumbnail deleted successfully!")
     else:
-        await update.message.reply_text("You don't have a custom thumbnail set.")
+        await reply.say("You don't have a custom thumbnail set.")
 
 
 async def setup_thumbnail_handlers(application):

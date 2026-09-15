@@ -126,19 +126,23 @@ async def _run_once():
 
             if remote_key:
                 carry_over_job_naming = None
+                carry_over_job_owners = None
                 try:
-                    from utils.job_queue import carry_over_job_naming, enqueue_job
+                    from utils.job_queue import carry_over_job_naming, carry_over_job_owners, enqueue_job
                 except Exception:
                     enqueue_job = None
 
-                # Build the payload once (including the stored media name) so the
-                # LPUSH fallback cannot deliver the file under an opaque job id.
+                # Build the payload once (including the stored media name and the
+                # owner) so the LPUSH fallback cannot deliver the file under an
+                # opaque job id or to nobody at all.
                 job = {"job_id": job_id, "input_key": remote_key}
                 out = _sval("output")
                 if out:
                     job["output_path"] = out
                 if carry_over_job_naming is not None:
                     carry_over_job_naming(job, stored)
+                if carry_over_job_owners is not None:
+                    carry_over_job_owners(job, stored)
 
                 if enqueue_job:
                     try:

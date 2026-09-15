@@ -15,7 +15,6 @@ DEFAULTS = {
     "words_remove": [],
     "save_thumbnail": False,
     "default_thumbnail": None,  # path or URL
-    "bulk_mode": False,  # when True, treat pasted URL lists as bulk uploads
     "use_custom_thumbnail": False,  # when True, use per-user custom thumbnail if set
 }
 

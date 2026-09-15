@@ -31,7 +31,13 @@ if str(project_root) not in sys.path:
     sys.path.insert(0, str(project_root))
 
 try:
-    from utils.job_queue import carry_over_job_naming, enqueue_job, get_redis, stored_job_naming
+    from utils.job_queue import (
+        carry_over_job_naming,
+        carry_over_job_owners,
+        enqueue_job,
+        get_redis,
+        stored_job_naming,
+    )
     from utils.storage import get_storage_backend_sync
 except Exception:
     print(
@@ -175,6 +181,14 @@ async def main(argv: list[str] | None = None) -> int:
     if args.name:
         job["original_filename"] = args.name
     carry_over_job_naming(job, stored)
+    # Copy the owner too: without chat_id/user_id the worker has nobody to
+    # deliver the result to, so the requeued job silently never reaches its user.
+    carry_over_job_owners(job, stored)
+    if not job.get("chat_id"):
+        logger.warning(
+            "Job %s has no stored chat_id; the result cannot be delivered. "
+            "The hash predates owner tracking, so re-run it once so the owner is recorded."
+        )
 
     try:
         await enqueue_job(job)

@@ -224,3 +224,18 @@ BULK_BITRATE_DEFAULT = MP3_DEFAULT_BITRATE
 
 def bulk_bitrate_key(val) -> str:
     return f"{BULK_BITRATE_PREFIX}{val}"
+
+
+# Bulk slideshow: how long each queued photo is shown when two or more photos
+# are collected. A per-user pick applied by the next "Apply Bulk".
+BULK_SLIDESHOW_MENU = "bulk_slideshow_menu"
+BULK_SLIDESHOW_PREFIX = "bulk_set_slideshow:"
+
+BULK_SLIDESHOW_CHOICES = (1.0, 2.0, 3.0, 5.0, 10.0)
+BULK_SLIDESHOW_DEFAULT = 3.0
+BULK_SLIDESHOW_MIN = 0.5
+BULK_SLIDESHOW_MAX = 30.0
+
+
+def bulk_slideshow_key(val) -> str:
+    return f"{BULK_SLIDESHOW_PREFIX}{val}"

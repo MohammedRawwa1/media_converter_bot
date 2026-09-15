@@ -17,6 +17,9 @@ from .callbacks import (
     BULK_PRESET_DEFAULT,
     BULK_PRESET_LABELS,
     BULK_PRESET_MENU,
+    BULK_SLIDESHOW_CHOICES,
+    BULK_SLIDESHOW_DEFAULT,
+    BULK_SLIDESHOW_MENU,
     CANCEL,
     CAPTION_EDITOR,
     COMPRESS_MENU,
@@ -58,6 +61,7 @@ from .callbacks import (
     bulk_bitrate_key,
     bulk_crf_key,
     bulk_preset_key,
+    bulk_slideshow_key,
     mp3_quality_key,
 )
 
@@ -328,14 +332,26 @@ class MediaMenuBuilder:
         buttons.append(
             [InlineKeyboardButton(f"🎵 Extract Audio: {bitrate}", callback_data=BULK_BITRATE_MENU)]
         )
+        try:
+            slideshow = float(s.get("bulk_slideshow_seconds"))
+        except (TypeError, ValueError):
+            slideshow = BULK_SLIDESHOW_DEFAULT
+        buttons.append(
+            [
+                InlineKeyboardButton(
+                    f"🎞️ Slideshow: {slideshow:g}s per photo", callback_data=BULK_SLIDESHOW_MENU
+                )
+            ]
+        )
 
-        # actions: apply and back
+        # actions: apply, clear the collected batch, and back
         buttons.append(
             [
                 InlineKeyboardButton("▶️ Apply Bulk", callback_data="bulk_apply"),
                 InlineKeyboardButton("↩️ Back", callback_data=MENU_MAIN),
             ]
         )
+        buttons.append([InlineKeyboardButton("🗑️ Clear List", callback_data="bulk_clear")])
         return InlineKeyboardMarkup(buttons)
 
     @staticmethod
@@ -393,6 +409,27 @@ class MediaMenuBuilder:
             [_preset("tv"), _preset("storage")],
             [InlineKeyboardButton("↩️ Back", callback_data="bulk_menu")],
         ]
+        return InlineKeyboardMarkup(buttons)
+
+    @staticmethod
+    def get_bulk_slideshow_menu(current=None) -> InlineKeyboardMarkup:
+        """Slideshow seconds-per-photo picker for bulk mode, marking the active value."""
+        try:
+            active = float(current)
+        except (TypeError, ValueError):
+            active = BULK_SLIDESHOW_DEFAULT
+
+        def _choice(value: float) -> InlineKeyboardButton:
+            mark = "✅ " if abs(value - active) < 1e-9 else ""
+            return InlineKeyboardButton(
+                f"{mark}{value:g}s", callback_data=bulk_slideshow_key(value)
+            )
+
+        rows = [
+            BULK_SLIDESHOW_CHOICES[i : i + 3] for i in range(0, len(BULK_SLIDESHOW_CHOICES), 3)
+        ]
+        buttons = [[_choice(v) for v in row] for row in rows]
+        buttons.append([InlineKeyboardButton("↩️ Back", callback_data="bulk_menu")])
         return InlineKeyboardMarkup(buttons)
 
     @staticmethod

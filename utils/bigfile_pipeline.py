@@ -30,7 +30,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 
 import config
-from utils import file_utils
+from utils import file_utils, media_cache
 
 logger = logging.getLogger(__name__)
 
@@ -127,57 +127,72 @@ class BigFilePipeline:
         await self._ensure_initialized()
 
         job_id = uuid.uuid4().hex
-        input_s3_key = f"inputs/{job_id}/source"
 
         # Determine extension from filename. The extension is allowlisted
         # so traversal/arbitrary suffixes can't reach the on-disk temp path.
         ext = file_utils.safe_extension(original_filename or "", ".bin")
 
+        # Where the input lands. With the media cache on, the key is derived from
+        # the media identity rather than the job id, so a *repeat* of the same
+        # file maps to the same object and can be reused instead of downloaded
+        # from Telegram and uploaded again.
+        _library_key = media_cache.media_library_key(file_unique_id) if file_unique_id else None
+        _shared_input = bool(_library_key and media_cache.cache_enabled())
+        input_s3_key = _library_key if _shared_input else f"inputs/{job_id}/source"
+
         actual_size = 0
         s3_key = input_s3_key
+        _reused = False
+        _bytes_hit = False
+        _source_meta_fields = {}
 
-        # ── Check Redis byte cache before downloading (fast path) ──
-        _cache_hit = False
-        if self._cache and file_unique_id:
+        # ── Reuse a media that already entered the pipe ──
+        # Same file_unique_id AND same byte size => the earlier input is still
+        # the right one, so skip Pyrogram entirely.
+        if media_cache.cache_enabled() and file_unique_id:
+            _entry = await media_cache.lookup(file_unique_id, expected_size=file_size)
+            if _entry and _entry.get("input_key") and self._storage is not None:
+                with contextlib.suppress(Exception):
+                    if await self._storage.exists(_entry["input_key"]):
+                        s3_key = _entry["input_key"]
+                        actual_size = int(_entry.get("size") or file_size or 0)
+                        _reused = True
+            elif _entry and _entry.get("path") and self._storage is None and os.path.exists(_entry["path"]):
+                s3_key = _entry["path"]
+                actual_size = int(_entry.get("size") or file_size or 0)
+                _reused = True
+            if _reused:
+                logger.info(
+                    "BigFilePipeline: media cache HIT for %s (%dMB) - reusing %s",
+                    file_unique_id,
+                    actual_size // (1024 * 1024),
+                    s3_key,
+                )
+
+        # ── Byte cache (small media): skips Pyrogram even when the storage
+        #    object has gone away ──
+        if not _reused and self._cache and file_unique_id:
             try:
-                cached_data = await self._cache.get_cached_file_bytes(file_unique_id)
-                if cached_data is not None and len(cached_data) > 0:
+                cached_data = await media_cache.get_bytes(file_unique_id, expected_size=file_size)
+                if cached_data:
                     logger.info(
-                        "BigFilePipeline: cache HIT for file_unique_id=%s (%dMB), uploading to S3",
+                        "BigFilePipeline: byte cache HIT for %s (%dMB)",
                         file_unique_id,
                         len(cached_data) // (1024 * 1024),
                     )
                     actual_size = len(cached_data)
                     if self._storage is not None:
-                        await self._storage.upload_bytes(cached_data, s3_key)
-                    _cache_hit = True
-                    if self._cache:
-                        with contextlib.suppress(Exception):
-                            await self._cache.cache_file_info(
-                                file_unique_id,
-                                {
-                                    "job_id": job_id,
-                                    "size": actual_size,
-                                    "path": s3_key,
-                                    "chat_id": chat_id,
-                                    "message_id": message_id,
-                                },
-                                ttl=86400,
-                            )
-                    logger.info(
-                        "BigFilePipeline: cache pipeline succeeded for %s/%s (%d bytes)",
-                        chat_id,
-                        message_id,
-                        actual_size,
-                    )
+                        await self._storage.upload_bytes(cached_data, input_s3_key)
+                    s3_key = input_s3_key
+                    _bytes_hit = True
             except Exception as e:
-                logger.debug("BigFilePipeline: cache check failed: %s", e)
+                logger.debug("BigFilePipeline: byte cache check failed: %s", e)
 
         # ── Disk-based download (single Pyrogram call, always used) ──
         # The previous in-memory path (download_bytes_via_userbot) often failed for files
         # 20-200MB, causing a fallback disk download that looked like two Pyrogram calls.
         # Now we always use the single disk-based path with progress callback support.
-        if not _cache_hit:
+        if not _reused and not _bytes_hit:
             try:
                 temp_dir = os.path.abspath(os.path.join(os.getenv("STORAGE_PATH", "storage"), "temp"))
                 os.makedirs(temp_dir, exist_ok=True)
@@ -235,31 +250,40 @@ class BigFilePipeline:
                         "source_format": str(_source_meta.get("format_name", "")),
                     }
 
-                # Cache file info in Redis
-                if self._cache and file_unique_id:
-                    with contextlib.suppress(Exception):
-                        await self._cache.cache_file_info(
-                            file_unique_id,
-                            {
-                                "job_id": job_id,
-                                "size": actual_size,
-                                "path": input_s3_key if self._storage is not None else temp_path,
-                                "chat_id": chat_id,
-                                "message_id": message_id,
-                            },
-                            ttl=86400,
-                        )
+                # The media descriptor is written once, after the upload, by
+                # media_cache.remember() below - it carries the storage key the
+                # reuse path needs, which this legacy write did not.
 
             except Exception as e:
                 logger.exception("BigFilePipeline: Pyrogram download error: %s", e)
                 return IngestResult(ok=False, error=f"Download error: {e}")
 
-            # Upload to S3
+            # Upload to S3 (the shared media key when caching is on)
             try:
                 if self._storage is not None:
-                    logger.info("BigFilePipeline: uploading to S3 key=%s", s3_key)
-                    await self._storage.upload_file(temp_path, s3_key)
+                    logger.info("BigFilePipeline: uploading to S3 key=%s", input_s3_key)
+                    await self._storage.upload_file(temp_path, input_s3_key)
+                    s3_key = input_s3_key
                     logger.info("BigFilePipeline: S3 upload complete")
+                    # Read the body for the small-media cache *before* the temp
+                    # file is removed below.
+                    _payload = None
+                    if (
+                        media_cache.cache_enabled()
+                        and file_unique_id
+                        and actual_size
+                        and actual_size <= media_cache.bytes_cache_limit()
+                    ):
+                        with contextlib.suppress(Exception), open(temp_path, "rb") as _fh:
+                            _payload = _fh.read()
+                    await media_cache.remember(
+                        file_unique_id,
+                        size=actual_size,
+                        input_key=input_s3_key,
+                        name=original_filename,
+                        storage="s3",
+                        data=_payload,
+                    )
                     # Immediately clean up temp file
                     try:
                         if os.path.exists(temp_path):
@@ -271,6 +295,13 @@ class BigFilePipeline:
                     # No S3 — keep the file locally
                     s3_key = temp_path
                     logger.info("BigFilePipeline: no S3 backend, using local path: %s", temp_path)
+                    await media_cache.remember(
+                        file_unique_id,
+                        size=actual_size,
+                        path=temp_path,
+                        name=original_filename,
+                        storage="local",
+                    )
             except Exception as e:
                 logger.exception("BigFilePipeline: S3 upload failed: %s", e)
                 s3_key = temp_path
@@ -305,7 +336,12 @@ class BigFilePipeline:
                 "file_unique_id": file_unique_id,
                 "file_size": actual_size,
                 "progress_channel": f"ffmpeg:progress:{job_id}",
-                "cleanup_input": True,
+                # A shared input must survive this job so later jobs can reuse it.
+                # With no storage backend the shared input IS the pipeline's own
+                # local file, so it has to be kept. On S3/R2 the shared object is
+                # never deleted by the worker anyway, and the worker's local temp
+                # copy of it must still be cleaned up - hence cleanup stays on.
+                "cleanup_input": not (_shared_input and self._storage is None),
                 "type": conversion_type or "ffmpeg",
                 "created_at": time.time(),
             }

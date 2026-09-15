@@ -102,6 +102,40 @@ def carry_over_job_naming(job: dict, stored: dict | None, *, overwrite: bool = F
     return job
 
 
+# Job-hash fields that identify the job's owner. A requeue rebuilds the payload
+# from the stored hash, so the owner has to be carried over explicitly - without
+# it the worker has no chat_id to deliver to and the user who queued the job
+# never receives their file.
+OWNER_JOB_FIELDS = ("chat_id", "user_id")
+
+
+def stored_job_owners(stored: dict | None) -> dict:
+    """Extract the owner fields from a stored job hash, bytes-safe."""
+    stored = _normalized_hash(stored)
+    owners = {}
+    for field in OWNER_JOB_FIELDS:
+        value = _as_hash_str(stored.get(field))
+        if value:
+            owners[field] = value
+    return owners
+
+
+def carry_over_job_owners(job: dict, stored: dict | None, *, overwrite: bool = False) -> dict:
+    """Copy the owner recorded in a stored job hash onto a rebuilt payload.
+
+    Mirrors :func:`carry_over_job_naming` for the delivery target. Numeric ids
+    are converted back to ``int`` because the hash stores them as strings and
+    the worker's Telegram calls expect a chat id, not a string.
+    """
+    for field, value in stored_job_owners(stored).items():
+        if overwrite or not job.get(field):
+            try:
+                job[field] = int(value)
+            except (TypeError, ValueError):
+                job[field] = value
+    return job
+
+
 async def get_redis():
     # Use a shared aioredis client for the process to avoid exhausting
     # Redis server client slots. We return a lightweight proxy whose
@@ -227,6 +261,13 @@ async def enqueue_job(job: dict) -> None:
             output_value = job.get("output_path") or job.get("output") or ""
             if output_value:
                 mapping["output"] = output_value
+            # Record the owner so monitoring can attribute a running/queued job
+            # to a user without re-reading the queue payload (which a worker has
+            # already popped by the time a status command looks at the hashes).
+            for _owner_field in ("chat_id", "user_id"):
+                _owner_value = job.get(_owner_field)
+                if _owner_value not in (None, ""):
+                    mapping[_owner_field] = str(_owner_value)
             # Persist the naming fields so a requeued job (or a retry that only
             # reads the hash back) still delivers under the original media name.
             # These are written only when the payload actually carries them: a

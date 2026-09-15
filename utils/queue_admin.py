@@ -122,21 +122,29 @@ class CacheReport:
     """Outcome of a ``/clear_cache`` run."""
 
     prefixes: dict[str, int] = field(default_factory=dict)
+    # ``cache:file:*`` is reported on its own because it is the media cache: the
+    # descriptors and the cached bodies that let a repeat skip a download.
+    media_cache: int = 0
+    # Shared media-library objects in storage, only removed when explicitly asked.
+    media_storage_keys: int = 0
     route_cache_keys: int = 0
     route_cache_memory: int = 0
     errors: list[str] = field(default_factory=list)
 
     @property
     def total_keys(self) -> int:
-        return sum(self.prefixes.values()) + self.route_cache_keys
+        return sum(self.prefixes.values()) + self.media_cache + self.route_cache_keys
 
     def as_lines(self) -> list[str]:
         lines = ["🧼 Redis cache cleared"]
         for prefix, count in sorted(self.prefixes.items()):
             lines.append(f"• {prefix}*  →  {count}")
+        lines.append(f"• media cache ({PREFIX_FILE}*)  →  {self.media_cache}")
         lines.append(f"• {ROUTE_CACHE_PREFIX}*  →  {self.route_cache_keys}")
         if self.route_cache_memory:
             lines.append(f"• in-memory route cache  →  {self.route_cache_memory}")
+        if self.media_storage_keys:
+            lines.append(f"• media library objects in storage  →  {self.media_storage_keys}")
         lines.append(f"\nTotal keys deleted: {self.total_keys}")
         if self.errors:
             lines.append("\n⚠️ Some steps failed:")
@@ -376,15 +384,61 @@ async def _delete_prefix(redis, prefix: str, report: CacheReport) -> int:
     return removed
 
 
-async def clear_cache_keys(*, clear_route_cache: bool = True) -> CacheReport:
+async def _purge_media_library(report: CacheReport) -> None:
+    """Delete the shared media-library objects from storage.
+
+    Opt-in, because these are *not* cache keys: they are the uploaded inputs that
+    later jobs reuse so the file is never downloaded from Telegram twice. The
+    per-job ``cleanup_input`` leaves them in place on purpose, so removing them is
+    an explicit cleanup rather than part of a routine cache wipe.
+    """
+    try:
+        from utils import media_cache
+        from utils.storage import get_storage_backend
+
+        backend = await get_storage_backend()
+        if backend is None:
+            report.errors.append("media library purge: no storage backend configured")
+            return
+
+        prefix = media_cache.LIBRARY_KEY_PREFIX
+        names = [entry.get("key") for entry in (await backend.list_keys(prefix)) or [] if entry.get("key")]
+
+        # The local backend lists a single directory level, but the library nests
+        # objects one directory deep (``<hash>/source``), so walk it too. The local
+        # backend exposes its root as ``base`` (not ``base_path``).
+        base = getattr(backend, "base_path", None) or getattr(backend, "base", None)
+        if base:
+            root = os.path.join(base, prefix.rstrip("/"))
+            if os.path.isdir(root):
+                for dirpath, _dirs, files in os.walk(root):
+                    for name in files:
+                        full = os.path.join(dirpath, name)
+                        names.append(os.path.relpath(full, base).replace("\\", "/"))
+
+        names = sorted({name for name in names if name})
+        if not names:
+            return
+        report.media_storage_keys = int(await backend.delete_keys(names) or 0)
+    except Exception as exc:
+        logger.exception("clear_cache: media library purge failed")
+        report.errors.append(f"media library purge: {exc}")
+
+
+async def clear_cache_keys(*, clear_route_cache: bool = True, clear_media_storage: bool = False) -> CacheReport:
     """Delete every Redis cache key the app writes, optionally including route cache.
 
-    Covers the ``utils.cache`` prefixes (job/file/user/meta/response, including the
-    binary ``cache:file:bytes:`` entries) and ``utils.route_cache`` keys. Job state
-    (``ffmpeg:job:*``) is never touched here - that is ``/cancelall``.
+    Covers the ``utils.cache`` prefixes (job/user/meta/response and the whole
+    ``cache:file:*`` media cache, descriptors and cached bodies alike) and
+    ``utils.route_cache`` keys. Job state (``ffmpeg:job:*``) is never touched here
+    - that is ``/cancelall``.
+
+    With ``clear_media_storage`` the shared media-library objects in storage are
+    deleted as well, so the cached media really does stop existing instead of
+    just losing its Redis descriptor.
     """
     report = CacheReport()
-    prefixes = (PREFIX_JOB, PREFIX_FILE, PREFIX_USER, PREFIX_META, PREFIX_RESPONSE)
+    prefixes = (PREFIX_JOB, PREFIX_USER, PREFIX_META, PREFIX_RESPONSE)
 
     try:
         redis = await job_queue.get_redis()
@@ -399,6 +453,15 @@ async def clear_cache_keys(*, clear_route_cache: bool = True) -> CacheReport:
         except Exception as exc:
             logger.exception("clear_cache: prefix %s failed", prefix)
             report.errors.append(f"{prefix}*: {exc}")
+
+    # The media cache is `cache:file:*` (descriptors) plus `cache:file:bytes:*`
+    # (cached bodies). Scanned together, reported on their own line.
+    try:
+        await _delete_prefix(redis, PREFIX_FILE, report)
+        report.media_cache = report.prefixes.pop(PREFIX_FILE, 0)
+    except Exception as exc:
+        logger.exception("clear_cache: media cache wipe failed")
+        report.errors.append(f"{PREFIX_FILE}*: {exc}")
 
     if clear_route_cache:
         try:
@@ -415,9 +478,14 @@ async def clear_cache_keys(*, clear_route_cache: bool = True) -> CacheReport:
         except Exception as exc:
             report.errors.append(f"in-memory route cache: {exc}")
 
+    if clear_media_storage:
+        await _purge_media_library(report)
+
     logger.info(
-        "clear_cache: prefixes=%s route_cache=%s memory=%s errors=%s",
+        "clear_cache: prefixes=%s media_cache=%s media_storage=%s route_cache=%s memory=%s errors=%s",
         report.prefixes,
+        report.media_cache,
+        report.media_storage_keys,
         report.route_cache_keys,
         report.route_cache_memory,
         len(report.errors),

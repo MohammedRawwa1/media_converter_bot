@@ -161,14 +161,15 @@ git push origin main
 |---|---|
 | `/start` | Welcome message with command list |
 | `/help` | Detailed feature list |
-| `/settings` | Open user settings (aliases: `/usettings`, `/usersettings`) |
-| `/bulkmenu` | Open bulk/URL processing menu |
+| `/usersettings` | Open user settings |
+| `/bulkmenu` | Open bulk/URL processing menu — files you send are collected automatically |
 | `/cancel` | Cancel current operation or login flow |
 | `/canceljob <job_id>` | Request cancellation for a queued/running job |
 | `/admin add|remove|list <user_id>` | Manage allowed users (admin only) |
 | `/addthumb` | Set a custom default thumbnail |
 | `/delthumb` | Remove custom default thumbnail |
 | `/loginstatus` | Live session health check (Telethon + Pyrogram) |
+| `/session_status` | Queue depth, online users & session health (`live` arg forces a real check) |
 | `/login [phone]` | Start Telethon login flow |
 | `/loginpyro [phone]` | Start Pyrogram login flow (handles 2FA reliably) |
 | `/logout` | Log out Telethon session (per-user) |
@@ -182,6 +183,10 @@ Send any video, audio, or document file to access the full menu:
 - **Document:** PDF, ZIP, etc.
 
 Supported operations: Format conversion, compression, resolution change, framerate adjust, trimming, merging, audio extraction, stream extraction, screenshot, thumbnail generation, sample generation, repair, optimization, metadata editing, archive creation.
+
+### Bulk Batches
+
+Every video, audio, document, or photo you send is collected into a batch automatically (deduped by file id, capped at 30). Sending an **album** collects it as a group and announces it once instead of once per file. Open `/bulkmenu`, toggle the actions and quality, then press **▶️ Apply Bulk** to run the whole batch; **🗑️ Clear List** drops it and the batch clears itself after a successful apply. Two or more queued photos are combined into a single **slideshow video** (3 s per photo, letterboxed onto a 1280x720 canvas); a lone photo is encoded with the selected video action, and audio-only actions skip it. The Apply summary lists every queued file next to the job id it became.
 
 ---
 
@@ -206,6 +211,10 @@ Supported operations: Format conversion, compression, resolution change, framera
 | `STORAGE_BACKEND` | `local` | Storage backend: `local`, `s3`, or `r2` |
 | `MAX_FILE_SIZE` | `4` | Maximum file size in GB |
 | `FORCE_POLLING` | `false` | Force polling mode even when WEBHOOK_URL is set |
+| `MEDIA_CACHE_ENABLED` | `1` | Reuse media that already entered the pipe instead of re-downloading it |
+| `MEDIA_CACHE_TTL_SECONDS` | `86400` | How long a media descriptor stays in Redis |
+| `MEDIA_CACHE_BYTES_MAX_MB` | `32` | Largest media body kept verbatim in Redis (larger files reuse the storage key) |
+| `PRESENCE_TTL_SECONDS` | `300` | How long a user counts as "online" after their last interaction |
 
 ### S3 / MinIO / R2
 | Variable | Description |
@@ -330,6 +339,33 @@ killed mid-encode takes that job with it. RabbitMQ replaces that with:
 A consumer therefore has to be idempotent: at-least-once delivery means a job
 can arrive twice. Nothing new is needed for that — the worker's input lock
 (`ffmpeg:lock:*`) and job-hash dedup already make a repeated delivery a no-op.
+
+### Reusing media that already entered the pipe
+
+Submitting the same file again must not download it from Telegram a second
+time. `utils/media_cache.py` keys on the Telegram `file_unique_id` and validates
+with the **byte size**, so a repeat only reuses the earlier copy when it is
+provably the same media (an id match with a different size is a miss and the
+stale entry is dropped):
+
+- **small media** (≤ `MEDIA_CACHE_BYTES_MAX_MB`) are stored verbatim in Redis, so
+the repeat skips even the storage round trip;
+- **large media** are stored once under a shared key
+(`inputs/library/<hash>/source`) and that key is reused. Jobs fed from it are
+marked `cleanup_input=False`, so the shared object survives for the next request
+and is **not** deleted when one job finishes.
+
+Because those shared inputs are intentionally not deleted per job, pair the
+bucket with a **lifecycle rule** (e.g. expire `inputs/library/` after a few days)
+so the library cannot grow without bound. Set `MEDIA_CACHE_ENABLED=0` to disable
+reuse entirely and go back to per-job inputs.
+
+The requeue tooling (`scripts/requeue_job.py`, `scripts/requeue_missing_jobs_once.py`)
+carries the stored owner (`chat_id`/`user_id`) onto the payload it rebuilds —
+without it a requeued job has nobody to deliver to. The worker's lock-collision
+requeue goes back through the same pipe it arrived on (RabbitMQ or the Redis
+delay set), and lands at the **back** of the queue so a requeued job never jumps
+the turn of the jobs already waiting.
 
 ### Rolling it out
 

@@ -13,14 +13,18 @@ from unittest.mock import patch
 from handlers import (
     _BULK_COMPRESS_CRF_DEFAULT,
     _BULK_EXTRACT_BITRATE_DEFAULT,
+    _BULK_LIST_LIMIT,
     _BULK_OPTIMIZE_DEFAULT,
     _BULK_OPTIMIZE_PRESETS,
     _audio_delivery_name,
+    _bulk_photo_supported,
     _bulk_quality_label,
     _bulk_rename_filename,
     _metadata_caption,
+    _normalize_bulk_item,
     _parse_bulk_crf,
     _read_bulk_settings,
+    _register_bulk_file,
     _resolve_bulk_plan,
     _sanitize_audio_bitrate,
     _sanitize_bulk_extract_bitrate,
@@ -438,6 +442,168 @@ class BulkSettingsStoreTests(unittest.TestCase):
         self.assertNotIn('f"✅ Audio extracted ({_DEFAULT_AUDIO_BITRATE})"', src)
 
 
+class BulkCollectTests(unittest.TestCase):
+    """Sent files are collected for the next Apply Bulk, without duplicates."""
+
+    def test_register_appends_the_file_once(self):
+        session = {}
+        f = {"id": "abc", "name": "a.mp4", "path": None}
+        self.assertTrue(_register_bulk_file(session, f))
+        self.assertFalse(_register_bulk_file(session, f))
+        self.assertEqual(session["bulk_list"], [f])
+
+    def test_register_keeps_distinct_files_in_send_order(self):
+        session = {}
+        for i in range(3):
+            _register_bulk_file(session, {"id": f"id{i}", "name": f"f{i}.mp4"})
+        self.assertEqual([x["id"] for x in session["bulk_list"]], ["id0", "id1", "id2"])
+
+    def test_register_rejects_junk_and_caps_the_queue(self):
+        session = {}
+        self.assertFalse(_register_bulk_file(session, None))
+        self.assertFalse(_register_bulk_file(session, {"name": "no id"}))
+        for i in range(_BULK_LIST_LIMIT + 5):
+            _register_bulk_file(session, {"id": f"id{i}"})
+        self.assertEqual(len(session["bulk_list"]), _BULK_LIST_LIMIT)
+        self.assertEqual(session["bulk_list"][0]["id"], "id5")
+
+    def test_normalize_accepts_dicts_and_bare_paths(self):
+        entry = {"id": "x", "path": os.path.join("tmp", "x.mp4")}
+        self.assertIs(_normalize_bulk_item(entry), entry)
+        normalized = _normalize_bulk_item(os.path.join("tmp", "song.mp3"))
+        self.assertEqual(normalized["path"], os.path.join("tmp", "song.mp3"))
+        self.assertEqual(normalized["name"], "song.mp3")
+        for junk in (None, "", 0):
+            self.assertIsNone(_normalize_bulk_item(junk))
+
+    def test_bulk_apply_reads_the_collected_list(self):
+        with open(os.path.join(PROJECT_ROOT, "handlers.py"), encoding="utf-8") as fh:
+            src = fh.read()
+        self.assertIn('sess.get("bulk_list") or sess.get("merge_list")', src)
+        self.assertIn("_ensure_bulk_file_downloaded(", src)
+
+
+class AlbumCollectTests(unittest.IsolatedAsyncioTestCase):
+    """An album (media group) is collected into the batch and announced once.
+
+    Telegram delivers an album as one update per item, so without buffering a
+    10-video album produced ten separate "registered - choose an action" menus.
+    The items are already registered in the batch by the caller; buffering only
+    suppresses the per-file menu and emits a single announcement.
+    """
+
+    @staticmethod
+    def _handler():
+        import handlers as handlers_module
+
+        handler = object.__new__(handlers_module.EnhancedMediaHandler)
+        handler.user_sessions = {}
+        return handler
+
+    @staticmethod
+    def _update(media_group_id, chat_id=7):
+        message = SimpleNamespace(
+            media_group_id=media_group_id,
+            chat=SimpleNamespace(id=chat_id),
+        )
+        return SimpleNamespace(message=message, effective_user=SimpleNamespace(id=chat_id))
+
+    async def test_standalone_send_is_not_an_album(self):
+        handler = self._handler()
+        session = {}
+        self.assertFalse(
+            await handler._buffer_album_item(
+                self._update(None), SimpleNamespace(bot=None), session, 7, "video"
+            )
+        )
+        self.assertFalse(session.get("album_batch"))
+
+    async def test_album_items_are_counted_once(self):
+        handler = self._handler()
+        session = {}
+        handler.user_sessions[7] = session
+        context = SimpleNamespace(bot=SimpleNamespace())
+
+        for _ in range(3):
+            self.assertTrue(
+                await handler._buffer_album_item(self._update("g1"), context, session, 7, "video")
+            )
+
+        entry = session["album_batch"]["g1"]
+        self.assertEqual(entry["count"], 3)
+        self.assertEqual(entry["kinds"], {"video"})
+        self.assertEqual(len(session["album_batch_timers"]), 1)
+
+    async def test_album_is_announced_once_with_the_batch_size(self):
+        handler = self._handler()
+        session = {"bulk_list": [{"id": "a"}, {"id": "b"}, {"id": "c"}]}
+        handler.user_sessions[7] = session
+        handler._persist_session = lambda _uid: None
+        sent = []
+
+        class FakeBot:
+            async def send_message(self, **kwargs):
+                sent.append(kwargs)
+
+        context = SimpleNamespace(bot=FakeBot())
+        for _ in range(3):
+            await handler._buffer_album_item(self._update("g1"), context, session, 7, "video")
+
+        await handler._flush_album_batch(7, "g1")
+        await handler._flush_album_batch(7, "g1")  # a second flush is a no-op
+
+        self.assertEqual(len(sent), 1)
+        self.assertIn("3 video", sent[0]["text"])
+        self.assertIn("Batch size: 3", sent[0]["text"])
+        self.assertEqual(sent[0]["chat_id"], 7)
+
+    def test_every_media_handler_registers_before_buffering(self):
+        """The album is only a *view* of the batch; registration must come first."""
+        with open(os.path.join(PROJECT_ROOT, "handlers.py"), encoding="utf-8") as fh:
+            src = fh.read()
+        self.assertEqual(src.count('_register_bulk_file(session, session["current_file"])'), 3)
+        self.assertEqual(src.count("await self._buffer_album_item(update, context, session, user_id"), 4)
+
+    def test_photos_join_the_batch_too(self):
+        """Photos are queued like video/audio/document so one Apply covers all."""
+        with open(os.path.join(PROJECT_ROOT, "handlers.py"), encoding="utf-8") as fh:
+            src = fh.read()
+        self.assertIn("_register_bulk_file(session, _photo_entry)", src)
+        self.assertIn('"type": "photo",', src)
+
+
+class PhotoBatchTests(unittest.TestCase):
+    """A photo can only run a plan that actually encodes video."""
+
+    def test_photo_runs_the_video_encodes(self):
+        for settings in (
+            {},
+            {"bulk_convert_mp4": True},
+            {"bulk_compress": True},
+            {"bulk_optimize": True},
+            {"bulk_rename": True},
+            {"bulk_convert_mp4": True, "bulk_remove_audio": True},
+        ):
+            plan = _resolve_bulk_plan(settings)
+            self.assertTrue(_bulk_photo_supported(plan), msg=repr(settings))
+
+    def test_photo_is_skipped_for_audio_only_plans(self):
+        for settings in (
+            {"bulk_extract_audio": True},
+            {"bulk_remove_audio": True},
+            {"bulk_remove_audio": True, "bulk_rename": True},
+        ):
+            plan = _resolve_bulk_plan(settings)
+            self.assertFalse(_bulk_photo_supported(plan), msg=repr(settings))
+        self.assertFalse(_bulk_photo_supported(None))
+
+    def test_apply_loop_guards_photos(self):
+        with open(os.path.join(PROJECT_ROOT, "handlers.py"), encoding="utf-8") as fh:
+            src = fh.read()
+        self.assertIn('if f.get("type") == "photo" and not _photo_ok:', src)
+        self.assertIn("Skipped {photo_skipped} photo(s)", src)
+
+
 class BulkRenameTests(unittest.TestCase):
     def test_applies_prefix_suffix_and_words_to_remove(self):
         settings = {"prefix": "[Bot] ", "suffix": " HD", "words_remove": ["1080p", "x264"]}
@@ -847,6 +1013,13 @@ class EnqueueNamingPersistenceTests(unittest.TestCase):
         fake = self._enqueue({"job_id": "j1", "original_name": "Legacy.mp4"})
         self.assertEqual(fake.hashes["ffmpeg:job:j1"]["original_filename"], "Legacy.mp4")
 
+    def test_the_owner_is_persisted_so_a_requeue_can_deliver(self):
+        """Without chat_id in the hash a requeued job has nobody to deliver to."""
+        fake = self._enqueue({"job_id": "j1", "chat_id": 4242, "user_id": 4242})
+        stored = fake.hashes["ffmpeg:job:j1"]
+        self.assertEqual(stored["chat_id"], "4242")
+        self.assertEqual(stored["user_id"], "4242")
+
     def test_requeue_scripts_carry_the_name_instead_of_relying_on_the_hash(self):
         """The requeue tooling must pass the name on the payload it builds."""
         for relative in (
@@ -875,6 +1048,95 @@ class EnqueueNamingPersistenceTests(unittest.TestCase):
         with open(os.path.join(PROJECT_ROOT, "workers", "ffmpeg_worker.py"), encoding="utf-8") as fh:
             src = fh.read()
         self.assertIn("duration=int(_vid_duration) if _vid_duration is not None else None", src)
+
+
+class StoredJobOwnerTests(unittest.TestCase):
+    """A requeue must carry the owner, or the user never gets the job they queued."""
+
+    def test_extracts_the_owner_fields(self):
+        from utils.job_queue import stored_job_owners
+
+        self.assertEqual(stored_job_owners({"chat_id": "7", "user_id": "7"}), {"chat_id": "7", "user_id": "7"})
+
+    def test_survives_bytes_and_missing_values(self):
+        from utils.job_queue import stored_job_owners
+
+        self.assertEqual(stored_job_owners({b"chat_id": b"99"}), {"chat_id": "99"})
+        for stored in (None, {}, {"status": "queued"}, {"chat_id": ""}):
+            self.assertEqual(stored_job_owners(stored), {}, msg=repr(stored))
+
+    def test_carry_over_restores_an_int_chat_id(self):
+        from utils.job_queue import carry_over_job_owners
+
+        job = carry_over_job_owners({"job_id": "j1"}, {"chat_id": "42", "user_id": "42"})
+        self.assertEqual(job["chat_id"], 42)
+        self.assertIsInstance(job["chat_id"], int)
+
+    def test_carry_over_never_replaces_an_explicit_owner(self):
+        from utils.job_queue import carry_over_job_owners
+
+        job = carry_over_job_owners({"job_id": "j1", "chat_id": 1}, {"chat_id": "2"})
+        self.assertEqual(job["chat_id"], 1)
+
+    def test_requeue_scripts_carry_the_owner(self):
+        for relative in (
+            os.path.join("scripts", "requeue_job.py"),
+            os.path.join("scripts", "requeue_missing_jobs_once.py"),
+        ):
+            with open(os.path.join(PROJECT_ROOT, relative), encoding="utf-8") as fh:
+                src = fh.read()
+            self.assertIn("carry_over_job_owners", src, relative)
+
+
+class MergeAudiosDeliveryTests(unittest.TestCase):
+    """merge_audios must caption from the session, not an undefined local."""
+
+    def test_a_successful_merge_sends_the_metadata_caption(self):
+        """Regression: the caption read ``current_file``, which only exists in
+        other methods, so a successful merge raised NameError while delivering."""
+        import asyncio
+
+        import handlers as handlers_module
+
+        handler = object.__new__(handlers_module.EnhancedMediaHandler)
+
+        async def _yes(*_args, **_kwargs):
+            return True
+
+        async def _noop(*_args, **_kwargs):
+            return None
+
+        captured = {}
+
+        class FakeConverter:
+            async def merge_audios(self, paths, output_path):
+                with open(output_path, "wb") as fh:
+                    fh.write(b"merged")
+                return True
+
+        class FakeBot:
+            async def send_audio(self, **kwargs):
+                captured.update(kwargs)
+
+        handler._require_callback = _yes
+        handler._check_conversion_quota = _yes
+        handler.safe_edit = _noop
+        handler.converter = FakeConverter()
+
+        session = {
+            "current_file": {"name": "First.mp3", "_source_metadata": {"title": "Tagged"}},
+            "merge_list": [os.path.join(TMP, "a.mp3"), os.path.join(TMP, "b.mp3")],
+        }
+        update = SimpleNamespace(
+            callback_query=SimpleNamespace(message=None),
+            effective_chat=SimpleNamespace(id=1),
+        )
+        context = SimpleNamespace(bot=FakeBot())
+
+        asyncio.run(handler.merge_audios(update, context, session))
+
+        self.assertEqual(captured.get("caption"), "Tagged")
+        self.assertEqual(session["merge_list"], [])
 
 
 class MenuTriggerCoverageTests(unittest.TestCase):

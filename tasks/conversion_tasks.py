@@ -381,6 +381,106 @@ async def merge_audios(audio_paths: list[str], output_path: str, timeout_seconds
                 os.unlink(concat_file)
 
 
+async def create_slideshow(
+    image_paths: list[str],
+    output_path: str,
+    seconds_per_image: float = 3.0,
+    music_path: str | None = None,
+    timeout_seconds: int = 18000,
+) -> tuple[bool, str]:
+    """Build a slideshow video from images, one shown for ``seconds_per_image``.
+
+    Every image is looped for the fixed duration and scaled onto a common
+    1280x720 canvas (letterboxed, never stretched) so images of different sizes
+    can be concatenated in a single pass. The result is a widely-playable H.264
+    MP4. When ``music_path`` names a readable audio file it is looped underneath
+    the slideshow and cut at the video's end.
+    """
+    if not image_paths:
+        return False, "No image paths provided"
+
+    for image_path in image_paths:
+        valid, error = _validate_input_file(image_path)
+        if not valid:
+            return False, f"Invalid image file: {error}"
+
+    valid, error = _validate_output_path(output_path)
+    if not valid:
+        return False, error
+
+    try:
+        duration = float(seconds_per_image)
+    except (TypeError, ValueError):
+        duration = 3.0
+    # A zero or negative duration would produce an empty video.
+    duration = duration if duration > 0 else 3.0
+
+    width, height = 1280, 720
+    cmd = [FFMPEG_PATH, "-y"]
+    for image_path in image_paths:
+        cmd.extend(["-loop", "1", "-t", f"{duration}", "-i", image_path])
+
+    # Optional background music. It is looped so a short track still covers the
+    # whole slideshow, and -shortest ends the output with the video rather than
+    # letting the audio keep running.
+    use_music = bool(music_path) and os.path.isfile(str(music_path))
+    if use_music:
+        cmd.extend(["-stream_loop", "-1", "-i", music_path])
+
+    chains = [
+        (
+            f"[{i}:v]scale={width}:{height}:force_original_aspect_ratio=decrease,"
+            f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1,fps=30[v{i}]"
+        )
+        for i in range(len(image_paths))
+    ]
+    concat_inputs = "".join(f"[v{i}]" for i in range(len(image_paths)))
+    chains.append(f"{concat_inputs}concat=n={len(image_paths)}:v=1:a=0[slideshow]")
+
+    cmd.extend(
+        [
+            "-filter_complex",
+            ";".join(chains),
+            "-map",
+            "[slideshow]",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "medium",
+            "-crf",
+            "23",
+            "-pix_fmt",
+            "yuv420p",
+            "-movflags",
+            "+faststart",
+        ]
+    )
+    if use_music:
+        # The music is the input right after the images, so its audio stream index
+        # is len(image_paths).
+        cmd.extend(["-map", f"{len(image_paths)}:a", "-c:a", "aac", "-b:a", "192k", "-shortest"])
+    cmd.append(output_path)
+
+    try:
+        _stdout, stderr, returncode = await run_subprocess_with_timeout(
+            cmd, timeout_seconds=timeout_seconds, operation_name="Slideshow"
+        )
+    except asyncio.CancelledError:
+        logger.error("Slideshow was cancelled")
+        return False, "Slideshow was cancelled"
+    except Exception as e:
+        logger.error(f"Slideshow subprocess error: {e}")
+        return False, str(e)
+
+    if returncode == 0:
+        logger.info(f"Successfully built a slideshow from {len(image_paths)} image(s)")
+        return True, "Slideshow created"
+
+    error = stderr.decode("utf-8", errors="ignore")[:200]
+    logger.error(f"Slideshow failed: {error}")
+    return False, error
+
+
 async def take_screenshot(input_path: str, output_path: str, time: str = "00:00:01") -> tuple[bool, str]:
     """Take screenshot from video asynchronously."""
     # Validate inputs

@@ -29,6 +29,7 @@ from telegram import Bot
 import config
 from tasks import (
     create_archive,
+    create_slideshow,
     extract_streams,
     generate_sample,
     merge_audios,
@@ -794,6 +795,21 @@ async def handle_job(job: dict):
             logger.debug("ffmpeg worker: Cache job start for fast status queries")
     except Exception:
         logger.debug("ffmpeg worker: mark processing start")
+    # Mirror the start into the Redis job hash. The hash stays "queued" from
+    # enqueue until the upload phase otherwise, so a status view cannot tell a
+    # job that is actually being worked on from one still waiting in the list.
+    try:
+        _start_r = await get_redis()
+        try:
+            await _start_r.hset(
+                f"ffmpeg:job:{job_id}",
+                mapping={"status": "processing", "started_at": str(time.time())},
+            )
+        finally:
+            with contextlib.suppress(Exception):
+                await _start_r.close()
+    except Exception:
+        logger.debug("ffmpeg worker: could not mark job %s as processing", job_id)
     with contextlib.suppress(Exception):
         await publish_update(progress_channel, {"job_id": job_id, "progress": 0, "message": "started"})
 
@@ -1052,6 +1068,33 @@ async def handle_job(job: dict):
                         )
                         files = job.get("files") or []
                         ok, msg = await merge_audios(files, output_path)
+                        success = ok
+                        info = output_path if ok else msg
+                        await publish_update(
+                            progress_channel,
+                            {
+                                "job_id": job_id,
+                                "progress": 100 if ok else 0,
+                                "message": "done" if ok else "error",
+                                "output": output_path if ok else None,
+                            },
+                        )
+
+                    elif job_type == "slideshow":
+                        await publish_update(
+                            progress_channel, {"job_id": job_id, "progress": 5, "message": "building slideshow"}
+                        )
+                        files = job.get("files") or []
+                        try:
+                            seconds = float(job.get("seconds_per_image") or 3.0)
+                        except (TypeError, ValueError):
+                            seconds = 3.0
+                        music_path = job.get("music_path")
+                        if music_path and not os.path.isfile(str(music_path)):
+                            music_path = None
+                        ok, msg = await create_slideshow(
+                            files, output_path, seconds_per_image=seconds, music_path=music_path
+                        )
                         success = ok
                         info = output_path if ok else msg
                         await publish_update(

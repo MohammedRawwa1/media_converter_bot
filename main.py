@@ -19,7 +19,7 @@ from urllib.parse import urlparse
 
 import aiohttp
 import httpx
-from telegram import Bot, Update
+from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.error import Conflict, TelegramError, TimedOut
 
 # Request location differs across PTB releases; try both locations and
@@ -39,6 +39,7 @@ import contextlib
 
 from telegram.ext import (
     Application,
+    ApplicationHandlerStop,
     CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
@@ -65,8 +66,9 @@ from tasks import (
 )
 from utils import (
     ensure_directories,
+    presence,
 )
-from utils.confirm import split_confirm
+from utils.confirm import NO_DATA, confirm_keyboard, is_cancel, parse_confirm, yes_data
 from utils.error_handler import (
     get_error_handler,
     setup_comprehensive_logging,
@@ -81,6 +83,7 @@ from utils.session_healthcheck import (
     start_session_healthcheck,
     stop_session_healthcheck,
 )
+from utils.session_status import collect_session_status, format_status
 from utils.webhook_monitor import WebhookRecoveryManager
 
 try:
@@ -256,7 +259,7 @@ Hello {_escape_markdown(user_name)}! Send a media file and choose an action from
 
 **⚡ Quick Commands:**
 /help — Detailed feature guide
-/settings — Your preferences
+/usersettings — Your preferences
 /cancel — Stop current operation
 /canceljob `<job_id>` — Cancel a pending job (space between /canceljob and the job ID)
 
@@ -266,6 +269,7 @@ Hello {_escape_markdown(user_name)}! Send a media file and choose an action from
 /logout — Log out Telethon session
 /logoutpyro — Log out Pyrogram session
 /loginstatus — Check live session health
+/session_status — Queue, online users & session health (`/session_status live` for a real check)
 
 **📦 Bulk & URLs:**
 /bulkmenu — Bulk URL processing
@@ -336,6 +340,7 @@ When you receive the verification code:
 /logout — Log out Telethon session
 /logoutpyro — Log out Pyrogram session
 /loginstatus — Check live session health
+/session_status — Queue, online users & session health (`/session_status live` for a real check)
 
 **Need help?** Just send a file and use the menus! 🎯
 """
@@ -557,6 +562,28 @@ def setup_handlers(application: Application) -> None:
     # registered above consumes /cancel first when a login is in progress.
     application.add_handler(CommandHandler("cancel", latency_wrapper(cancel_command, "cancel_command")))
 
+    # ── Presence: every update marks the sender active so /session_status can
+    #    report who is using the bot. Group -1 runs before the real handlers and
+    #    deliberately does not stop propagation, so no command is consumed here.
+    try:
+        from telegram.ext import TypeHandler
+
+        async def _presence_touch(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+            user = getattr(update, "effective_user", None)
+            if user is None:
+                return
+            # Fire-and-forget: a slow heartbeat must never delay a reply.
+            try:
+                context.application.create_task(presence.touch(getattr(user, "id", None)))
+            except Exception:
+                asyncio.create_task(presence.touch(getattr(user, "id", None)))
+
+        # Group -2: it must run before the confirm dispatcher (group -1), because
+        # PTB stops at the first matching handler *within* a group.
+        application.add_handler(TypeHandler(Update, _presence_touch), group=-2)
+    except Exception:
+        logger.debug("Could not register the presence heartbeat handler")
+
     async def loginstatus_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Live session health check.
 
@@ -702,10 +729,14 @@ def setup_handlers(application: Application) -> None:
     # Callback query handler for menu interactions
     application.add_handler(CallbackQueryHandler(latency_wrapper(handler_manager.callback_handler, "callback_handler")))
 
-    # Register custom thumbnail commands if module available
+    # Register custom thumbnail commands if module available. ``perform_del_thumb``
+    # is captured here so the shared confirmation dispatcher can run it too.
+    perform_del_thumb = None
     try:
         from custom_thumbnail import add_thumb, del_thumb
+        from custom_thumbnail import perform_del_thumb as _perform_del_thumb
 
+        perform_del_thumb = _perform_del_thumb
         application.add_handler(CommandHandler("addthumb", latency_wrapper(add_thumb, "add_thumb")))
         application.add_handler(CommandHandler("delthumb", latency_wrapper(del_thumb, "del_thumb")))
         logger.info("Registered custom thumbnail commands (/addthumb, /delthumb)")
@@ -721,12 +752,12 @@ def setup_handlers(application: Application) -> None:
             await update.message.reply_text("Unauthorized: admin only")
             return
 
-        confirmed, positional = split_confirm(context.args if hasattr(context, "args") else [])
-        if not positional:
-            await update.message.reply_text("Usage: /admin add|remove|list <user_id> [confirm]")
+        args = [str(arg).strip() for arg in (context.args or [])]
+        if not args:
+            await update.message.reply_text("Usage: /admin add|remove|list <user_id>")
             return
 
-        cmd = positional[0].lower()
+        cmd = args[0].lower()
         if cmd == "list":
             users = sorted(list(ALLOWED_USER_IDS))
             await update.message.reply_text(f"Allowed users: {users}")
@@ -736,54 +767,59 @@ def setup_handlers(application: Application) -> None:
             await update.message.reply_text("Unknown admin command")
             return
 
-        if len(positional) < 2:
+        if len(args) < 2:
             await update.message.reply_text("Specify a user id")
             return
 
         try:
-            target = int(positional[1])
+            target = int(args[1])
         except Exception:
             await update.message.reply_text("Invalid user id")
             return
 
-        # Both directions need an explicit confirm: `remove` locks a user out, and
-        # `add` hands out access - the id comes from a human, and one wrong digit
-        # is a stranger.
-        if not confirmed:
-            action = "Grant access to" if cmd == "add" else "Revoke access for"
-            await update.message.reply_text(
-                f"⚠️ *{action}* `{target}`?\nReply with `/admin {cmd} {target} confirm` to proceed.",
-                parse_mode="Markdown",
-            )
-            return
-
-        if cmd == "add":
-            cfg.ALLOWED_USER_IDS.add(target)
-            persist_allowed_users()
-            await update.message.reply_text(f"Added {target} to allowed users")
-            return
-        if cmd == "remove":
-            cfg.ALLOWED_USER_IDS.discard(target)
-            persist_allowed_users()
-            await update.message.reply_text(f"Removed {target} from allowed users")
-            return
+        # Both directions ask first: `remove` locks a user out, and `add` hands
+        # out access - the id comes from a human, and one wrong digit is a stranger.
+        verb = "Grant access to" if cmd == "add" else "Revoke access for"
+        await update.message.reply_text(
+            f"⚠️ *{verb}* `{target}`?",
+            parse_mode="Markdown",
+            reply_markup=confirm_keyboard("admin", payload=f"{cmd}:{target}"),
+        )
 
     application.add_handler(CommandHandler("admin", latency_wrapper(admin_command, "admin_command")))
 
-    async def logout_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Log out and delete the Telethon session. Requires an explicit confirm."""
-        confirmed, _ = split_confirm(context.args if hasattr(context, "args") else [])
-        if not confirmed:
-            await update.message.reply_text(
-                "⚠️ *Log out and delete the Telethon session*\n"
-                "• Removes the session file, its journal/lock and your per-user copy\n"
-                "• Clears the session stored in MongoDB for your account\n"
-                "• You will have to run /login again, with a fresh Telegram code\n\n"
-                "Reply with `/logout confirm` to proceed.",
-                parse_mode="Markdown",
-            )
+    async def _perform_admin(reply, payload: str):
+        cmd, _, target_raw = (payload or "").partition(":")
+        try:
+            target = int(target_raw)
+        except (TypeError, ValueError):
+            await reply.say("⚠️ Invalid user id in the confirmation.")
             return
+        if cmd == "add":
+            cfg.ALLOWED_USER_IDS.add(target)
+            persist_allowed_users()
+            await reply.say(f"✅ Added {target} to allowed users")
+        elif cmd == "remove":
+            cfg.ALLOWED_USER_IDS.discard(target)
+            persist_allowed_users()
+            await reply.say(f"✅ Removed {target} from allowed users")
+        else:
+            await reply.say("⚠️ Unknown admin action.")
 
+    async def logout_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Ask before logging out and deleting the Telethon session."""
+        await update.message.reply_text(
+            "⚠️ *Log out and delete the Telethon session*?\n"
+            "• Removes the session file, its journal/lock and your per-user copy\n"
+            "• Clears the session stored in MongoDB for your account\n"
+            "• You will have to run /login again, with a fresh Telegram code",
+            parse_mode="Markdown",
+            reply_markup=confirm_keyboard("logout"),
+        )
+
+    application.add_handler(CommandHandler("logout", latency_wrapper(logout_command, "logout_command")))
+
+    async def _perform_logout(reply, update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_id = update.effective_user.id
 
         # ── Clean up any active login flow before logging out ──
@@ -853,31 +889,27 @@ def setup_handlers(application: Application) -> None:
             _invalidate_session_cache(user_id=user_id)
 
             if removed:
-                await update.message.reply_text(
-                    f"✅ Logged out and removed Telethon session files:\n{chr(10).join(removed)}"
-                )
+                await reply.say(f"✅ Logged out and removed Telethon session files:\n{chr(10).join(removed)}")
             else:
-                await update.message.reply_text("No local Telethon session file was found to remove.")
+                await reply.say("No local Telethon session file was found to remove.")
         except Exception as exc:
             logger.exception("/logout failed: %s", exc)
-            await update.message.reply_text("Failed to remove the Telethon session. Check server logs for details.")
-
-    application.add_handler(CommandHandler("logout", latency_wrapper(logout_command, "logout_command")))
+            await reply.say("Failed to remove the Telethon session. Check server logs for details.")
 
     async def logoutpyro_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Log out of Pyrogram and clear its session. Requires an explicit confirm."""
-        confirmed, _ = split_confirm(context.args if hasattr(context, "args") else [])
-        if not confirmed:
-            await update.message.reply_text(
-                "⚠️ *Log out of Pyrogram and clear its session*\n"
-                "• Clears the Pyrogram session JSON (per-user and global)\n"
-                "• Clears the Pyrogram session string stored in MongoDB\n"
-                "• You will have to run /loginpyro again\n\n"
-                "Reply with `/logoutpyro confirm` to proceed.",
-                parse_mode="Markdown",
-            )
-            return
+        """Ask before logging out of Pyrogram and clearing its session."""
+        await update.message.reply_text(
+            "⚠️ *Log out of Pyrogram and clear its session*?\n"
+            "• Clears the Pyrogram session JSON (per-user and global)\n"
+            "• Clears the Pyrogram session string stored in MongoDB\n"
+            "• You will have to run /loginpyro again",
+            parse_mode="Markdown",
+            reply_markup=confirm_keyboard("logoutpyro"),
+        )
 
+    application.add_handler(CommandHandler("logoutpyro", latency_wrapper(logoutpyro_command, "logoutpyro_command")))
+
+    async def _perform_logoutpyro(reply, update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_id = update.effective_user.id
 
         # ── Clean up any active login flow before logging out ──
@@ -919,31 +951,27 @@ def setup_handlers(application: Application) -> None:
                 logger.debug("logoutpyro: MongoDB clear failed: %s", exc)
 
             if removed:
-                await update.message.reply_text(
-                    f"✅ Logged out of Pyrogram and cleared session:\n{chr(10).join(removed)}"
-                )
+                await reply.say(f"✅ Logged out of Pyrogram and cleared session:\n{chr(10).join(removed)}")
             else:
-                await update.message.reply_text("No Pyrogram session was found to clear.")
+                await reply.say("No Pyrogram session was found to clear.")
         except Exception as exc:
             logger.exception("/logoutpyro failed: %s", exc)
-            await update.message.reply_text("Failed to clear the Pyrogram session. Check server logs for details.")
-
-    application.add_handler(CommandHandler("logoutpyro", latency_wrapper(logoutpyro_command, "logoutpyro_command")))
+            await reply.say("Failed to clear the Pyrogram session. Check server logs for details.")
 
     async def recoverpyro_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Recover a stale per-user Pyrogram session from persisted MongoDB state."""
-        confirmed, _ = split_confirm(context.args if hasattr(context, "args") else [])
-        if not confirmed:
-            await update.message.reply_text(
-                "⚠️ *Recover a stale Pyrogram session*\n"
-                "• Clears the per-user Pyrogram JSON entry if it is stale\n"
-                "• Re-resolves the session from persisted MongoDB\n"
-                "• Restores the per-user JSON file so uploads/downloads work again\n\n"
-                "Reply with `/recoverpyro confirm` to proceed.",
-                parse_mode="Markdown",
-            )
-            return
+        """Ask before recovering a stale per-user Pyrogram session."""
+        await update.message.reply_text(
+            "⚠️ *Recover a stale Pyrogram session*?\n"
+            "• Clears the per-user Pyrogram JSON entry if it is stale\n"
+            "• Re-resolves the session from persisted MongoDB\n"
+            "• Restores the per-user JSON file so uploads/downloads work again",
+            parse_mode="Markdown",
+            reply_markup=confirm_keyboard("recoverpyro"),
+        )
 
+    application.add_handler(CommandHandler("recoverpyro", latency_wrapper(recoverpyro_command, "recoverpyro_command")))
+
+    async def _perform_recoverpyro(reply, update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_id = update.effective_user.id
 
         try:
@@ -951,7 +979,7 @@ def setup_handlers(application: Application) -> None:
             session_str, source = await checker._invalidate_stale_pyrogram_session(user_id=user_id)
 
             if not session_str:
-                await update.message.reply_text(
+                await reply.say(
                     "⚠️ No persisted Pyrogram session could be recovered for your account. "
                     "Try `/loginpyro` again if you need a fresh login."
                 )
@@ -960,44 +988,85 @@ def setup_handlers(application: Application) -> None:
             from utils.telethon_session import save_session_string_to_file_async
 
             await save_session_string_to_file_async(session_str, client_type="pyrogram", user_id=user_id)
-            await update.message.reply_text(
+            await reply.say(
                 f"✅ Recovered Pyrogram session for your account.\n"
                 f"Source: `{source}`\n"
                 f"The per-user JSON file has been restored so the bot can use it again."
             )
         except Exception as exc:
             logger.exception("/recoverpyro failed: %s", exc)
-            await update.message.reply_text(
-                "Failed to recover the Pyrogram session. Check server logs for details."
-            )
-
-    application.add_handler(CommandHandler("recoverpyro", latency_wrapper(recoverpyro_command, "recoverpyro_command")))
+            await reply.say("Failed to recover the Pyrogram session. Check server logs for details.")
 
     async def canceljob_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Cancel one job. Requires an explicit ``confirm``, like /cancelall."""
-        confirmed, positional = split_confirm(context.args if hasattr(context, "args") else [])
-        if not positional:
-            await update.message.reply_text("Usage: /canceljob <job_id> confirm")
+        """Ask before cancelling one job."""
+        args = [str(arg).strip() for arg in (context.args or [])]
+        if not args:
+            await update.message.reply_text("Usage: /canceljob <job_id>")
             return
 
-        job_id = positional[0]
-        if not confirmed:
-            await update.message.reply_text(
-                f"⚠️ *Cancel job* `{job_id}`?\n"
-                "The worker stops at its next checkpoint and the job is discarded.\n"
-                f"Reply with `/canceljob {job_id} confirm` to proceed.",
-                parse_mode="Markdown",
-            )
-            return
-
-        try:
-            await cancel_job(job_id)
-            await update.message.reply_text(f"Requested cancellation for job {job_id}")
-        except Exception as e:
-            logger.exception("Failed to request cancel for job %s: %s", job_id, e)
-            await update.message.reply_text(f"Failed to cancel job {job_id}: {e}")
+        job_id = args[0]
+        await update.message.reply_text(
+            f"⚠️ *Cancel job* `{job_id}`?\n"
+            "The worker stops at its next checkpoint and the job is discarded.",
+            parse_mode="Markdown",
+            reply_markup=confirm_keyboard("canceljob", payload=job_id),
+        )
 
     application.add_handler(CommandHandler("canceljob", latency_wrapper(canceljob_command, "canceljob_command")))
+
+    async def _perform_canceljob(reply, job_id: str):
+        try:
+            await cancel_job(job_id)
+            await reply.say(f"✅ Requested cancellation for job {job_id}")
+        except Exception as e:
+            logger.exception("Failed to request cancel for job %s: %s", job_id, e)
+            await reply.say(f"❌ Failed to cancel job {job_id}: {e}")
+
+    class _Reply:
+        """Send an action's output whether a command or a button triggered it.
+
+        A command answers in a fresh message; a button press turns the prompt the
+        user just answered into the result, then falls back to new messages so a
+        multi-line outcome is never truncated.
+        """
+
+        def __init__(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+            self.update = update
+            self.context = context
+            self.query = getattr(update, "callback_query", None)
+            self._edited = False
+            self._placeholder = None
+
+        async def pending(self, text: str):
+            """Show a placeholder the next :meth:`say` replaces."""
+            if self.query is not None:
+                return await self.say(text)
+            self._placeholder = await self.update.message.reply_text(text)
+            return self._placeholder
+
+        async def say(self, text: str, **kwargs):
+            if self._placeholder is not None:
+                placeholder, self._placeholder = self._placeholder, None
+                try:
+                    return await placeholder.edit_text(text, **kwargs)
+                except Exception:
+                    logger.debug("confirm: could not update the progress message")
+
+            if self.query is None:
+                return await self.update.message.reply_text(text, **kwargs)
+
+            message = getattr(self.query, "message", None)
+            if not self._edited and message is not None:
+                self._edited = True
+                try:
+                    return await message.edit_text(text, **kwargs)
+                except Exception:
+                    logger.debug("confirm: could not edit the prompt; sending a new message")
+
+            chat_id = getattr(message, "chat_id", None)
+            if chat_id is None and getattr(self.update, "effective_chat", None):
+                chat_id = self.update.effective_chat.id
+            return await self.context.bot.send_message(chat_id=chat_id, text=text, **kwargs)
 
     def _admin_only(update: Update) -> bool:
         """True when the caller is the configured admin.
@@ -1015,29 +1084,27 @@ def setup_handlers(application: Application) -> None:
             await update.message.reply_text("Unauthorized: admin only")
             return
 
-        confirmed, _ = split_confirm(context.args if hasattr(context, "args") else [])
-        if not confirmed:
-            await update.message.reply_text(
-                "⚠️ *Cancel every job on both pipes*\n"
-                "• Redis queue: `ffmpeg:jobs` + `ffmpeg:delayed`\n"
-                "• Running jobs: flagged `cancel=1` so workers stop\n"
-                "• RabbitMQ: `media.jobs.run` / `.retry` / `.dead` purged\n"
-                "• Progress keys, input locks and stale dedup keys cleared\n\n"
-                "This affects *all users*, not just yours.\n"
-                "Reply with `/cancelall confirm` to proceed.",
-                parse_mode="Markdown",
-            )
-            return
-
-        status = await update.message.reply_text("🧹 Draining both pipes, this can take a moment...")
-        try:
-            report = await cancel_all_jobs()
-            await status.edit_text("\n".join(report.as_lines()))
-        except Exception:
-            logger.exception("/cancelall failed")
-            await status.edit_text("❌ /cancelall failed — check the logs for details.")
+        await update.message.reply_text(
+            "⚠️ *Cancel every job on both pipes*?\n"
+            "• Redis queue: `ffmpeg:jobs` + `ffmpeg:delayed`\n"
+            "• Running jobs: flagged `cancel=1` so workers stop\n"
+            "• RabbitMQ: `media.jobs.run` / `.retry` / `.dead` purged\n"
+            "• Progress keys, input locks and stale dedup keys cleared\n\n"
+            "This affects *all users*, not just yours.",
+            parse_mode="Markdown",
+            reply_markup=confirm_keyboard("cancelall"),
+        )
 
     application.add_handler(CommandHandler("cancelall", latency_wrapper(cancelall_command, "cancelall_command")))
+
+    async def _perform_cancelall(reply):
+        await reply.pending("🧹 Draining both pipes, this can take a moment...")
+        try:
+            report = await cancel_all_jobs()
+            await reply.say("\n".join(report.as_lines()))
+        except Exception:
+            logger.exception("/cancelall failed")
+            await reply.say("❌ /cancelall failed — check the logs for details.")
 
     async def clear_cache_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Wipe the Redis cache keys written by utils.cache and utils.route_cache."""
@@ -1045,28 +1112,95 @@ def setup_handlers(application: Application) -> None:
             await update.message.reply_text("Unauthorized: admin only")
             return
 
-        confirmed, _ = split_confirm(context.args if hasattr(context, "args") else [])
-        if not confirmed:
-            await update.message.reply_text(
-                "🧼 *Clear Redis cache*\n"
-                "• `cache:job:` and `cache:file:` (including cached file bytes)\n"
-                "• `cache:user:` / `cache:meta:` / `cache:resp:`\n"
-                "• `routecache:` and the in-memory route cache\n\n"
-                "Job state (`ffmpeg:job:*`) is left alone — use `/cancelall` for that.\n"
-                "Reply with `/clear_cache confirm` to proceed.",
-                parse_mode="Markdown",
-            )
-            return
-
-        status = await update.message.reply_text("🧼 Clearing cache keys...")
-        try:
-            report = await clear_cache_keys()
-            await status.edit_text("\n".join(report.as_lines()))
-        except Exception:
-            logger.exception("/clear_cache failed")
-            await status.edit_text("❌ /clear_cache failed — check the logs for details.")
+        # Two Yes buttons: the plain wipe only touches Redis, while the second
+        # also deletes the shared media-library objects so the cached media really
+        # stops existing instead of just losing its Redis descriptor.
+        await update.message.reply_text(
+            "🧼 *Clear Redis cache*?\n"
+            "• `cache:job:`\n"
+            "• `cache:user:` / `cache:meta:` / `cache:resp:`\n"
+            "• `routecache:` and the in-memory route cache\n"
+            "• the **media cache** (`cache:file:*`): the descriptors and the\n"
+            "  cached audio/video bodies that let a repeat skip a download\n\n"
+            "Job state (`ffmpeg:job:*`) is left alone — use `/cancelall` for that.\n"
+            "*Objects in storage* are kept unless you pick **Yes + storage**.",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup(
+                [
+                    [
+                        InlineKeyboardButton("✅ Yes", callback_data=yes_data("clear_cache")),
+                        InlineKeyboardButton("🧹 Yes + storage", callback_data=yes_data("clear_cache", "storage")),
+                    ],
+                    [InlineKeyboardButton("❌ No", callback_data=NO_DATA)],
+                ]
+            ),
+        )
 
     application.add_handler(CommandHandler("clear_cache", latency_wrapper(clear_cache_command, "clear_cache_command")))
+
+    async def _perform_clear_cache(reply, purge_storage: bool):
+        await reply.pending("🧼 Clearing cache keys...")
+        try:
+            report = await clear_cache_keys(clear_media_storage=purge_storage)
+            await reply.say("\n".join(report.as_lines()))
+        except Exception:
+            logger.exception("/clear_cache failed")
+            await reply.say("❌ /clear_cache failed — check the logs for details.")
+
+    async def confirm_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Run the action behind an inline Yes/No confirmation.
+
+        Registered in group ``-1`` so it answers before the menu callback handler
+        (which accepts every callback data) can inspect the same press, and
+        stopped afterwards so the menu never sees it.
+        """
+        query = update.callback_query
+        data = getattr(query, "data", None)
+        if is_cancel(data):
+            with contextlib.suppress(Exception):
+                await query.answer("Cancelled")
+            with contextlib.suppress(Exception):
+                await query.edit_message_text("❌ Cancelled.")
+            raise ApplicationHandlerStop
+
+        parsed = parse_confirm(data)
+        if parsed is None:
+            return
+        action, payload = parsed
+
+        with contextlib.suppress(Exception):
+            await query.answer()
+        reply = _Reply(update, context)
+        try:
+            if action == "cancelall":
+                await _perform_cancelall(reply)
+            elif action == "clear_cache":
+                await _perform_clear_cache(reply, payload == "storage")
+            elif action == "canceljob":
+                await _perform_canceljob(reply, payload or "")
+            elif action == "admin":
+                await _perform_admin(reply, payload or "")
+            elif action == "logout":
+                await _perform_logout(reply, update, context)
+            elif action == "logoutpyro":
+                await _perform_logoutpyro(reply, update, context)
+            elif action == "recoverpyro":
+                await _perform_recoverpyro(reply, update, context)
+            elif action == "delthumb":
+                if perform_del_thumb is None:
+                    await reply.say("⚠️ Thumbnail handlers are unavailable.")
+                else:
+                    await perform_del_thumb(reply, update, context)
+            else:
+                await reply.say("⚠️ Unknown action.")
+        except Exception:
+            logger.exception("confirm action %r failed", action)
+            with contextlib.suppress(Exception):
+                await reply.say("❌ Action failed — check the logs for details.")
+        # Nothing else may handle this press.
+        raise ApplicationHandlerStop
+
+    application.add_handler(CallbackQueryHandler(confirm_callback, pattern=r"^cf[mn]"), group=-1)
 
     # Settings command - forward to handler manager's show_settings
     async def settings_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1075,8 +1209,6 @@ def setup_handlers(application: Application) -> None:
         except Exception:
             await update.message.reply_text("⚠️ Failed to open settings.")
 
-    application.add_handler(CommandHandler("settings", latency_wrapper(settings_command, "settings_command")))
-    application.add_handler(CommandHandler("usettings", latency_wrapper(settings_command, "settings_command")))
     application.add_handler(CommandHandler("usersettings", latency_wrapper(settings_command, "settings_command")))
 
     async def bulk_url_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1094,6 +1226,46 @@ def setup_handlers(application: Application) -> None:
             await update.message.reply_text("⚠️ Failed to open bulk menu.")
 
     application.add_handler(CommandHandler("bulkmenu", latency_wrapper(bulk_menu_command, "bulk_menu_command")))
+
+    async def session_status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Queue depth, who is online, and session health in one view.
+
+        Admins get the whole dashboard; everyone else sees their own jobs and
+        queue turn. ``/session_status live`` additionally runs a real Telegram
+        session check instead of reporting the last cached result.
+        """
+        args = [str(arg).lower() for arg in (getattr(context, "args", None) or [])]
+        live = "live" in args
+        is_admin = _admin_only(update)
+
+        note = await update.message.reply_text(
+            "🩺 Testing sessions live — connecting to Telegram..."
+            if live
+            else "📊 Collecting status..."
+        )
+        try:
+            payload = await collect_session_status(
+                user_id=getattr(update.effective_user, "id", None),
+                is_admin=is_admin,
+                live_sessions=live,
+            )
+            text = format_status(payload, is_admin=is_admin)
+        except Exception:
+            logger.exception("/session_status failed")
+            text = "❌ /session_status failed — check the logs for details."
+
+        try:
+            await note.edit_text(text, parse_mode="HTML")
+        except Exception:
+            with contextlib.suppress(Exception):
+                await update.message.reply_text(text, parse_mode="HTML")
+
+    application.add_handler(
+        CommandHandler("session_status", latency_wrapper(session_status_command, "session_status_command"))
+    )
+    application.add_handler(
+        CommandHandler("sessionstatus", latency_wrapper(session_status_command, "session_status_command"))
+    )
 
     # Store handler manager in bot_data for access in other handlers
     application.bot_data["handler_manager"] = handler_manager
