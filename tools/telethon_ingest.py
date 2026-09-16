@@ -434,11 +434,7 @@ async def _upload_and_enqueue(
     # one reads the source off disk instead of pulling it back out of storage.
     # The worker verifies the path exists, so a separate container just downloads
     # as before - this is a hint, never an assumption.
-    _local_hint = (
-        {"input_path": local_path}
-        if keep_local and local_path and os.path.exists(local_path)
-        else {}
-    )
+    _local_hint = {"input_path": local_path} if keep_local and local_path and os.path.exists(local_path) else {}
 
     job = {
         "job_id": job_id,

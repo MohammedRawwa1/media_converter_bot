@@ -9,6 +9,7 @@ these run without any service.
 import asyncio
 
 import pytest
+from source_helpers import read_source
 
 from utils import media_cache
 from utils.cache import PREFIX_FILE
@@ -176,20 +177,12 @@ def test_lookup_never_raises_without_redis(monkeypatch):
 
 
 def _handlers_source():
-    import os
-
-    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    with open(os.path.join(root, "handlers.py"), encoding="utf-8") as fh:
-        return fh.read()
+    return read_source("handlers.py")
 
 
 def test_pipeline_reuses_the_cached_input_and_keeps_it():
     """The big-file path must look up before downloading and not delete a shared input."""
-    import os
-
-    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    with open(os.path.join(root, "utils", "bigfile_pipeline.py"), encoding="utf-8") as fh:
-        src = fh.read()
+    src = read_source("utils", "bigfile_pipeline.py")
 
     assert "media_cache.lookup(" in src
     assert "media_cache.remember(" in src
@@ -201,11 +194,7 @@ def test_pipeline_reuses_the_cached_input_and_keeps_it():
 
 def test_pipeline_reuses_a_bare_byte_hit_without_remember():
     """A media the pipeline only saw through the byte tier still skips Pyrogram."""
-    import os
-
-    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    with open(os.path.join(root, "utils", "bigfile_pipeline.py"), encoding="utf-8") as fh:
-        src = fh.read()
+    src = read_source("utils", "bigfile_pipeline.py")
 
     assert "_bytes_hit" in src
     assert "if not _reused and not _bytes_hit:" in src

@@ -132,7 +132,6 @@ if _PTBRequest is not None:
             # even where their order does not.
             return await super().do_request(url=url, method=method, request_data=request_data, **kwargs)
 
-
     def flood_gated_request(**kwargs):
         """A gated request, or None when PTB's request class cannot be imported.
 

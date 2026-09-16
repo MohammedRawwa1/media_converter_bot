@@ -111,9 +111,7 @@ def _int_or_none(value) -> int | None:
 # ── Collection ──────────────────────────────────────────────────────────
 
 
-async def collect_session_status(
-    *, user_id=None, is_admin=False, live_sessions=False, force_storage=False
-) -> dict:
+async def collect_session_status(*, user_id=None, is_admin=False, live_sessions=False, force_storage=False) -> dict:
     """Gather the whole dashboard. Never raises; degrades field by field.
 
     ``force_storage`` skips the cached storage scan - the Refresh button passes
@@ -528,9 +526,7 @@ async def _storage_egress(stored_bytes) -> dict | None:
     try:
         from utils.storage import egress_snapshot
 
-        return await asyncio.wait_for(
-            egress_snapshot(stored_bytes=stored_bytes), timeout=PROBE_TIMEOUT_SECONDS
-        )
+        return await asyncio.wait_for(egress_snapshot(stored_bytes=stored_bytes), timeout=PROBE_TIMEOUT_SECONDS)
     except Exception:
         logger.debug("session_status: egress snapshot failed")
         return None
@@ -888,9 +884,7 @@ def _admin_sections(payload: dict) -> list[str]:
     for row in active[:ACTIVE_LIST_LIMIT]:
         turn = row.get("turn")
         turn_txt = f", next #{turn}" if turn else ""
-        lines.append(
-            f"• <code>{row['user_id']}</code> — {row['waiting']} waiting, {row['running']} running{turn_txt}"
-        )
+        lines.append(f"• <code>{row['user_id']}</code> — {row['waiting']} waiting, {row['running']} running{turn_txt}")
     if len(active) > ACTIVE_LIST_LIMIT:
         lines.append(f"<i>…and {len(active) - ACTIVE_LIST_LIMIT} more</i>")
     if not active:
@@ -914,14 +908,10 @@ def _capacity_section(capacity: dict) -> list[str]:
         headroom = capacity.get("headroom_bytes")
         if headroom is not None and headroom < 0:
             lines.append(
-                f"• Worker RSS: <b>{_mb(peak)}</b> of {_mb(ceiling)}"
-                f" — ⚠️ over ceiling by <b>{_mb(-headroom)}</b>"
+                f"• Worker RSS: <b>{_mb(peak)}</b> of {_mb(ceiling)} — ⚠️ over ceiling by <b>{_mb(-headroom)}</b>"
             )
         else:
-            lines.append(
-                f"• Worker RSS: <b>{_mb(peak)}</b> of {_mb(ceiling)}"
-                f" — headroom <b>{_mb(headroom)}</b>"
-            )
+            lines.append(f"• Worker RSS: <b>{_mb(peak)}</b> of {_mb(ceiling)} — headroom <b>{_mb(headroom)}</b>")
     else:
         lines.append(f"• Worker RSS: <b>{_mb(peak)}</b> (no memory ceiling set)")
 
@@ -952,8 +942,7 @@ def _memory_section(memory: dict) -> list[str]:
         percent_txt = "?" if percent is None else f"{percent:g}"
         badge = {"high": " ⚠️", "critical": " 🔴"}.get(memory.get("pressure"), "")
         lines.append(
-            f"• {scope}: <b>{_bytes_human(used)}</b> of {_bytes_human(total)}"
-            f" — <b>{percent_txt}%</b> used{badge}"
+            f"• {scope}: <b>{_bytes_human(used)}</b> of {_bytes_human(total)} — <b>{percent_txt}%</b> used{badge}"
         )
         free = memory.get("free_bytes")
         if free is not None:
@@ -1025,10 +1014,7 @@ def _egress_lines(storage: dict) -> list[str]:
     percent = egress.get("percent")
 
     if allowance and isinstance(percent, (int, float)):
-        lines = [
-            f"• Egress {period}: <b>{pulled}</b> of <b>{_bytes_human(allowance)}</b> "
-            f"free ({percent:.0f}%) {icon}"
-        ]
+        lines = [f"• Egress {period}: <b>{pulled}</b> of <b>{_bytes_human(allowance)}</b> free ({percent:.0f}%) {icon}"]
     else:
         lines = [f"• Egress {period}: <b>{pulled}</b> {icon}"]
 

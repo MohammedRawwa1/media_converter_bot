@@ -11,6 +11,8 @@ import uuid
 from types import SimpleNamespace
 from unittest.mock import patch
 
+from source_helpers import read_source
+
 from utils import batch_pipeline
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -126,9 +128,7 @@ class BatchLockTests(unittest.IsolatedAsyncioTestCase):
 
     def test_progress_key_does_not_collide_with_the_lock(self):
         self.assertEqual(batch_pipeline.batch_progress_key("abc"), "ffmpeg:batch:abc:done")
-        self.assertNotEqual(
-            batch_pipeline.batch_progress_key("abc"), batch_pipeline.batch_lock_key("abc")
-        )
+        self.assertNotEqual(batch_pipeline.batch_progress_key("abc"), batch_pipeline.batch_lock_key("abc"))
 
     async def test_acquires_when_free(self):
         redis = _FakeRedis(set_result=True)
@@ -231,12 +231,14 @@ class FfmpegSlotTests(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(batch_pipeline.over_memory_ceiling())
 
     def test_memory_ceiling_triggers_above_the_limit(self):
-        with patch.object(batch_pipeline, "MEMORY_CEILING_BYTES", 100), patch.object(
-            batch_pipeline, "rss_bytes", return_value=150
+        with (
+            patch.object(batch_pipeline, "MEMORY_CEILING_BYTES", 100),
+            patch.object(batch_pipeline, "rss_bytes", return_value=150),
         ):
             self.assertTrue(batch_pipeline.over_memory_ceiling())
-        with patch.object(batch_pipeline, "MEMORY_CEILING_BYTES", 100), patch.object(
-            batch_pipeline, "rss_bytes", return_value=40
+        with (
+            patch.object(batch_pipeline, "MEMORY_CEILING_BYTES", 100),
+            patch.object(batch_pipeline, "rss_bytes", return_value=40),
         ):
             self.assertFalse(batch_pipeline.over_memory_ceiling())
 
@@ -395,9 +397,11 @@ class BatchProgressMessageTests(unittest.IsolatedAsyncioTestCase):
             str(job.get(batch_pipeline.BATCH_TOTAL_FIELD) or 0),
         )
         bot = _FakeBot()
-        with patch.object(worker, "Bot", lambda *a, **k: bot), patch.object(
-            worker, "get_redis", _returning(redis)
-        ), patch.object(worker.config, "BOT_TOKEN", "tok", create=True):
+        with (
+            patch.object(worker, "Bot", lambda *a, **k: bot),
+            patch.object(worker, "get_redis", _returning(redis)),
+            patch.object(worker.config, "BOT_TOKEN", "tok", create=True),
+        ):
             await worker._report_batch_progress(job)
         return bot
 
@@ -484,9 +488,11 @@ class BatchProgressMessageTests(unittest.IsolatedAsyncioTestCase):
             raise error
 
         bot.edit_message_text = _fail
-        with patch.object(worker, "Bot", lambda *a, **k: bot), patch.object(
-            worker, "get_redis", _returning(redis)
-        ), patch.object(worker.config, "BOT_TOKEN", "tok", create=True):
+        with (
+            patch.object(worker, "Bot", lambda *a, **k: bot),
+            patch.object(worker, "get_redis", _returning(redis)),
+            patch.object(worker.config, "BOT_TOKEN", "tok", create=True),
+        ):
             await worker._report_batch_progress(self._job(total=4))
         return bot
 
@@ -508,9 +514,11 @@ class BatchProgressMessageTests(unittest.IsolatedAsyncioTestCase):
 
         redis = _ProgressRedis()
         bot = _FakeBot()
-        with patch.object(worker, "Bot", lambda *a, **k: bot), patch.object(
-            worker, "get_redis", _returning(redis)
-        ), patch.object(worker.config, "BOT_TOKEN", "tok", create=True):
+        with (
+            patch.object(worker, "Bot", lambda *a, **k: bot),
+            patch.object(worker, "get_redis", _returning(redis)),
+            patch.object(worker.config, "BOT_TOKEN", "tok", create=True),
+        ):
             await worker._report_batch_progress(self._job(total=3))
 
         self.assertEqual(bot.sent, [])
@@ -561,12 +569,13 @@ class ClaimHeartbeatTests(unittest.IsolatedAsyncioTestCase):
             locks.append("batch")
             return True
 
-        with patch.object(worker, "get_redis", _get_redis), patch.object(
-            worker, "_RSS_HEARTBEAT_SECONDS", 0.02
-        ), patch.object(worker, "_publish_worker_rss", _publish), patch.object(
-            batch_pipeline, "CLAIM_HEARTBEAT_SECONDS", 0.05
-        ), patch.object(batch_pipeline, "refresh_ffmpeg_slot", _refresh), patch.object(
-            batch_pipeline, "refresh_batch_lock", _refresh_lock
+        with (
+            patch.object(worker, "get_redis", _get_redis),
+            patch.object(worker, "_RSS_HEARTBEAT_SECONDS", 0.02),
+            patch.object(worker, "_publish_worker_rss", _publish),
+            patch.object(batch_pipeline, "CLAIM_HEARTBEAT_SECONDS", 0.05),
+            patch.object(batch_pipeline, "refresh_ffmpeg_slot", _refresh),
+            patch.object(batch_pipeline, "refresh_batch_lock", _refresh_lock),
         ):
             task = asyncio.create_task(
                 worker._keep_claims_alive(batch_pipeline.tag_batch_job({"job_id": "j1"}, "b1", 0, 2), 0)
@@ -626,8 +635,9 @@ class FinalizeTests(unittest.IsolatedAsyncioTestCase):
     async def test_batch_job_releases_its_lock(self):
         redis = _FakeRedis()
         job = batch_pipeline.tag_batch_job({"job_id": "j1"}, "b1", 0, 3)
-        with patch.object(batch_pipeline, "reclaim_memory", return_value={}), patch.object(
-            batch_pipeline, "sweep_temp_artifacts", return_value={}
+        with (
+            patch.object(batch_pipeline, "reclaim_memory", return_value={}),
+            patch.object(batch_pipeline, "sweep_temp_artifacts", return_value={}),
         ):
             summary = await batch_pipeline.finalize_job(job, source="redis", redis=redis)
         self.assertEqual(len(redis.eval_calls), 1)
@@ -635,8 +645,9 @@ class FinalizeTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_plain_job_does_not_touch_a_lock(self):
         redis = _FakeRedis()
-        with patch.object(batch_pipeline, "reclaim_memory", return_value={}), patch.object(
-            batch_pipeline, "sweep_temp_artifacts", return_value={}
+        with (
+            patch.object(batch_pipeline, "reclaim_memory", return_value={}),
+            patch.object(batch_pipeline, "sweep_temp_artifacts", return_value={}),
         ):
             summary = await batch_pipeline.finalize_job({"job_id": "j2"}, redis=redis)
         self.assertEqual(redis.eval_calls, [])
@@ -645,8 +656,9 @@ class FinalizeTests(unittest.IsolatedAsyncioTestCase):
     async def test_handing_back_the_ffmpeg_slot(self):
         redis = _FakeRedis()
         job = {"job_id": "j4"}
-        with patch.object(batch_pipeline, "reclaim_memory", return_value={}), patch.object(
-            batch_pipeline, "sweep_temp_artifacts", return_value={}
+        with (
+            patch.object(batch_pipeline, "reclaim_memory", return_value={}),
+            patch.object(batch_pipeline, "sweep_temp_artifacts", return_value={}),
         ):
             summary = await batch_pipeline.finalize_job(job, redis=redis, ffmpeg_slot=3)
         self.assertTrue(summary["ffmpeg_slot_released"])
@@ -662,9 +674,11 @@ class FinalizeTests(unittest.IsolatedAsyncioTestCase):
 
 class MemoryReclaimTests(unittest.TestCase):
     def test_reclaim_collects_and_trims_and_reports_rss(self):
-        with patch.object(batch_pipeline, "_malloc_trim", return_value=True) as trim, patch.object(
-            batch_pipeline, "rss_bytes", side_effect=[1000, 400]
-        ), patch.object(batch_pipeline.gc, "collect", return_value=42) as collect:
+        with (
+            patch.object(batch_pipeline, "_malloc_trim", return_value=True) as trim,
+            patch.object(batch_pipeline, "rss_bytes", side_effect=[1000, 400]),
+            patch.object(batch_pipeline.gc, "collect", return_value=42) as collect,
+        ):
             result = batch_pipeline.reclaim_memory("test")
         collect.assert_called_once()
         trim.assert_called_once()
@@ -680,16 +694,18 @@ class MemoryReclaimTests(unittest.TestCase):
         self.assertIn("collected", result)
 
     def test_restart_threshold_defaults_to_disabled(self):
-        with patch.object(batch_pipeline, "RESTART_RSS_THRESHOLD", 0), patch.object(
-            batch_pipeline, "rss_bytes", return_value=999_999_999
+        with (
+            patch.object(batch_pipeline, "RESTART_RSS_THRESHOLD", 0),
+            patch.object(batch_pipeline, "rss_bytes", return_value=999_999_999),
         ):
             self.assertFalse(batch_pipeline.memory_pressure())
 
     def test_restart_is_requested_above_the_threshold(self):
         batch_pipeline.reset_restart_request()
         try:
-            with patch.object(batch_pipeline, "RESTART_RSS_THRESHOLD", 100), patch.object(
-                batch_pipeline, "rss_bytes", return_value=500
+            with (
+                patch.object(batch_pipeline, "RESTART_RSS_THRESHOLD", 100),
+                patch.object(batch_pipeline, "rss_bytes", return_value=500),
             ):
                 self.assertTrue(batch_pipeline.request_restart_if_pressured())
                 self.assertTrue(batch_pipeline.restart_requested())
@@ -699,8 +715,9 @@ class MemoryReclaimTests(unittest.TestCase):
     def test_restart_is_not_requested_below_the_threshold(self):
         batch_pipeline.reset_restart_request()
         try:
-            with patch.object(batch_pipeline, "RESTART_RSS_THRESHOLD", 100), patch.object(
-                batch_pipeline, "rss_bytes", return_value=50
+            with (
+                patch.object(batch_pipeline, "RESTART_RSS_THRESHOLD", 100),
+                patch.object(batch_pipeline, "rss_bytes", return_value=50),
             ):
                 self.assertFalse(batch_pipeline.request_restart_if_pressured())
                 self.assertFalse(batch_pipeline.restart_requested())
@@ -768,8 +785,7 @@ class WiringTests(unittest.TestCase):
     """The bot tags batch jobs and the worker runs/finalizes them one at a time."""
 
     def _read(self, *parts):
-        with open(os.path.join(PROJECT_ROOT, *parts), encoding="utf-8") as fh:
-            return fh.read()
+        return read_source(*parts)
 
     def test_bulk_apply_tags_every_job_with_one_batch(self):
         src = self._read("handlers.py")
@@ -854,14 +870,10 @@ class ClaimTtlTests(unittest.TestCase):
     def test_batch_data_outlives_the_lock_by_a_long_way(self):
         # Counters must survive however long the batch really takes; only the
         # lock is short-lived, and only the lock is refreshed.
-        self.assertGreater(
-            batch_pipeline.BATCH_STATE_TTL_SECONDS, batch_pipeline.BATCH_LOCK_TTL_SECONDS * 10
-        )
+        self.assertGreater(batch_pipeline.BATCH_STATE_TTL_SECONDS, batch_pipeline.BATCH_LOCK_TTL_SECONDS * 10)
 
     def test_heartbeat_is_a_small_fraction_of_the_lock_ttl(self):
-        self.assertLess(
-            batch_pipeline.CLAIM_HEARTBEAT_SECONDS, batch_pipeline.BATCH_LOCK_TTL_SECONDS / 5
-        )
+        self.assertLess(batch_pipeline.CLAIM_HEARTBEAT_SECONDS, batch_pipeline.BATCH_LOCK_TTL_SECONDS / 5)
 
 
 class ClaimRefreshTests(unittest.IsolatedAsyncioTestCase):
@@ -943,9 +955,8 @@ class BatchProgressDedupTests(unittest.IsolatedAsyncioTestCase):
     def test_worker_claims_before_it_increments(self):
         from workers import ffmpeg_worker as worker
 
-        with open(os.path.join(PROJECT_ROOT, "workers", "ffmpeg_worker.py"), encoding="utf-8") as fh:
-            src = fh.read()
-        claim = src.index("claim_batch_progress_slot(r, batch_id, job.get(\"job_id\"))")
+        src = read_source("workers", "ffmpeg_worker.py")
+        claim = src.index('claim_batch_progress_slot(r, batch_id, job.get("job_id"))')
         increment = src.index("done = int(await r.incr(done_key))")
         self.assertLess(claim, increment)
         self.assertTrue(hasattr(worker, "_report_batch_progress"))
@@ -972,9 +983,7 @@ class BatchResumeTests(unittest.IsolatedAsyncioTestCase):
         await batch_pipeline.open_batch_resume(redis, batch_id="b1", user_id=7)
         self.assertTrue(await batch_pipeline.mark_batch_entry_finished(redis, "b1", "file-abc"))
 
-        self.assertEqual(
-            await batch_pipeline.read_finished_entries(redis, 7), {"b1": {"file-abc"}}
-        )
+        self.assertEqual(await batch_pipeline.read_finished_entries(redis, 7), {"b1": {"file-abc"}})
 
     async def test_an_unfinished_batch_reports_nothing(self):
         redis = _ProgressRedis()
@@ -1082,8 +1091,7 @@ class DuplicateDeliveryTests(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(await worker._job_already_delivered({"job_id": "j1"}))
 
     def test_delivery_is_recorded_and_checked_before_the_slot_is_taken(self):
-        with open(os.path.join(PROJECT_ROOT, "workers", "ffmpeg_worker.py"), encoding="utf-8") as fh:
-            src = fh.read()
+        src = read_source("workers", "ffmpeg_worker.py")
         self.assertIn('"delivered": "1" if sent else "0"', src)
         guard = src.index("if await _job_already_delivered(job):")
         slot = src.index("slot = await _claim_execution_slot(job)")
@@ -1172,8 +1180,7 @@ class BulkFetchReportingTests(unittest.TestCase):
 
     @staticmethod
     def _src(name: str = "handlers.py") -> str:
-        with open(os.path.join(PROJECT_ROOT, name), encoding="utf-8") as fh:
-            return fh.read()
+        return read_source(name)
 
     def test_failure_reason_names_the_real_cause(self):
         from handlers import _bulk_failure_reason
@@ -1267,15 +1274,15 @@ class RelayCopyCleanupTests(unittest.IsolatedAsyncioTestCase):
     async def test_a_delete_failure_never_raises(self):
         from handlers import EnhancedMediaHandler
 
-        ok = await EnhancedMediaHandler._discard_relay_copy(
-            object(), _RelayContext(_RelayBot(fail=True)), -100123, 42
-        )
+        ok = await EnhancedMediaHandler._discard_relay_copy(object(), _RelayContext(_RelayBot(fail=True)), -100123, 42)
         self.assertFalse(ok)
 
     def test_a_stopped_batch_discards_its_relay_copy(self):
         src = BulkFetchReportingTests._src()
         self.assertIn('"batch cancelled"', src)
-        discard = src.index('_discard_relay_copy(\n                                    context, _pipeline_chat, _pipeline_msg')
+        discard = src.index(
+            "_discard_relay_copy(\n                                    context, _pipeline_chat, _pipeline_msg"
+        )
         cancelled = src.index('if _ingest.error == "batch cancelled":')
         self.assertLess(cancelled, discard)
 
@@ -1315,9 +1322,7 @@ class UserbotRelayCleanupTests(unittest.IsolatedAsyncioTestCase):
     async def test_a_delete_failure_never_raises(self):
         from utils.userbot_downloader import _discard_relay_copy
 
-        self.assertFalse(
-            await _discard_relay_copy(self._Client(fail=True), "pyrogram", -100123, 42)
-        )
+        self.assertFalse(await _discard_relay_copy(self._Client(fail=True), "pyrogram", -100123, 42))
 
 
 class BulkPipelineWatchTests(unittest.IsolatedAsyncioTestCase):
@@ -1332,8 +1337,7 @@ class BulkPipelineWatchTests(unittest.IsolatedAsyncioTestCase):
     """
 
     def _src(self):
-        with open(os.path.join(PROJECT_ROOT, "handlers.py"), encoding="utf-8") as fh:
-            return fh.read()
+        return read_source("handlers.py")
 
     def test_a_batch_files_stages_render_on_the_applys_message(self):
         src = self._src()
@@ -1540,8 +1544,7 @@ class SourceFetchTests(unittest.IsolatedAsyncioTestCase):
     """
 
     def _src(self):
-        with open(os.path.join(PROJECT_ROOT, "workers", "ffmpeg_worker.py"), encoding="utf-8") as fh:
-            return fh.read()
+        return read_source("workers", "ffmpeg_worker.py")
 
     def test_the_fetch_is_reported_and_bounded(self):
         src = self._src()
@@ -1640,9 +1643,7 @@ class GhostClaimTests(unittest.IsolatedAsyncioTestCase):
 
         async def hset(self, key, mapping=None, **kwargs):
             fields = {**dict(mapping or {}), **kwargs}
-            self.hashes.setdefault(self._text(key), {}).update(
-                {str(k): str(v) for k, v in fields.items()}
-            )
+            self.hashes.setdefault(self._text(key), {}).update({str(k): str(v) for k, v in fields.items()})
             self.hset_calls.append((self._text(key), dict(fields)))
             return len(fields)
 
@@ -1659,9 +1660,7 @@ class GhostClaimTests(unittest.IsolatedAsyncioTestCase):
             return sum(
                 1
                 for key in keys
-                if self._text(key) in self.strings
-                or self._text(key) in self.workers
-                or self._text(key) in self.hashes
+                if self._text(key) in self.strings or self._text(key) in self.workers or self._text(key) in self.hashes
             )
 
         async def eval(self, script, numkeys, *args):
@@ -1691,9 +1690,7 @@ class GhostClaimTests(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertTrue(await batch_pipeline._slot_owner_is_gone(redis, "job-dead"))
-        self.assertEqual(
-            await batch_pipeline.sweep_ghost_claims(redis), {"slots": 1, "locks": 0, "dedup": 0}
-        )
+        self.assertEqual(await batch_pipeline.sweep_ghost_claims(redis), {"slots": 1, "locks": 0, "dedup": 0})
         self.assertNotIn("ffmpeg:slot:0", redis.strings)
 
     async def test_a_live_workers_claim_is_never_taken(self):
@@ -1704,9 +1701,7 @@ class GhostClaimTests(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertFalse(await batch_pipeline._slot_owner_is_gone(redis, "job-live"))
-        self.assertEqual(
-            await batch_pipeline.sweep_ghost_claims(redis), {"slots": 0, "locks": 0, "dedup": 0}
-        )
+        self.assertEqual(await batch_pipeline.sweep_ghost_claims(redis), {"slots": 0, "locks": 0, "dedup": 0})
         self.assertEqual(redis.strings["ffmpeg:slot:0"], "job-live")
 
     async def test_a_finished_claim_is_left_to_the_worker_that_owns_it(self):
@@ -1742,9 +1737,7 @@ class GhostClaimTests(unittest.IsolatedAsyncioTestCase):
             jobs={"ffmpeg:job:job-dead": {"status": "processing", "worker": "w-dead"}},
         )
 
-        self.assertEqual(
-            await batch_pipeline.sweep_ghost_claims(redis), {"slots": 0, "locks": 1, "dedup": 0}
-        )
+        self.assertEqual(await batch_pipeline.sweep_ghost_claims(redis), {"slots": 0, "locks": 1, "dedup": 0})
         self.assertNotIn("ffmpeg:batch:abc", redis.strings)
         # Not one of the batch's own keys is a claim.
         for key in (
@@ -1782,9 +1775,7 @@ class GhostClaimTests(unittest.IsolatedAsyncioTestCase):
             workers=("w-alive",),
         )
 
-        self.assertEqual(
-            await batch_pipeline.sweep_ghost_claims(redis), {"slots": 0, "locks": 0, "dedup": 0}
-        )
+        self.assertEqual(await batch_pipeline.sweep_ghost_claims(redis), {"slots": 0, "locks": 0, "dedup": 0})
         self.assertEqual(redis.strings[key], "job-live")
 
     async def test_a_queued_dedup_key_is_kept(self):
@@ -1827,15 +1818,14 @@ class GhostClaimTests(unittest.IsolatedAsyncioTestCase):
 
         redis = self._Claims()
 
-        with patch.object(batch_pipeline, "MEMORY_CEILING_BYTES", 0), patch.object(
-            worker, "get_redis", _returning(redis)
+        with (
+            patch.object(batch_pipeline, "MEMORY_CEILING_BYTES", 0),
+            patch.object(worker, "get_redis", _returning(redis)),
         ):
             slot = await worker._claim_execution_slot({"job_id": "job-9"})
 
         self.assertEqual(slot, 0)
-        self.assertEqual(
-            redis.hashes["ffmpeg:job:job-9"]["worker"], batch_pipeline.worker_identity()
-        )
+        self.assertEqual(redis.hashes["ffmpeg:job:job-9"]["worker"], batch_pipeline.worker_identity())
 
 
 class ActiveConversionRaceTests(unittest.IsolatedAsyncioTestCase):
@@ -1864,12 +1854,8 @@ class ActiveConversionRaceTests(unittest.IsolatedAsyncioTestCase):
             await gate.wait()
 
         # Start two conversions for the same user.
-        t1 = asyncio.create_task(
-            handler._run_with_concurrency_limit(42, "file_a", slow(gate1))
-        )
-        t2 = asyncio.create_task(
-            handler._run_with_concurrency_limit(42, "file_b", slow(gate2))
-        )
+        t1 = asyncio.create_task(handler._run_with_concurrency_limit(42, "file_a", slow(gate1)))
+        t2 = asyncio.create_task(handler._run_with_concurrency_limit(42, "file_b", slow(gate2)))
         await asyncio.sleep(0)  # let both acquire the semaphore
 
         # Both are running; the counter should be 2.
@@ -1919,9 +1905,7 @@ class ActiveConversionRaceTests(unittest.IsolatedAsyncioTestCase):
         async def slow(gate):
             await gate.wait()
 
-        t1 = asyncio.create_task(
-            handler._run_with_concurrency_limit(7, "file_1", slow(gate1))
-        )
+        t1 = asyncio.create_task(handler._run_with_concurrency_limit(7, "file_1", slow(gate1)))
         await asyncio.sleep(0)
 
         # active_conversions shows file_1.
@@ -1929,9 +1913,7 @@ class ActiveConversionRaceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(handler._active_conversion_count[7], 1)
 
         # Second file starts — overwrites the name but increments the counter.
-        t2 = asyncio.create_task(
-            handler._run_with_concurrency_limit(7, "file_2", slow(gate2))
-        )
+        t2 = asyncio.create_task(handler._run_with_concurrency_limit(7, "file_2", slow(gate2)))
         await asyncio.sleep(0)
         self.assertEqual(handler.active_conversions[7], "file_2")
         self.assertEqual(handler._active_conversion_count[7], 2)
@@ -1962,12 +1944,8 @@ class ActiveConversionRaceTests(unittest.IsolatedAsyncioTestCase):
         async def slow():
             await gate.wait()
 
-        t1 = asyncio.create_task(
-            handler._run_with_concurrency_limit(1, "a", slow())
-        )
-        t2 = asyncio.create_task(
-            handler._run_with_concurrency_limit(2, "b", slow())
-        )
+        t1 = asyncio.create_task(handler._run_with_concurrency_limit(1, "a", slow()))
+        t2 = asyncio.create_task(handler._run_with_concurrency_limit(2, "b", slow()))
         await asyncio.sleep(0)
 
         self.assertEqual(len(handler.active_conversions), 2)

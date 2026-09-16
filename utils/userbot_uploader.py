@@ -1439,9 +1439,7 @@ async def send_file_via_userbot(
     # ── Priority 2: Telethon user account ──
     from utils.telethon_session import get_db_model, has_usable_telethon_session_async
 
-    if TelegramClient is not None and await has_usable_telethon_session_async(
-        user_id=user_id, db_model=get_db_model()
-    ):
+    if TelegramClient is not None and await has_usable_telethon_session_async(user_id=user_id, db_model=get_db_model()):
         try:
             msg_id = await _send_with_telethon(
                 chat_id,

@@ -35,8 +35,7 @@ async def del_thumb(update: Update, context: CallbackContext):
     rather than an immediate delete.
     """
     await update.message.reply_text(
-        "⚠️ *Delete your custom thumbnail*?\n"
-        "Later conversions will fall back to the default thumbnail.",
+        "⚠️ *Delete your custom thumbnail*?\nLater conversions will fall back to the default thumbnail.",
         parse_mode="Markdown",
         reply_markup=confirm_keyboard("delthumb"),
     )

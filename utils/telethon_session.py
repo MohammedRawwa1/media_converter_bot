@@ -1005,9 +1005,7 @@ def has_usable_telethon_session(user_id: int | None = None) -> bool:
     return os.path.exists(session_path) or os.path.exists(session_path + ".session")
 
 
-async def has_usable_telethon_session_async(
-    user_id: int | None = None, db_model: object | None = None
-) -> bool:
+async def has_usable_telethon_session_async(user_id: int | None = None, db_model: object | None = None) -> bool:
     """Async ``has_usable_telethon_session`` that also consults MongoDB.
 
     The synchronous variant can only inspect the JSON files, env vars and

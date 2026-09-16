@@ -104,9 +104,7 @@ def test_over_gets_a_louder_message_than_watch():
 
 def test_a_reading_without_an_allowance_still_renders():
     """No stored reading means no ratio - the message must not invent one."""
-    text = egress_monitor.format_egress_alert(
-        _egress(allowance_bytes=None, percent=None, stored_bytes=None)
-    )
+    text = egress_monitor.format_egress_alert(_egress(allowance_bytes=None, percent=None, stored_bytes=None))
 
     # The egress line reports the bytes and stops there - no invented ratio and
     # no "?" standing in for an allowance that was never read.
@@ -181,9 +179,7 @@ def test_a_ratio_below_the_line_never_alerts(monkeypatch):
 
 def test_an_unknown_rating_is_silent_rather_than_guessed(monkeypatch):
     """No allowance yet means there is no ratio to alert about."""
-    monitor, app = _monitor(
-        monkeypatch, _egress("unknown", allowance_bytes=None, percent=None, stored_bytes=None)
-    )
+    monitor, app = _monitor(monkeypatch, _egress("unknown", allowance_bytes=None, percent=None, stored_bytes=None))
 
     assert asyncio.run(monitor.check_and_alert()) is None
     assert app.bot.sent == []

@@ -504,9 +504,7 @@ class TelegramEditCoalescer:
         # (chat_id, message_id) -> (last_sent_monotonic, text_digest)
         self._last: dict[tuple, tuple[float, int]] = {}
 
-    def should_skip(
-        self, chat_id, message_id, text, min_interval: float | None = None, force: bool = False
-    ) -> bool:
+    def should_skip(self, chat_id, message_id, text, min_interval: float | None = None, force: bool = False) -> bool:
         """Whether this edit should be dropped instead of sent.
 
         Skipped when it would repeat the text already on the message (Telegram

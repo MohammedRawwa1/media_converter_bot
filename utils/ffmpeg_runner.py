@@ -300,8 +300,10 @@ async def probe_media(path: str) -> dict:
         lowered = str(tag_key).lower()
         if lowered in ("title", "filename") and tag_value and not result.get("title"):
             result["title"] = str(tag_value)[:128]
-        elif lowered in ("artist", "artists", "album_artist", "performer", "author") and tag_value and not result.get(
-            "performer"
+        elif (
+            lowered in ("artist", "artists", "album_artist", "performer", "author")
+            and tag_value
+            and not result.get("performer")
         ):
             result["performer"] = str(tag_value)[:128]
 

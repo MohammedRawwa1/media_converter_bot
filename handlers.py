@@ -44,6 +44,7 @@ except ImportError:
         """Fallback used only when utils.file_utils cannot be imported."""
         return f"{fallback_stem}{default_ext}"
 
+
 # Import config module if available (some code references `config.<NAME>`)
 try:
     import config
@@ -403,7 +404,9 @@ def _metadata_caption(current_file: dict | None, fallback: str | None = None) ->
     if fallback:
         return fallback
 
-    name = current_file.get("name") or current_file.get("original_filename") or current_file.get("output_filename") or ""
+    name = (
+        current_file.get("name") or current_file.get("original_filename") or current_file.get("output_filename") or ""
+    )
     stem = os.path.splitext(os.path.basename(name))[0].strip()
     if stem:
         return stem
@@ -664,7 +667,7 @@ def _bulk_display_name(file_info: dict | None) -> str:
     if len(name) > _BULK_NAME_MAX:
         stem, ext = os.path.splitext(name)
         keep = max(1, _BULK_NAME_MAX - len(ext) - 1)
-        name = f"{stem[:keep]}…{ext}" if ext else f"{name[:_BULK_NAME_MAX - 1]}…"
+        name = f"{stem[:keep]}…{ext}" if ext else f"{name[: _BULK_NAME_MAX - 1]}…"
     return name
 
 
@@ -673,9 +676,7 @@ def _batch_stop_markup(batch_id):
     if not batch_id:
         return None
     try:
-        return InlineKeyboardMarkup(
-            [[InlineKeyboardButton("⏹️ Stop batch", callback_data=f"batch_cancel:{batch_id}")]]
-        )
+        return InlineKeyboardMarkup([[InlineKeyboardButton("⏹️ Stop batch", callback_data=f"batch_cancel:{batch_id}")]])
     except Exception:
         return None
 
@@ -726,10 +727,7 @@ def _batch_member_text(batch_id, index, total, name, info: dict | None = None) -
     except (TypeError, ValueError):
         label = str(name or "")
     body = f"{label}\n{emoji} {stage}" if label else f"{emoji} {stage}"
-    return (
-        f"{head}{body}\n"
-        "Conversions run one file at a time — each result arrives as its job finishes."
-    )
+    return f"{head}{body}\nConversions run one file at a time — each result arrives as its job finishes."
 
 
 def _bulk_batch_lines(entries, limit: int = 12) -> list[str]:
@@ -1199,9 +1197,7 @@ class EnhancedMediaHandler:
                         telegram_edit_coalescer.record(_edit_chat_id, _edit_message_id, text)
                         return True
                     except _RetryAfter as e:
-                        _left = await telegram_flood_gate.note(
-                            getattr(e, "retry_after", None) or 5, _flood_scope
-                        )
+                        _left = await telegram_flood_gate.note(getattr(e, "retry_after", None) or 5, _flood_scope)
                         logger.warning("_edit:429 on progress_msg, window=%.0fs", _left)
                         if _left <= telegram_flood_gate.inline_max:
                             await asyncio.sleep(_left + 0.5)
@@ -1574,9 +1570,7 @@ class EnhancedMediaHandler:
         except Exception:
             logger.exception("_watch_job_progress failed for %s", job_id)
 
-    async def _await_job_finished(
-        self, job_id: str, poll_interval: float = 2.0, timeout: float = 0.0
-    ) -> str | None:
+    async def _await_job_finished(self, job_id: str, poll_interval: float = 2.0, timeout: float = 0.0) -> str | None:
         """Wait for a queued job to reach a terminal state **without editing Telegram**.
 
         The bulk pipeline has to know when a file is done before it fetches the
@@ -1829,9 +1823,7 @@ class EnhancedMediaHandler:
         """
         async with self.conversion_semaphore:
             self.active_conversions[user_id] = task_name
-            self._active_conversion_count[user_id] = (
-                self._active_conversion_count.get(user_id, 0) + 1
-            )
+            self._active_conversion_count[user_id] = self._active_conversion_count.get(user_id, 0) + 1
             try:
                 return await coroutine
             finally:
@@ -2574,9 +2566,7 @@ class EnhancedMediaHandler:
                 with contextlib.suppress(Exception):
                     data = await r.hgetall(f"ffmpeg:job:{job_id}")
                     info = {
-                        (k.decode() if isinstance(k, bytes) else k): (
-                            v.decode() if isinstance(v, bytes) else v
-                        )
+                        (k.decode() if isinstance(k, bytes) else k): (v.decode() if isinstance(v, bytes) else v)
                         for k, v in (data or {}).items()
                     }
                 text = _batch_member_text(batch_id, index, total, name, info)
@@ -3110,6 +3100,7 @@ class EnhancedMediaHandler:
                             return
                         try:
                             from utils.job_queue import get_redis
+
                             while True:
                                 redis = await get_redis()
                                 try:
@@ -3156,9 +3147,7 @@ class EnhancedMediaHandler:
                             else:
                                 text = f"⬇️ Pipeline download: {pct}% ({mb_sent}MB / {mb_total}MB)"
                             asyncio.run_coroutine_threadsafe(
-                                _pipeline_progress_msg.edit_text(
-                                    text, reply_markup=_batch_stop_markup(batch_label)
-                                ),
+                                _pipeline_progress_msg.edit_text(text, reply_markup=_batch_stop_markup(batch_label)),
                                 _pipeline_loop,
                             )
                         except Exception:
@@ -3548,9 +3537,7 @@ class EnhancedMediaHandler:
                                 _relay_msg_id,
                             )
                             # The copy was forwarded for that download only.
-                            await self._discard_relay_copy(
-                                context, _relay_chat_id, _relay_msg_id, "download failed"
-                            )
+                            await self._discard_relay_copy(context, _relay_chat_id, _relay_msg_id, "download failed")
                     except Exception as _relay_exc:
                         logger.exception("Relay: forwarding/download failed: %s", _relay_exc)
 
@@ -3625,9 +3612,7 @@ class EnhancedMediaHandler:
 
                 if _cache_uid and _media_cache.cache_enabled():
                     _library_key = _media_cache.media_library_key(_cache_uid)
-                    _entry = await _media_cache.lookup(
-                        _cache_uid, expected_size=current_file.get("size")
-                    )
+                    _entry = await _media_cache.lookup(_cache_uid, expected_size=current_file.get("size"))
                     _stored_key = (_entry or {}).get("input_key")
                     if _stored_key:
                         _stored_ok = True
@@ -4659,9 +4644,7 @@ class EnhancedMediaHandler:
                                 photo_path = _stored_path
                                 _photo_reused = True
                             else:
-                                _cached = await _media_cache.get_bytes(
-                                    _photo_uid, expected_size=_photo_size
-                                )
+                                _cached = await _media_cache.get_bytes(_photo_uid, expected_size=_photo_size)
                                 if _cached:
                                     with open(photo_path, "wb") as _fh:
                                         _fh.write(_cached)
@@ -5968,9 +5951,7 @@ class EnhancedMediaHandler:
             elif data == "bulk_bitrate_menu":
                 # Extract Audio bitrate picker for the next Apply
                 sess = session or self.user_sessions.setdefault(user_id, {})
-                current = _sanitize_bulk_extract_bitrate(
-                    _read_bulk_settings(user_id, sess).get("bulk_extract_bitrate")
-                )
+                current = _sanitize_bulk_extract_bitrate(_read_bulk_settings(user_id, sess).get("bulk_extract_bitrate"))
                 await self.safe_edit(
                     query,
                     f"🎵 <b>Bulk Extract Audio bitrate</b>\n\nCurrent: {current}\n"
@@ -6136,8 +6117,7 @@ class EnhancedMediaHandler:
                     if not files:
                         await self.safe_edit(
                             query,
-                            "✅ Nothing left to do — every file collected here was already "
-                            "finished by an earlier run.",
+                            "✅ Nothing left to do — every file collected here was already finished by an earlier run.",
                         )
                         with contextlib.suppress(Exception):
                             sess.pop("_bulk_apply_started_at", None)
@@ -6156,9 +6136,7 @@ class EnhancedMediaHandler:
                     # A photo has no audio/video stream, so audio-only plans skip
                     # it (and are reported) instead of enqueuing a job that fails.
                     _photo_ok = _bulk_photo_supported(_plan)
-                    _slideshow_seconds = _sanitize_bulk_slideshow_seconds(
-                        _bulk_settings.get("bulk_slideshow_seconds")
-                    )
+                    _slideshow_seconds = _sanitize_bulk_slideshow_seconds(_bulk_settings.get("bulk_slideshow_seconds"))
 
                     enqueued = 0
                     skipped = 0
@@ -6251,13 +6229,9 @@ class EnhancedMediaHandler:
                         _music_entry = _bulk_slideshow_music(files)
                         if _music_entry is not None:
                             try:
-                                _mp = await self._ensure_bulk_file_downloaded(
-                                    update, context, sess, _music_entry
-                                )
+                                _mp = await self._ensure_bulk_file_downloaded(update, context, sess, _music_entry)
                             except Exception:
-                                logger.debug(
-                                    "bulk: slideshow music download failed for %s", _music_entry.get("id")
-                                )
+                                logger.debug("bulk: slideshow music download failed for %s", _music_entry.get("id"))
                                 _mp = None
                             if _mp and os.path.exists(_mp):
                                 _music_path = _mp
@@ -6313,14 +6287,17 @@ class EnhancedMediaHandler:
                                     # loop could finish (and the batch be closed out)
                                     # while the slideshow was still converting, and
                                     # the batch's counts could never line up.
-                                    if await self._await_member_job(
-                                        query,
-                                        job_id,
-                                        batch_id=_batch_id,
-                                        index=_batch_seq,
-                                        total=_batch_total,
-                                        name=_label,
-                                    ) == "done":
+                                    if (
+                                        await self._await_member_job(
+                                            query,
+                                            job_id,
+                                            batch_id=_batch_id,
+                                            index=_batch_seq,
+                                            total=_batch_total,
+                                            name=_label,
+                                        )
+                                        == "done"
+                                    ):
                                         # The photos became this one video, so every
                                         # photo that went into it is done - otherwise a
                                         # resume would rebuild the slideshow.
@@ -6366,9 +6343,7 @@ class EnhancedMediaHandler:
                                         stopped = True
                                         _remaining = len(_bulk_files) - _idx - 1
                                         if _remaining:
-                                            results.append(
-                                                (f"+{_remaining} remaining file(s)", "⏹️ batch stopped")
-                                            )
+                                            results.append((f"+{_remaining} remaining file(s)", "⏹️ batch stopped"))
                                         break
                                 except Exception:
                                     logger.debug("bulk apply: could not read the cancel marker")
@@ -6384,9 +6359,7 @@ class EnhancedMediaHandler:
                             # is running, so without this the one thing the user
                             # stares at while a batch is being fed is a message
                             # that has not changed since they pressed Apply.
-                            await self._bulk_show_fetch_progress(
-                                query, _batch_id, _idx + 1, len(_bulk_files), f
-                            )
+                            await self._bulk_show_fetch_progress(query, _batch_id, _idx + 1, len(_bulk_files), f)
 
                             # Each entry may need its own download — the session's
                             # current_file is not necessarily this file.
@@ -6454,9 +6427,7 @@ class EnhancedMediaHandler:
                             # after the fetch bound, which must never cut a live
                             # conversion short - with its own watchdog showing the
                             # encode instead of a silent poll.
-                            await self._await_bulk_pipeline_job(
-                                f, query=query, index=_idx + 1, total=len(_bulk_files)
-                            )
+                            await self._await_bulk_pipeline_job(f, query=query, index=_idx + 1, total=len(_bulk_files))
 
                             # A file the batch stopped before touching reports no
                             # path and no storage key - identical to a real fetch
@@ -6515,9 +6486,7 @@ class EnhancedMediaHandler:
 
                             if not _file_path and not f.get("input_key"):
                                 skipped += 1
-                                results.append(
-                                    (_bulk_display_name(f), "❌ could not fetch — no file or storage key")
-                                )
+                                results.append((_bulk_display_name(f), "❌ could not fetch — no file or storage key"))
                                 continue
 
                             job_id = str(uuid.uuid4()) if uuid else None
@@ -6588,9 +6557,7 @@ class EnhancedMediaHandler:
                                     )
                                     if _job_status is None:
                                         stalled = True
-                                        results.append(
-                                            (_bulk_display_name(f), "⏱️ worker did not finish this job")
-                                        )
+                                        results.append((_bulk_display_name(f), "⏱️ worker did not finish this job"))
                                         break
                                     if _job_status == "done" and _batch_id:
                                         # This file is genuinely finished, so a later
@@ -6680,7 +6647,9 @@ class EnhancedMediaHandler:
                         _head = f"✅ Bulk apply finished — queued {enqueued} file(s).\n• Applied: {_applied}"
                     _halted = stopped or stalled
                     if _batch_id and not _halted:
-                        _head += f"\n• Batch ID: `{_batch_id}`\nUse `/cancelbatch {_batch_id}` to stop the remaining jobs."
+                        _head += (
+                            f"\n• Batch ID: `{_batch_id}`\nUse `/cancelbatch {_batch_id}` to stop the remaining jobs."
+                        )
                     if enqueued and not _halted:
                         _head += (
                             "\n🐢 Processing one file at a time (memory-safe) — "
@@ -6703,13 +6672,9 @@ class EnhancedMediaHandler:
                         # one the pipeline already tried and failed to convert.
                         _head += f"\n❗ {failed} file(s) failed."
                     if _reclaimed:
-                        _head += (
-                            f"\n↩️ Skipped {_reclaimed} file(s) an earlier run had already finished."
-                        )
+                        _head += f"\n↩️ Skipped {_reclaimed} file(s) an earlier run had already finished."
                     if photo_skipped:
-                        _head += (
-                            f"\n⚠️ Skipped {photo_skipped} photo(s) — “{_applied}” needs an audio/video stream."
-                        )
+                        _head += f"\n⚠️ Skipped {photo_skipped} photo(s) — “{_applied}” needs an audio/video stream."
                     if _plan["ignored"]:
                         _skipped = ", ".join(_BULK_ACTION_LABELS[key] for key in _plan["ignored"])
                         _head += f"\n⚠️ Skipped — cannot run in the same pass: {_skipped}"
@@ -7268,9 +7233,7 @@ class EnhancedMediaHandler:
             await notify("❌ No video file found.")
             return
 
-        audio_bitrate = _sanitize_audio_bitrate(
-            bitrate or current_file.get("audio_bitrate") or _DEFAULT_AUDIO_BITRATE
-        )
+        audio_bitrate = _sanitize_audio_bitrate(bitrate or current_file.get("audio_bitrate") or _DEFAULT_AUDIO_BITRATE)
         current_file["audio_bitrate"] = audio_bitrate
         session["current_file"] = current_file
         delivery_name = _audio_delivery_name(current_file.get("name"), current_file.get("id"))
@@ -9016,7 +8979,9 @@ class EnhancedMediaHandler:
                         user_settings.set_user_setting(user_id, "words_remove", [])
                         await update.message.reply_text("✅ Cleared words remover list.")
                     else:
-                        await update.message.reply_text("❓ Unknown settings command. Send /usersettings for instructions.")
+                        await update.message.reply_text(
+                            "❓ Unknown settings command. Send /usersettings for instructions."
+                        )
                 except Exception:
                     await update.message.reply_text("⚠️ Failed to update settings.")
 

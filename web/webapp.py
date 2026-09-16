@@ -89,14 +89,15 @@ def _job_store_prune(now: float | None = None) -> int:
             JOB_STORE.pop(key, None)
             removed += 1
     if len(JOB_STORE) > JOB_STORE_MAX_ENTRIES:
-        keep = sorted(
-            JOB_STORE.items(), key=lambda kv: kv[1].get("created_at") or 0, reverse=True
-        )[: JOB_STORE_MAX_ENTRIES]
+        keep = sorted(JOB_STORE.items(), key=lambda kv: kv[1].get("created_at") or 0, reverse=True)[
+            :JOB_STORE_MAX_ENTRIES
+        ]
         keep_keys = {k for k, _ in keep}
         for key in [k for k in JOB_STORE if k not in keep_keys]:
             JOB_STORE.pop(key, None)
             removed += 1
     return removed
+
 
 # Try to use async job queue helpers when available
 try:

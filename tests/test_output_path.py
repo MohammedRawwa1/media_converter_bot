@@ -18,17 +18,16 @@ decides between local and remote is exercised for real.
 """
 
 import asyncio
-import os
 import time
+
+from source_helpers import assigned_values, flatten, is_and_operand, parse_source, read_source
 
 from tasks import cleanup_tasks
 from workers import ffmpeg_worker
 
 
 def _worker_src() -> str:
-    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    with open(os.path.join(root, "workers", "ffmpeg_worker.py"), encoding="utf-8") as fh:
-        return fh.read()
+    return read_source("workers", "ffmpeg_worker.py")
 
 
 # ── the thumbnail is delivered from disk ────────────────────────────────
@@ -38,9 +37,7 @@ def test_local_thumbnail_is_used_when_it_exists(tmp_path):
     local = tmp_path / "thumb.jpg"
     local.write_bytes(b"jpeg")
 
-    found = ffmpeg_worker._local_thumb_candidate(
-        {"_local_thumb": str(local), "thumbnail": "outputs/job/thumb.jpg"}
-    )
+    found = ffmpeg_worker._local_thumb_candidate({"_local_thumb": str(local), "thumbnail": "outputs/job/thumb.jpg"})
 
     # The local path wins over the key, which is what avoids the download.
     assert found == str(local)
@@ -64,11 +61,15 @@ def test_a_stale_local_thumbnail_falls_through_to_the_key(tmp_path):
 
 def test_delivery_checks_disk_before_reaching_for_the_object():
     src = _worker_src()
+    tree = parse_source("workers", "ffmpeg_worker.py")
 
     # Every delivery site (zip, video, other) seeds itself from disk first...
     assert src.count("thumb_path = _local_thumb_candidate(job)") == 3
     # ...and only then falls back to the job's field, which the download follows.
-    assert src.count('cand = None if thumb_path else job.get("thumbnail")') == 3
+    # Compared as the value it assigns: the formatter wraps this one in
+    # parentheses when the line is long, which the text of it would not survive.
+    fallback = flatten('None if thumb_path else job.get("thumbnail")')
+    assert [flatten(value) for value in assigned_values(tree, "cand")].count(fallback) == 3
 
 
 def test_the_uploaded_thumbnail_key_never_becomes_the_delivery_field():
@@ -87,9 +88,12 @@ def test_the_uploaded_thumbnail_key_never_becomes_the_delivery_field():
 
 def test_output_upload_is_gated_on_something_remote_reading_it():
     src = _worker_src()
+    tree = parse_source("workers", "ffmpeg_worker.py")
 
     assert '_needs_remote_copy = bool(config.ENABLE_LINK_SEND or not job.get("chat_id"))' in src
-    assert "and _needs_remote_copy:" in src
+    # Asked as an expression: a wrapped condition leaves the colon after the
+    # closing bracket, which no whitespace collapsing can undo.
+    assert is_and_operand(tree, "_needs_remote_copy")
 
 
 def test_a_skipped_upload_still_reports_a_result():

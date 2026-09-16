@@ -91,9 +91,7 @@ class FakeRedis:
 
     async def exists(self, *keys):
         return sum(
-            1
-            for key in keys
-            if key in self.strings or key in self.sets or key in self.hashes or key in self.lists
+            1 for key in keys if key in self.strings or key in self.sets or key in self.hashes or key in self.lists
         )
 
     def scan_iter(self, match="*", count=None):
@@ -457,9 +455,7 @@ def test_a_fresh_tombstone_is_kept(monkeypatch):
 def test_a_stop_by_hand_keeps_the_marker_it_wrote(monkeypatch):
     r = FakeRedis()
     _seed_batch(r, "batch-a", members=["j1"], statuses={"j1": "cancelled"}, total=3, done=1)
-    r.strings[batch_pipeline.batch_cancel_key("batch-a")] = batch_pipeline.batch_tombstone_value(
-        "cancelled by admin"
-    )
+    r.strings[batch_pipeline.batch_cancel_key("batch-a")] = batch_pipeline.batch_tombstone_value("cancelled by admin")
     _use(monkeypatch, r)
 
     asyncio.run(batch_pipeline.purge_stale_batches(r))
@@ -484,9 +480,7 @@ def test_a_stop_by_hand_marks_only_a_batch_that_still_has_work(monkeypatch):
         done=1,
     )
     running = FakeRedis()
-    _seed_batch(
-        running, "batch-a", members=["j1"], statuses={"j1": RUNNING}, total=3, done=1
-    )
+    _seed_batch(running, "batch-a", members=["j1"], statuses={"j1": RUNNING}, total=3, done=1)
     _use(monkeypatch, finished)
 
     asyncio.run(batch_pipeline.cancel_batch(finished, batch_id="batch-a", requested_by="user"))

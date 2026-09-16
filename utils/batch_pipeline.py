@@ -232,6 +232,7 @@ async def claim_batch_progress_slot(redis, batch_id, job_id) -> bool:
 # The record is keyed per *user* rather than per batch, because that is the
 # question the menu asks: "which of my collected files are already done?".
 
+
 def batch_finished_keys(batch_id) -> str:
     """Redis set of the collection entries a batch has already finished."""
     return f"{BATCH_KEY_PREFIX}{batch_id}:finished"
@@ -420,9 +421,7 @@ async def cancel_batch(redis=None, *, batch_id, requested_by=None, ttl_seconds=N
         # :func:`_batch_needs_tombstone`: a marker with nothing behind it is one
         # key more for ``scripts/cleanup_stale_redis.py`` to keep finding.
         if await _batch_needs_tombstone(redis, batch_id):
-            await redis.set(
-                batch_cancel_key(batch_id), batch_tombstone_value(requested_by or "user"), ex=ttl
-            )
+            await redis.set(batch_cancel_key(batch_id), batch_tombstone_value(requested_by or "user"), ex=ttl)
         from utils.job_queue import DELAYED_SET, JOB_LIST
 
         members = await redis.smembers(batch_jobs_key(batch_id))
@@ -468,9 +467,7 @@ async def cancel_batch(redis=None, *, batch_id, requested_by=None, ttl_seconds=N
         # The keys carry the user id, not the batch id, so they are found by
         # value rather than by pattern.
         try:
-            async for dedup_key in redis.scan_iter(
-                match=f"{PIPELINE_DEDUP_PREFIX}*", count=200
-            ):
+            async for dedup_key in redis.scan_iter(match=f"{PIPELINE_DEDUP_PREFIX}*", count=200):
                 raw_owner = await redis.get(dedup_key)
                 owner = _job_text(raw_owner)
                 if owner in ("pending", *job_ids) and await redis.delete(dedup_key):
@@ -520,9 +517,7 @@ async def set_batch_total(redis=None, *, batch_id, total) -> bool:
             from utils.job_queue import get_redis
 
             redis = await get_redis()
-        await redis.set(
-            batch_total_key(batch_id), int(total), ex=max(1, int(BATCH_STATE_TTL_SECONDS))
-        )
+        await redis.set(batch_total_key(batch_id), int(total), ex=max(1, int(BATCH_STATE_TTL_SECONDS)))
         return True
     except Exception:
         logger.debug("batch_pipeline: could not record batch total for %s", batch_id)
@@ -668,7 +663,6 @@ async def read_active_batches(redis) -> list[dict]:
     return rows
 
 
-
 # ---------------------------------------------------------------------------
 # Tearing a batch down
 # ---------------------------------------------------------------------------
@@ -693,9 +687,7 @@ BATCH_TOMBSTONE_REASON = "cancelled by admin"
 # finishing the batch it just cancelled in the same run.
 BATCH_TOMBSTONE_GRACE_SECONDS = max(
     0,
-    _env_number(
-        "BATCH_TOMBSTONE_GRACE_SECONDS", _env_number("JOB_MAX_SECONDS", 6 * 3600)
-    ),
+    _env_number("BATCH_TOMBSTONE_GRACE_SECONDS", _env_number("JOB_MAX_SECONDS", 6 * 3600)),
 )
 # The suffix of a batch id that carries its tombstone, and the separator its value
 # uses for the time it was written (``cancelled by admin|1699999999``).
@@ -713,9 +705,7 @@ def batch_tombstone_value(reason, written_at=None) -> str:
     stamp = time.time() if written_at is None else float(written_at)
     # Fixed precision, not ``:g``: that drops to exponent form for a large epoch
     # and loses so much of the value that the age comes back minutes wrong.
-    return (
-        f"{str(reason or BATCH_TOMBSTONE_REASON)}{_TOMBSTONE_STAMP_SEPARATOR}{stamp:.3f}"
-    )
+    return f"{str(reason or BATCH_TOMBSTONE_REASON)}{_TOMBSTONE_STAMP_SEPARATOR}{stamp:.3f}"
 
 
 def _tombstone_written_at(raw) -> float | None:
@@ -734,6 +724,7 @@ def _tombstone_written_at(raw) -> float | None:
     except ValueError:
         return None
     return value if value > 0 else None
+
 
 # Suffixes under ``ffmpeg:batch:`` that are not batch ids themselves.
 _NON_BATCH_SUFFIXES = frozenset({"active", "resume"})
@@ -954,9 +945,7 @@ async def _batch_needs_tombstone(redis, batch_id, cancelled_job_ids=None) -> boo
     known_dead = {str(value) for value in (cancelled_job_ids or ())}
     if known_dead:
         try:
-            members = {
-                _job_text(value) for value in await redis.smembers(batch_jobs_key(batch_id))
-            }
+            members = {_job_text(value) for value in await redis.smembers(batch_jobs_key(batch_id))}
         except Exception:
             return True
         if members & known_dead:
@@ -990,11 +979,7 @@ async def purge_stale_tombstones(redis=None, *, grace_seconds=None) -> int:
             from utils.job_queue import get_redis
 
             redis = await get_redis()
-        grace = (
-            float(BATCH_TOMBSTONE_GRACE_SECONDS)
-            if grace_seconds is None
-            else max(0.0, float(grace_seconds))
-        )
+        grace = float(BATCH_TOMBSTONE_GRACE_SECONDS) if grace_seconds is None else max(0.0, float(grace_seconds))
         now = time.time()
         async for raw_key in redis.scan_iter(match=f"{BATCH_KEY_PREFIX}*", count=500):
             key = raw_key.decode() if isinstance(raw_key, (bytes, bytearray)) else str(raw_key)
@@ -1188,9 +1173,7 @@ async def try_acquire_batch_lock(redis, batch_id, job_id) -> bool:
             return True
         return False
     except Exception:
-        logger.warning(
-            "batch_pipeline: could not acquire lock for batch %s (running anyway)", batch_id
-        )
+        logger.warning("batch_pipeline: could not acquire lock for batch %s (running anyway)", batch_id)
         return True
 
 
@@ -1237,11 +1220,7 @@ async def _sweep_stale_dedup_keys(redis, freed: dict) -> None:
             owner = str(owner) if owner else ""
             # A placeholder has no owner to ask about, and an empty value is a key
             # that survives only as a skeleton - both are stale by definition.
-            if (
-                owner
-                and owner != _PENDING_DEDUP_VALUE
-                and not await _slot_owner_is_gone(redis, owner)
-            ):
+            if owner and owner != _PENDING_DEDUP_VALUE and not await _slot_owner_is_gone(redis, owner):
                 continue
             try:
                 if await redis.delete(raw_key):
@@ -1784,9 +1763,7 @@ def _rmtree(path: str) -> None:
         logger.debug("batch_pipeline: _rmtree failed for %s", path)
 
 
-async def finalize_job(
-    job: dict | None, *, source: str = "", redis=None, sweep: bool = True, ffmpeg_slot=None
-) -> dict:
+async def finalize_job(job: dict | None, *, source: str = "", redis=None, sweep: bool = True, ffmpeg_slot=None) -> dict:
     """End-of-job cleanup: free the ffmpeg slot and batch lock, reclaim memory.
 
     ``ffmpeg_slot`` is the slot index the caller took from
@@ -1871,9 +1848,7 @@ def request_restart(reason: str = "") -> bool:
     """
     global _restart_requested
     _restart_requested = True
-    logger.warning(
-        "batch_pipeline: worker restart requested%s", f" ({reason})" if reason else ""
-    )
+    logger.warning("batch_pipeline: worker restart requested%s", f" ({reason})" if reason else "")
     return True
 
 

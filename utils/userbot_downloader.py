@@ -81,14 +81,17 @@ class _ProgressWatch:
 
     def wrap(self, user_progress):
         if user_progress is not None and asyncio.iscoroutinefunction(user_progress):
+
             async def _progress(current, total, *args):
                 self.last_activity = self.loop.time()
                 return await user_progress(current, total, *args)
         else:
+
             def _progress(current, total, *args):
                 self.last_activity = self.loop.time()
                 if user_progress is not None:
                     return user_progress(current, total, *args)
+
         return _progress
 
 
@@ -101,9 +104,7 @@ async def _wait_download_or_stall(dl_task, watch) -> object:
     cancels the task and raises - the caller's retry loop then treats it like
     the old wall-clock timeout.
     """
-    hard_deadline = (
-        watch.loop.time() + DOWNLOAD_HARD_SECONDS if DOWNLOAD_HARD_SECONDS > 0 else None
-    )
+    hard_deadline = watch.loop.time() + DOWNLOAD_HARD_SECONDS if DOWNLOAD_HARD_SECONDS > 0 else None
     while True:
         try:
             # shield: an expired poll must not cancel the still-running download
@@ -2183,9 +2184,7 @@ async def download_forward_via_userbot(
             logger.warning("userbot: Pyrogram download error (%s); trying Telethon fallback", e)
 
     # Try Telethon only when a usable session exists (MongoDB included).
-    if TelegramClient is not None and await has_usable_telethon_session_async(
-        user_id=user_id, db_model=get_db_model()
-    ):
+    if TelegramClient is not None and await has_usable_telethon_session_async(user_id=user_id, db_model=get_db_model()):
         try:
             result = await _download_with_telethon(
                 chat_id,
@@ -2270,9 +2269,7 @@ async def download_bytes_via_userbot(
             )
 
     # Try Telethon with BytesIO as fallback (MongoDB included)
-    if TelegramClient is not None and await has_usable_telethon_session_async(
-        user_id=user_id, db_model=get_db_model()
-    ):
+    if TelegramClient is not None and await has_usable_telethon_session_async(user_id=user_id, db_model=get_db_model()):
         try:
             from utils.telethon_session import build_telethon_client
             from utils.telethon_session import get_userbot_credentials as _get_creds

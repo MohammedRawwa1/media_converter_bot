@@ -5,6 +5,8 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
+from source_helpers import read_source
+
 from handlers import (
     _BULK_NAME_MAX,
     _BULK_SLIDESHOW_MAX,
@@ -48,9 +50,7 @@ class CreateSlideshowTests(unittest.IsolatedAsyncioTestCase):
     async def _run(self, images, runner, output=None, seconds=3.0, music=None):
         output = output or os.path.join(TMP, "slideshow_out.mp4")
         with patch.object(ct, "run_subprocess_with_timeout", runner):
-            result = await ct.create_slideshow(
-                images, output, seconds_per_image=seconds, music_path=music
-            )
+            result = await ct.create_slideshow(images, output, seconds_per_image=seconds, music_path=music)
         return result, runner.commands[-1] if runner.commands else None
 
     async def test_builds_one_looped_input_per_image(self):
@@ -176,13 +176,10 @@ class SlideshowPickerTests(unittest.TestCase):
         self.assertEqual(_sanitize_bulk_slideshow_seconds(5), 5.0)
         self.assertEqual(_sanitize_bulk_slideshow_seconds("2.5"), 2.5)
         for bad in (0, -1, _BULK_SLIDESHOW_MIN / 2, _BULK_SLIDESHOW_MAX + 1, "nope", None, True):
-            self.assertEqual(
-                _sanitize_bulk_slideshow_seconds(bad), _BULK_SLIDESHOW_SECONDS, msg=repr(bad)
-            )
+            self.assertEqual(_sanitize_bulk_slideshow_seconds(bad), _BULK_SLIDESHOW_SECONDS, msg=repr(bad))
 
     def test_apply_uses_the_stored_seconds_and_names_the_music(self):
-        with open(os.path.join(PROJECT_ROOT, "handlers.py"), encoding="utf-8") as fh:
-            src = fh.read()
+        src = read_source("handlers.py")
         self.assertIn('_bulk_settings.get("bulk_slideshow_seconds")', src)
         self.assertIn('"music_path": _music_path,', src)
         self.assertIn("bulk_slideshow_menu", src)
@@ -210,9 +207,8 @@ class ImageDocumentTests(unittest.TestCase):
             self.assertIn(ext, _IMAGE_EXTS)
 
     def test_handle_document_queues_images_as_photos(self):
-        with open(os.path.join(PROJECT_ROOT, "handlers.py"), encoding="utf-8") as fh:
-            src = fh.read()
-        self.assertIn('if file_ext in _IMAGE_EXTS:', src)
+        src = read_source("handlers.py")
+        self.assertIn("if file_ext in _IMAGE_EXTS:", src)
         self.assertIn('_register_bulk_file(session, {**session["current_file"], "type": "photo"})', src)
 
 
@@ -242,15 +238,13 @@ class SlideshowWiringTests(unittest.TestCase):
     """The worker must expose the slideshow job type the bot enqueues."""
 
     def test_worker_handles_the_slideshow_job_type(self):
-        with open(os.path.join(PROJECT_ROOT, "workers", "ffmpeg_worker.py"), encoding="utf-8") as fh:
-            src = fh.read()
+        src = read_source("workers", "ffmpeg_worker.py")
         self.assertIn('job_type == "slideshow"', src)
         self.assertIn("create_slideshow", src)
         self.assertIn("seconds_per_image", src)
 
     def test_apply_groups_album_photos_into_one_slideshow(self):
-        with open(os.path.join(PROJECT_ROOT, "handlers.py"), encoding="utf-8") as fh:
-            src = fh.read()
+        src = read_source("handlers.py")
         self.assertIn('"type": "slideshow",', src)
         self.assertIn("_slideshow_photos", src)
         # Two photos are the album case; a lone photo keeps the single-file path.
@@ -274,8 +268,7 @@ class BulkSummaryTests(unittest.TestCase):
         self.assertIn("…", short)
 
     def test_apply_prints_a_per_file_section_with_job_ids(self):
-        with open(os.path.join(PROJECT_ROOT, "handlers.py"), encoding="utf-8") as fh:
-            src = fh.read()
+        src = read_source("handlers.py")
         self.assertIn("🗂 Per-file:", src)
         self.assertIn("📋 queued · {job_id}", src)
         self.assertIn("results[:_BULK_SUMMARY_MAX_LINES]", src)

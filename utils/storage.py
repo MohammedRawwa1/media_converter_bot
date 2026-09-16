@@ -127,9 +127,7 @@ def _usage_group(key: str, depth: int) -> str:
     return "/".join(parts[:depth]) + "/"
 
 
-def _usage_add(
-    groups: dict[str, dict[str, int]], key: str, size: int, depth: int
-) -> None:
+def _usage_add(groups: dict[str, dict[str, int]], key: str, size: int, depth: int) -> None:
     """Fold one object into the group totals."""
     name = _usage_group(key, depth)
     row = groups.setdefault(name, {"objects": 0, "bytes": 0})
@@ -218,9 +216,7 @@ async def record_egress(nbytes, *, kind: str = "object", period: str | None = No
 
     # One line per step, not per byte: a busy cycle must not turn the egress
     # counter itself into a log flood.
-    if EGRESS_WARN_STEP_BYTES > 0 and (total // EGRESS_WARN_STEP_BYTES) != (
-        (total - nbytes) // EGRESS_WARN_STEP_BYTES
-    ):
+    if EGRESS_WARN_STEP_BYTES > 0 and (total // EGRESS_WARN_STEP_BYTES) != ((total - nbytes) // EGRESS_WARN_STEP_BYTES):
         logger.warning(
             "egress: %s bytes have left storage this cycle (%s): %.1f GB against an "
             "allowance of x%g stored bytes - check the free-egress policy before it is "
@@ -771,7 +767,9 @@ class S3AsyncBackend(AsyncStorageBackend):
                 if self._use_aioboto3:
                     async with self._session.client("s3", **self._client_kwargs()) as client:
                         resp = await client.get_object(
-                            Bucket=self.bucket, Key=key, Range=range_header,
+                            Bucket=self.bucket,
+                            Key=key,
+                            Range=range_header,
                         )
                         body = await resp["Body"].read()
                     os.makedirs(os.path.dirname(dest_path) or ".", exist_ok=True)
@@ -782,11 +780,11 @@ class S3AsyncBackend(AsyncStorageBackend):
                 if boto3 is None:
                     raise RuntimeError("boto3 is required for S3 operations when aioboto3 is not installed")
 
-                def _sync_range():
+                # ``range_header`` is bound as a default so the thread reads this
+                # attempt's range rather than whatever the next iteration set.
+                def _sync_range(range_header=range_header):
                     client = boto3.client("s3", **self._client_kwargs())
-                    resp = client.get_object(
-                        Bucket=self.bucket, Key=key, Range=range_header,
-                    )
+                    resp = client.get_object(Bucket=self.bucket, Key=key, Range=range_header)
                     return resp["Body"].read()
 
                 body = await asyncio.to_thread(_sync_range)

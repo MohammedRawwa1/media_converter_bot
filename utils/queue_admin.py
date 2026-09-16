@@ -393,9 +393,7 @@ async def _drop_stale_batches(redis, report: QueueReport, bot=None) -> None:
     """
     from utils import batch_pipeline
 
-    summary = await batch_pipeline.purge_stale_batches(
-        redis, cancelled_job_ids=report.job_ids, reason=CANCEL_REASON
-    )
+    summary = await batch_pipeline.purge_stale_batches(redis, cancelled_job_ids=report.job_ids, reason=CANCEL_REASON)
     report.batches = len(summary["batches"])
     report.batch_keys = int(summary["keys"])
     report.batch_tombstones = int(summary.get("tombstones", 0))

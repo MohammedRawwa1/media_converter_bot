@@ -98,6 +98,7 @@ def test_egress_warns_once_per_step_not_once_per_byte(monkeypatch, caplog):
 
 def test_period_is_the_utc_month():
     """A billing cycle is a calendar month, so the counter rolls over on the 1st."""
+
     def _at(*parts):
         return calendar.timegm((*parts, 0, 0, 0))
 

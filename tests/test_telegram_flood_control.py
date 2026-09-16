@@ -15,6 +15,7 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
+from source_helpers import read_source
 from telegram.error import RetryAfter
 
 from utils import rate_limiter
@@ -411,9 +412,7 @@ class FloodGatedRequestTests(unittest.IsolatedAsyncioTestCase):
     async def test_a_gated_chat_raises_without_touching_the_network(self):
         await self.gate.note(27565, self.gate.scope_for_chat(-1004400932750))
 
-        _result, calls, exc = await self._call(
-            "sendMessage", self._data(chat_id=-1004400932750, text="hi")
-        )
+        _result, calls, exc = await self._call("sendMessage", self._data(chat_id=-1004400932750, text="hi"))
 
         self.assertEqual(calls, 0)
         self.assertIsInstance(exc, RetryAfter)
@@ -461,9 +460,7 @@ class FloodGatedRequestTests(unittest.IsolatedAsyncioTestCase):
         """A DM's chat_id is the user's own id - the case from the incident."""
         await self.gate.note(26903, self.gate.scope_for_chat(1405333465))
 
-        _result, calls, exc = await self._call(
-            "sendMessage", self._data(chat_id="1405333465", text="done")
-        )
+        _result, calls, exc = await self._call("sendMessage", self._data(chat_id="1405333465", text="done"))
 
         self.assertEqual(calls, 0)
         self.assertIsInstance(exc, RetryAfter)
@@ -505,10 +502,8 @@ class FloodGatedRequestTests(unittest.IsolatedAsyncioTestCase):
 
     def test_the_bot_and_the_worker_both_use_it(self):
         """Wiring, asserted from source: a call site that forgets it is silent."""
-        with open(os.path.join(PROJECT_ROOT, "main.py"), encoding="utf-8") as fh:
-            self.assertIn("FloodGatedRequest", fh.read())
-        with open(os.path.join(PROJECT_ROOT, "workers", "ffmpeg_worker.py"), encoding="utf-8") as fh:
-            worker_src = fh.read()
+        self.assertIn("FloodGatedRequest", read_source("main.py"))
+        worker_src = read_source("workers", "ffmpeg_worker.py")
         self.assertIn("request=flood_gated_request()", worker_src)
         self.assertEqual(worker_src.count("Bot(token=bot_token,"), worker_src.count("request=flood_gated_request()"))
 
@@ -832,8 +827,7 @@ class DeferredDeliveryTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(len(windows), 1)
         self.assertGreater(list(windows.values())[0], 26000)
-        with open(os.path.join(PROJECT_ROOT, "main.py"), encoding="utf-8") as fh:
-            self.assertIn('"telegram_flood": flood', fh.read())
+        self.assertIn('"telegram_flood": flood', read_source("main.py"))
 
     async def test_the_health_count_follows_the_queue(self):
         self.assertEqual(await self.deferred.pending(), 0)
@@ -843,15 +837,13 @@ class DeferredDeliveryTests(unittest.IsolatedAsyncioTestCase):
 
     def test_the_worker_never_fails_a_job_it_deferred(self):
         """Wiring, asserted from source: a deferral must not finalize as error."""
-        with open(os.path.join(PROJECT_ROOT, "workers", "ffmpeg_worker.py"), encoding="utf-8") as fh:
-            src = fh.read()
+        src = read_source("workers", "ffmpeg_worker.py")
 
         self.assertIn("if _deferred_window:", src)
         self.assertIn('_final_status = "processing"', src)
         self.assertIn("delivery_deferred", src)
         # The bot's watcher only reaches the result if the hash says processing.
-        with open(os.path.join(PROJECT_ROOT, "handlers.py"), encoding="utf-8") as fh:
-            handlers_src = fh.read()
+        handlers_src = read_source("handlers.py")
         self.assertIn("_terminal_pending_since", handlers_src)
         self.assertIn("_FLOOD_TERMINAL_MAX_WAIT_SECONDS", handlers_src)
 
@@ -900,9 +892,7 @@ class CoalescerGateMismatchTests(unittest.IsolatedAsyncioTestCase):
 
         # Both the bot's safe_edit path and the worker's _set_batch_message
         # check the gate before editing.  The gate is open for both.
-        self.assertTrue(asyncio.get_event_loop().run_until_complete(
-            gate.should_drop_inline(scope)
-        ))
+        self.assertTrue(asyncio.get_event_loop().run_until_complete(gate.should_drop_inline(scope)))
 
     def test_coalescer_skip_does_not_block_when_gate_is_open(self):
         """The coalescer pacing is process-local; the gate is the backstop."""
@@ -913,9 +903,7 @@ class CoalescerGateMismatchTests(unittest.IsolatedAsyncioTestCase):
         # The coalescer says "skip" (recent edit), but the gate is closed.
         coalescer.record(-100, 1, "old text")
         self.assertTrue(coalescer.should_skip(-100, 1, "new text"))
-        self.assertFalse(asyncio.get_event_loop().run_until_complete(
-            gate.should_drop_inline(scope)
-        ))
+        self.assertFalse(asyncio.get_event_loop().run_until_complete(gate.should_drop_inline(scope)))
 
     def test_worker_edit_not_seen_by_bot_coalescer(self):
         """The worker edits the batch bar; the bot's coalescer doesn't pace it."""
@@ -938,11 +926,10 @@ class CoalescerGateMismatchTests(unittest.IsolatedAsyncioTestCase):
         # Simulate a very short window.
         asyncio.get_event_loop().run_until_complete(gate.note(0.01, scope))
         import time
+
         time.sleep(0.02)
 
-        self.assertFalse(asyncio.get_event_loop().run_until_complete(
-            gate.should_drop_inline(scope)
-        ))
+        self.assertFalse(asyncio.get_event_loop().run_until_complete(gate.should_drop_inline(scope)))
 
     def test_concurrent_updates_does_not_break_coalescer(self):
         """With concurrent_updates, two handlers for the same message are safe

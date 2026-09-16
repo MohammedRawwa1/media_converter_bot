@@ -234,9 +234,7 @@ class CleanupManager:
         its own, longer TTL, and sweeping it here is what silently turned every
         repeat of the same media back into a fresh download plus upload.
         """
-        return await self._cleanup_s3_prefix(
-            "inputs/", self.s3_input_ttl, exclude_prefixes=(LIBRARY_KEY_PREFIX,)
-        )
+        return await self._cleanup_s3_prefix("inputs/", self.s3_input_ttl, exclude_prefixes=(LIBRARY_KEY_PREFIX,))
 
     async def cleanup_s3_library(self) -> int:
         """Clean cached library objects older than ``S3_LIBRARY_TTL``.
@@ -293,8 +291,7 @@ class CleanupManager:
             to_delete = [
                 obj["key"]
                 for obj in objects
-                if (now - obj["last_modified"]) > max_age_seconds
-                and not obj["key"].startswith(tuple(exclude_prefixes))
+                if (now - obj["last_modified"]) > max_age_seconds and not obj["key"].startswith(tuple(exclude_prefixes))
             ]
 
             if not to_delete:

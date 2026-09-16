@@ -291,9 +291,7 @@ def test_format_shows_capacity_on_the_admin_dashboard(monkeypatch):
     monkeypatch.setattr(batch_pipeline, "MAX_CONCURRENT_FFMPEG", 1)
     payload = summarize(jobs=[], queued=[], waiting=0, delayed=0, online_ids=[])
     payload["redis"] = {"connected": True, "ping_ms": 1.0, "error": None}
-    payload["capacity"] = summarize_capacity(
-        slots_used=1, worker_rss={"w1": 300 * 1024 * 1024}
-    )
+    payload["capacity"] = summarize_capacity(slots_used=1, worker_rss={"w1": 300 * 1024 * 1024})
 
     text = format_status(payload, is_admin=True)
 
@@ -306,9 +304,7 @@ def test_format_warns_when_a_worker_is_over_the_ceiling(monkeypatch):
     monkeypatch.setattr(batch_pipeline, "MEMORY_CEILING_BYTES", 100 * 1024 * 1024)
     payload = summarize(jobs=[], queued=[], waiting=0, delayed=0, online_ids=[])
     payload["redis"] = {"connected": True, "ping_ms": 1.0, "error": None}
-    payload["capacity"] = summarize_capacity(
-        slots_used=1, worker_rss={"w1": 150 * 1024 * 1024}
-    )
+    payload["capacity"] = summarize_capacity(slots_used=1, worker_rss={"w1": 150 * 1024 * 1024})
 
     text = format_status(payload, is_admin=True)
     assert "over ceiling by <b>50.0 MB</b>" in text
@@ -653,9 +649,7 @@ def _keyboard_rows(keyboard):
 
 
 def test_status_keyboard_offers_refresh_to_everyone():
-    assert _keyboard_rows(status_keyboard(is_admin=False)) == [
-        [refresh_data()]
-    ]
+    assert _keyboard_rows(status_keyboard(is_admin=False)) == [[refresh_data()]]
 
 
 def test_status_keyboard_gives_admins_a_separate_restart_row():

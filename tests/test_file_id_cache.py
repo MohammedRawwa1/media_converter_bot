@@ -13,7 +13,6 @@ This test suite verifies:
 - Graceful fallback when Redis is unavailable
 """
 
-import asyncio
 import os
 import tempfile
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -59,9 +58,7 @@ class TestFileIdCacheContentIdentity:
             temp_path = f.name
 
         try:
-            identity = file_id_cache._compute_content_hash(
-                file_unique_id="UID123", file_path=temp_path
-            )
+            identity = file_id_cache._compute_content_hash(file_unique_id="UID123", file_path=temp_path)
             assert identity == "uid:UID123"
         finally:
             os.unlink(temp_path)
@@ -151,7 +148,6 @@ class TestFileIdCacheStorage:
     async def test_invalidate_file_id(self):
         """Test invalidating a cached file_id."""
         file_unique_id = "test_unique_id_789"
-        content_identity = file_id_cache._compute_content_hash(file_unique_id=file_unique_id)
 
         mock_cache = AsyncMock()
         mock_cache.delete.return_value = True
@@ -209,9 +205,7 @@ class TestFileIdCacheSendCachedMedia:
         file_unique_id = "source_unique_id"
         cached_file_id = "cached_telegram_file_id"
 
-        with patch(
-            "utils.file_id_cache.get_file_id", return_value=cached_file_id
-        ):
+        with patch("utils.file_id_cache.get_file_id", return_value=cached_file_id):
             result = await file_id_cache.send_cached_media(
                 mock_bot,
                 chat_id=456,
@@ -249,10 +243,9 @@ class TestFileIdCacheSendCachedMedia:
             temp_path = f.name
 
         try:
-            with patch(
-                "utils.file_id_cache.get_file_id", return_value=None
-            ), patch(
-                "utils.file_id_cache.store_file_id", return_value=True
+            with (
+                patch("utils.file_id_cache.get_file_id", return_value=None),
+                patch("utils.file_id_cache.store_file_id", return_value=True),
             ):
                 result = await file_id_cache.send_cached_media(
                     mock_bot,
@@ -409,18 +402,24 @@ class TestFileIdCacheIntegration:
 
             for chat_id in user_chats:
                 # Mock the cache for each call
-                with patch("utils.file_id_cache._get_cache") as mock_get_cache, \
-                     patch("utils.file_id_cache.get_file_id") as mock_get_file_id, \
-                     patch("utils.file_id_cache.store_file_id") as mock_store_file_id:
+                with (
+                    patch("utils.file_id_cache._get_cache") as mock_get_cache,
+                    patch("utils.file_id_cache.get_file_id") as mock_get_file_id,
+                    patch("utils.file_id_cache.store_file_id") as mock_store_file_id,
+                ):
 
-                    async def mock_get_file_id_fn(media_type, file_unique_id=None, file_path=None, content_identity=None):
+                    async def mock_get_file_id_fn(
+                        media_type, file_unique_id=None, file_path=None, content_identity=None
+                    ):
                         nonlocal cache_miss
                         if cache_miss:
                             cache_miss = False
                             return None  # Cache miss
                         return stored_file_id  # Cache hit - stored_file_id is now "cached_..."
 
-                    async def mock_store_file_id_fn(media_type, file_id, file_unique_id=None, file_path=None, content_identity=None, ttl=None):
+                    async def mock_store_file_id_fn(
+                        media_type, file_id, file_unique_id=None, file_path=None, content_identity=None, ttl=None
+                    ):
                         nonlocal stored_file_id
                         # Store with a "cached_" prefix to distinguish from fresh uploads
                         stored_file_id = f"cached_{file_id}"
@@ -431,7 +430,7 @@ class TestFileIdCacheIntegration:
                     mock_cache = AsyncMock()
                     mock_get_cache.return_value = mock_cache
 
-                    result = await file_id_cache.send_cached_media(
+                    await file_id_cache.send_cached_media(
                         mock_bot,
                         chat_id=chat_id,
                         media_type="video",
@@ -441,18 +440,19 @@ class TestFileIdCacheIntegration:
                         caption="Welcome to the bot!",
                     )
 
-
-
             # First user: cache miss (uploaded fresh)
-            assert call_log[0]["used_cached"] is False, \
+            assert call_log[0]["used_cached"] is False, (
                 f"Expected cache miss on first call, got used_cached={call_log[0]['used_cached']}"
+            )
 
             # Subsequent users: cache hit (used cached file_id)
             for i in range(1, len(call_log)):
-                assert call_log[i]["used_cached"] is True, \
+                assert call_log[i]["used_cached"] is True, (
                     f"Expected cache hit on call {i}, got used_cached={call_log[i]['used_cached']}"
-                assert call_log[i]["used_file_id"].startswith("cached_"), \
+                )
+                assert call_log[i]["used_file_id"].startswith("cached_"), (
                     f"Expected cached file_id on call {i}, got {call_log[i]['used_file_id']}"
+                )
 
             # Verify only one fresh upload happened (the first call)
             fresh_uploads = [c for c in call_log if c["used_cached"] is False]
@@ -472,15 +472,12 @@ class TestFileIdCacheIntegration:
 
         temp_paths = []
         try:
-            for i, content in enumerate([content1, content2]):
+            for content in (content1, content2):
                 with tempfile.NamedTemporaryFile(mode="wb", delete=False, suffix=".mp4") as f:
                     f.write(content)
                     temp_paths.append(f.name)
 
-            identities = [
-                file_id_cache._compute_content_hash(file_path=p)
-                for p in temp_paths
-            ]
+            identities = [file_id_cache._compute_content_hash(file_path=p) for p in temp_paths]
 
             # Each file should have a unique identity
             assert len(set(identities)) == 2

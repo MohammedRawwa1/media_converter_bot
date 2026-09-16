@@ -60,6 +60,7 @@ except Exception:  # pragma: no cover - PTB request layer unavailable
     def flood_gated_request(**kwargs):
         return None
 
+
 try:
     from utils.storage import get_storage_backend
 except Exception:
@@ -71,6 +72,8 @@ except Exception:  # pragma: no cover - accounting is optional, never fatal
 
     async def record_source_cache(*_args, **_kwargs):
         return {}
+
+
 try:
     from utils.rate_limiter import ConversionRateLimiterRedis
 
@@ -159,6 +162,8 @@ async def _cache_file_id(
     except Exception:
         logger.debug("ffmpeg_worker: file_id cache store failed, will re-upload next time")
         return False
+
+
 # Cache for output probe results to avoid double ffprobe/thumbnail generation.
 # Keyed by output file path; values are (video_meta, thumb_path).
 _output_probe_cache: dict[str, tuple[dict | None, str | None]] = {}
@@ -173,9 +178,7 @@ _output_probe_cache: dict[str, tuple[dict | None, str | None]] = {}
 # at all, so a stalled one held the batch lock and the only conversion slot for
 # good, freezing every later member of its batch with nothing reported anywhere.
 STORAGE_DOWNLOAD_TIMEOUT_SECONDS = float(os.environ.get("STORAGE_DOWNLOAD_TIMEOUT_SECONDS", "900"))
-STORAGE_DOWNLOAD_MIN_BYTES_PER_SECOND = float(
-    os.environ.get("STORAGE_DOWNLOAD_MIN_BYTES_PER_SECOND", str(256 * 1024))
-)
+STORAGE_DOWNLOAD_MIN_BYTES_PER_SECOND = float(os.environ.get("STORAGE_DOWNLOAD_MIN_BYTES_PER_SECOND", str(256 * 1024)))
 STORAGE_DOWNLOAD_MAX_SECONDS = float(os.environ.get("STORAGE_DOWNLOAD_MAX_SECONDS", str(6 * 3600)))
 
 
@@ -1261,9 +1264,7 @@ async def handle_job(job: dict):
             # attacker-supplied original_filenames can't inject odd suffixes
             # into the on-disk temp path.
             ext = file_utils.safe_extension(job.get("original_filename") or "", "")
-        temp_input_path = _library_source_cache_path(input_key, ext) or os.path.join(
-            temp_dir, f"{job_id}_src{ext}"
-        )
+        temp_input_path = _library_source_cache_path(input_key, ext) or os.path.join(temp_dir, f"{job_id}_src{ext}")
         # A cache location lives in its own per-hash directory; the per-job path
         # shares the existing temp dir. create the one that's missing.
         with contextlib.suppress(Exception):
@@ -1391,7 +1392,8 @@ async def handle_job(job: dict):
                     job_id,
                 )
                 await _set_job_state(
-                    job_id, "error",
+                    job_id,
+                    "error",
                     "the source is missing from storage",
                     progress=0,
                 )
@@ -1425,7 +1427,9 @@ async def handle_job(job: dict):
         _probe_slice_path = f"{temp_input_path}.probe"
         try:
             range_ok = await backend.download_range(
-                input_key, _probe_slice_path, end=2_097_151,
+                input_key,
+                _probe_slice_path,
+                end=2_097_151,
             )
             if range_ok and os.path.exists(_probe_slice_path) and os.path.getsize(_probe_slice_path) > 0:
                 from utils.ffmpeg_runner import probe_media
@@ -1438,7 +1442,8 @@ async def handle_job(job: dict):
                         job_id,
                     )
                     await _set_job_state(
-                        job_id, "error",
+                        job_id,
+                        "error",
                         "source appears corrupt or unsupported",
                         progress=0,
                     )
@@ -2240,7 +2245,9 @@ async def handle_job(job: dict):
                                                     _td = tempfile.mkdtemp(prefix="worker_thumb_")
                                                     _tp = os.path.join(_td, "thumb.jpg")
                                                     _img = _PILImg.open(str(_existing_thumb))
-                                                    _img.thumbnail((_THUMB_MAX_EDGE, _THUMB_MAX_EDGE), _PILImg.Resampling.LANCZOS)
+                                                    _img.thumbnail(
+                                                        (_THUMB_MAX_EDGE, _THUMB_MAX_EDGE), _PILImg.Resampling.LANCZOS
+                                                    )
                                                     _img.save(_tp, "JPEG", quality=85, optimize=True)
                                                     if os.path.exists(_tp) and os.path.getsize(_tp) > 0:
                                                         _thumb_path = _tp
@@ -2272,7 +2279,9 @@ async def handle_job(job: dict):
                                                     from PIL import Image as _PILImg
 
                                                     _img = _PILImg.open(_thumb_path)
-                                                    _img.thumbnail((_THUMB_MAX_EDGE, _THUMB_MAX_EDGE), _PILImg.Resampling.LANCZOS)
+                                                    _img.thumbnail(
+                                                        (_THUMB_MAX_EDGE, _THUMB_MAX_EDGE), _PILImg.Resampling.LANCZOS
+                                                    )
                                                     _img.save(_thumb_path, "JPEG", quality=85, optimize=True)
                                                 except ImportError:
                                                     pass  # Pillow not available; use ffmpeg output as-is
@@ -2355,9 +2364,7 @@ async def handle_job(job: dict):
                                 finally:
                                     await r.close()
                             except Exception:
-                                logger.debug(
-                                    "ffmpeg worker: could not record the local result path for %s", job_id
-                                )
+                                logger.debug("ffmpeg worker: could not record the local result path for %s", job_id)
                     except Exception:
                         logger.debug("ffmpeg worker: operation failed")
 
@@ -2696,7 +2703,9 @@ async def handle_job(job: dict):
                                                         title=os.path.splitext(_delivery_name)[0],
                                                         filename=_delivery_name,
                                                         performer="",
-                                                        duration=int(_vid_duration) if _vid_duration is not None else None,
+                                                        duration=int(_vid_duration)
+                                                        if _vid_duration is not None
+                                                        else None,
                                                     )
                                             elif kind == "video":
                                                 # Try to attach thumbnail (thumb) when available
@@ -3411,9 +3420,7 @@ async def handle_job(job: dict):
                         source="worker",
                     )
                     # Same reason as above: the hash is what the bot reads.
-                    await _set_job_state(
-                        job_id, "error", "processing failed", progress=0, channel=progress_channel
-                    )
+                    await _set_job_state(job_id, "error", "processing failed", progress=0, channel=progress_channel)
                     return
             finally:
                 ACTIVE_JOBS.dec()
@@ -3512,9 +3519,7 @@ async def _maybe_stop_for_restart(allow_restart: bool, *, force: bool = False) -
         return False
     await _consume_forced_restart(force=force)
     if batch_pipeline.restart_requested():
-        logger.warning(
-            "Exiting so the container restarts with a clean heap (no job in flight)"
-        )
+        logger.warning("Exiting so the container restarts with a clean heap (no job in flight)")
         return True
     return False
 
@@ -3653,10 +3658,7 @@ def _batch_view_rows(batches) -> list[str]:
             continue
         if total <= 0:
             continue
-        rows.append(
-            f"{batch_pipeline.progress_bar(done, total)} {done}/{total}"
-            f"  #{str(row.get('batch_id', ''))[:8]}"
-        )
+        rows.append(f"{batch_pipeline.progress_bar(done, total)} {done}/{total}  #{str(row.get('batch_id', ''))[:8]}")
         if len(rows) >= batch_pipeline.BATCH_VIEW_MAX_ROWS:
             break
     return rows
@@ -3690,9 +3692,7 @@ def _batch_cancel_keyboard(batch_id):
     try:
         from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
-        return InlineKeyboardMarkup(
-            [[InlineKeyboardButton("⏹️ Stop batch", callback_data=f"batch_cancel:{batch_id}")]]
-        )
+        return InlineKeyboardMarkup([[InlineKeyboardButton("⏹️ Stop batch", callback_data=f"batch_cancel:{batch_id}")]])
     except Exception:
         return None
 
@@ -3746,9 +3746,7 @@ async def _set_batch_message(bot, r, batch_id, chat_id, stored, text):
         # while a flood window is open. min_interval=0 because every report here is
         # a discrete event (file n of m finished): dropping one would leave the bar
         # a file behind. Only an exact repeat of the current text is skipped.
-        if telegram_edit_coalescer.should_skip(
-            _edit_chat_id, _edit_message_id, text, min_interval=0.0
-        ):
+        if telegram_edit_coalescer.should_skip(_edit_chat_id, _edit_message_id, text, min_interval=0.0):
             return stored
         if await telegram_flood_gate.should_drop_inline(_flood_scope):
             return stored
@@ -3834,9 +3832,7 @@ async def _batch_live_progress(job: dict) -> None:
                         state["done"], state["total"], name=name, pct=pct, batches=state["batches"]
                     )
                     if text != last_text:
-                        state["stored"] = await _set_batch_message(
-                            bot, r, batch_id, chat_id, state["stored"], text
-                        )
+                        state["stored"] = await _set_batch_message(bot, r, batch_id, chat_id, state["stored"], text)
                         last_text = text
                 except asyncio.CancelledError:
                     raise
@@ -3892,9 +3888,7 @@ async def _report_batch_progress(job: dict) -> None:
             with contextlib.suppress(Exception):
                 await r.expire(done_key, int(batch_pipeline.BATCH_STATE_TTL_SECONDS))
         else:
-            logger.debug(
-                "ffmpeg worker: job %s already counted toward batch %s", job.get("job_id"), batch_id
-            )
+            logger.debug("ffmpeg worker: job %s already counted toward batch %s", job.get("job_id"), batch_id)
             done = int(await r.get(done_key) or 0)
         state = await _batch_state(r, batch_id, job)
         total = state["total"]
@@ -4161,9 +4155,7 @@ async def _rabbitmq_consumer_supervisor(stop_event: asyncio.Event | None = None)
         except asyncio.CancelledError:
             raise
         except Exception:
-            logger.exception(
-                "eventbus: RabbitMQ consumer crashed; restarting in %.0fs", backoff
-            )
+            logger.exception("eventbus: RabbitMQ consumer crashed; restarting in %.0fs", backoff)
             try:
                 await asyncio.sleep(backoff)
             except asyncio.CancelledError:

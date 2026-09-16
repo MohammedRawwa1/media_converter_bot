@@ -6,6 +6,8 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
+from source_helpers import read_source
+
 from utils import userbot_downloader as mod
 
 
@@ -61,7 +63,6 @@ class UserbotDownloaderTests(unittest.IsolatedAsyncioTestCase):
         client.get_messages.assert_awaited_once()
         download_mock.assert_awaited_once()
 
-
     def test_the_telethon_path_feeds_the_stall_watch(self):
         """Telethon's progress callback is what proves a download is still alive.
 
@@ -70,8 +71,7 @@ class UserbotDownloaderTests(unittest.IsolatedAsyncioTestCase):
         was killed as "stalled" at DOWNLOAD_STALL_SECONDS while running perfectly
         well - and restarted from zero on the next attempt.
         """
-        with open(mod.__file__, encoding="utf-8") as fh:
-            source = fh.read()
+        source = read_source("utils", "userbot_downloader.py")
 
         self.assertIn('"progress_callback": _watch.wrap(progress_callback)', source)
         # Once for the Pyrogram path, once for Telethon: every stall-guarded
@@ -91,9 +91,7 @@ class UserbotDownloaderTests(unittest.IsolatedAsyncioTestCase):
                     progress(1, 1)
                 return "crawled.mp4"
 
-            result = await mod._wait_download_or_stall(
-                asyncio.create_task(crawling_download()), watch
-            )
+            result = await mod._wait_download_or_stall(asyncio.create_task(crawling_download()), watch)
 
         self.assertEqual(result, "crawled.mp4")
 
@@ -107,9 +105,7 @@ class UserbotDownloaderTests(unittest.IsolatedAsyncioTestCase):
                 return "never.mp4"
 
             with self.assertRaises(TimeoutError):
-                await mod._wait_download_or_stall(
-                    asyncio.create_task(silent_download()), watch
-                )
+                await mod._wait_download_or_stall(asyncio.create_task(silent_download()), watch)
 
 
 if __name__ == "__main__":

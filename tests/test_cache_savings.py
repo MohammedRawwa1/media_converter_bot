@@ -17,6 +17,8 @@ import pytest
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
+from source_helpers import read_source  # noqa: E402
+
 from utils import media_cache, session_status, storage  # noqa: E402
 
 
@@ -29,10 +31,8 @@ def _clean_counters():
 
 
 def _read(rel: str) -> str:
-    """Source of a repo file, from the test file's own location."""
-    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    with open(os.path.join(root, rel), encoding="utf-8") as fh:
-        return fh.read()
+    """Source of a repo file, flattened so a reformat cannot break a match."""
+    return read_source(rel)
 
 
 def _no_redis(monkeypatch):
@@ -217,7 +217,7 @@ def test_fetcher_and_ingest_fall_back_to_a_per_job_key():
 def test_ingest_hands_the_worker_a_local_path_when_it_keeps_the_file():
     ingest = _read("tools/telethon_ingest.py")
     assert "_local_hint" in ingest
-    assert '**_local_hint' in ingest
+    assert "**_local_hint" in ingest
 
 
 def test_ingest_derives_an_identity_from_a_message():

@@ -17,6 +17,8 @@ import pytest
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
+from source_helpers import read_object_source  # noqa: E402
+
 from tasks import cleanup_tasks as cleanup_mod  # noqa: E402
 from utils import media_cache  # noqa: E402
 from workers import ffmpeg_worker  # noqa: E402
@@ -77,7 +79,7 @@ def test_shared_cache_detection_matches_only_the_library_copy():
 
 def test_job_reuses_the_cache_and_keeps_it_after_the_job():
     """The source is downloaded into the cache, then deliberately not deleted."""
-    src = inspect.getsource(ffmpeg_worker.handle_job)
+    src = read_object_source(ffmpeg_worker.handle_job)
     # The reuse check runs before the download and short-circuits it.
     assert "_shared_cache_path = _library_source_cache_path(input_key)" in src
     assert "reusing shared local source cache" in src
@@ -90,9 +92,9 @@ def test_job_reuses_the_cache_and_keeps_it_after_the_job():
 
 def test_downloads_land_atomically_so_the_cache_cannot_hold_half_a_media():
     """A cut connection must not leave a truncated file for later jobs to reuse."""
-    src = inspect.getsource(ffmpeg_worker.handle_job)
+    src = read_object_source(ffmpeg_worker.handle_job)
     assert "os.replace(_part_path, temp_input_path)" in src
-    assert 'backend.download_file(input_key, _part_path)' in src
+    assert "backend.download_file(input_key, _part_path)" in src
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -217,7 +219,7 @@ def test_audio_probe_returns_none_rather_than_a_partial_dict(tmp_path, monkeypat
 
 
 def test_delivery_sites_pass_the_audio_tags_through():
-    src = inspect.getsource(ffmpeg_worker.handle_job)
+    src = read_object_source(ffmpeg_worker.handle_job)
     assert src.count("audio_meta=_pre_am") == 2
     assert src.count("_probe_audio_delivery(out, _delivery_name)") == 2
 

@@ -1016,8 +1016,7 @@ def setup_handlers(application: Application) -> None:
 
         job_id = args[0]
         await update.message.reply_text(
-            f"⚠️ *Cancel job* `{job_id}`?\n"
-            "The worker stops at its next checkpoint and the job is discarded.",
+            f"⚠️ *Cancel job* `{job_id}`?\nThe worker stops at its next checkpoint and the job is discarded.",
             parse_mode="Markdown",
             reply_markup=confirm_keyboard("canceljob", payload=job_id),
         )
@@ -1057,7 +1056,9 @@ def setup_handlers(application: Application) -> None:
             # cancel_batch takes the batch's whole Redis state with it (counters,
             # membership, the resume record and the members' dedup keys), so a
             # stopped batch is never left behind for the stale-Redis sweep to find.
-            report = await cancel_batch(batch_id=batch_id, requested_by=getattr(reply.update.effective_user, "id", None))
+            report = await cancel_batch(
+                batch_id=batch_id, requested_by=getattr(reply.update.effective_user, "id", None)
+            )
             _ref = report.get("message")
             if _ref:
                 with contextlib.suppress(Exception):
@@ -1306,9 +1307,7 @@ def setup_handlers(application: Application) -> None:
         is_admin = _admin_only(update)
 
         note = await update.message.reply_text(
-            "🩺 Testing sessions live — connecting to Telegram..."
-            if live
-            else "📊 Collecting status..."
+            "🩺 Testing sessions live — connecting to Telegram..." if live else "📊 Collecting status..."
         )
         keyboard = status_keyboard(is_admin=is_admin, live=live)
         try:
@@ -1461,9 +1460,7 @@ def setup_handlers(application: Application) -> None:
         raise ApplicationHandlerStop
 
     application.add_handler(
-        CallbackQueryHandler(
-            latency_wrapper(session_status_callback, "session_status_callback"), pattern=r"^st:"
-        ),
+        CallbackQueryHandler(latency_wrapper(session_status_callback, "session_status_callback"), pattern=r"^st:"),
         group=-1,
     )
 
@@ -1571,14 +1568,20 @@ async def main(background: bool = False) -> None:
             read_timeout=http_read_timeout,
         )
         bot_instance = Bot(token=BOT_TOKEN, request=req)
-        application = Application.builder().bot(bot_instance).concurrent_updates(
-            int(os.environ.get("CONCURRENT_UPDATES", "8"))
-        ).build()
+        application = (
+            Application.builder()
+            .bot(bot_instance)
+            .concurrent_updates(int(os.environ.get("CONCURRENT_UPDATES", "8")))
+            .build()
+        )
     except Exception:
         # Fallback to default behavior
-        application = Application.builder().token(BOT_TOKEN).concurrent_updates(
-            int(os.environ.get("CONCURRENT_UPDATES", "8"))
-        ).build()
+        application = (
+            Application.builder()
+            .token(BOT_TOKEN)
+            .concurrent_updates(int(os.environ.get("CONCURRENT_UPDATES", "8")))
+            .build()
+        )
 
     # Allow forcing polling even when WEBHOOK_URL is set (useful for local/dev runs)
     force_polling = os.environ.get("FORCE_POLLING", "").lower() in ("1", "true", "yes")
@@ -1812,7 +1815,9 @@ async def main(background: bool = False) -> None:
             if _existing_json.get("telethon_session") != _telethon_env:
                 await save_session_string_to_file_async(_telethon_env, client_type="telethon")
             if _admin_persist_id:
-                await save_session_string_to_file_async(_telethon_env, client_type="telethon", user_id=_admin_persist_id)
+                await save_session_string_to_file_async(
+                    _telethon_env, client_type="telethon", user_id=_admin_persist_id
+                )
                 if _mongo_db is not None:
                     await _mongo_db.save_session(
                         _admin_persist_id,

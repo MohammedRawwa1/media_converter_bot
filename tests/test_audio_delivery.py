@@ -4,11 +4,22 @@ import ast
 import contextlib
 import inspect
 import os
-import re
 import tempfile
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
+
+from source_helpers import (
+    call_keywords,
+    called_methods,
+    called_string_args,
+    compared_literals,
+    defined_functions,
+    find_function,
+    literal_dict,
+    parse_source,
+    read_source,
+)
 
 from handlers import (
     _BULK_COMPRESS_CRF_DEFAULT,
@@ -245,7 +256,15 @@ class BulkQualityTests(unittest.TestCase):
         self.assertEqual(plan["output_ext"], ".mp3")
 
     def test_extract_bitrate_honors_the_chosen_value(self):
-        for chosen, expected in (("64k", "64k"), ("96k", "96k"), ("192k", "192k"), ("320k", "320k"), (192, "192k"), (" 128K ", "128k"), ("128kbps", "128k")):
+        for chosen, expected in (
+            ("64k", "64k"),
+            ("96k", "96k"),
+            ("192k", "192k"),
+            ("320k", "320k"),
+            (192, "192k"),
+            (" 128K ", "128k"),
+            ("128kbps", "128k"),
+        ):
             plan = _resolve_bulk_plan({"bulk_extract_audio": True, "bulk_extract_bitrate": chosen})
             args = self._args(plan)
             self.assertEqual(args[args.index("-ab") + 1], expected, msg=repr(chosen))
@@ -265,9 +284,7 @@ class BulkQualityTests(unittest.TestCase):
         self.assertEqual(compress["ffmpeg_args"][compress["ffmpeg_args"].index("-b:a") + 1], "128k")
 
     def test_extract_bitrate_survives_rename(self):
-        plan = _resolve_bulk_plan(
-            {"bulk_extract_audio": True, "bulk_rename": True, "bulk_extract_bitrate": "96k"}
-        )
+        plan = _resolve_bulk_plan({"bulk_extract_audio": True, "bulk_rename": True, "bulk_extract_bitrate": "96k"})
         args = self._args(plan)
         self.assertEqual(args[args.index("-ab") + 1], "96k")
         self.assertTrue(plan["rename"])
@@ -429,15 +446,13 @@ class BulkSettingsStoreTests(unittest.TestCase):
             self.assertEqual(_read_bulk_settings(7, None), {})
 
     def test_apply_summary_reports_the_quality(self):
-        with open(os.path.join(PROJECT_ROOT, "handlers.py"), encoding="utf-8") as fh:
-            src = fh.read()
+        src = read_source("handlers.py")
         self.assertIn("_bulk_quality_label(_plan)", src)
         self.assertIn("_read_bulk_settings(user_id, sess)", src)
 
     def test_delivery_caption_uses_the_chosen_bitrate(self):
         """The message the user receives must not keep claiming 128k."""
-        with open(os.path.join(PROJECT_ROOT, "handlers.py"), encoding="utf-8") as fh:
-            src = fh.read()
+        src = read_source("handlers.py")
         self.assertIn("f\"✅ Audio extracted ({_plan['extract_bitrate']})\"", src)
         self.assertNotIn('f"✅ Audio extracted ({_DEFAULT_AUDIO_BITRATE})"', src)
 
@@ -477,8 +492,7 @@ class BulkCollectTests(unittest.TestCase):
             self.assertIsNone(_normalize_bulk_item(junk))
 
     def test_bulk_apply_reads_the_collected_list(self):
-        with open(os.path.join(PROJECT_ROOT, "handlers.py"), encoding="utf-8") as fh:
-            src = fh.read()
+        src = read_source("handlers.py")
         self.assertIn('sess.get("bulk_list") or sess.get("merge_list")', src)
         self.assertIn("_ensure_bulk_file_downloaded(", src)
 
@@ -512,9 +526,7 @@ class AlbumCollectTests(unittest.IsolatedAsyncioTestCase):
         handler = self._handler()
         session = {}
         self.assertFalse(
-            await handler._buffer_album_item(
-                self._update(None), SimpleNamespace(bot=None), session, 7, "video"
-            )
+            await handler._buffer_album_item(self._update(None), SimpleNamespace(bot=None), session, 7, "video")
         )
         self.assertFalse(session.get("album_batch"))
 
@@ -525,9 +537,7 @@ class AlbumCollectTests(unittest.IsolatedAsyncioTestCase):
         context = SimpleNamespace(bot=SimpleNamespace())
 
         for _ in range(3):
-            self.assertTrue(
-                await handler._buffer_album_item(self._update("g1"), context, session, 7, "video")
-            )
+            self.assertTrue(await handler._buffer_album_item(self._update("g1"), context, session, 7, "video"))
 
         entry = session["album_batch"]["g1"]
         self.assertEqual(entry["count"], 3)
@@ -559,17 +569,15 @@ class AlbumCollectTests(unittest.IsolatedAsyncioTestCase):
 
     def test_every_media_handler_registers_before_buffering(self):
         """The album is only a *view* of the batch; registration must come first."""
-        with open(os.path.join(PROJECT_ROOT, "handlers.py"), encoding="utf-8") as fh:
-            src = fh.read()
+        src = read_source("handlers.py")
         self.assertEqual(src.count('_register_bulk_file(session, session["current_file"])'), 3)
         self.assertEqual(src.count("await self._buffer_album_item(update, context, session, user_id"), 4)
 
     def test_photos_join_the_batch_too(self):
         """Photos are queued like video/audio/document so one Apply covers all."""
-        with open(os.path.join(PROJECT_ROOT, "handlers.py"), encoding="utf-8") as fh:
-            src = fh.read()
+        src = read_source("handlers.py")
         self.assertIn("_register_bulk_file(session, _photo_entry)", src)
-        self.assertIn('"type": "photo",', src)
+        self.assertIn('"type": "photo"', src)
 
 
 class PhotoBatchTests(unittest.TestCase):
@@ -598,8 +606,7 @@ class PhotoBatchTests(unittest.TestCase):
         self.assertFalse(_bulk_photo_supported(None))
 
     def test_apply_loop_guards_photos(self):
-        with open(os.path.join(PROJECT_ROOT, "handlers.py"), encoding="utf-8") as fh:
-            src = fh.read()
+        src = read_source("handlers.py")
         self.assertIn('if f.get("type") == "photo" and not _photo_ok:', src)
         self.assertIn("Skipped {photo_skipped} photo(s)", src)
 
@@ -836,17 +843,15 @@ class JobNameAuditTests(unittest.TestCase):
         self.assertEqual(missing, [], f"job dicts without original_filename at lines {missing}")
 
     def test_url_jobs_derive_the_name_from_the_url(self):
-        with open(os.path.join(PROJECT_ROOT, "handlers.py"), encoding="utf-8") as fh:
-            src = fh.read()
+        src = read_source("handlers.py")
         # Both URL entry points: /bulk_url and the pasted-URL handler.
         self.assertGreaterEqual(src.count('"original_filename": filename_from_url(url)'), 2)
 
     def test_extraction_archive_names_the_zip(self):
-        with open(os.path.join(PROJECT_ROOT, "handlers.py"), encoding="utf-8") as fh:
-            src = fh.read()
+        src = read_source("handlers.py")
         # extract_streams delivers ``archive_path``, not ``output_path``, so the
         # archive name has to be carried explicitly.
-        self.assertIn('"output_filename": _streams_name,', src)
+        self.assertIn('"output_filename": _streams_name', src)
 
 
 class StoredJobNamingTests(unittest.TestCase):
@@ -983,8 +988,7 @@ class EnqueueNamingPersistenceTests(unittest.TestCase):
 
     def test_worker_restores_them_from_the_hash(self):
         """The worker's fallback must still read a requeue's missing name back."""
-        with open(os.path.join(PROJECT_ROOT, "workers", "ffmpeg_worker.py"), encoding="utf-8") as fh:
-            src = fh.read()
+        src = read_source("workers", "ffmpeg_worker.py")
         self.assertIn('_sval("original_filename")', src)
         self.assertIn('_sval("output_filename")', src)
 
@@ -1023,31 +1027,27 @@ class EnqueueNamingPersistenceTests(unittest.TestCase):
     def test_requeue_scripts_carry_the_name_instead_of_relying_on_the_hash(self):
         """The requeue tooling must pass the name on the payload it builds."""
         for relative in (
-            os.path.join("scripts", "requeue_job.py"),
-            os.path.join("scripts", "requeue_missing_jobs_once.py"),
-            os.path.join("scripts", "forward_auto_reenrich.py"),
+            ("scripts", "requeue_job.py"),
+            ("scripts", "requeue_missing_jobs_once.py"),
+            ("scripts", "forward_auto_reenrich.py"),
         ):
-            with open(os.path.join(PROJECT_ROOT, relative), encoding="utf-8") as fh:
-                src = fh.read()
-            self.assertIn("carry_over_job_naming", src, relative)
+            self.assertIn("carry_over_job_naming", read_source(*relative), "/".join(relative))
 
     def test_requeue_lpush_fallback_keeps_the_naming_fields(self):
         """The fallback must push the full payload, not a stripped-down one."""
-        with open(os.path.join(PROJECT_ROOT, "scripts", "requeue_missing_jobs_once.py"), encoding="utf-8") as fh:
-            src = fh.read()
+        src = read_source("scripts", "requeue_missing_jobs_once.py")
         self.assertNotIn('json.dumps({"job_id": job_id, "input_key": remote_key})', src)
-        self.assertIn('json.dumps(job)', src)
+        self.assertIn("json.dumps(job)", src)
 
     def test_requeue_job_script_exposes_a_name_override(self):
-        with open(os.path.join(PROJECT_ROOT, "scripts", "requeue_job.py"), encoding="utf-8") as fh:
-            src = fh.read()
+        src = read_source("scripts", "requeue_job.py")
         self.assertIn('"--name"', src)
         self.assertIn("stored_job_naming", src)
 
     def test_worker_bot_api_audio_send_includes_duration(self):
-        with open(os.path.join(PROJECT_ROOT, "workers", "ffmpeg_worker.py"), encoding="utf-8") as fh:
-            src = fh.read()
-        self.assertIn("duration=int(_vid_duration) if _vid_duration is not None else None", src)
+        """Checked on the call itself, so wrapping the argument cannot hide it."""
+        durations = call_keywords(parse_source("workers", "ffmpeg_worker.py"), "send_audio", "duration")
+        self.assertIn("int(_vid_duration) if _vid_duration is not None else None", durations)
 
 
 class StoredJobOwnerTests(unittest.TestCase):
@@ -1080,12 +1080,10 @@ class StoredJobOwnerTests(unittest.TestCase):
 
     def test_requeue_scripts_carry_the_owner(self):
         for relative in (
-            os.path.join("scripts", "requeue_job.py"),
-            os.path.join("scripts", "requeue_missing_jobs_once.py"),
+            ("scripts", "requeue_job.py"),
+            ("scripts", "requeue_missing_jobs_once.py"),
         ):
-            with open(os.path.join(PROJECT_ROOT, relative), encoding="utf-8") as fh:
-                src = fh.read()
-            self.assertIn("carry_over_job_owners", src, relative)
+            self.assertIn("carry_over_job_owners", read_source(*relative), "/".join(relative))
 
 
 class MergeAudiosDeliveryTests(unittest.TestCase):
@@ -1175,20 +1173,15 @@ class MenuTriggerCoverageTests(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        with open(os.path.join(PROJECT_ROOT, "handlers.py"), encoding="utf-8") as fh:
-            src = fh.read()
-        start = src.index("async def callback_handler")
-        end = src.find("\n    async def ", start + 10)
-        body = src[start : end if end != -1 else len(src)]
+        # Read the dispatch out of the syntax tree, not the text: moving the
+        # method, re-indenting it or re-wrapping a line must not change the
+        # triggers seen here.
+        tree = parse_source("handlers.py")
+        callback = find_function(tree, "callback_handler")
 
-        cls.matchers = [("eq", m.group(1)) for m in re.finditer(r'data == "([^"]+)"', body)]
-        cls.matchers += [("prefix", m.group(1)) for m in re.finditer(r'data\.startswith\("([^"]+)"\)', body)]
-
-        cls.aliases = {}
-        alias_match = re.search(r"aliases = \{(.*?)\n        \}", body, re.S)
-        if alias_match:
-            for m in re.finditer(r'"([^"]+)"\s*:\s*"([^"]+)"', alias_match.group(1)):
-                cls.aliases[m.group(1)] = m.group(2)
+        cls.matchers = [("eq", value) for value in compared_literals(callback, "data")]
+        cls.matchers += [("prefix", value) for value in called_string_args(callback, "data.startswith")]
+        cls.aliases = literal_dict(callback, "aliases")
 
     def _is_dispatched(self, callback_data):
         data = self.aliases.get(callback_data, callback_data)
@@ -1247,13 +1240,10 @@ class MenuTriggerCoverageTests(unittest.TestCase):
         self.assertEqual(unhandled, [], "unhandled menu triggers:\n" + "\n".join(unhandled))
 
     def test_every_dispatched_handler_method_exists(self):
-        with open(os.path.join(PROJECT_ROOT, "handlers.py"), encoding="utf-8") as fh:
-            src = fh.read()
-        defined = set(re.findall(r"^\s*(?:async )?def (\w+)\(", src, re.M))
-        start = src.index("async def callback_handler")
-        end = src.find("\n    async def ", start + 10)
-        body = src[start : end if end != -1 else len(src)]
-        called = set(re.findall(r"self\.(\w+)\(", body))
+        tree = parse_source("handlers.py")
+        callback = find_function(tree, "callback_handler")
+        defined = defined_functions(tree)
+        called = called_methods(callback, "self")
         self.assertEqual(
             sorted(m for m in called if m not in defined),
             [],

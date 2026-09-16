@@ -414,8 +414,7 @@ def _cause_table() -> tuple[tuple[type, str, str], ...]:
         (
             ClusterAuthorizationFailedError,
             "cluster_acl",
-            "A cluster-level ACL is missing: an idempotent producer needs IdempotentWrite "
-            "on the cluster resource.",
+            "A cluster-level ACL is missing: an idempotent producer needs IdempotentWrite on the cluster resource.",
         ),
         (
             UnknownTopicOrPartitionError,
@@ -423,7 +422,11 @@ def _cause_table() -> tuple[tuple[type, str, str], ...]:
             "The topic does not exist and auto-create is off. Create it on the broker, or "
             "grant Create on the cluster resource.",
         ),
-        (LeaderNotAvailableError, "topic_missing", "The topic has no leader; if it was just created, retry once it has one."),
+        (
+            LeaderNotAvailableError,
+            "topic_missing",
+            "The topic has no leader; if it was just created, retry once it has one.",
+        ),
         (InvalidTopicError, "config", "The topic name is not valid for this broker."),
         (KafkaConfigurationError, "config", "The client configuration was rejected; check the KAFKA_* variables."),
     )
@@ -581,9 +584,7 @@ async def preflight(
         # have makes the send retry until it times out, which then reads as a
         # network problem - the exact misdiagnosis this function exists to avoid.
         try:
-            partitions = await asyncio.wait_for(
-                producer.partitions_for(settings.kafka_topic), timeout=probe_timeout_s
-            )
+            partitions = await asyncio.wait_for(producer.partitions_for(settings.kafka_topic), timeout=probe_timeout_s)
         except Exception as exc:
             known = _known_topics(producer)
             if known is not None and settings.kafka_topic not in known:

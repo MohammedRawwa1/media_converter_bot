@@ -114,9 +114,7 @@ class WebRateLimiter:
         # most recently active half and drop the rest rather than evicting one per
         # request, which would just re-scan on every call at the cap.
         if len(self.buckets) > self.max_buckets:
-            keep = sorted(self.buckets.items(), key=lambda kv: kv[1][1], reverse=True)[
-                : self.max_buckets // 2
-            ]
+            keep = sorted(self.buckets.items(), key=lambda kv: kv[1][1], reverse=True)[: self.max_buckets // 2]
             removed += len(self.buckets) - len(keep)
             self.buckets = dict(keep)
         return removed

@@ -35,11 +35,9 @@ Usage:
 
 from __future__ import annotations
 
-import contextlib
 import hashlib
 import logging
 import os
-import time
 
 logger = logging.getLogger(__name__)
 
@@ -377,9 +375,8 @@ def _extract_file_id(message, media_type: str) -> str | None:
         elif media_type == "voice":
             if hasattr(message, "voice") and message.voice:
                 return message.voice.file_id
-        elif media_type == "sticker":
-            if hasattr(message, "sticker") and message.sticker:
-                return message.sticker.file_id
+        elif media_type == "sticker" and hasattr(message, "sticker") and message.sticker:
+            return message.sticker.file_id
     except Exception:
         logger.debug("file_id_cache: failed to extract file_id from message")
     return None

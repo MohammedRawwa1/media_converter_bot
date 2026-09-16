@@ -63,14 +63,10 @@ def test_mongodb_resolution_merges_client_sessions(monkeypatch, tmp_path):
     _reset_session_env(monkeypatch, tmp_path)
 
     telethon_value, _ = asyncio.run(
-        telethon_session._resolve_telethon_session_with_source(
-            user_id=42, db_model=FakeMergedDbModel({})
-        )
+        telethon_session._resolve_telethon_session_with_source(user_id=42, db_model=FakeMergedDbModel({}))
     )
     pyrogram_value, _ = asyncio.run(
-        telethon_session._resolve_pyrogram_session_with_source(
-            user_id=42, db_model=FakeMergedDbModel({})
-        )
+        telethon_session._resolve_pyrogram_session_with_source(user_id=42, db_model=FakeMergedDbModel({}))
     )
 
     assert telethon_value == "telethon-from-phone-a"
@@ -114,9 +110,7 @@ def test_per_user_json_outranks_stale_env(monkeypatch, tmp_path):
         telethon_session.save_session_string_to_file_async("fresh-json-session", client_type="telethon", user_id=42)
     )
 
-    value, source = asyncio.run(
-        telethon_session._resolve_telethon_session_with_source(user_id=42, db_model=None)
-    )
+    value, source = asyncio.run(telethon_session._resolve_telethon_session_with_source(user_id=42, db_model=None))
 
     assert value == "fresh-json-session"
     assert source == "json"
@@ -126,13 +120,9 @@ def test_pyrogram_per_user_json_outranks_stale_env(monkeypatch, tmp_path):
     _reset_session_env(monkeypatch, tmp_path)
     monkeypatch.setenv("PYROGRAM_SESSION", "stale-pyro-env")
 
-    asyncio.run(
-        telethon_session.save_session_string_to_file_async("fresh-pyro", client_type="pyrogram", user_id=42)
-    )
+    asyncio.run(telethon_session.save_session_string_to_file_async("fresh-pyro", client_type="pyrogram", user_id=42))
 
-    value, source = asyncio.run(
-        telethon_session._resolve_pyrogram_session_with_source(user_id=42, db_model=None)
-    )
+    value, source = asyncio.run(telethon_session._resolve_pyrogram_session_with_source(user_id=42, db_model=None))
 
     assert value == "fresh-pyro"
     assert source == "json"
@@ -159,9 +149,7 @@ def test_global_json_is_not_used_for_a_scoped_user(monkeypatch, tmp_path):
     asyncio.run(telethon_session.save_session_string_to_file_async("global-only", client_type="telethon"))
     telethon_session._invalidate_session_cache()
 
-    value, source = asyncio.run(
-        telethon_session._resolve_telethon_session_with_source(user_id=99, db_model=None)
-    )
+    value, source = asyncio.run(telethon_session._resolve_telethon_session_with_source(user_id=99, db_model=None))
     assert value is None
     assert source == "missing"
 
@@ -240,9 +228,7 @@ def test_restore_per_user_session_files_merges_per_phone_sessions(monkeypatch, t
 
     assert asyncio.run(telethon_session.restore_per_user_session_files(model)) == 1
     pyro, _ = asyncio.run(telethon_session._resolve_pyrogram_session_with_source(user_id=5, db_model=None))
-    tele, _ = asyncio.run(
-        telethon_session._resolve_telethon_session_with_source(user_id=5, db_model=None)
-    )
+    tele, _ = asyncio.run(telethon_session._resolve_telethon_session_with_source(user_id=5, db_model=None))
 
     assert pyro == "pyro-phone"
     assert tele == "telethon-phone"
@@ -263,9 +249,7 @@ def test_registered_db_model_covers_callers_that_pass_none(monkeypatch, tmp_path
     _reset_session_env(monkeypatch, tmp_path)
     telethon_session.set_db_model(FakeDbModel({"telethon_session": "from-registry"}))
 
-    value, source = asyncio.run(
-        telethon_session._resolve_telethon_session_with_source(user_id=11, db_model=None)
-    )
+    value, source = asyncio.run(telethon_session._resolve_telethon_session_with_source(user_id=11, db_model=None))
 
     assert (value, source) == ("from-registry", "mongodb")
 
@@ -274,9 +258,7 @@ def test_registered_db_model_is_used_for_pyrogram(monkeypatch, tmp_path):
     _reset_session_env(monkeypatch, tmp_path)
     telethon_session.set_db_model(FakeDbModel({"pyrogram_session": "pyro-registry"}))
 
-    value, source = asyncio.run(
-        telethon_session._resolve_pyrogram_session_with_source(user_id=11, db_model=None)
-    )
+    value, source = asyncio.run(telethon_session._resolve_pyrogram_session_with_source(user_id=11, db_model=None))
 
     assert (value, source) == ("pyro-registry", "mongodb")
 
@@ -309,7 +291,9 @@ def test_session_healthchecker_invalidates_stale_pyrogram_json_before_fallback(m
     """A dead per-user Pyrogram JSON entry should be cleared so MongoDB can supply the valid session."""
     _reset_session_env(monkeypatch, tmp_path)
 
-    asyncio.run(telethon_session.save_session_string_to_file_async("stale-json-session", client_type="pyrogram", user_id=42))
+    asyncio.run(
+        telethon_session.save_session_string_to_file_async("stale-json-session", client_type="pyrogram", user_id=42)
+    )
 
     checker = SessionHealthChecker(admin_user_id=42, db_model=FakeDbModel({"pyrogram_session": "fresh-mongo-session"}))
     session_str, source = asyncio.run(checker._invalidate_stale_pyrogram_session(user_id=42))
@@ -318,7 +302,9 @@ def test_session_healthchecker_invalidates_stale_pyrogram_json_before_fallback(m
     assert source == "mongodb"
 
     telethon_session.set_db_model(checker.db_model)
-    value, resolved_source = asyncio.run(telethon_session._resolve_pyrogram_session_with_source(user_id=42, db_model=None))
+    value, resolved_source = asyncio.run(
+        telethon_session._resolve_pyrogram_session_with_source(user_id=42, db_model=None)
+    )
     assert value == "fresh-mongo-session"
     assert resolved_source == "mongodb"
 
@@ -344,7 +330,9 @@ def test_session_healthchecker_persists_missing_per_user_pyrogram_json(monkeypat
             return None
 
     monkeypatch.setenv("PYROGRAM_SESSION", "live-session-string")
-    monkeypatch.setattr(telethon_session, "build_pyrogram_client", lambda api_id, api_hash, session_str=None: FakePyroClient())
+    monkeypatch.setattr(
+        telethon_session, "build_pyrogram_client", lambda api_id, api_hash, session_str=None: FakePyroClient()
+    )
     monkeypatch.setattr(telethon_session, "get_userbot_credentials", lambda: (123, "hash"))
 
     checker = SessionHealthChecker(admin_user_id=42, db_model=None)
@@ -364,9 +352,7 @@ def test_pyrogram_resolution_prefers_fresh_json_over_stale_mongodb(monkeypatch, 
     """A fresh per-user JSON session must outrank a stale durable MongoDB one."""
     _reset_session_env(monkeypatch, tmp_path)
 
-    asyncio.run(
-        telethon_session.save_session_string_to_file_async("fresh-json", client_type="pyrogram", user_id=42)
-    )
+    asyncio.run(telethon_session.save_session_string_to_file_async("fresh-json", client_type="pyrogram", user_id=42))
 
     value, source = asyncio.run(
         telethon_session._resolve_pyrogram_session_with_source(
@@ -441,9 +427,7 @@ def test_healthcheck_keeps_pyrogram_json_on_auth_failure(monkeypatch, tmp_path):
     """A failed check must report unhealthy and leave the per-user JSON untouched."""
     _reset_session_env(monkeypatch, tmp_path)
 
-    asyncio.run(
-        telethon_session.save_session_string_to_file_async("stored-good", client_type="pyrogram", user_id=42)
-    )
+    asyncio.run(telethon_session.save_session_string_to_file_async("stored-good", client_type="pyrogram", user_id=42))
 
     class AuthFailClient:
         storage = type("Storage", (), {"dc_id": lambda self: 4})()
@@ -460,9 +444,7 @@ def test_healthcheck_keeps_pyrogram_json_on_auth_failure(monkeypatch, tmp_path):
         async def export_session_string(self):
             return "never-saved"
 
-    monkeypatch.setattr(
-        telethon_session, "build_pyrogram_client", lambda *a, **k: AuthFailClient()
-    )
+    monkeypatch.setattr(telethon_session, "build_pyrogram_client", lambda *a, **k: AuthFailClient())
     monkeypatch.setattr(telethon_session, "get_userbot_credentials", lambda: (123, "hash"))
 
     checker = SessionHealthChecker(admin_user_id=42, db_model=FakeDbModel({}))

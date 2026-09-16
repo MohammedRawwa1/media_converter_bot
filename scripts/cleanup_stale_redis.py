@@ -31,12 +31,26 @@ except ImportError:
     print("ERROR: redis package is required")
     raise SystemExit(2) from None
 
-ACTIVE_STATUSES = frozenset({
-    "queued", "processing", "waiting", "started", "uploading", "sending",
-})
-TERMINAL_STATUSES = frozenset({
-    "done", "completed", "error", "failed", "cancelled", "canceled",
-})
+ACTIVE_STATUSES = frozenset(
+    {
+        "queued",
+        "processing",
+        "waiting",
+        "started",
+        "uploading",
+        "sending",
+    }
+)
+TERMINAL_STATUSES = frozenset(
+    {
+        "done",
+        "completed",
+        "error",
+        "failed",
+        "cancelled",
+        "canceled",
+    }
+)
 JOB_PREFIX = "ffmpeg:job:"
 BATCH_PREFIX = "ffmpeg:batch:"
 # Keys under the batch prefix that are not a batch id themselves.
@@ -84,7 +98,7 @@ def active_job_ids(r, selected_batch: str | None = None) -> tuple[set[str], dict
     hashes: dict[str, dict] = {}
     for raw_key in scan(r, f"{JOB_PREFIX}*"):
         key = text(raw_key)
-        job_id = key[len(JOB_PREFIX):]
+        job_id = key[len(JOB_PREFIX) :]
         stored = job_hash(r, job_id)
         hashes[job_id] = stored
         if selected_batch and stored.get("batch_id") != selected_batch:
@@ -195,7 +209,7 @@ def main() -> int:
     batch_ids: set[str] = set()
     for raw_key in scan(r, f"{BATCH_PREFIX}*"):
         key = text(raw_key)
-        suffix = key[len(BATCH_PREFIX):]
+        suffix = key[len(BATCH_PREFIX) :]
         batch_id = suffix.split(":", 1)[0]
         if batch_id and batch_id not in BATCH_NON_ID_SUFFIXES:
             batch_ids.add(batch_id)
