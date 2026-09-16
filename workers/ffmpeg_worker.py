@@ -1405,6 +1405,19 @@ async def handle_job(job: dict):
                 job_id,
             )
 
+        # ── HEAD size: fill in the timeout budget when the job hash lacks it ──
+        # The job hash's ``file_size`` field is the size Telegram reported at
+        # upload; if it was 0 or missing the download timeout falls back to the
+        # floor (1800 s).  A second HEAD (zero egress) lets us scale the
+        # timeout to the real object size.
+        if source_bytes <= 0:
+            try:
+                real_size = await backend.get_file_size(input_key)
+                if real_size and real_size > 0:
+                    source_bytes = real_size
+            except Exception:
+                pass
+
         # ── Range-probe: inspect the first 2 MB before pulling the whole file ──
         # Container headers (MP4 moov, MKV SegmentInfo, AVI RIFF header) live
         # in the first few MB.  ffprobe on a 2 MB slice catches most corrupt /
