@@ -2956,6 +2956,13 @@ async def _report_batch_progress(job: dict) -> None:
         # ``scripts/cleanup_stale_redis.py`` would show the same batch again.
         if await batch_pipeline.is_batch_cancelled(r, batch_id):
             return
+        # The same question for a batch that was taken down without a marker: a
+        # cancel-all tombstones only the batches that still had something to
+        # stop, so one that finished and was then swept as stale is gone with no
+        # marker at all. The INCR below would write its counter straight back,
+        # and the message after it would post a bar for a batch nothing owns.
+        if not await batch_pipeline.batch_owns_state(r, batch_id):
+            return
         # Count each job exactly once. A retried delivery runs this block again,
         # and a plain INCR would then count one file twice - finishing the batch
         # early and removing its bar while files were still queued.
@@ -3044,16 +3051,34 @@ async def _keep_claims_alive(job: dict, slot) -> None:
     freezing a batch at 0%). This heartbeat is the other half of that bargain:
     it is what keeps a legitimately long conversion's slot and batch lock alive
     for as long as the job actually runs.
+
+    It publishes this worker's *own* heartbeat on its own, faster timer. The
+    ghost-claim checks ask whether the claiming worker is still heartbeating to
+    tell a claim whose owner died mid-encode from one that is still converting,
+    and the only other publisher is the idle loop - which is not running while a
+    job is. Without this, a conversion longer than the heartbeat's TTL made its
+    own worker look dead: the next job stole the live claim and started a second
+    ffmpeg beside it, on a box whose whole design is one conversion at a time.
     """
     job_id = job.get("job_id")
     batch_id = batch_pipeline.job_batch_id(job)
+    # Both default to half a minute or more; the floors only stop a mis-set
+    # configuration from turning this into a hot loop.
+    heartbeat_every = max(0.01, _RSS_HEARTBEAT_SECONDS)
+    claim_every = max(0.01, batch_pipeline.CLAIM_HEARTBEAT_SECONDS)
+    next_claim_refresh = time.time() + claim_every
     try:
         r = await get_redis()
     except Exception:
         return
     try:
         while True:
-            await asyncio.sleep(batch_pipeline.CLAIM_HEARTBEAT_SECONDS)
+            await asyncio.sleep(heartbeat_every)
+            with contextlib.suppress(Exception):
+                await _publish_worker_rss()
+            if time.time() < next_claim_refresh:
+                continue
+            next_claim_refresh = time.time() + claim_every
             with contextlib.suppress(Exception):
                 await batch_pipeline.refresh_ffmpeg_slot(r, slot, job_id)
             if batch_id:

@@ -326,6 +326,31 @@ def test_cancel_all_takes_the_batches_down_and_deletes_their_bars(fake_redis):
     assert report.errors == []
 
 
+def test_cancel_all_leaves_nothing_for_the_offline_cleaner(fake_redis):
+    """A batch that finished before the cancel needs no marker, and no state left.
+
+    The marker exists to stop a member that is still running (or an apply that is
+    still feeding the batch). Every member here finished and was counted, so there
+    is nobody left to stop - and a ``:cancelled`` key no later run would ever clear
+    is exactly what ``scripts/cleanup_stale_redis.py`` kept finding after a
+    ``/cancelall`` on a completed batch.
+    """
+    r = fake_redis
+    _seed_batch(r, "batch-a", status="done")
+    r.strings[batch_pipeline.batch_total_key("batch-a")] = "1"
+    r.strings[batch_pipeline.batch_progress_key("batch-a")] = "1"
+
+    report = asyncio.run(cancel_all_jobs())
+
+    assert report.batches == 1
+    assert report.batch_tombstones == 0
+    for key in batch_pipeline.batch_state_keys("batch-a"):
+        assert key not in r.strings
+        assert key not in r.sets
+    assert batch_pipeline.batch_cancel_key("batch-a") not in r.strings
+    assert "batch-a" not in r.sets[batch_pipeline.ACTIVE_BATCHES_KEY]
+
+
 def test_cancel_all_counts_a_batch_whose_bar_is_already_gone(fake_redis):
     # The worker deletes a batch's message when it finishes, so a batch can be
     # perfectly stale with no bar left to remove.

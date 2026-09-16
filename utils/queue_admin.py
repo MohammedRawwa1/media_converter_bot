@@ -17,10 +17,12 @@ It also takes down the batch state those jobs belong to (``ffmpeg:batch:*``:
 counters, membership, the progress message's location, the resume record and the
 active set). Cancelling every job leaves no batch with a live member, so every
 batch is stale on the way out - which is why this replaces running
-``scripts/cleanup_stale_redis.py`` by hand after a cancel. Each batch is
-tombstoned as it goes so a worker still finishing one member cannot put its
-progress bar back, and the bar itself is deleted from the chat when a bot is
-passed in.
+``scripts/cleanup_stale_redis.py`` by hand after a cancel. Each batch is taken
+down, and a batch that still has something to stop - a member winding down, or an
+apply still feeding it - is tombstoned as it goes so neither can put its progress
+bar back; a batch whose members have all reported gets no marker, since one
+nothing acts on is a key the offline script keeps finding. The bar itself is
+deleted from the chat when a bot is passed in.
 
 Ghosted work goes with it: dedup keys of every kind (including the ``pending``
 placeholder an interrupted ingest leaves), tombstones old enough that no member

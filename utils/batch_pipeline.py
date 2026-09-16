@@ -378,9 +378,11 @@ async def mark_batch_file_done(redis=None, *, batch_id) -> int | None:
 async def cancel_batch(redis=None, *, batch_id, requested_by=None, ttl_seconds=None) -> dict:
     """Cancel one batch, remove its queued or delayed members and take its state down.
 
-    The marker is written first. A worker that already owns one job observes the
-    per-job cancel flag; every later member is discarded before it can acquire a
-    conversion slot or be deferred again.
+    The marker is written first, and only when it still has something to stop: a
+    worker that already owns one job observes the per-job cancel flag, and the
+    apply that is feeding the batch reads the marker before it queues the next
+    file. A batch that has already counted every member has neither, so it is
+    taken down without one - see :func:`_batch_needs_tombstone`.
 
     The batch's own keys go with it: counters, membership, the finished-entries
     record and the progress message's location, plus the batch's entry in every
@@ -393,9 +395,11 @@ async def cancel_batch(redis=None, *, batch_id, requested_by=None, ttl_seconds=N
     member's job hash now reads ``cancelled`` forever, so without this the file
     could never be converted again until the dedup key expired on its own.
 
-    What is deliberately *kept* is the tombstone: it is the only thing stopping
-    a worker that is still finishing one member from editing or reposting the
-    progress message, so it has to outlive everything else.
+    What is deliberately *kept* is the tombstone, where one was needed: it is the
+    only thing stopping a worker that is still finishing one member from editing
+    or reposting the progress message, so it has to outlive everything else. It is
+    not written for a batch that is already over, because a marker nothing can act
+    on is just a key the offline cleaner keeps reporting.
 
     The progress message's ``chat_id:message_id`` is returned in ``message`` so
     a caller with a bot can take the bar itself out of the chat.
@@ -410,9 +414,15 @@ async def cancel_batch(redis=None, *, batch_id, requested_by=None, ttl_seconds=N
     job_ids = []
     queued = delayed = dropped_dedup = 0
     try:
-        await redis.set(
-            batch_cancel_key(batch_id), batch_tombstone_value(requested_by or "user"), ex=ttl
-        )
+        # The marker is what stops a member that is still running (and an apply
+        # that is still feeding the batch) - so it is written while either is
+        # possible, and not for a batch that is already over. See
+        # :func:`_batch_needs_tombstone`: a marker with nothing behind it is one
+        # key more for ``scripts/cleanup_stale_redis.py`` to keep finding.
+        if await _batch_needs_tombstone(redis, batch_id):
+            await redis.set(
+                batch_cancel_key(batch_id), batch_tombstone_value(requested_by or "user"), ex=ttl
+            )
         from utils.job_queue import DELAYED_SET, JOB_LIST
 
         members = await redis.smembers(batch_jobs_key(batch_id))
@@ -759,7 +769,39 @@ def batch_state_keys(batch_id) -> tuple[str, ...]:
     )
 
 
-async def purge_batch(redis=None, *, batch_id, reason=BATCH_TOMBSTONE_REASON, ttl_seconds=None) -> dict:
+async def batch_owns_state(redis, batch_id) -> bool:
+    """Whether a batch still owns any state of its own, or a place in the view.
+
+    A batch has both from the moment the bot creates it - the expected count is
+    published, and the aggregate view is told about it, before the first job is
+    queued - so a batch with neither has been taken down (stopped by hand, or
+    swept as stale). That is the question a *late* report has to ask before it
+    writes anything: re-creating the counter puts the batch back in Redis for
+    ``/cancelall`` to find all over again, and posting its bar puts a message back
+    that nothing owns and nothing will ever take down.
+
+    Its tombstone deliberately does not count: that key outlives the state. An
+    unreadable Redis answers ``True``, so a hiccup can never silence progress.
+    """
+    if not batch_id:
+        return False
+    try:
+        if await redis.exists(*batch_state_keys(batch_id)):
+            return True
+        listed = await redis.smembers(ACTIVE_BATCHES_KEY)
+        return any(_job_text(value) == str(batch_id) for value in listed or ())
+    except Exception:
+        return True
+
+
+async def purge_batch(
+    redis=None,
+    *,
+    batch_id,
+    reason=BATCH_TOMBSTONE_REASON,
+    ttl_seconds=None,
+    fence=None,
+) -> dict:
     """Take one batch down: tombstone it first, then drop everything it owns.
 
     Order matters. The tombstone stops a worker that is still finishing a member
@@ -767,6 +809,12 @@ async def purge_batch(redis=None, *, batch_id, reason=BATCH_TOMBSTONE_REASON, tt
     message's location is forgotten. The location itself is *returned* rather
     than deleted from the chat, because removing a Telegram message needs a bot
     and this module deliberately has none.
+
+    ``fence`` is the caller's answer to "does this batch still have anything to
+    stop"; ``None`` means it was not asked and the marker is written. See
+    :func:`_batch_needs_tombstone` - a batch that is already over needs no marker,
+    and leaving one behind is what made ``/cancelall`` hand work back to
+    ``scripts/cleanup_stale_redis.py``.
     """
     result = {"batch_id": str(batch_id or ""), "keys": 0, "message": None}
     if not batch_id:
@@ -778,8 +826,11 @@ async def purge_batch(redis=None, *, batch_id, reason=BATCH_TOMBSTONE_REASON, tt
 
             redis = await get_redis()
         ttl = max(1, int(ttl_seconds or BATCH_STATE_TTL_SECONDS))
-        with contextlib.suppress(Exception):
-            await redis.set(batch_cancel_key(batch_id), batch_tombstone_value(reason), ex=ttl)
+        if fence is None:
+            fence = await _batch_needs_tombstone(redis, batch_id)
+        if fence:
+            with contextlib.suppress(Exception):
+                await redis.set(batch_cancel_key(batch_id), batch_tombstone_value(reason), ex=ttl)
         with contextlib.suppress(Exception):
             stock = await redis.get(batch_message_key(batch_id))
             result["message"] = parse_batch_message_ref(stock) if stock else None
@@ -812,6 +863,12 @@ async def purge_stale_batches(
     member on that list cannot keep its batch alive even if its hash still reads
     active, which is what covers a cancel whose flag write failed.
 
+    Each batch taken down is tombstoned only if it still has something to stop
+    (a member running, or an apply still feeding it) - see
+    :func:`_batch_needs_tombstone`. A batch whose members have all reported needs
+    no marker, and a marker left behind is a key ``/cancelall`` then hands back to
+    ``scripts/cleanup_stale_redis.py`` on every later run.
+
     Returns ``{batches, keys, messages, kept}``, where ``messages`` are the
     ``(chat_id, message_id)`` pairs the caller should delete from the chat.
     """
@@ -827,7 +884,11 @@ async def purge_stale_batches(
                 summary["kept"] += 1
                 continue
             purged = await purge_batch(
-                redis, batch_id=batch_id, reason=reason, ttl_seconds=ttl_seconds
+                redis,
+                batch_id=batch_id,
+                reason=reason,
+                ttl_seconds=ttl_seconds,
+                fence=await _batch_needs_tombstone(redis, batch_id, cancelled_job_ids),
             )
             summary["batches"].append(batch_id)
             summary["keys"] += purged["keys"]
@@ -846,6 +907,66 @@ async def purge_stale_batches(
         if own and redis is not None:
             with contextlib.suppress(Exception):
                 await redis.close()
+
+
+def _counters_say_finished(done, total) -> bool:
+    """Whether a batch's own counters account for every member it queued.
+
+    ``:done`` is advanced by each member that *reports*, whether it succeeded or
+    failed, so this says "nothing is left to run and nothing is left to report" -
+    not "everything worked". A missing, unreadable or zero counter cannot say that,
+    and neither can a batch that has not queued its first job yet; all of those
+    keep the marker, which is the direction that cannot lose work.
+    """
+    try:
+        finished, expected = int(_job_text(done)), int(_job_text(total))
+    except (TypeError, ValueError):
+        return False
+    return expected > 0 and finished >= expected
+
+
+async def _batch_needs_tombstone(redis, batch_id, cancelled_job_ids=None) -> bool:
+    """Whether taking this batch down still has anything to stop.
+
+    The tombstone is how a batch says "this is over": the worker still finishing a
+    member reads it before it edits or reposts the progress message, and an apply
+    that is still feeding the batch reads it before it queues the next file. It is
+    needed while either of those is possible, and the batch's own state says so:
+
+    * it has not finished counting - ``:done`` has not reached ``:total`` - so a
+      member may still be reporting, or the apply may still have files to queue;
+    * a member was cancelled by this run, whose hash is now terminal and so
+      invisible to the liveness check; or
+    * something already tombstoned it - a stop by hand writes the marker as it
+      flags the running member, and that member keeps winding down.
+
+    A batch with none of those is over: every member finished and was counted, so
+    there is nobody left to stop. Leaving a marker behind for it is what made
+    ``/cancelall`` look incomplete - the next ``scripts/cleanup_stale_redis.py``
+    run found a ``:cancelled`` key no run would ever clear, because the batch it
+    belonged to no longer existed.
+    """
+    try:
+        if await redis.exists(batch_cancel_key(batch_id)):
+            return True
+    except Exception:
+        return True
+    known_dead = {str(value) for value in (cancelled_job_ids or ())}
+    if known_dead:
+        try:
+            members = {
+                _job_text(value) for value in await redis.smembers(batch_jobs_key(batch_id))
+            }
+        except Exception:
+            return True
+        if members & known_dead:
+            return True
+    try:
+        done = await redis.get(batch_progress_key(batch_id))
+        total = await redis.get(batch_total_key(batch_id))
+    except Exception:
+        return True
+    return not _counters_say_finished(done, total)
 
 
 async def purge_stale_tombstones(redis=None, *, grace_seconds=None) -> int:

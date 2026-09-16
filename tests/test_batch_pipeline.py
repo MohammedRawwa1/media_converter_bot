@@ -310,6 +310,9 @@ class _ProgressRedis:
     async def smembers(self, key):
         return set(self.sets.get(key, set()))
 
+    async def exists(self, *keys):
+        return sum(1 for key in keys if key in self.store or key in self.sets)
+
     async def incr(self, key):
         self.store[key] = int(self.store.get(key, 0)) + 1
         return self.store[key]
@@ -380,6 +383,13 @@ class BatchProgressMessageTests(unittest.IsolatedAsyncioTestCase):
     async def _report(self, job, redis):
         from workers import ffmpeg_worker as worker
 
+        # The bot publishes a batch's expected count before it queues its first
+        # job, and the worker reports only for a batch that still owns its state,
+        # so a real report always has that key behind it.
+        redis.store.setdefault(
+            batch_pipeline.batch_total_key("b1"),
+            str(job.get(batch_pipeline.BATCH_TOTAL_FIELD) or 0),
+        )
         bot = _FakeBot()
         with patch.object(worker, "Bot", lambda *a, **k: bot), patch.object(
             worker, "get_redis", _returning(redis)
@@ -486,6 +496,22 @@ class BatchProgressMessageTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("✅ clip.mp4", _batch_progress_text(4, 12, name="clip.mp4"))
         self.assertNotIn("clip.mp4", _batch_progress_text(4, 12))
 
+    async def test_a_batch_that_was_taken_down_is_never_reported_again(self):
+        # Nothing left in Redis for this batch: a cancel-all swept it as stale
+        # after its last file. The INCR below would write its counter straight
+        # back, and the message after that would post a bar nothing owns.
+        from workers import ffmpeg_worker as worker
+
+        redis = _ProgressRedis()
+        bot = _FakeBot()
+        with patch.object(worker, "Bot", lambda *a, **k: bot), patch.object(
+            worker, "get_redis", _returning(redis)
+        ), patch.object(worker.config, "BOT_TOKEN", "tok", create=True):
+            await worker._report_batch_progress(self._job(total=3))
+
+        self.assertEqual(bot.sent, [])
+        self.assertEqual(redis.store, {})
+
     async def test_progress_never_raises_when_redis_is_down(self):
         from workers import ffmpeg_worker as worker
 
@@ -494,6 +520,65 @@ class BatchProgressMessageTests(unittest.IsolatedAsyncioTestCase):
 
         with patch.object(worker, "get_redis", _boom):
             await worker._report_batch_progress(self._job())
+
+
+class ClaimHeartbeatTests(unittest.IsolatedAsyncioTestCase):
+    """A worker that is busy is still alive, and has to keep saying so.
+
+    The ghost-claim checks tell a claim whose owner died mid-encode from a live one
+    by asking whether its worker still heartbeats. The idle loop is the only other
+    publisher, and it is not running while a job is - so a conversion longer than
+    the heartbeat's TTL used to make its own worker look dead, and the next job
+    stole the live claim and started a second ffmpeg beside it.
+    """
+
+    async def test_a_running_job_publishes_the_heartbeat_on_its_own_timer(self):
+        from workers import ffmpeg_worker as worker
+
+        heartbeats: list[float] = []
+        claims: list[str] = []
+        locks: list[str] = []
+
+        class _Redis:
+            async def close(self):
+                return None
+
+        async def _get_redis():
+            return _Redis()
+
+        async def _publish(*args, **kwargs):
+            heartbeats.append(time.time())
+
+        async def _refresh(*args, **kwargs):
+            claims.append("slot")
+            return True
+
+        async def _refresh_lock(*args, **kwargs):
+            locks.append("batch")
+            return True
+
+        with patch.object(worker, "get_redis", _get_redis), patch.object(
+            worker, "_RSS_HEARTBEAT_SECONDS", 0.02
+        ), patch.object(worker, "_publish_worker_rss", _publish), patch.object(
+            batch_pipeline, "CLAIM_HEARTBEAT_SECONDS", 0.05
+        ), patch.object(batch_pipeline, "refresh_ffmpeg_slot", _refresh), patch.object(
+            batch_pipeline, "refresh_batch_lock", _refresh_lock
+        ):
+            task = asyncio.create_task(
+                worker._keep_claims_alive(batch_pipeline.tag_batch_job({"job_id": "j1"}, "b1", 0, 2), 0)
+            )
+            await asyncio.sleep(0.16)
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+
+        # The heartbeat keeps ticking for the whole job...
+        self.assertGreaterEqual(len(heartbeats), 3)
+        # ...while the slot and the batch lock are re-armed on their own, slower
+        # timer, and neither is re-armed as often as the heartbeat.
+        self.assertGreaterEqual(len(claims), 1)
+        self.assertEqual(len(locks), len(claims))
+        self.assertLess(len(claims), len(heartbeats))
 
 
 class WorkerRestartRequestTests(unittest.IsolatedAsyncioTestCase):

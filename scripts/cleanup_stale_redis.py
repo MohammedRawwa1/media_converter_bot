@@ -219,12 +219,18 @@ def main() -> int:
         for suffix in BATCH_STATE_SUFFIXES:
             key = f"{BATCH_PREFIX}{batch_id}{suffix}"
             if r.exists(key):
-                report_or_delete(r, key, apply=args.apply, reason="batch", count=counts)
+                # The tombstone is not batch state: it is the marker a stop leaves
+                # while a member may still be running, so it gets its own line.
+                # ``/cancelall`` no longer writes one for a batch that was already
+                # over, which is why a run against a healthy Redis should now
+                # report neither of these.
+                reason = "batch tombstone" if suffix == ":cancelled" else "batch"
+                report_or_delete(r, key, apply=args.apply, reason=reason, count=counts)
         # Membership outside the batch's own keys: the aggregate view, and every
         # user's resume record. Left behind, both keep pointing at a batch whose
-        # state is gone. (/cancelall keeps the ``:cancelled`` tombstone instead of
-        # deleting it, because a worker may still be finishing a member; this
-        # script only runs where nothing is.)
+        # state is gone. (/cancelall keeps the ``:cancelled`` tombstone while a
+        # worker could still be finishing a member or an apply could still be
+        # feeding the batch; this script only runs where nothing is.)
         # Checked with SISMEMBER and only removed under --apply: a dry run used to
         # call SREM outright, so previewing quietly took the batch out of the
         # aggregate view and out of every user's resume record while printing
@@ -238,7 +244,7 @@ def main() -> int:
                 print(f"  {'DELETE' if args.apply else 'STALE'} resume member {batch_id} of {text(resume_key)}")
 
     print("Summary:")
-    for name in ("queue", "delayed", "lock", "slot", "dedup", "batch", "batch lock"):
+    for name in ("queue", "delayed", "lock", "slot", "dedup", "batch", "batch tombstone", "batch lock"):
         print(f"  {name}: {counts[name]}")
     if not args.apply:
         print("No data was deleted. Re-run with --apply to remove these stale entries.")

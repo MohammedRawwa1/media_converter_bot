@@ -12,6 +12,7 @@ record. Two things matter and are the reason this has its own file:
 """
 
 import asyncio
+import json
 import time
 
 from utils import batch_pipeline, job_queue
@@ -27,10 +28,35 @@ class FakeRedis:
         self.strings: dict[str, str] = {}
         self.sets: dict[str, set[str]] = {}
         self.hashes: dict[str, dict[str, str]] = {}
+        self.lists: dict[str, list[str]] = {}
+        self.zsets: dict[str, list[str]] = {}
         self.unreadable_sets: set[str] = set()
 
     async def get(self, key):
         return self.strings.get(key)
+
+    async def hset(self, key, mapping=None, **kwargs):
+        fields = {**dict(mapping or {}), **kwargs}
+        self.hashes.setdefault(key, {}).update({str(k): str(v) for k, v in fields.items()})
+        return len(fields)
+
+    async def eval(self, script, numkeys, *args):
+        """Stands in for the prune script: drops this batch's queue members."""
+        key, batch_id = str(args[0]), str(args[1])
+        items = list(self.lists.get(key, []))
+        kept = [item for item in items if str(json.loads(item).get("batch_id")) != batch_id]
+        self.lists[key] = kept
+        return len(items) - len(kept)
+
+    async def zrange(self, key, start, stop):
+        values = self.zsets.get(key, [])
+        return values[start:] if stop == -1 else values[start : stop + 1]
+
+    async def zrem(self, key, *values):
+        members = self.zsets.get(key, [])
+        before = len(members)
+        self.zsets[key] = [item for item in members if item not in set(values)]
+        return before - len(self.zsets[key])
 
     async def set(self, key, value, nx=False, px=None, ex=None):
         self.strings[key] = str(value)
@@ -64,7 +90,11 @@ class FakeRedis:
         return self.hashes.get(key, {}).get(field)
 
     async def exists(self, *keys):
-        return sum(1 for key in keys if key in self.strings or key in self.sets or key in self.hashes)
+        return sum(
+            1
+            for key in keys
+            if key in self.strings or key in self.sets or key in self.hashes or key in self.lists
+        )
 
     def scan_iter(self, match="*", count=None):
         prefix = match[:-1] if match and match.endswith("*") else match
@@ -158,6 +188,17 @@ def test_purge_batch_without_an_id_is_a_no_op(monkeypatch):
     assert asyncio.run(batch_pipeline.purge_batch(r, batch_id=None))["keys"] == 0
 
 
+def test_purge_batch_can_skip_the_marker_nothing_needs(monkeypatch):
+    r = FakeRedis()
+    _seed_batch(r, "batch-a", members=["j1"], statuses={"j1": FINISHED})
+    _use(monkeypatch, r)
+
+    purged = asyncio.run(batch_pipeline.purge_batch(r, batch_id="batch-a", fence=False))
+
+    assert purged["keys"] > 0
+    assert r.strings.get(batch_pipeline.batch_cancel_key("batch-a")) is None
+
+
 # ── the sweep ───────────────────────────────────────────────────────────
 
 
@@ -173,6 +214,65 @@ def test_sweep_clears_a_batch_whose_jobs_are_all_finished(monkeypatch):
     assert summary["keys"] > 0
     # The resume record must not keep pointing at a batch that no longer exists.
     assert r.sets.get("ffmpeg:batch:resume:42") == set()
+
+
+def test_sweep_leaves_no_marker_for_a_batch_that_counted_everything(monkeypatch):
+    """The reported bug: ``/cancelall`` left a ``:cancelled`` key for a batch that
+    was already over, and ``scripts/cleanup_stale_redis.py`` kept finding it.
+
+    Every member finished and was counted, so no worker (and no apply feeding the
+    batch) is left to stop: a marker here has nothing behind it, and the batch it
+    names no longer exists - so no later run would ever clear it.
+    """
+    r = FakeRedis()
+    _seed_batch(
+        r,
+        "batch-a",
+        members=["j1", "j2"],
+        statuses={"j1": FINISHED, "j2": FINISHED},
+        total=2,
+        done=2,
+    )
+    _use(monkeypatch, r)
+
+    summary = asyncio.run(batch_pipeline.purge_stale_batches(r))
+
+    assert summary["batches"] == ["batch-a"]
+    assert not [key for key in r.strings if key.startswith("ffmpeg:batch:")]
+    assert r.strings.get(batch_pipeline.batch_cancel_key("batch-a")) is None
+
+
+def test_sweep_fences_a_batch_it_cancelled_a_member_of(monkeypatch):
+    # Covers the run that stops a member itself: its hash is written terminal, so
+    # only the member list the caller hands in still shows it could be running -
+    # and a worker that is still winding that member down must find the marker.
+    r = FakeRedis()
+    _seed_batch(
+        r,
+        "batch-a",
+        members=["j1", "j2"],
+        statuses={"j1": "cancelled", "j2": FINISHED},
+        total=2,
+        done=2,
+    )
+    _use(monkeypatch, r)
+
+    summary = asyncio.run(batch_pipeline.purge_stale_batches(r, cancelled_job_ids=["j1"]))
+
+    assert summary["batches"] == ["batch-a"]
+    assert r.strings.get(batch_pipeline.batch_cancel_key("batch-a"))
+
+
+def test_sweep_fences_a_batch_that_has_not_counted_everything(monkeypatch):
+    # ``:done`` short of ``:total`` is the apply still feeding the batch: it asks
+    # about the marker before it queues the next file, so the marker has to be up.
+    r = FakeRedis()
+    _seed_batch(r, "batch-a", members=["j1"], statuses={"j1": FINISHED}, total=3, done=1)
+    _use(monkeypatch, r)
+
+    asyncio.run(batch_pipeline.purge_stale_batches(r))
+
+    assert r.strings.get(batch_pipeline.batch_cancel_key("batch-a"))
 
 
 def test_sweep_keeps_a_batch_with_a_running_member(monkeypatch):
@@ -341,8 +441,8 @@ def test_an_old_tombstone_is_removed(monkeypatch):
 
 
 def test_a_fresh_tombstone_is_kept(monkeypatch):
-    # A worker may still be finishing a member of the batch this sweep just
-    # cancelled, and the tombstone is the only thing stopping it reposting the bar.
+    # A member of this batch may still be reporting - it has not finished counting
+    # - and the tombstone is the only thing stopping it reposting the bar.
     r = FakeRedis()
     _seed_batch(r, "batch-a", members=["j1"], statuses={"j1": FINISHED})
     _use(monkeypatch, r)
@@ -352,6 +452,48 @@ def test_a_fresh_tombstone_is_kept(monkeypatch):
     assert summary["batches"] == ["batch-a"]
     assert summary["tombstones"] == 0
     assert batch_pipeline.batch_cancel_key("batch-a") in r.strings
+
+
+def test_a_stop_by_hand_keeps_the_marker_it_wrote(monkeypatch):
+    r = FakeRedis()
+    _seed_batch(r, "batch-a", members=["j1"], statuses={"j1": "cancelled"}, total=3, done=1)
+    r.strings[batch_pipeline.batch_cancel_key("batch-a")] = batch_pipeline.batch_tombstone_value(
+        "cancelled by admin"
+    )
+    _use(monkeypatch, r)
+
+    asyncio.run(batch_pipeline.purge_stale_batches(r))
+
+    assert batch_pipeline.batch_cancel_key("batch-a") in r.strings
+
+
+def test_a_stop_by_hand_marks_only_a_batch_that_still_has_work(monkeypatch):
+    """The button path decides the same way ``/cancelall`` does.
+
+    Stopping a batch that has counted every member - a stale bar, or a Stop pressed
+    after the last file landed - has nobody left to stop, so it takes the state
+    down without leaving a marker behind.
+    """
+    finished = FakeRedis()
+    _seed_batch(
+        finished,
+        "batch-a",
+        members=["j1"],
+        statuses={"j1": FINISHED},
+        total=1,
+        done=1,
+    )
+    running = FakeRedis()
+    _seed_batch(
+        running, "batch-a", members=["j1"], statuses={"j1": RUNNING}, total=3, done=1
+    )
+    _use(monkeypatch, finished)
+
+    asyncio.run(batch_pipeline.cancel_batch(finished, batch_id="batch-a", requested_by="user"))
+    asyncio.run(batch_pipeline.cancel_batch(running, batch_id="batch-a", requested_by="user"))
+
+    assert finished.strings.get(batch_pipeline.batch_cancel_key("batch-a")) is None
+    assert running.strings.get(batch_pipeline.batch_cancel_key("batch-a"))
 
 
 def test_a_tombstone_for_a_batch_with_a_live_member_is_kept(monkeypatch):
