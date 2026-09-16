@@ -144,7 +144,11 @@ def test_purge_batch_tombstones_before_forgetting_anything(monkeypatch):
 
     asyncio.run(batch_pipeline.purge_batch(r, batch_id="batch-a", reason="cancelled by admin"))
 
-    assert r.strings[batch_pipeline.batch_cancel_key("batch-a")] == "cancelled by admin"
+    # The value carries when it was written, which is what later lets a sweep tell
+    # an old tombstone from one a worker might still be depending on.
+    stored = r.strings[batch_pipeline.batch_cancel_key("batch-a")]
+    assert stored.startswith("cancelled by admin|")
+    assert batch_pipeline._tombstone_written_at(stored) > 0
 
 
 def test_purge_batch_without_an_id_is_a_no_op(monkeypatch):
@@ -303,4 +307,75 @@ def test_sweep_survives_an_unreachable_redis(monkeypatch):
 
     summary = asyncio.run(batch_pipeline.purge_stale_batches())
 
-    assert summary == {"batches": [], "keys": 0, "messages": [], "kept": 0}
+    assert summary == {"batches": [], "keys": 0, "messages": [], "kept": 0, "tombstones": 0}
+
+
+# ── ghosted old batches ─────────────────────────────────────────────────
+
+
+def test_the_tombstone_value_carries_when_it_was_written():
+    now = time.time()
+    value = batch_pipeline.batch_tombstone_value("cancelled by admin", written_at=now)
+    assert value.startswith("cancelled by admin|")
+    # Millisecond precision is plenty for a grace window measured in hours.
+    assert abs(batch_pipeline._tombstone_written_at(value) - now) < 0.01
+    # A pre-timestamp tombstone has no age to reason about.
+    assert batch_pipeline._tombstone_written_at("cancelled by admin") is None
+    # A label may contain anything, so only the last segment is the stamp.
+    assert batch_pipeline._tombstone_written_at(batch_pipeline.batch_tombstone_value("a|b", 5)) == 5
+
+
+def test_an_old_tombstone_is_removed(monkeypatch):
+    r = FakeRedis()
+    stale = time.time() - batch_pipeline.BATCH_TOMBSTONE_GRACE_SECONDS - 60
+    r.strings[batch_pipeline.batch_cancel_key("batch-a")] = batch_pipeline.batch_tombstone_value(
+        "cancelled by admin", written_at=stale
+    )
+    _use(monkeypatch, r)
+
+    summary = asyncio.run(batch_pipeline.purge_stale_batches(r))
+
+    assert summary["batches"] == []
+    assert summary["tombstones"] == 1
+    assert batch_pipeline.batch_cancel_key("batch-a") not in r.strings
+
+
+def test_a_fresh_tombstone_is_kept(monkeypatch):
+    # A worker may still be finishing a member of the batch this sweep just
+    # cancelled, and the tombstone is the only thing stopping it reposting the bar.
+    r = FakeRedis()
+    _seed_batch(r, "batch-a", members=["j1"], statuses={"j1": FINISHED})
+    _use(monkeypatch, r)
+
+    summary = asyncio.run(batch_pipeline.purge_stale_batches(r))
+
+    assert summary["batches"] == ["batch-a"]
+    assert summary["tombstones"] == 0
+    assert batch_pipeline.batch_cancel_key("batch-a") in r.strings
+
+
+def test_a_tombstone_for_a_batch_with_a_live_member_is_kept(monkeypatch):
+    r = FakeRedis()
+    _seed_batch(r, "batch-a", members=["j1"], statuses={"j1": RUNNING})
+    stale = time.time() - batch_pipeline.BATCH_TOMBSTONE_GRACE_SECONDS - 60
+    r.strings[batch_pipeline.batch_cancel_key("batch-a")] = batch_pipeline.batch_tombstone_value(
+        "cancelled by admin", written_at=stale
+    )
+    _use(monkeypatch, r)
+
+    summary = asyncio.run(batch_pipeline.purge_stale_batches(r))
+
+    assert summary["tombstones"] == 0
+    assert batch_pipeline.batch_cancel_key("batch-a") in r.strings
+
+
+def test_a_tombstone_from_before_the_timestamp_is_left_alone(monkeypatch):
+    # Its age cannot be established, and guessing it risks the repost this exists
+    # to prevent - so it is left to the offline script, which only runs where
+    # nothing is live.
+    r = FakeRedis()
+    r.strings[batch_pipeline.batch_cancel_key("batch-a")] = "cancelled by admin"
+    _use(monkeypatch, r)
+
+    assert asyncio.run(batch_pipeline.purge_stale_tombstones(r)) == 0
+    assert batch_pipeline.batch_cancel_key("batch-a") in r.strings

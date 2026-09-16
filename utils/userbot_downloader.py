@@ -1115,12 +1115,20 @@ async def _download_with_telethon(
                             getattr(msg, "id", None),
                             dest_path,
                         )
-                        dl_kwargs = {"file": dest_path}
-                        if progress_callback is not None:
-                            dl_kwargs["progress_callback"] = progress_callback
+                        # The stall guard only ever learns that a download is
+                        # alive through the watch, so the callback is injected and
+                        # wrapped rather than left to the caller: Telethon's own
+                        # progress callback is what keeps the transfer from
+                        # looking silent from byte one, and a call that passed no
+                        # callback would otherwise be killed as "stalled" at
+                        # DOWNLOAD_STALL_SECONDS while running perfectly well.
+                        _watch = _ProgressWatch()
+                        dl_kwargs = {
+                            "file": dest_path,
+                            "progress_callback": _watch.wrap(progress_callback),
+                        }
                         # part_size_kb removed in Telethon v1.35+; catch TypeError and retry without
                         try:
-                            _watch = _ProgressWatch()
                             _dl_result = await _wait_download_or_stall(
                                 asyncio.create_task(
                                     client.download_media(msg, **dl_kwargs, part_size_kb=chunk_size_kb)
@@ -1129,7 +1137,6 @@ async def _download_with_telethon(
                             )
                         except TypeError:
                             logger.debug("userbot: Telethon does not support part_size_kb, retrying without")
-                            _watch = _ProgressWatch()
                             _dl_result = await _wait_download_or_stall(
                                 asyncio.create_task(client.download_media(msg, **dl_kwargs)),
                                 _watch,

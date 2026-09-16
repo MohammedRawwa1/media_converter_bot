@@ -410,7 +410,9 @@ async def cancel_batch(redis=None, *, batch_id, requested_by=None, ttl_seconds=N
     job_ids = []
     queued = delayed = dropped_dedup = 0
     try:
-        await redis.set(batch_cancel_key(batch_id), str(requested_by or "user"), ex=ttl)
+        await redis.set(
+            batch_cancel_key(batch_id), batch_tombstone_value(requested_by or "user"), ex=ttl
+        )
         from utils.job_queue import DELAYED_SET, JOB_LIST
 
         members = await redis.smembers(batch_jobs_key(batch_id))
@@ -456,12 +458,13 @@ async def cancel_batch(redis=None, *, batch_id, requested_by=None, ttl_seconds=N
         # The keys carry the user id, not the batch id, so they are found by
         # value rather than by pattern.
         try:
-            async for dedup_key in redis.scan_iter(match="ffmpeg:pipeline_dedup:*", count=200):
+            async for dedup_key in redis.scan_iter(
+                match=f"{PIPELINE_DEDUP_PREFIX}*", count=200
+            ):
                 raw_owner = await redis.get(dedup_key)
                 owner = _job_text(raw_owner)
-                if owner in ("pending", *job_ids):
-                    if await redis.delete(dedup_key):
-                        dropped_dedup += 1
+                if owner in ("pending", *job_ids) and await redis.delete(dedup_key):
+                    dropped_dedup += 1
         except Exception:
             logger.debug("batch_pipeline: could not clear dedup keys for batch %s", batch_id)
 
@@ -670,6 +673,58 @@ BATCH_PURGE_GRACE_SECONDS = max(0, _env_number("BATCH_PURGE_GRACE_SECONDS", 900)
 # reposts the progress message, so a batch that is over cannot put its bar back.
 BATCH_TOMBSTONE_REASON = "cancelled by admin"
 
+# How long a tombstone is left alone before it may be removed.
+#
+# The tombstone is the only thing that stops a worker still encoding one of the
+# batch's members from resurrecting its counter and reposting its bar, so it has
+# to outlive the longest a member can run - the worker's own job ceiling. Once
+# that much time has passed the batch is provably inert, which is what lets
+# ``/cancelall`` clear *ghosted old* batches without racing the worker that is
+# finishing the batch it just cancelled in the same run.
+BATCH_TOMBSTONE_GRACE_SECONDS = max(
+    0,
+    _env_number(
+        "BATCH_TOMBSTONE_GRACE_SECONDS", _env_number("JOB_MAX_SECONDS", 6 * 3600)
+    ),
+)
+# The suffix of a batch id that carries its tombstone, and the separator its value
+# uses for the time it was written (``cancelled by admin|1699999999``).
+_TOMBSTONE_SUFFIX = ":cancelled"
+_TOMBSTONE_STAMP_SEPARATOR = "|"
+
+
+def batch_tombstone_value(reason, written_at=None) -> str:
+    """A tombstone's value: why it was written, plus when.
+
+    Nothing ever reads the value - ``is_batch_cancelled`` only checks that the key
+    exists - so it is free to carry the age, which is what lets
+    :func:`purge_stale_tombstones` tell an old tombstone from a fresh one.
+    """
+    stamp = time.time() if written_at is None else float(written_at)
+    # Fixed precision, not ``:g``: that drops to exponent form for a large epoch
+    # and loses so much of the value that the age comes back minutes wrong.
+    return (
+        f"{str(reason or BATCH_TOMBSTONE_REASON)}{_TOMBSTONE_STAMP_SEPARATOR}{stamp:.3f}"
+    )
+
+
+def _tombstone_written_at(raw) -> float | None:
+    """When a tombstone was written, or ``None`` for one from before this.
+
+    An unstamped value has no age to reason about, so callers must keep it: it
+    may have been written seconds ago by a worker that is still finishing a
+    member.
+    """
+    text = _job_text(raw)
+    _, separator, stamp = text.rpartition(_TOMBSTONE_STAMP_SEPARATOR)
+    if not separator:
+        return None
+    try:
+        value = float(stamp)
+    except ValueError:
+        return None
+    return value if value > 0 else None
+
 # Suffixes under ``ffmpeg:batch:`` that are not batch ids themselves.
 _NON_BATCH_SUFFIXES = frozenset({"active", "resume"})
 
@@ -680,6 +735,10 @@ _TERMINAL_JOB_STATUSES = frozenset({"done", "completed", "error", "failed", "can
 
 _JOB_HASH_PREFIX = "ffmpeg:job:"
 _RESUME_KEY_PREFIX = f"{BATCH_KEY_PREFIX}resume:"
+# ``ffmpeg:pipeline_dedup:<user>:<file_unique_id>`` - the one-owner-per-input gate
+# the pipeline writes, and the placeholder it uses before the job exists.
+PIPELINE_DEDUP_PREFIX = "ffmpeg:pipeline_dedup:"
+_PENDING_DEDUP_VALUE = "pending"
 
 
 def batch_started_key(batch_id) -> str:
@@ -720,7 +779,7 @@ async def purge_batch(redis=None, *, batch_id, reason=BATCH_TOMBSTONE_REASON, tt
             redis = await get_redis()
         ttl = max(1, int(ttl_seconds or BATCH_STATE_TTL_SECONDS))
         with contextlib.suppress(Exception):
-            await redis.set(batch_cancel_key(batch_id), str(reason), ex=ttl)
+            await redis.set(batch_cancel_key(batch_id), batch_tombstone_value(reason), ex=ttl)
         with contextlib.suppress(Exception):
             stock = await redis.get(batch_message_key(batch_id))
             result["message"] = parse_batch_message_ref(stock) if stock else None
@@ -756,7 +815,7 @@ async def purge_stale_batches(
     Returns ``{batches, keys, messages, kept}``, where ``messages`` are the
     ``(chat_id, message_id)`` pairs the caller should delete from the chat.
     """
-    summary: dict = {"batches": [], "keys": 0, "messages": [], "kept": 0}
+    summary: dict = {"batches": [], "keys": 0, "messages": [], "kept": 0, "tombstones": 0}
     own = redis is None
     try:
         if own:
@@ -775,10 +834,66 @@ async def purge_stale_batches(
             if purged["message"]:
                 summary["messages"].append(purged["message"])
             await _forget_resume_membership(redis, batch_id)
+        # Ghosted *old* batches: a tombstone is the last key left by a batch that
+        # is long over, so it is removable - see purge_stale_tombstones. Run
+        # after the loop so a tombstone this sweep just wrote (age zero) is kept.
+        summary["tombstones"] = await purge_stale_tombstones(redis)
         return summary
     except Exception:
         logger.debug("batch_pipeline: stale batch sweep failed")
         return summary
+    finally:
+        if own and redis is not None:
+            with contextlib.suppress(Exception):
+                await redis.close()
+
+
+async def purge_stale_tombstones(redis=None, *, grace_seconds=None) -> int:
+    """Remove the tombstones of batches that are over and long inert.
+
+    A tombstone is only removed when its batch has no live member *and* the
+    tombstone itself is older than :data:`BATCH_TOMBSTONE_GRACE_SECONDS`. Before
+    that, a worker could still be finishing one of its members and needs it - so
+    ``/cancelall`` can clear ghosted old batches without racing the very worker
+    that is finishing the batch it just cancelled.
+
+    A tombstone from before the value carried a timestamp is left alone: its age
+    cannot be established, and guessing it would risk exactly that race.
+    ``scripts/cleanup_stale_redis.py`` removes those, and only runs where nothing
+    is live.
+    """
+    own = redis is None
+    removed = 0
+    try:
+        if own:
+            from utils.job_queue import get_redis
+
+            redis = await get_redis()
+        grace = (
+            float(BATCH_TOMBSTONE_GRACE_SECONDS)
+            if grace_seconds is None
+            else max(0.0, float(grace_seconds))
+        )
+        now = time.time()
+        async for raw_key in redis.scan_iter(match=f"{BATCH_KEY_PREFIX}*", count=500):
+            key = raw_key.decode() if isinstance(raw_key, (bytes, bytearray)) else str(raw_key)
+            if not key.endswith(_TOMBSTONE_SUFFIX):
+                continue
+            batch_id = key[len(BATCH_KEY_PREFIX) : -len(_TOMBSTONE_SUFFIX)]
+            if not batch_id or ":" in batch_id:
+                continue
+            if await _batch_is_live(redis, batch_id):
+                continue
+            written = _tombstone_written_at(await redis.get(raw_key))
+            if written is None or now - written < grace:
+                continue
+            with contextlib.suppress(Exception):
+                if await redis.delete(raw_key):
+                    removed += 1
+        return removed
+    except Exception:
+        logger.debug("batch_pipeline: could not sweep stale tombstones")
+        return removed
     finally:
         if own and redis is not None:
             with contextlib.suppress(Exception):
@@ -936,17 +1051,20 @@ async def try_acquire_batch_lock(redis, batch_id, job_id) -> bool:
             return True
         holder = await redis.get(key)
         holder = holder.decode() if isinstance(holder, (bytes, bytearray)) else holder
-        if holder and await _slot_owner_is_gone(redis, holder):
-            # The batch's previous runner died (or finished without releasing):
-            # a ghost claim would freeze the whole batch for its full TTL.
-            if await redis.eval(_STEAL_STALE_SLOT_SCRIPT, 1, key, holder, owner, ttl_ms):
-                logger.warning(
-                    "batch_pipeline: stole stale batch lock %s from gone job %s (for job %s)",
-                    batch_id,
-                    holder,
-                    owner,
-                )
-                return True
+        if not holder or not await _slot_owner_is_gone(redis, holder):
+            return False
+        # The batch's previous runner died (or finished without releasing), and a
+        # ghost claim would freeze the whole batch for its full TTL - so the lock
+        # is stolen from it. Only from it, though: the compare-and-steal above is
+        # what keeps a live holder from losing the claim to a racer.
+        if await redis.eval(_STEAL_STALE_SLOT_SCRIPT, 1, key, holder, owner, ttl_ms):
+            logger.warning(
+                "batch_pipeline: stole stale batch lock %s from gone job %s (for job %s)",
+                batch_id,
+                holder,
+                owner,
+            )
+            return True
         return False
     except Exception:
         logger.warning(
@@ -967,68 +1085,109 @@ async def release_batch_lock(redis, batch_id, job_id) -> bool:
         return False
 
 
+async def _sweep_stale_dedup_keys(redis, freed: dict) -> None:
+    """Delete the dedup keys whose owner is gone, so its file can convert again.
+
+    ``ffmpeg:pipeline_dedup:<user>:<file_unique_id>`` is only ever a gate - it
+    stops the same file being ingested twice - so an owner that has gone turns a
+    one-off crash into a file that refuses to be converted at all. Three owners
+    count as gone, the third being what a redeploy leaves behind:
+
+    * the owner's job hash no longer exists (deleted after delivery, or expired);
+    * the owner finished, failed or was cancelled;
+    * the owner's hash still reads ``processing`` but the worker that claimed it
+      is dead, so that status will never change to anything terminal.
+
+    ``pending`` goes with them. There is nothing behind it to ask about - it is
+    the placeholder an ingest writes *before* it has a job - so an ingest that
+    died leaves it to block its file for the key's whole 24h TTL, and no other
+    path clears it: the apply-time dedup check treats ``pending`` as live, and
+    ``cancel_batch`` only clears the batches it owns. A live ingest rewrites the
+    key with its job id as soon as it has one, so being wrong here costs one
+    duplicate ingest - the same trade ``tasks.cleanup_tasks`` already makes.
+    """
+    try:
+        async for raw_key in redis.scan_iter(match=f"{PIPELINE_DEDUP_PREFIX}*", count=200):
+            try:
+                owner = await redis.get(raw_key)
+            except Exception:
+                continue
+            owner = owner.decode() if isinstance(owner, (bytes, bytearray)) else owner
+            owner = str(owner) if owner else ""
+            # A placeholder has no owner to ask about, and an empty value is a key
+            # that survives only as a skeleton - both are stale by definition.
+            if (
+                owner
+                and owner != _PENDING_DEDUP_VALUE
+                and not await _slot_owner_is_gone(redis, owner)
+            ):
+                continue
+            try:
+                if await redis.delete(raw_key):
+                    freed["dedup"] += 1
+            except Exception:
+                continue
+    except Exception:
+        logger.debug("batch_pipeline: could not sweep stale dedup keys")
+
+
+async def _sweep_claim(redis, key, freed: dict, field: str) -> None:
+    """Delete one claim whose owner is gone, counted under ``freed[field]``."""
+    try:
+        holder = await redis.get(key)
+    except Exception:
+        return
+    holder = holder.decode() if isinstance(holder, (bytes, bytearray)) else holder
+    if not holder:
+        return
+    if not await _slot_owner_is_gone(redis, holder):
+        return
+    try:
+        if await redis.delete(key):
+            freed[field] += 1
+            logger.warning("batch_pipeline: swept ghost claim %s (holder %s)", key, holder)
+    except Exception:
+        return
+
+
 async def sweep_ghost_claims(redis=None) -> dict:
-    """Release every claim whose owner has no live job behind it.
+    """Release every claim whose owner has no live worker behind it.
 
     A slot or batch lock outlives its job whenever a worker dies between the
     claim and the release - crash, OOM kill, or a deploy - and from then on
     every new job defers on "slot busy" until the claim's TTL expires. The
-    steal paths in acquire_ffmpeg_slot/try_acquire_batch_lock cover the common
-    case (owner hash deleted or terminal); this sweep catches the rest - an
-    owner still marked ``running`` because it died mid-encode - and it runs at
-    worker startup, before any consumer or queue loop can race it.
+    steal paths in acquire_ffmpeg_slot/try_acquire_batch_lock cover an owner
+    whose hash is gone or terminal; this sweep catches the rest - above all an
+    owner still marked ``processing`` because its worker died mid-encode and so
+    never wrote a terminal status - by asking whether the claiming worker is
+    still heartbeating. The same question frees the abandoned
+    ``ffmpeg:pipeline_dedup:*`` keys, which are what make a *file* refuse to be
+    processed again rather than making the queue refuse to work. It runs at
+    worker startup, before any consumer or queue loop can race it, and again from
+    ``/cancelall``.
     """
     if redis is None:
-        return {"slots": 0, "locks": 0}
-    freed = {"slots": 0, "locks": 0}
-    # ``canceled`` included: the enum sits in the cancel path and the tombstone
-    # check accepts both spellings, so the sweep must too.
-    terminal = {"done", "completed", "error", "failed", "cancelled", "canceled"}
+        return {"slots": 0, "locks": 0, "dedup": 0}
+    freed = {"slots": 0, "locks": 0, "dedup": 0}
     try:
         # -- Conversion slots -------------------------------------------------
         async for key in redis.scan_iter(match=f"{FFMPEG_SLOT_PREFIX}*", count=100):
-            holder = await redis.get(key)
-            holder = holder.decode() if isinstance(holder, (bytes, bytearray)) else holder
-            if not holder:
-                continue
-            try:
-                status = await redis.hget(f"{_JOB_HASH_PREFIX}{holder}", "status")
-            except Exception:
-                status = None
-            if status is not None:
-                status = status.decode() if isinstance(status, (bytes, bytearray)) else status
-            if status is not None and status not in terminal:
-                continue
-            if await redis.delete(key):
-                freed["slots"] += 1
-                logger.warning(
-                    "batch_pipeline: swept ghost claim %s (holder %s, status %s)",
-                    key,
-                    holder,
-                    status or "missing",
-                )
+            await _sweep_claim(redis, key, freed, "slots")
         # -- Batch locks ------------------------------------------------------
-        async for key in redis.scan_iter(match=f"{BATCH_KEY_PREFIX}*:lock", count=100):
-            holder = await redis.get(key)
-            holder = holder.decode() if isinstance(holder, (bytes, bytearray)) else holder
-            if not holder:
+        # ``ffmpeg:batch:<id>`` *is* the lock. Everything else under the prefix is
+        # the batch's own state (``:jobs``, ``:total``, ``:done``, ``:msg``, the
+        # tombstone) or one of the bookkeeping sets, and none of those is a claim.
+        # The previous ``*:lock`` pattern matched none of them, so batch locks
+        # were never actually swept - and a ghost one froze its batch for its
+        # full TTL exactly the way a ghost slot froze the whole queue.
+        async for raw_key in redis.scan_iter(match=f"{BATCH_KEY_PREFIX}*", count=100):
+            key = raw_key.decode() if isinstance(raw_key, (bytes, bytearray)) else str(raw_key)
+            suffix = key[len(BATCH_KEY_PREFIX) :]
+            if not suffix or ":" in suffix or suffix in _NON_BATCH_SUFFIXES:
                 continue
-            try:
-                status = await redis.hget(f"{_JOB_HASH_PREFIX}{holder}", "status")
-            except Exception:
-                status = None
-            if status is not None:
-                status = status.decode() if isinstance(status, (bytes, bytearray)) else status
-            if status is not None and status not in terminal:
-                continue
-            if await redis.delete(key):
-                freed["locks"] += 1
-                logger.warning(
-                    "batch_pipeline: swept ghost claim %s (holder %s, status %s)",
-                    key,
-                    holder,
-                    status or "missing",
-                )
+            await _sweep_claim(redis, key, freed, "locks")
+        # -- Dedup keys whose owner is gone -----------------------------------
+        await _sweep_stale_dedup_keys(redis, freed)
         return freed
     except Exception:
         logger.warning("batch_pipeline: ghost-claim sweep failed", exc_info=True)
@@ -1127,13 +1286,41 @@ return 0
 """
 
 
+async def _claiming_worker_is_gone(redis, owner: str):
+    """Whether the worker that claimed a slot or lock is provably gone.
+
+    Every worker stamps its :func:`worker_identity` on a job's hash as it takes
+    the job's claim, and re-publishes its own heartbeat key while it runs, so a
+    claim whose worker has no heartbeat left belongs to a process that died.
+
+    Returns ``None`` when the hash carries no stamp - a job prepared before this
+    bookkeeping existed - because that claim's age cannot be established and
+    callers must then fall back to the job's status, which is all the old builds
+    had to go on.
+    """
+    try:
+        raw = await redis.hget(f"{_JOB_HASH_PREFIX}{owner}", "worker")
+    except Exception:
+        return None
+    worker = raw.decode() if isinstance(raw, (bytes, bytearray)) else raw
+    if not worker:
+        return None
+    try:
+        return not await redis.exists(f"{WORKER_RSS_KEY_PREFIX}{worker}")
+    except Exception:
+        return None
+
+
 async def _slot_owner_is_gone(redis, owner: str) -> bool:
     """Whether a slot's holder no longer has a live job behind it.
 
     Every queued or running job has a hash from the moment it is prepared; the
     hash is deleted when its result is delivered, and terminal statuses are
-    written when it fails or is cancelled. A slot held by a job id with no hash
-    (or a terminal one) is a ghost from a crashed or finished worker.
+    written when it fails or is cancelled. On top of that, the claiming worker
+    heartbeats on its own key, which is the only thing that can tell a worker
+    that died mid-encode (leaving ``processing`` behind forever) from one that is
+    still encoding - without it, such a claim blocked every conversion until its
+    full TTL ran out.
     """
     if not owner:
         return False  # unknown holder: respect the TTL
@@ -1144,7 +1331,17 @@ async def _slot_owner_is_gone(redis, owner: str) -> bool:
     if raw is None:
         return True
     status = raw.decode() if isinstance(raw, (bytes, bytearray)) else raw
-    return status in _TERMINAL_JOB_STATUSES
+    worker_gone = await _claiming_worker_is_gone(redis, owner)
+    if worker_gone is True:
+        return True
+    if status in _TERMINAL_JOB_STATUSES:
+        # Terminal *and* still held means its owner never released it. When the
+        # claiming worker is still heartbeating it is about to release it itself
+        # (its job just ended), so leave the claim alone rather than let a second
+        # conversion start beside the one that is still winding down. An unstamped
+        # owner keeps the old behaviour, since nothing better can be checked.
+        return worker_gone is not False
+    return False
 
 
 async def acquire_ffmpeg_slot(redis, job_id, *, slots=None, ttl_seconds=None):
@@ -1155,10 +1352,12 @@ async def acquire_ffmpeg_slot(redis, job_id, *, slots=None, ttl_seconds=None):
     so no slot could be checked - in that case the caller runs the job rather
     than stall the queue, and release is a no-op.
 
-    A busy slot whose owner no longer has a live job (worker died mid-run, or
-    the job finished without releasing) is stolen instead of honored: a ghost
-    claim would otherwise block every conversion until its full TTL ran out -
-    up to ``BATCH_LOCK_TTL_SECONDS`` of dead air after every deploy.
+    A busy slot whose owner is gone (its job hash deleted, or its worker no longer
+    heartbeating) is stolen instead of honored: a ghost claim would otherwise
+    block every conversion until its full TTL ran out - up to
+    ``BATCH_LOCK_TTL_SECONDS`` of dead air after every deploy. A claim held by a
+    worker that is still alive is left alone, even when its job already reads as
+    finished, because that worker is about to release it itself.
     """
     total = MAX_CONCURRENT_FFMPEG if slots is None else max(1, int(slots))
     ttl_ms = int((FFMPEG_SLOT_TTL_SECONDS if ttl_seconds is None else ttl_seconds) * 1000)
@@ -1220,14 +1419,28 @@ WORKER_RSS_KEY_PREFIX = "ffmpeg:worker:rss:"
 WORKER_RSS_TTL_SECONDS = _env_number("WORKER_RSS_TTL_SECONDS", 90)
 
 
+# One token per process, drawn once at import.
+#
+# Host name and pid are not enough: a container that always runs pid 1 under a
+# stable host name - which is what a redeploy on a platform like Railway gives you
+# - would let a new process re-publish the *dead* process's heartbeat key, making
+# the claims it left behind look live forever. The token is what keeps this
+# process's heartbeat its own.
+_WORKER_INSTANCE_TOKEN = uuid.uuid4().hex[:8]
+
+
 def worker_identity() -> str:
-    """A stable id for this worker process, used to key its heartbeat."""
+    """A stable id for this worker process, used to key its heartbeat.
+
+    Stable for the life of the process, and distinct from every other worker -
+    including the previous incarnation of this same container.
+    """
     try:
         import socket
 
-        return f"{socket.gethostname()}:{os.getpid()}"
+        return f"{socket.gethostname()}:{os.getpid()}:{_WORKER_INSTANCE_TOKEN}"
     except Exception:
-        return f"worker:{os.getpid()}"
+        return f"worker:{os.getpid()}:{_WORKER_INSTANCE_TOKEN}"
 
 
 async def publish_worker_rss(redis=None, *, worker_id=None, rss=None) -> bool:

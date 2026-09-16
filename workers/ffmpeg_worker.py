@@ -2718,6 +2718,16 @@ async def _claim_execution_slot(job: dict):
                 "" if deferred else " (defer failed)",
             )
             return None
+        # Stamp which worker owns this claim. The ghost-claim checks read it with
+        # this worker's heartbeat to tell a claim whose owner died mid-encode
+        # (OOM kill, redeploy) from one that is genuinely still converting, so a
+        # claim left by a dead worker is freed as soon as its heartbeat expires
+        # instead of holding the one conversion slot for its full TTL.
+        with contextlib.suppress(Exception):
+            await r.hset(
+                f"ffmpeg:job:{job.get('job_id')}",
+                mapping={"worker": batch_pipeline.worker_identity()},
+            )
         return slot
     finally:
         with contextlib.suppress(Exception):
@@ -3231,9 +3241,10 @@ async def worker_loop(stop_event: asyncio.Event | None = None, *, allow_restart:
 
     # This process just booted, so it cannot own any claim yet - and on Railway
     # the old process is already gone, so nothing else holds one either. Any
-    # slot/lock a previous deploy left behind is a ghost: release them now so
-    # the first job after a redeploy never waits out a 15-minute TTL on a claim
-    # whose owner died with the old container.
+    # slot, batch lock or dedup key a previous deploy left behind is a ghost:
+    # release them now so the first job after a redeploy never waits out a
+    # 15-minute TTL on a claim whose owner died with the old container, and the
+    # first file never reads as "still being processed" by a job that is gone.
     try:
         _redis_for_sweep = await get_redis()
         freed = await batch_pipeline.sweep_ghost_claims(_redis_for_sweep)

@@ -57,6 +57,10 @@ BATCH_STATE_SUFFIXES = (
 )
 DEDUPE_PREFIX = "ffmpeg:pipeline_dedup:"
 LOCK_PREFIX = "ffmpeg:lock:"
+# The global conversion slots. One of these left behind by a worker that is gone
+# is what makes the queue defer every new job ("slot busy") until its TTL runs
+# out, so it belongs in here as much as the input locks do.
+SLOT_PREFIX = "ffmpeg:slot:"
 JOB_LIST = "ffmpeg:jobs"
 DELAYED_SET = "ffmpeg:delayed"
 
@@ -107,6 +111,16 @@ def is_stale_job(job_id: str | None, hashes: dict[str, dict], selected_batch: st
     if selected_batch and stored.get("batch_id") != selected_batch:
         return False
     return stored.get("status") in TERMINAL_STATUSES
+
+
+def _drop_member(r, key: str, member: str, *, apply: bool) -> bool:
+    """Whether ``key`` holds ``member`` - removing it only when applying."""
+    try:
+        if not apply:
+            return bool(r.sismember(key, member))
+        return bool(r.srem(key, member))
+    except Exception:
+        return False
 
 
 def report_or_delete(r, key: str, *, apply: bool, reason: str, count: Counter) -> None:
@@ -160,6 +174,14 @@ def main() -> int:
         if owner not in active:
             report_or_delete(r, key, apply=args.apply, reason="lock", count=counts)
 
+    # Conversion slots hold the same kind of value as an input lock, so the same
+    # rule applies: an owner that is not an active job is a ghost claim.
+    for raw_key in scan(r, f"{SLOT_PREFIX}*"):
+        key = text(raw_key)
+        owner = text(r.get(raw_key) or "")
+        if owner not in active:
+            report_or_delete(r, key, apply=args.apply, reason="slot", count=counts)
+
     # Dedup keys are safe to remove when their referenced job is absent or
     # terminal. The special pending value is always preserved.
     for raw_key in scan(r, f"{DEDUPE_PREFIX}*"):
@@ -188,6 +210,12 @@ def main() -> int:
         members = {text(x) for x in r.smembers(f"{BATCH_PREFIX}{batch_id}:jobs")}
         if members & active:
             continue
+        # The batch's own lock is the bare ``ffmpeg:batch:<id>`` key, which is why
+        # it is not one of BATCH_STATE_SUFFIXES. It was held by one of the members,
+        # and no member is active, so it is stale like everything else here.
+        lock_key = f"{BATCH_PREFIX}{batch_id}"
+        if r.exists(lock_key):
+            report_or_delete(r, lock_key, apply=args.apply, reason="batch lock", count=counts)
         for suffix in BATCH_STATE_SUFFIXES:
             key = f"{BATCH_PREFIX}{batch_id}{suffix}"
             if r.exists(key):
@@ -197,16 +225,20 @@ def main() -> int:
         # state is gone. (/cancelall keeps the ``:cancelled`` tombstone instead of
         # deleting it, because a worker may still be finishing a member; this
         # script only runs where nothing is.)
-        if r.srem(BATCH_ACTIVE_SET, batch_id):
+        # Checked with SISMEMBER and only removed under --apply: a dry run used to
+        # call SREM outright, so previewing quietly took the batch out of the
+        # aggregate view and out of every user's resume record while printing
+        # "STALE" and then promising that no data was deleted.
+        if _drop_member(r, BATCH_ACTIVE_SET, batch_id, apply=args.apply):
             counts["batch"] += 1
             print(f"  {'DELETE' if args.apply else 'STALE'} {BATCH_ACTIVE_SET} member {batch_id}")
         for resume_key in scan(r, f"{BATCH_RESUME_PREFIX}*"):
-            if r.srem(resume_key, batch_id):
+            if _drop_member(r, resume_key, batch_id, apply=args.apply):
                 counts["batch"] += 1
                 print(f"  {'DELETE' if args.apply else 'STALE'} resume member {batch_id} of {text(resume_key)}")
 
     print("Summary:")
-    for name in ("queue", "delayed", "lock", "dedup", "batch"):
+    for name in ("queue", "delayed", "lock", "slot", "dedup", "batch", "batch lock"):
         print(f"  {name}: {counts[name]}")
     if not args.apply:
         print("No data was deleted. Re-run with --apply to remove these stale entries.")

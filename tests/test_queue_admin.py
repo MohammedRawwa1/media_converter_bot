@@ -14,6 +14,7 @@ covers every prefix the app writes but never touches job state.
 
 import asyncio
 import json
+import time
 
 import pytest
 
@@ -219,17 +220,50 @@ def test_cancel_all_flags_queued_job_hashes_before_deleting_the_list(fake_redis)
     assert r.hashes[f"{JOB_HASH_PREFIX}queued-1"]["cancel"] == "1"
 
 
-def test_cancel_all_keeps_a_pending_ingest_dedup_key(fake_redis):
+def test_cancel_all_drops_every_kind_of_dedup_key(fake_redis):
     r = fake_redis
     r.strings[f"{DEDUP_PREFIX}mid-ingest"] = "pending"
+    r.strings[f"{DEDUP_PREFIX}running"] = "job-running"
     r.strings[f"{DEDUP_PREFIX}orphan"] = "job-that-never-existed"
+    r.hashes[f"{JOB_HASH_PREFIX}job-running"] = {"status": "processing"}
 
     report = asyncio.run(cancel_all_jobs())
 
-    # Only the dangling one goes: "pending" means the pipeline is still ingesting.
-    assert report.dedup_keys == 1
-    assert f"{DEDUP_PREFIX}mid-ingest" in r.strings
-    assert f"{DEDUP_PREFIX}orphan" not in r.strings
+    # Including "pending": it is a placeholder, not a live owner, and left behind
+    # it would keep that file un-convertible until its own 24h TTL ran out.
+    assert report.dedup_keys == 3
+    assert not [key for key in r.strings if key.startswith(DEDUP_PREFIX)]
+
+
+def test_cancel_all_frees_the_claims_of_workers_that_are_gone(fake_redis):
+    r = fake_redis
+    # A worker died mid-encode: its hash still reads "processing" and nothing
+    # heartbeats for it, while the slot it took makes every later job wait.
+    r.strings["ffmpeg:slot:0"] = "job-dead"
+    r.hashes[f"{JOB_HASH_PREFIX}job-dead"] = {"status": "processing", "worker": "w-dead"}
+    # A worker that is still up releases its own claim when its job ends.
+    r.strings["ffmpeg:slot:1"] = "job-live"
+    r.hashes[f"{JOB_HASH_PREFIX}job-live"] = {"status": "processing", "worker": "w-alive"}
+    r.strings[f"{batch_pipeline.WORKER_RSS_KEY_PREFIX}w-alive"] = "1234"
+
+    report = asyncio.run(cancel_all_jobs())
+
+    assert report.slots_freed == 1
+    assert "ffmpeg:slot:0" not in r.strings
+    assert r.strings["ffmpeg:slot:1"] == "job-live"
+
+
+def test_cancel_all_removes_a_ghosted_old_batch(fake_redis):
+    r = fake_redis
+    stale = time.time() - batch_pipeline.BATCH_TOMBSTONE_GRACE_SECONDS - 60
+    r.strings[batch_pipeline.batch_cancel_key("batch-old")] = batch_pipeline.batch_tombstone_value(
+        "cancelled by admin", written_at=stale
+    )
+
+    report = asyncio.run(cancel_all_jobs())
+
+    assert report.batch_tombstones == 1
+    assert batch_pipeline.batch_cancel_key("batch-old") not in r.strings
 
 
 def test_cancel_all_leaves_locks_owned_by_live_jobs_alone(fake_redis):

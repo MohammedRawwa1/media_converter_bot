@@ -194,11 +194,17 @@ class FfmpegSlotTests(unittest.IsolatedAsyncioTestCase):
     async def test_reports_busy_when_every_slot_is_taken(self):
         redis = _FakeRedis(set_result=None)
         self.assertIsNone(await batch_pipeline.acquire_ffmpeg_slot(redis, "job-2", slots=3))
-        self.assertEqual([c["key"] for c in redis.set_calls], [
-            "ffmpeg:slot:0",
-            "ffmpeg:slot:1",
-            "ffmpeg:slot:2",
-        ])
+        # Every slot is attempted. A read that finds no holder retries its SET on
+        # the same key (the claim may have expired in between), so this is a set
+        # of keys rather than an exact call count.
+        self.assertEqual(
+            {call["key"] for call in redis.set_calls},
+            {
+                "ffmpeg:slot:0",
+                "ffmpeg:slot:1",
+                "ffmpeg:slot:2",
+            },
+        )
 
     async def test_runs_without_a_slot_when_redis_errors(self):
         class _Broken(_FakeRedis):
@@ -267,6 +273,10 @@ class CapacityTelemetryTests(unittest.IsolatedAsyncioTestCase):
         first = batch_pipeline.worker_identity()
         self.assertEqual(first, batch_pipeline.worker_identity())
         self.assertIn(str(os.getpid()), first)
+        # Plus a per-process token, so a redeploy that reuses the host name and
+        # pid cannot re-publish the dead process's heartbeat - which would make
+        # the claims it left behind look live forever.
+        self.assertIn(batch_pipeline._WORKER_INSTANCE_TOKEN, first)
 
 
 class _ProgressRedis:
@@ -1502,6 +1512,238 @@ class SourceFetchTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('_set_job_state(job_id, "error", "could not fetch the source from storage"', src)
         self.assertIn('"processing failed", progress=0, channel=progress_channel', src)
         self.assertIn('str(info or "conversion failed"),', src)
+
+
+class GhostClaimTests(unittest.IsolatedAsyncioTestCase):
+    """A claim left behind by a dead worker must not fence the queue.
+
+    The case these guard is the one no status can describe: a worker killed
+    mid-encode (OOM kill, redeploy) still has a job hash reading ``processing``
+    and never got to release the slot it took. Only the claiming worker's own
+    heartbeat can tell that apart from a live, slow conversion.
+    """
+
+    class _Claims:
+        """Claims, job hashes and worker heartbeats the ghost checks read."""
+
+        def __init__(self, *, claims=None, jobs=None, workers=()):
+            self.strings = dict(claims or {})
+            self.hashes = {key: dict(value) for key, value in (jobs or {}).items()}
+            self.workers = {f"{batch_pipeline.WORKER_RSS_KEY_PREFIX}{name}" for name in workers}
+            self.hset_calls = []
+
+        @staticmethod
+        def _text(value):
+            return value.decode() if isinstance(value, (bytes, bytearray)) else str(value)
+
+        async def get(self, key):
+            return self.strings.get(self._text(key))
+
+        async def set(self, key, value, nx=False, px=None, ex=None):
+            self.strings[self._text(key)] = str(value)
+            return True
+
+        async def hget(self, key, field):
+            return self.hashes.get(self._text(key), {}).get(field)
+
+        async def hset(self, key, mapping=None, **kwargs):
+            fields = {**dict(mapping or {}), **kwargs}
+            self.hashes.setdefault(self._text(key), {}).update(
+                {str(k): str(v) for k, v in fields.items()}
+            )
+            self.hset_calls.append((self._text(key), dict(fields)))
+            return len(fields)
+
+        async def delete(self, *keys):
+            removed = 0
+            for key in keys:
+                key = self._text(key)
+                if key in self.strings:
+                    del self.strings[key]
+                    removed += 1
+            return removed
+
+        async def exists(self, *keys):
+            return sum(
+                1
+                for key in keys
+                if self._text(key) in self.strings
+                or self._text(key) in self.workers
+                or self._text(key) in self.hashes
+            )
+
+        async def eval(self, script, numkeys, *args):
+            return 1
+
+        def scan_iter(self, match="*", count=100):
+            prefix = match[:-1] if match.endswith("*") else match
+            keys = sorted(set(self.strings) | self.workers | set(self.hashes))
+
+            async def _gen():
+                for key in keys:
+                    if key.startswith(prefix):
+                        yield key
+
+            return _gen()
+
+        async def close(self):
+            return None
+
+    async def test_a_processing_claim_whose_worker_is_gone_is_a_ghost(self):
+        # The hash still says "processing" - the worker was killed before it could
+        # write anything else - so only the missing heartbeat gives it away.
+        redis = self._Claims(
+            claims={"ffmpeg:slot:0": "job-dead"},
+            jobs={"ffmpeg:job:job-dead": {"status": "processing", "worker": "w-dead"}},
+            workers=("w-alive",),
+        )
+
+        self.assertTrue(await batch_pipeline._slot_owner_is_gone(redis, "job-dead"))
+        self.assertEqual(
+            await batch_pipeline.sweep_ghost_claims(redis), {"slots": 1, "locks": 0, "dedup": 0}
+        )
+        self.assertNotIn("ffmpeg:slot:0", redis.strings)
+
+    async def test_a_live_workers_claim_is_never_taken(self):
+        redis = self._Claims(
+            claims={"ffmpeg:slot:0": "job-live"},
+            jobs={"ffmpeg:job:job-live": {"status": "processing", "worker": "w-alive"}},
+            workers=("w-alive",),
+        )
+
+        self.assertFalse(await batch_pipeline._slot_owner_is_gone(redis, "job-live"))
+        self.assertEqual(
+            await batch_pipeline.sweep_ghost_claims(redis), {"slots": 0, "locks": 0, "dedup": 0}
+        )
+        self.assertEqual(redis.strings["ffmpeg:slot:0"], "job-live")
+
+    async def test_a_finished_claim_is_left_to_the_worker_that_owns_it(self):
+        # Terminal, but its worker is alive and about to release it. Stealing it
+        # here would start a second conversion beside one that is still winding
+        # down, which is what the one-slot cap exists to prevent.
+        redis = self._Claims(
+            claims={"ffmpeg:slot:0": "job-done"},
+            jobs={"ffmpeg:job:job-done": {"status": "done", "worker": "w-alive"}},
+            workers=("w-alive",),
+        )
+
+        self.assertFalse(await batch_pipeline._slot_owner_is_gone(redis, "job-done"))
+
+    async def test_a_claim_from_before_the_stamp_falls_back_to_its_status(self):
+        redis = self._Claims(jobs={"ffmpeg:job:old": {"status": "done"}})
+
+        self.assertIsNone(await batch_pipeline._claiming_worker_is_gone(redis, "old"))
+        self.assertTrue(await batch_pipeline._slot_owner_is_gone(redis, "old"))
+        self.assertTrue(await batch_pipeline._slot_owner_is_gone(redis, "never-existed"))
+
+    async def test_a_ghost_batch_lock_is_swept(self):
+        # ``ffmpeg:batch:<id>`` is the lock; the old ``*:lock`` pattern matched
+        # nothing, so a ghost one froze its batch for its whole TTL.
+        redis = self._Claims(
+            claims={
+                "ffmpeg:batch:abc": "job-dead",
+                "ffmpeg:batch:abc:done": "2",
+                "ffmpeg:batch:abc:cancelled": "cancelled by admin|1",
+                "ffmpeg:batch:resume:42": "member",
+                "ffmpeg:batch:active": "member",
+            },
+            jobs={"ffmpeg:job:job-dead": {"status": "processing", "worker": "w-dead"}},
+        )
+
+        self.assertEqual(
+            await batch_pipeline.sweep_ghost_claims(redis), {"slots": 0, "locks": 1, "dedup": 0}
+        )
+        self.assertNotIn("ffmpeg:batch:abc", redis.strings)
+        # Not one of the batch's own keys is a claim.
+        for key in (
+            "ffmpeg:batch:abc:done",
+            "ffmpeg:batch:abc:cancelled",
+            "ffmpeg:batch:resume:42",
+            "ffmpeg:batch:active",
+        ):
+            self.assertIn(key, redis.strings)
+
+    async def test_a_dedup_key_whose_owner_worker_died_is_dropped(self):
+        """The file-level ghost: nothing behind the key, so the file is stuck.
+
+        Unlike a claim, nothing releases a dedup key on the owner's behalf: the
+        apply-time check treats a ``processing`` owner as live and skips the file,
+        so the only signal that the worker is gone is its missing heartbeat.
+        """
+        key = f"{batch_pipeline.PIPELINE_DEDUP_PREFIX}42:BAhJ"
+        redis = self._Claims(
+            claims={key: "job-dead"},
+            jobs={"ffmpeg:job:job-dead": {"status": "processing", "worker": "w-dead"}},
+            workers=("w-alive",),
+        )
+
+        freed = await batch_pipeline.sweep_ghost_claims(redis)
+
+        self.assertEqual(freed, {"slots": 0, "locks": 0, "dedup": 1})
+        self.assertNotIn(key, redis.strings)
+
+    async def test_a_dedup_key_of_a_live_worker_is_kept(self):
+        key = f"{batch_pipeline.PIPELINE_DEDUP_PREFIX}42:BAhJ"
+        redis = self._Claims(
+            claims={key: "job-live"},
+            jobs={"ffmpeg:job:job-live": {"status": "processing", "worker": "w-alive"}},
+            workers=("w-alive",),
+        )
+
+        self.assertEqual(
+            await batch_pipeline.sweep_ghost_claims(redis), {"slots": 0, "locks": 0, "dedup": 0}
+        )
+        self.assertEqual(redis.strings[key], "job-live")
+
+    async def test_a_queued_dedup_key_is_kept(self):
+        # A job waiting in the queue owns its input, and it has no worker stamp yet
+        # because it has not been claimed - dropping it would let the same file be
+        # ingested twice.
+        key = f"{batch_pipeline.PIPELINE_DEDUP_PREFIX}42:BAhJ"
+        redis = self._Claims(
+            claims={key: "job-queued"},
+            jobs={"ffmpeg:job:job-queued": {"status": "queued"}},
+        )
+
+        self.assertEqual((await batch_pipeline.sweep_ghost_claims(redis))["dedup"], 0)
+        self.assertIn(key, redis.strings)
+
+    async def test_a_dedup_key_whose_owner_is_gone_is_dropped(self):
+        gone = f"{batch_pipeline.PIPELINE_DEDUP_PREFIX}42:gone"
+        delivered = f"{batch_pipeline.PIPELINE_DEDUP_PREFIX}42:delivered"
+        finished = f"{batch_pipeline.PIPELINE_DEDUP_PREFIX}42:finished"
+        redis = self._Claims(
+            claims={gone: "job-that-never-existed", delivered: "job-done", finished: ""},
+            jobs={"ffmpeg:job:job-done": {"status": "done", "worker": "w-dead"}},
+        )
+
+        self.assertEqual((await batch_pipeline.sweep_ghost_claims(redis))["dedup"], 3)
+        self.assertEqual(redis.strings, {})
+
+    async def test_a_pending_dedup_key_is_dropped(self):
+        # A crashed ingest leaves this behind and only this placeholder blocks the
+        # file: there is no owner for the apply-time check to inspect, and it treats
+        # "pending" as live, so nothing else would ever clear it.
+        key = f"{batch_pipeline.PIPELINE_DEDUP_PREFIX}42:BAhJ"
+        redis = self._Claims(claims={key: batch_pipeline._PENDING_DEDUP_VALUE})
+
+        self.assertEqual((await batch_pipeline.sweep_ghost_claims(redis))["dedup"], 1)
+        self.assertNotIn(key, redis.strings)
+
+    async def test_the_worker_stamps_its_identity_when_it_takes_a_claim(self):
+        from workers import ffmpeg_worker as worker
+
+        redis = self._Claims()
+
+        with patch.object(batch_pipeline, "MEMORY_CEILING_BYTES", 0), patch.object(
+            worker, "get_redis", _returning(redis)
+        ):
+            slot = await worker._claim_execution_slot({"job_id": "job-9"})
+
+        self.assertEqual(slot, 0)
+        self.assertEqual(
+            redis.hashes["ffmpeg:job:job-9"]["worker"], batch_pipeline.worker_identity()
+        )
 
 
 if __name__ == "__main__":

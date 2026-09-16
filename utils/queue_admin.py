@@ -22,6 +22,12 @@ tombstoned as it goes so a worker still finishing one member cannot put its
 progress bar back, and the bar itself is deleted from the chat when a bot is
 passed in.
 
+Ghosted work goes with it: dedup keys of every kind (including the ``pending``
+placeholder an interrupted ingest leaves), tombstones old enough that no member
+can still be running, and the conversion slots, batch locks and dedup keys left
+behind by workers that are gone - which are what make the queue refuse new
+conversions, and a single file refuse to be processed again.
+
 ``cancel_all_jobs`` drains both. It purges the broker even when
 ``EVENTBUS_QUEUE_ROLLOUT_PERCENT`` is 0, because that setting only stops *new*
 jobs from being routed there - anything already queued must still be drained, or
@@ -100,7 +106,10 @@ class QueueReport:
     batches: int = 0
     batch_messages: int = 0
     batch_keys: int = 0
+    batch_tombstones: int = 0
     batches_kept: int = 0
+    slots_freed: int = 0
+    locks_freed: int = 0
     job_ids: list[str] = field(default_factory=list)
     broker: dict[str, int | str] = field(default_factory=dict)
     errors: list[str] = field(default_factory=list)
@@ -123,6 +132,11 @@ class QueueReport:
             lines.append(f"• Batch keys removed:  {self.batch_keys}")
             if self.batch_messages:
                 lines.append(f"• Batch bars deleted:  {self.batch_messages}")
+        if self.batch_tombstones:
+            lines.append(f"• Old tombstones:      {self.batch_tombstones}")
+        if self.slots_freed or self.locks_freed:
+            claims = f"{self.slots_freed} slot(s), {self.locks_freed} batch lock(s)"
+            lines.append(f"• Ghost claims freed:  {claims}")
         if self.broker:
             purged = ", ".join(f"{name}={count}" for name, count in sorted(self.broker.items()))
             lines.append(f"• Broker queues:       {purged}")
@@ -264,6 +278,13 @@ async def _drop_stale_dedup_keys(redis, report: QueueReport) -> None:
     Mirrors ``scripts/cleanup_stale_dedup_keys.py``: a key is only removed when the
     job hash says the job is finished, cancelled or errored, and an unreadable
     state keeps the key (conservative - never un-dedup something mid-ingest).
+
+    ``pending`` goes too. It is the placeholder an ingest writes while it is still
+    deciding, and ``cancel_batch`` already drops it for its own batch's files; left
+    behind by a cancel-all it keeps that file from ever being converted again until
+    the key's own 24h TTL ran out, which is the "ghosted, refuses to re-run" trap
+    this command exists to clear. An ingest that is genuinely mid-flight rewrites
+    the key with its job id as soon as it has one, so it loses nothing real.
     """
     for key in await _scan_keys(redis, f"{DEDUP_PREFIX}*"):
         try:
@@ -273,7 +294,7 @@ async def _drop_stale_dedup_keys(redis, report: QueueReport) -> None:
             continue
         if not owner:
             continue
-        if await _job_is_active(redis, owner):
+        if owner != PENDING_PLACEHOLDER and await _job_is_active(redis, owner):
             continue
         with contextlib.suppress(Exception):
             await redis.delete(key)
@@ -375,10 +396,35 @@ async def _drop_stale_batches(redis, report: QueueReport, bot=None) -> None:
     )
     report.batches = len(summary["batches"])
     report.batch_keys = int(summary["keys"])
+    report.batch_tombstones = int(summary.get("tombstones", 0))
     report.batches_kept = int(summary["kept"])
     for ref in summary["messages"]:
         if await _delete_batch_message(bot, ref):
             report.batch_messages += 1
+
+
+async def _sweep_ghost_work(redis, report: QueueReport) -> None:
+    """Free what dead workers left behind: conversion slots, batch locks, dedups.
+
+    Cancelling a job does not free the claim its worker took - the worker that owns
+    it releases it when the job ends, and one that was killed (OOM, redeploy) never
+    gets to. Until then the single global ffmpeg slot reads "busy" for every later
+    job, which is the "ghost in an ffmpeg slot, refuses new work" failure, and a
+    dedup key whose owner is gone is the same thing one level down: that particular
+    file will not be processed again.
+
+    A claim or dedup key whose worker still heartbeats is deliberately left alone:
+    that worker is about to release it itself, and stealing the slot early would let
+    a second conversion start beside the one still winding down.
+    """
+    from utils import batch_pipeline
+
+    freed = await batch_pipeline.sweep_ghost_claims(redis)
+    report.slots_freed = int(freed.get("slots", 0))
+    report.locks_freed = int(freed.get("locks", 0))
+    # The dedicated dedup pass above drops everything it can see; folding this
+    # sweep's findings in means the report never under-reports what was removed.
+    report.dedup_keys += int(freed.get("dedup", 0))
 
 
 async def cancel_all_jobs(*, purge_broker: bool = True, bot=None) -> QueueReport:
@@ -409,8 +455,10 @@ async def cancel_all_jobs(*, purge_broker: bool = True, bot=None) -> QueueReport
             ("progress keys", _drop_progress_keys(redis, report)),
             ("stale locks", _release_stale_locks(redis, report, cancelled)),
             ("dedup keys", _drop_stale_dedup_keys(redis, report)),
-            # Last, because the steps above are what make every batch stale.
+            # Last, because the steps above are what make every batch stale and
+            # every claim's owner over.
             ("stale batches", _drop_stale_batches(redis, report, bot)),
+            ("ghost work", _sweep_ghost_work(redis, report)),
         )
         for name, step in steps:
             try:
