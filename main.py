@@ -1202,6 +1202,31 @@ def setup_handlers(application: Application) -> None:
 
     application.add_handler(CommandHandler("clear_cache", latency_wrapper(clear_cache_command, "clear_cache_command")))
 
+    async def reset_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Reset all stale Redis state: egress counters, alert state, storage cache,
+        and old completed/failed/cancelled job hashes.
+
+        Use this after switching storage backends or env vars to wipe the old
+        account's metrics so /session_status starts fresh.
+        """
+        if not _admin_only(update):
+            await update.message.reply_text("Unauthorized: admin only")
+            return
+
+        await update.message.reply_text(
+            "⚠️ *Reset all stale stats to zero*?\n\n"
+            "This clears:\n"
+            "• Egress counters (`storage:egress:*`)\n"
+            "• Egress alert state (`storage:egress:alert_state`)\n"
+            "• Storage usage cache (`status:storage:usage`)\n"
+            "• Old completed/failed/cancelled job hashes (`ffmpeg:job:*`)\n\n"
+            "Running and queued jobs are *not* affected.",
+            parse_mode="Markdown",
+            reply_markup=confirm_keyboard("reset"),
+        )
+
+    application.add_handler(CommandHandler("reset", latency_wrapper(reset_command, "reset_command")))
+
     async def _perform_clear_cache(reply, purge_storage: bool):
         await reply.pending("🧼 Clearing cache keys...")
         try:
@@ -1210,6 +1235,80 @@ def setup_handlers(application: Application) -> None:
         except Exception:
             logger.exception("/clear_cache failed")
             await reply.say("❌ /clear_cache failed — check the logs for details.")
+
+    async def _perform_reset(reply):
+        """Clear all stale Redis state: egress counters, alert state,
+        storage cache, and old completed/failed/cancelled job hashes.
+        """
+        await reply.pending("🔄 Resetting stale stats...")
+        cleared = []
+        errors = []
+        try:
+            from utils.job_queue import get_redis
+
+            r = await get_redis()
+            try:
+                # 1. Egress counters: storage:egress:YYYY-MM:object/link
+                egress_keys = []
+                async for key in r.scan_iter(match="storage:egress:*", count=200):
+                    egress_keys.append(key)
+                if egress_keys:
+                    await r.delete(*egress_keys)
+                    cleared.append(f"Egress counters: {len(egress_keys)} key(s)")
+                else:
+                    cleared.append("Egress counters: none found")
+
+                # 2. Egress alert state
+                alert_deleted = await r.delete("storage:egress:alert_state")
+                cleared.append(f"Egress alert state: {'cleared' if alert_deleted else 'none found'}")
+
+                # 3. Storage usage cache
+                cache_deleted = await r.delete("status:storage:usage")
+                cleared.append(f"Storage cache: {'cleared' if cache_deleted else 'none found'}")
+
+                # 4. Old completed/failed/cancelled job hashes
+                terminal_statuses = {"done", "completed", "error", "failed", "cancelled", "canceled"}
+                stale_keys = []
+                async for key in r.scan_iter(match="ffmpeg:job:*", count=500):
+                    try:
+                        status = await r.hget(key, "status")
+                        if isinstance(status, bytes):
+                            status = status.decode()
+                        if status and status.lower() in terminal_statuses:
+                            stale_keys.append(key)
+                    except Exception:
+                        pass
+                if stale_keys:
+                    await r.delete(*stale_keys)
+                    cleared.append(f"Stale job hashes: {len(stale_keys)} cleared")
+                else:
+                    cleared.append("Stale job hashes: none found")
+
+            finally:
+                with contextlib.suppress(Exception):
+                    await r.close()
+        except Exception as exc:
+            errors.append(str(exc))
+            logger.exception("/reset failed")
+
+        # Also clear the in-memory egress counters so the current process
+        # does not keep reporting stale totals until a restart.
+        try:
+            from utils.storage import _EGRESS_LOCAL
+
+            _EGRESS_LOCAL.clear()
+            cleared.append("In-memory egress counters: cleared")
+        except Exception:
+            pass
+
+        lines = ["✅ <b>Reset complete</b>", ""]
+        lines.extend(cleared)
+        if errors:
+            lines.append("")
+            lines.append(f"⚠️ Errors: {'; '.join(errors)}")
+        lines.append("")
+        lines.append("Run /session_status to see the fresh state.")
+        await reply.say("\n".join(lines), parse_mode="HTML")
 
     async def confirm_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Run the action behind an inline Yes/No confirmation.
@@ -1242,6 +1341,8 @@ def setup_handlers(application: Application) -> None:
                 await _perform_worker_restart(reply, update)
             elif action == "clear_cache":
                 await _perform_clear_cache(reply, payload == "storage")
+            elif action == "reset":
+                await _perform_reset(reply)
             elif action == "canceljob":
                 await _perform_canceljob(reply, payload or "")
             elif action == "cancelbatch":
