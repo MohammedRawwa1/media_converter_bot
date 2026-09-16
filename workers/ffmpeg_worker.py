@@ -99,6 +99,56 @@ FORWARD_NOTIFY_EVENT: asyncio.Event | None = None
 # Redis cache instance shared between worker_loop and handle_job
 _cache = None
 LAST_FORWARD_NOTIFICATION: dict | None = None
+
+
+async def _get_cached_file_id(
+    media_type: str,
+    *,
+    file_unique_id: str | None = None,
+    file_path: str | None = None,
+) -> str | None:
+    """Get a cached Telegram file_id for the given media, if available.
+
+    Uses the file_id_cache module to retrieve a previously stored file_id.
+    Falls back gracefully when the cache is unavailable.
+    """
+    try:
+        from utils import file_id_cache
+
+        return await file_id_cache.get_file_id(
+            media_type,
+            file_unique_id=file_unique_id,
+            file_path=file_path,
+        )
+    except Exception:
+        logger.debug("ffmpeg_worker: file_id cache lookup failed, will upload fresh")
+        return None
+
+
+async def _cache_file_id(
+    media_type: str,
+    file_id: str,
+    *,
+    file_unique_id: str | None = None,
+    file_path: str | None = None,
+) -> bool:
+    """Cache a Telegram file_id for future reuse.
+
+    Uses the file_id_cache module to store the file_id.
+    Falls back gracefully when the cache is unavailable.
+    """
+    try:
+        from utils import file_id_cache
+
+        return await file_id_cache.store_file_id(
+            media_type,
+            file_id,
+            file_unique_id=file_unique_id,
+            file_path=file_path,
+        )
+    except Exception:
+        logger.debug("ffmpeg_worker: file_id cache store failed, will re-upload next time")
+        return False
 # Cache for output probe results to avoid double ffprobe/thumbnail generation.
 # Keyed by output file path; values are (video_meta, thumb_path).
 _output_probe_cache: dict[str, tuple[dict | None, str | None]] = {}
@@ -324,11 +374,58 @@ async def _send_video_result(
     vid_duration: int | None = None,
     vid_width: int | None = None,
     vid_height: int | None = None,
-) -> None:
-    """Open a video file, wrap with upload progress, and send_video with metadata."""
+    file_unique_id: str | None = None,
+) -> str | None:
+    """Open a video file, wrap with upload progress, and send_video with metadata.
+
+    Returns the Telegram file_id of the sent video, or None on failure.
+    The file_id is cached for reuse on subsequent sends of the same media.
+
+    Args:
+        file_unique_id: Optional stable identifier for the video content.
+            If provided, the resulting file_id will be cached for reuse,
+            avoiding repeated uploads to Telegram (and the associated IDrive egress).
+    """
     _bot_up_cb = _make_upload_progress_callback(job_id, progress_channel) if job_id and progress_channel else None
     _cleanup_thumb = _temp_thumb
+    _sent_file_id = None
     try:
+        # Try to use cached file_id first (if we have a content identity)
+        if file_unique_id:
+            _cached_file_id = await _get_cached_file_id("video", file_unique_id=file_unique_id)
+            if _cached_file_id:
+                logger.info(
+                    "Worker: using cached file_id for video (chat_id=%s), avoiding re-upload",
+                    chat_id,
+                )
+                _send_kwargs = {
+                    "chat_id": chat_id,
+                    "video": _cached_file_id,
+                    "caption": caption,
+                    "supports_streaming": True,
+                }
+                if vid_duration is not None:
+                    _send_kwargs["duration"] = vid_duration
+                if vid_width is not None:
+                    _send_kwargs["width"] = vid_width
+                if vid_height is not None:
+                    _send_kwargs["height"] = vid_height
+                if thumb_path:
+                    try:
+                        with open(thumb_path, "rb") as _tf:
+                            _send_kwargs["thumbnail"] = _tf
+                            _msg = await bot.send_video(**_send_kwargs)
+                    except Exception:
+                        _send_kwargs.pop("thumbnail", None)
+                        _msg = await bot.send_video(**_send_kwargs)
+                else:
+                    _msg = await bot.send_video(**_send_kwargs)
+                _sent_file_id = getattr(_msg, "video", None)
+                if _sent_file_id and hasattr(_sent_file_id, "file_id"):
+                    _sent_file_id = _sent_file_id.file_id
+                return _sent_file_id
+
+        # No cached file_id - upload the file fresh
         with open(file_path, "rb") as _fh:
             _fh = _ProgressFileWrapper(_fh, file_size, _bot_up_cb) if file_size and _bot_up_cb else _fh
             _send_kwargs = {
@@ -354,12 +451,21 @@ async def _send_video_result(
                 try:
                     with open(thumb_path, "rb") as _tf:
                         _send_kwargs["thumbnail"] = _tf
-                        await bot.send_video(**_send_kwargs)
+                        _msg = await bot.send_video(**_send_kwargs)
                 except Exception:
                     _send_kwargs.pop("thumbnail", None)  # Remove closed file handle before retry
-                    await bot.send_video(**_send_kwargs)
+                    _msg = await bot.send_video(**_send_kwargs)
             else:
-                await bot.send_video(**_send_kwargs)
+                _msg = await bot.send_video(**_send_kwargs)
+            _sent_file_id = getattr(_msg, "video", None)
+            if _sent_file_id and hasattr(_sent_file_id, "file_id"):
+                _sent_file_id = _sent_file_id.file_id
+
+            # Cache the file_id for future reuse
+            if _sent_file_id and file_unique_id:
+                await _cache_file_id("video", _sent_file_id, file_unique_id=file_unique_id)
+
+            return _sent_file_id
     finally:
         if _cleanup_thumb and os.path.exists(_cleanup_thumb):
             try:

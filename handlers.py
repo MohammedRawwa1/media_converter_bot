@@ -1931,6 +1931,57 @@ class EnhancedMediaHandler:
         session["current_file"] = current_file
         return True
 
+    # ── Media file_id caching helpers ─────────────────────────────────────
+    async def _get_cached_file_id(
+        self,
+        media_type: str,
+        *,
+        file_unique_id: str | None = None,
+        file_path: str | None = None,
+    ) -> str | None:
+        """Get a cached Telegram file_id for the given media, if available.
+
+        Uses the file_id_cache module to retrieve a previously stored file_id.
+        Falls back gracefully when the cache is unavailable.
+        """
+        try:
+            from utils.file_id_cache import get_file_id
+
+            return await get_file_id(
+                media_type,
+                file_unique_id=file_unique_id,
+                file_path=file_path,
+            )
+        except Exception:
+            logger.debug("handlers: file_id cache lookup failed, will upload fresh")
+            return None
+
+    async def _cache_file_id(
+        self,
+        media_type: str,
+        file_id: str,
+        *,
+        file_unique_id: str | None = None,
+        file_path: str | None = None,
+    ) -> bool:
+        """Cache a Telegram file_id for future reuse.
+
+        Uses the file_id_cache module to store the file_id.
+        Falls back gracefully when the cache is unavailable.
+        """
+        try:
+            from utils.file_id_cache import store_file_id
+
+            return await store_file_id(
+                media_type,
+                file_id,
+                file_unique_id=file_unique_id,
+                file_path=file_path,
+            )
+        except Exception:
+            logger.debug("handlers: failed to cache file_id for %s", media_type)
+            return False
+
     # ── Video delivery helper: send_video with rich metadata ──────────────
     async def _send_video_result(
         self,
@@ -1939,13 +1990,22 @@ class EnhancedMediaHandler:
         file_path: str,
         caption: str = "",
         thumb_path: str | None = None,
-    ) -> None:
+        file_unique_id: str | None = None,
+    ) -> str | None:
         """Send a video file with probed metadata (duration, width, height, thumbnail).
 
         Uses the shared ``probe_video_for_delivery`` utility to extract video
         metadata and generate a thumbnail, then calls send_video with all
         available info so Telegram shows the video's duration, dimensions,
         and thumbnail.
+
+        Returns the Telegram file_id of the sent video, or None on failure.
+        The file_id is cached for reuse on subsequent sends of the same media
+        to avoid repeated egress from IDrive/object storage.
+
+        Args:
+            file_unique_id: Optional stable identifier for the video content.
+                If provided, the resulting file_id will be cached for reuse.
         """
         _vid_duration = None
         _vid_width = None
@@ -1971,7 +2031,45 @@ class EnhancedMediaHandler:
         except Exception:
             logger.debug("handlers: probe_video_for_delivery failed")
 
-        # ── Send with all available metadata ──
+        # ── Try to use cached file_id first ──
+        _sent_file_id = None
+        if file_unique_id:
+            _cached_file_id = await self._get_cached_file_id(
+                "video",
+                file_unique_id=file_unique_id,
+            )
+            if _cached_file_id:
+                logger.info(
+                    "handlers: using cached file_id for video (chat_id=%s), avoiding re-upload",
+                    chat_id,
+                )
+                _send_kwargs = {
+                    "chat_id": chat_id,
+                    "video": _cached_file_id,
+                    "caption": caption,
+                    "supports_streaming": True,
+                }
+                if _vid_duration is not None:
+                    _send_kwargs["duration"] = _vid_duration
+                if _vid_width is not None:
+                    _send_kwargs["width"] = _vid_width
+                if _vid_height is not None:
+                    _send_kwargs["height"] = _vid_height
+                if _thumb_path:
+                    try:
+                        with open(_thumb_path, "rb") as _tf:
+                            _send_kwargs["thumb"] = _tf
+                            _msg = await bot.send_video(**_send_kwargs)
+                    except Exception:
+                        await bot.send_video(**_send_kwargs)
+                else:
+                    _msg = await bot.send_video(**_send_kwargs)
+                _sent_file_id = getattr(_msg, "video", None)
+                if _sent_file_id and hasattr(_sent_file_id, "file_id"):
+                    _sent_file_id = _sent_file_id.file_id
+                return _sent_file_id
+
+        # ── Send with all available metadata (fresh upload) ──
         try:
             with open(file_path, "rb") as _fh:
                 _send_kwargs = {
@@ -1990,15 +2088,235 @@ class EnhancedMediaHandler:
                     try:
                         with open(_thumb_path, "rb") as _tf:
                             _send_kwargs["thumb"] = _tf
-                            await bot.send_video(**_send_kwargs)
+                            _msg = await bot.send_video(**_send_kwargs)
                     except Exception:
-                        await bot.send_video(**_send_kwargs)
+                        _msg = await bot.send_video(**_send_kwargs)
                 else:
-                    await bot.send_video(**_send_kwargs)
+                    _msg = await bot.send_video(**_send_kwargs)
+                _sent_file_id = getattr(_msg, "video", None)
+                if _sent_file_id and hasattr(_sent_file_id, "file_id"):
+                    _sent_file_id = _sent_file_id.file_id
+
+                # Cache the file_id for future reuse
+                if _sent_file_id and file_unique_id:
+                    await self._cache_file_id(
+                        "video",
+                        _sent_file_id,
+                        file_unique_id=file_unique_id,
+                    )
+
+                return _sent_file_id
         finally:
             if _cleanup_thumb and _thumb_path and os.path.exists(_thumb_path):
                 with contextlib.suppress(Exception):
                     os.remove(_thumb_path)
+
+    # ── Photo delivery helper with file_id caching ───────────────────────
+    async def _send_photo_result(
+        self,
+        bot,
+        chat_id: int,
+        file_path: str,
+        caption: str = "",
+        file_unique_id: str | None = None,
+    ) -> str | None:
+        """Send a photo file with file_id caching.
+
+        Returns the Telegram file_id of the sent photo, or None on failure.
+        The file_id is cached for reuse on subsequent sends of the same photo
+        to avoid repeated egress from IDrive/object storage.
+        """
+        # ── Try to use cached file_id first ──
+        if file_unique_id:
+            _cached_file_id = await self._get_cached_file_id(
+                "photo",
+                file_unique_id=file_unique_id,
+            )
+            if _cached_file_id:
+                logger.info(
+                    "handlers: using cached file_id for photo (chat_id=%s), avoiding re-upload",
+                    chat_id,
+                )
+                _msg = await bot.send_photo(
+                    chat_id=chat_id,
+                    photo=_cached_file_id,
+                    caption=caption,
+                )
+                _sent_file_id = getattr(_msg, "photo", None)
+                if _sent_file_id and hasattr(_sent_file_id, "file_id"):
+                    _sent_file_id = _sent_file_id[-1].file_id  # Last photo is highest res
+                return _sent_file_id
+
+        # ── Fresh upload ──
+        try:
+            with open(file_path, "rb") as _fh:
+                _msg = await bot.send_photo(
+                    chat_id=chat_id,
+                    photo=_fh,
+                    caption=caption,
+                )
+            _sent_file_id = getattr(_msg, "photo", None)
+            if _sent_file_id and hasattr(_sent_file_id, "file_id"):
+                _sent_file_id = _sent_file_id[-1].file_id  # Last photo is highest res
+
+            # Cache the file_id for future reuse
+            if _sent_file_id and file_unique_id:
+                await self._cache_file_id(
+                    "photo",
+                    _sent_file_id,
+                    file_unique_id=file_unique_id,
+                )
+
+            return _sent_file_id
+        except Exception:
+            logger.exception("handlers: failed to send photo")
+            return None
+
+    # ── Audio delivery helper with file_id caching ───────────────────────
+    async def _send_audio_result(
+        self,
+        bot,
+        chat_id: int,
+        file_path: str,
+        caption: str = "",
+        title: str | None = None,
+        performer: str | None = None,
+        filename: str | None = None,
+        file_unique_id: str | None = None,
+    ) -> str | None:
+        """Send an audio file with file_id caching.
+
+        Returns the Telegram file_id of the sent audio, or None on failure.
+        The file_id is cached for reuse on subsequent sends of the same audio
+        to avoid repeated egress from IDrive/object storage.
+        """
+        # ── Try to use cached file_id first ──
+        if file_unique_id:
+            _cached_file_id = await self._get_cached_file_id(
+                "audio",
+                file_unique_id=file_unique_id,
+            )
+            if _cached_file_id:
+                logger.info(
+                    "handlers: using cached file_id for audio (chat_id=%s), avoiding re-upload",
+                    chat_id,
+                )
+                _send_kwargs = {
+                    "chat_id": chat_id,
+                    "audio": _cached_file_id,
+                    "caption": caption,
+                }
+                if title:
+                    _send_kwargs["title"] = title
+                if performer:
+                    _send_kwargs["performer"] = performer
+                if filename:
+                    _send_kwargs["filename"] = filename
+                _msg = await bot.send_audio(**_send_kwargs)
+                _sent_file_id = getattr(_msg, "audio", None)
+                if _sent_file_id and hasattr(_sent_file_id, "file_id"):
+                    _sent_file_id = _sent_file_id.file_id
+                return _sent_file_id
+
+        # ── Fresh upload ──
+        try:
+            with open(file_path, "rb") as _fh:
+                _send_kwargs = {
+                    "chat_id": chat_id,
+                    "audio": _fh,
+                    "caption": caption,
+                }
+                if title:
+                    _send_kwargs["title"] = title
+                if performer:
+                    _send_kwargs["performer"] = performer
+                if filename:
+                    _send_kwargs["filename"] = filename
+                _msg = await bot.send_audio(**_send_kwargs)
+            _sent_file_id = getattr(_msg, "audio", None)
+            if _sent_file_id and hasattr(_sent_file_id, "file_id"):
+                _sent_file_id = _sent_file_id.file_id
+
+            # Cache the file_id for future reuse
+            if _sent_file_id and file_unique_id:
+                await self._cache_file_id(
+                    "audio",
+                    _sent_file_id,
+                    file_unique_id=file_unique_id,
+                )
+
+            return _sent_file_id
+        except Exception:
+            logger.exception("handlers: failed to send audio")
+            return None
+
+    # ── Document delivery helper with file_id caching ────────────────────
+    async def _send_document_result(
+        self,
+        bot,
+        chat_id: int,
+        file_path: str,
+        caption: str = "",
+        filename: str | None = None,
+        file_unique_id: str | None = None,
+    ) -> str | None:
+        """Send a document file with file_id caching.
+
+        Returns the Telegram file_id of the sent document, or None on failure.
+        The file_id is cached for reuse on subsequent sends of the same document
+        to avoid repeated egress from IDrive/object storage.
+        """
+        # ── Try to use cached file_id first ──
+        if file_unique_id:
+            _cached_file_id = await self._get_cached_file_id(
+                "document",
+                file_unique_id=file_unique_id,
+            )
+            if _cached_file_id:
+                logger.info(
+                    "handlers: using cached file_id for document (chat_id=%s), avoiding re-upload",
+                    chat_id,
+                )
+                _send_kwargs = {
+                    "chat_id": chat_id,
+                    "document": _cached_file_id,
+                    "caption": caption,
+                }
+                if filename:
+                    _send_kwargs["filename"] = filename
+                _msg = await bot.send_document(**_send_kwargs)
+                _sent_file_id = getattr(_msg, "document", None)
+                if _sent_file_id and hasattr(_sent_file_id, "file_id"):
+                    _sent_file_id = _sent_file_id.file_id
+                return _sent_file_id
+
+        # ── Fresh upload ──
+        try:
+            with open(file_path, "rb") as _fh:
+                _send_kwargs = {
+                    "chat_id": chat_id,
+                    "document": _fh,
+                    "caption": caption,
+                }
+                if filename:
+                    _send_kwargs["filename"] = filename
+                _msg = await bot.send_document(**_send_kwargs)
+            _sent_file_id = getattr(_msg, "document", None)
+            if _sent_file_id and hasattr(_sent_file_id, "file_id"):
+                _sent_file_id = _sent_file_id.file_id
+
+            # Cache the file_id for future reuse
+            if _sent_file_id and file_unique_id:
+                await self._cache_file_id(
+                    "document",
+                    _sent_file_id,
+                    file_unique_id=file_unique_id,
+                )
+
+            return _sent_file_id
+        except Exception:
+            logger.exception("handlers: failed to send document")
+            return None
 
     async def _ensure_bulk_file_downloaded(
         self,
