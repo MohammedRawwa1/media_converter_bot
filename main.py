@@ -1605,7 +1605,17 @@ async def main(background: bool = False) -> None:
                     read_timeout=http_read_timeout,
                 )
                 GET_UPDATES_BOT = Bot(token=BOT_TOKEN, request=gu_req)
-                logger.info("Dedicated get_updates client initialized (pool=%s)", gu_pool_size)
+                # Initialize the bot so its username/id are populated.
+                # Without this, CommandHandler.check_update() crashes with
+                # "Bot is not properly initialized" when updates fetched via
+                # this bot are dispatched through the Application's handler chain.
+                _gu_me = await GET_UPDATES_BOT.get_me()
+                logger.info(
+                    "Dedicated get_updates client initialized (pool=%s, bot=@%s id=%s)",
+                    gu_pool_size,
+                    getattr(_gu_me, "username", "?"),
+                    getattr(_gu_me, "id", "?"),
+                )
             except Exception as e:
                 logger.warning("Failed to initialize dedicated get_updates client: %s", e)
                 GET_UPDATES_BOT = None
@@ -2042,6 +2052,17 @@ async def main(background: bool = False) -> None:
                         logger.warning(f"Failed to delete webhook before long-poller: {e}")
 
                 logger.info("Starting background long-poller (FORCE_POLLING enabled)")
+
+                # Stop the Application's built-in Updater polling so it doesn't
+                # conflict with our custom long-poller. Both calling getUpdates
+                # on the same token simultaneously causes Telegram Conflict errors.
+                try:
+                    _updater = getattr(application, "updater", None)
+                    if _updater is not None and getattr(_updater, "is_running", lambda: False)():
+                        await _updater.stop()
+                        logger.info("Stopped Application built-in Updater (custom long-poller will handle polling)")
+                except Exception as e:
+                    logger.debug("Could not stop built-in Updater: %s", e)
 
                 # Distributed lock to prevent multiple workers from polling simultaneously
                 _longpoll_redis_lock = None
@@ -3078,6 +3099,20 @@ try:
         # Always HTTP 200: this endpoint backs the platform healthcheck and the
         # keep-alive ping, so a degraded pipe must be visible in the body rather
         # than restarting a container that is still converting files.
+        # Expose the dedicated get_updates bot identity so ops can confirm
+        # it was initialized (username populated) at startup.
+        _gu_bot = globals().get("GET_UPDATES_BOT")
+        _gu_info = None
+        if _gu_bot is not None:
+            _me = getattr(_gu_bot, "bot", None)  # populated by get_me()
+            if _me is not None:
+                _gu_info = {
+                    "username": getattr(_me, "username", None),
+                    "id": getattr(_me, "id", None),
+                }
+            else:
+                _gu_info = {"error": "not initialized"}
+
         payload.update(
             {
                 "bot_initialized": BOT_APPLICATION is not None,
@@ -3087,6 +3122,7 @@ try:
                 "error": getattr(app.state, "startup_error", None),
                 "redis_keys": redis_keys,
                 "telegram_flood": flood,
+                "get_updates_bot": _gu_info,
             }
         )
         return payload
