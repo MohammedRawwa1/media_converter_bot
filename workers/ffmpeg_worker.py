@@ -2643,6 +2643,11 @@ async def _claim_execution_slot(job: dict):
     try:
         batch_id = batch_pipeline.job_batch_id(job)
         if batch_id and await batch_pipeline.is_batch_cancelled(r, batch_id):
+            logger.info(
+                "Batch %s already cancelled: dropping deferred job %s",
+                batch_id,
+                job.get("job_id"),
+            )
             with contextlib.suppress(Exception):
                 await r.hset(
                     f"ffmpeg:job:{job.get('job_id')}",
@@ -2935,6 +2940,12 @@ async def _report_batch_progress(job: dict) -> None:
     except Exception:
         return
     try:
+        # A batch the user stopped has already had its state taken down
+        # (``cancel_batch``); only its tombstone survives. Re-writing the done
+        # counter here would resurrect it, and the next dry-run of
+        # ``scripts/cleanup_stale_redis.py`` would show the same batch again.
+        if await batch_pipeline.is_batch_cancelled(r, batch_id):
+            return
         # Count each job exactly once. A retried delivery runs this block again,
         # and a plain INCR would then count one file twice - finishing the batch
         # early and removing its bar while files were still queued.
@@ -2986,13 +2997,33 @@ def _parse_batch_message_ref(stored) -> tuple[int, int] | None:
 
 
 async def _delete_batch_message(bot, redis, msg_key: str, stored) -> None:
-    """Remove a batch's progress message and stop tracking it."""
+    """Remove a batch's progress message and stop tracking it.
+
+    The reference is only forgotten once the message is confirmed gone. A
+    transient Telegram failure keeps it, so a later report (a redelivered job,
+    or /cancelall's sweep, which reads the same key) retries the delete -
+    otherwise a failed final delete would leave a bar claiming a finished batch
+    forever, with nothing left that would ever take it down.
+    """
     parsed = _parse_batch_message_ref(stored) if stored else None
+    deleted = True
     if parsed is not None:
-        with contextlib.suppress(Exception):
+        try:
+            from telegram.error import BadRequest
+        except Exception:
+            BadRequest = None
+        try:
             await bot.delete_message(chat_id=parsed[0], message_id=parsed[1])
-    with contextlib.suppress(Exception):
-        await redis.delete(msg_key)
+        except Exception as exc:
+            # Already gone (the stop path deleted it, or it aged out of the
+            # edit window): done, forget the reference as planned.
+            if BadRequest is not None and isinstance(exc, BadRequest):
+                pass
+            else:
+                deleted = False
+    if deleted:
+        with contextlib.suppress(Exception):
+            await redis.delete(msg_key)
 
 
 async def _keep_claims_alive(job: dict, slot) -> None:
@@ -3069,6 +3100,13 @@ async def _run_queued_job(job: dict, source: str) -> None:
             job.get("job_id"),
             source,
         )
+        # If the first attempt delivered the file but died before its batch
+        # progress landed, this redelivery is the last chance to take the
+        # batch's bar down. Best-effort and idempotent (claim_batch_progress_slot
+        # counts each job once), so running it here is harmless when the counter
+        # is already correct.
+        with contextlib.suppress(Exception):
+            await _report_batch_progress(job)
         return
     slot = await _claim_execution_slot(job)
     if slot is None:
@@ -3100,13 +3138,18 @@ async def _run_queued_job(job: dict, source: str) -> None:
         # never race on the same message.
         if batch_progress_task is not None:
             batch_progress_task.cancel()
-            with contextlib.suppress(Exception):
+            # ``await`` re-raises CancelledError and that is a BaseException, so
+            # suppress(Exception) would let it escape and - on the RabbitMQ path
+            # - kill the consumer for good, skipping the progress report and the
+            # slot/batch-lock release below. Swallow it here; a real shutdown
+            # cancellation re-enters through handle_job's own await point.
+            with contextlib.suppress(asyncio.CancelledError):
                 await batch_progress_task
         # Stop the heartbeat before the claims are released, so a refresh can
         # never land after finalize_job handed the slot back.
         if claims_task is not None:
             claims_task.cancel()
-            with contextlib.suppress(Exception):
+            with contextlib.suppress(asyncio.CancelledError):
                 await claims_task
         # How far into its batch this file got, for the user's progress message.
         with contextlib.suppress(Exception):
@@ -3139,6 +3182,35 @@ async def _rabbitmq_consumer_task(stop_event: asyncio.Event | None = None) -> No
     """Consume jobs from RabbitMQ (messages are acked only after processing)."""
     queue = eventbus.get_queue()
     await queue.consume(lambda job: _run_queued_job(job, "rabbitmq"), stop_event=stop_event)
+
+
+async def _rabbitmq_consumer_supervisor(stop_event: asyncio.Event | None = None) -> None:
+    """Keep the RabbitMQ consumer alive for the life of the worker.
+
+    A consumer that dies used to take its queue out of service until the next
+    deploy: jobs kept landing in the broker, nothing consumed them, and every
+    file sat "queued" while the Redis loop drained an empty list. Restarts are
+    spaced out so a persistently broken broker cannot spin the process.
+    """
+    backoff = 2.0
+    while not (stop_event is not None and stop_event.is_set()):
+        try:
+            await _rabbitmq_consumer_task(stop_event)
+            if stop_event is not None and stop_event.is_set():
+                return
+            logger.warning("eventbus: RabbitMQ consumer returned early; restarting it")
+            backoff = 2.0
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception(
+                "eventbus: RabbitMQ consumer crashed; restarting in %.0fs", backoff
+            )
+            try:
+                await asyncio.sleep(backoff)
+            except asyncio.CancelledError:
+                raise
+            backoff = min(backoff * 2.0, 60.0)
 
 
 async def worker_loop(stop_event: asyncio.Event | None = None, *, allow_restart: bool = False):
@@ -3200,7 +3272,7 @@ async def worker_loop(stop_event: asyncio.Event | None = None, *, allow_restart:
     rabbit_task = None
     try:
         if eventbus.get_settings().consumes_rabbitmq:
-            rabbit_task = asyncio.create_task(_rabbitmq_consumer_task(stop_event))
+            rabbit_task = asyncio.create_task(_rabbitmq_consumer_supervisor(stop_event))
             logger.info("eventbus: RabbitMQ job consumer started alongside the Redis queue")
     except Exception:
         rabbit_task = None
@@ -3238,7 +3310,9 @@ async def worker_loop(stop_event: asyncio.Event | None = None, *, allow_restart:
         try:
             if forward_task:
                 forward_task.cancel()
-                with contextlib.suppress(Exception):
+                # CancelledError is a BaseException: suppress(Exception) would
+                # let it escape and mask the rest of the shutdown.
+                with contextlib.suppress(asyncio.CancelledError):
                     await forward_task
         except Exception:
             logger.debug("ffmpeg worker: ensure forward listener is cancelled")
@@ -3247,7 +3321,7 @@ async def worker_loop(stop_event: asyncio.Event | None = None, *, allow_restart:
         try:
             if rabbit_task:
                 rabbit_task.cancel()
-                with contextlib.suppress(Exception):
+                with contextlib.suppress(asyncio.CancelledError):
                     await rabbit_task
         except Exception:
             logger.debug("ffmpeg worker: RabbitMQ consumer shutdown failed")

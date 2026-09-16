@@ -376,21 +376,39 @@ async def mark_batch_file_done(redis=None, *, batch_id) -> int | None:
 
 
 async def cancel_batch(redis=None, *, batch_id, requested_by=None, ttl_seconds=None) -> dict:
-    """Cancel one batch and remove its queued or delayed members.
+    """Cancel one batch, remove its queued or delayed members and take its state down.
 
     The marker is written first. A worker that already owns one job observes the
     per-job cancel flag; every later member is discarded before it can acquire a
     conversion slot or be deferred again.
+
+    The batch's own keys go with it: counters, membership, the finished-entries
+    record and the progress message's location, plus the batch's entry in every
+    user's resume set and the aggregate view. This is what ``/cancelall`` gets
+    for free from ``purge_stale_batches`` - a single batch stopped by hand used
+    to leave all of that behind until its TTL ran out, which is exactly what
+    ``scripts/cleanup_stale_redis.py`` then kept finding.
+
+    The members' ``ffmpeg:pipeline_dedup:*`` keys are dropped too: a stopped
+    member's job hash now reads ``cancelled`` forever, so without this the file
+    could never be converted again until the dedup key expired on its own.
+
+    What is deliberately *kept* is the tombstone: it is the only thing stopping
+    a worker that is still finishing one member from editing or reposting the
+    progress message, so it has to outlive everything else.
+
+    The progress message's ``chat_id:message_id`` is returned in ``message`` so
+    a caller with a bot can take the bar itself out of the chat.
     """
     if not batch_id:
-        return {"batch_id": batch_id, "jobs": 0, "queued": 0, "delayed": 0}
+        return {"batch_id": batch_id, "jobs": 0, "queued": 0, "delayed": 0, "dedup": 0, "message": None}
     if redis is None:
         from utils.job_queue import get_redis
 
         redis = await get_redis()
     ttl = max(1, int(ttl_seconds or BATCH_STATE_TTL_SECONDS))
     job_ids = []
-    queued = delayed = 0
+    queued = delayed = dropped_dedup = 0
     try:
         await redis.set(batch_cancel_key(batch_id), str(requested_by or "user"), ex=ttl)
         from utils.job_queue import DELAYED_SET, JOB_LIST
@@ -430,9 +448,45 @@ async def cancel_batch(redis=None, *, batch_id, requested_by=None, ttl_seconds=N
                     delayed += int(await redis.zrem(DELAYED_SET, item))
             except Exception:
                 continue
+
+        # The dedup keys that pointed at this batch's members. ``pending`` is
+        # cleared as well on purpose: it is the placeholder of an ingest that is
+        # still deciding, and a batch that has been stopped by hand must not
+        # keep that file from ever being converted again once its wait is over.
+        # The keys carry the user id, not the batch id, so they are found by
+        # value rather than by pattern.
+        try:
+            async for dedup_key in redis.scan_iter(match="ffmpeg:pipeline_dedup:*", count=200):
+                raw_owner = await redis.get(dedup_key)
+                owner = _job_text(raw_owner)
+                if owner in ("pending", *job_ids):
+                    if await redis.delete(dedup_key):
+                        dropped_dedup += 1
+        except Exception:
+            logger.debug("batch_pipeline: could not clear dedup keys for batch %s", batch_id)
+
+        # Take the state down, tombstone excepted - that was written first and
+        # is the only key of this batch that survives the stop.
+        message = None
+        try:
+            stock = await redis.get(batch_message_key(batch_id))
+            message = parse_batch_message_ref(stock) if stock else None
+        except Exception:
+            pass
+        dropped = int(await redis.delete(*batch_state_keys(batch_id)) or 0)
         with contextlib.suppress(Exception):
-            await redis.delete(batch_jobs_key(batch_id))
-        return {"batch_id": str(batch_id), "jobs": len(job_ids), "queued": queued, "delayed": delayed}
+            await redis.srem(ACTIVE_BATCHES_KEY, str(batch_id))
+        with contextlib.suppress(Exception):
+            await _forget_resume_membership(redis, batch_id)
+        return {
+            "batch_id": str(batch_id),
+            "jobs": len(job_ids),
+            "queued": queued,
+            "delayed": delayed,
+            "dedup": dropped_dedup,
+            "keys": dropped,
+            "message": message,
+        }
     finally:
         if redis is not None:
             with contextlib.suppress(Exception):

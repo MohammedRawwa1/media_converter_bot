@@ -6337,16 +6337,15 @@ class EnhancedMediaHandler:
                     return
 
                 try:
-                    from utils.batch_pipeline import (
-                        batch_message_key,
-                        cancel_batch,
-                        parse_batch_message_ref,
-                        unregister_active_batch,
-                    )
-                    from utils.job_queue import get_redis
+                    from utils.batch_pipeline import cancel_batch
 
+                    # The stop takes the whole batch down itself: members flagged,
+                    # queue and delayed entries pruned, the members' dedup keys
+                    # dropped, and every ``ffmpeg:batch:<id>:*`` key removed apart
+                    # from the tombstone that keeps a still-finishing worker from
+                    # reposting the bar. The progress message's location comes back
+                    # in ``report['message']`` so the bar can be deleted here.
                     report = await cancel_batch(batch_id=batch_id, requested_by=user_id)
-                    await unregister_active_batch(batch_id=batch_id)
 
                     # A batch can show two stoppable messages - the bot's summary and
                     # the worker's progress bar - and each carries its own Stop
@@ -6355,23 +6354,18 @@ class EnhancedMediaHandler:
                     # like a batch frozen at its last percentage. Take the batch's
                     # own progress message down as well, unless it is the one the
                     # user just pressed (that becomes the confirmation below).
-                    with contextlib.suppress(Exception):
-                        _pressed_id = getattr(getattr(query, "message", None), "message_id", None)
-                        _r_stop = await get_redis()
-                        _stored = await _r_stop.get(batch_message_key(batch_id))
-                        _ref = parse_batch_message_ref(_stored) if _stored else None
-                        if _ref and _ref[1] != _pressed_id:
-                            with contextlib.suppress(Exception):
-                                await context.bot.delete_message(chat_id=_ref[0], message_id=_ref[1])
-                        if _stored:
-                            # Forget it, so nothing edits or reposts a removed bar.
-                            await _r_stop.delete(batch_message_key(batch_id))
+                    _ref = report.get("message")
+                    _pressed_id = getattr(getattr(query, "message", None), "message_id", None)
+                    if _ref and _ref[1] != _pressed_id:
+                        with contextlib.suppress(Exception):
+                            await context.bot.delete_message(chat_id=_ref[0], message_id=_ref[1])
 
                     await self.safe_edit(
                         query,
                         "⏹️ Batch stopped.\n"
                         f"• Flagged {report['jobs']} job(s)\n"
-                        f"• Removed {report['queued']} queued and {report['delayed']} waiting job(s)",
+                        f"• Removed {report['queued']} queued and {report['delayed']} waiting job(s)\n"
+                        f"• Dropped {report.get('dedup', 0)} dedup key(s) and cleared the batch state",
                     )
                     with contextlib.suppress(BadRequest):
                         await query.answer("Batch stopped")

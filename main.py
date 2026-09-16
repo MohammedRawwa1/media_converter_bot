@@ -1049,11 +1049,19 @@ def setup_handlers(application: Application) -> None:
         try:
             from utils.batch_pipeline import cancel_batch
 
+            # cancel_batch takes the batch's whole Redis state with it (counters,
+            # membership, the resume record and the members' dedup keys), so a
+            # stopped batch is never left behind for the stale-Redis sweep to find.
             report = await cancel_batch(batch_id=batch_id, requested_by=getattr(reply.update.effective_user, "id", None))
+            _ref = report.get("message")
+            if _ref:
+                with contextlib.suppress(Exception):
+                    await reply.context.bot.delete_message(chat_id=_ref[0], message_id=_ref[1])
             await reply.say(
                 f"✅ Batch `{report['batch_id']}` cancelled.\n"
                 f"Flagged {report['jobs']} job(s); removed {report['queued']} queued and "
-                f"{report['delayed']} delayed job(s). No remaining member will be requeued.",
+                f"{report['delayed']} delayed job(s); dropped {report.get('dedup', 0)} dedup key(s). "
+                f"No remaining member will be requeued.",
                 parse_mode="Markdown",
             )
         except Exception:
