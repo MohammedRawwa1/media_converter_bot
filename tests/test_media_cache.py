@@ -173,6 +173,306 @@ def test_lookup_never_raises_without_redis(monkeypatch):
     assert asyncio.run(media_cache.remember("uid", size=1)) is False
 
 
+# ── the durable tier: MongoDB holds what Redis can lose ─────────────────
+
+
+class FakeRegistryModel:
+    """The only two methods media_cache is allowed to call on the Mongo model."""
+
+    def __init__(self):
+        self.docs: dict[str, dict] = {}
+        self.forgotten: list[str] = []
+
+    async def lookup_media(self, file_unique_id):
+        doc = self.docs.get(file_unique_id)
+        return dict(doc) if doc else None
+
+    async def remember_media(self, file_unique_id, entry):
+        merged = {k: v for k, v in dict(entry).items() if v is not None}
+        merged["file_unique_id"] = file_unique_id
+        self.docs[file_unique_id] = merged
+        return True
+
+    async def forget_media(self, file_unique_id):
+        self.docs.pop(file_unique_id, None)
+        self.forgotten.append(file_unique_id)
+        return True
+
+
+@pytest.fixture
+def durable(monkeypatch):
+    """A registered Mongo model: the tier Redis cannot lose."""
+    model = FakeRegistryModel()
+
+    async def _db_model():
+        return model
+
+    monkeypatch.setattr(media_cache, "_db_model", _db_model)
+    monkeypatch.setenv("MEDIA_REGISTRY_ENABLED", "1")
+    return model
+
+
+def test_a_redis_miss_is_not_believed_when_mongo_knows_the_media(fake_cache, durable):
+    durable.docs["uid-8"] = {"size": 99, "input_key": "inputs/library/x/source", "storage": "s3"}
+
+    entry = asyncio.run(media_cache.lookup("uid-8", expected_size=99))
+
+    assert entry["input_key"] == "inputs/library/x/source"
+    # The hot tier is refilled, so the next lookup is one round trip again.
+    assert fake_cache.info[_info_key("uid-8")]["size"] == 99
+
+
+def test_an_empty_redis_descriptor_is_treated_as_a_miss(fake_cache, durable):
+    fake_cache.info[_info_key("uid-11")] = {}
+    durable.docs["uid-11"] = {"size": 7, "input_key": "k"}
+    assert asyncio.run(media_cache.lookup("uid-11", expected_size=7))["input_key"] == "k"
+
+
+def test_a_durable_hit_needs_no_redis_at_all(monkeypatch, durable):
+    """Redis being unreachable is exactly when the durable tier matters."""
+
+    async def _no_redis():
+        return None
+
+    monkeypatch.setattr(media_cache, "_cache", _no_redis)
+    durable.docs["uid-9"] = {"size": 5, "input_key": "inputs/library/y/source"}
+
+    entry = asyncio.run(media_cache.lookup("uid-9", expected_size=5))
+
+    assert entry["input_key"] == "inputs/library/y/source"
+
+
+def test_remember_writes_both_tiers(fake_cache, durable):
+    asyncio.run(media_cache.remember("uid-10", size=2048, input_key="inputs/library/z/source", storage="s3"))
+    assert durable.docs["uid-10"]["input_key"] == "inputs/library/z/source"
+    assert fake_cache.info[_info_key("uid-10")]["size"] == 2048
+
+
+def test_remember_succeeds_when_only_mongo_took_it(monkeypatch, durable):
+    async def _no_redis():
+        return None
+
+    monkeypatch.setattr(media_cache, "_cache", _no_redis)
+
+    stored = asyncio.run(media_cache.remember("uid-12", size=64, input_key="k"))
+
+    assert stored is True
+    assert durable.docs["uid-12"]["size"] == 64
+
+
+def test_a_durable_size_mismatch_drops_both_copies(fake_cache, durable):
+    durable.docs["uid-13"] = {"size": 5, "input_key": "stale"}
+
+    assert asyncio.run(media_cache.lookup("uid-13", expected_size=6)) is None
+
+    assert "uid-13" not in durable.docs
+    assert durable.forgotten == ["uid-13"]
+
+
+def test_forget_clears_the_durable_copy(fake_cache, durable):
+    asyncio.run(media_cache.remember("uid-14", size=4, input_key="k"))
+    asyncio.run(media_cache.forget("uid-14"))
+
+    assert "uid-14" not in durable.docs
+    assert durable.forgotten == ["uid-14"]
+
+
+def test_the_registry_can_be_switched_off(fake_cache, durable, monkeypatch):
+    monkeypatch.setenv("MEDIA_REGISTRY_ENABLED", "0")
+    assert media_cache.registry_enabled() is False
+    durable.docs["uid-15"] = {"size": 3, "input_key": "k"}
+    # Redis is empty, and the durable tier was told not to answer.
+    assert asyncio.run(media_cache.lookup("uid-15", expected_size=3)) is None
+
+
+def test_the_telegram_token_and_probe_duration_are_kept(fake_cache, durable):
+    """The token a file arrived under, and its probed duration, both survive."""
+    asyncio.run(
+        media_cache.remember(
+            "uid-16",
+            size=1024,
+            input_key="inputs/library/w/source",
+            storage="s3",
+            file_id="BAACAgQAAxkBAAIQ",
+            duration=2994.58,
+        )
+    )
+
+    assert durable.docs["uid-16"]["file_id"] == "BAACAgQAAxkBAAIQ"
+    assert durable.docs["uid-16"]["duration"] == 2994.58
+    assert fake_cache.info[_info_key("uid-16")]["duration"] == 2994.58
+
+
+# ── the model behind the durable tier ───────────────────────────────────
+
+
+class _FakeUpdateResult:
+    matched_count = 1
+    modified_count = 1
+    deleted_count = 1
+
+
+class _FakeCursor:
+    def __init__(self, docs):
+        self._docs = docs
+        self._limit = None
+
+    def sort(self, *args):
+        return self
+
+    def skip(self, *args):
+        return self
+
+    def limit(self, n):
+        self._limit = n
+        return self
+
+    def allow_disk_use(self):
+        return self
+
+    async def to_list(self, length=None):
+        return self._docs[: (self._limit or length or len(self._docs))]
+
+
+class _FakeCollection:
+    def __init__(self, name):
+        self.name = name
+        self.docs: dict[str, dict] = {}
+        self.indexes: list[tuple] = []
+        self.fail_update = False
+
+    @staticmethod
+    def _doc_key(filters) -> str:
+        """Whichever key field this collection is addressed by.
+
+        The media registry is keyed by ``file_unique_id`` and the file_id
+        registry by ``cache_key``, so the fake has to read the key the caller
+        actually used instead of assuming one.
+        """
+        for field in ("file_unique_id", "cache_key"):
+            if field in filters:
+                return filters[field]
+        raise KeyError(f"no known key field in {filters}")
+
+    async def update_one(self, flt, upd, upsert=False):
+        if self.fail_update:
+            raise RuntimeError("mongo down")
+        self.docs.setdefault(self._doc_key(flt), {}).update(upd["$set"])
+        return _FakeUpdateResult()
+
+    def find(self, flt, projection=None):
+        doc = self.docs.get(self._doc_key(flt))
+        return _FakeCursor([dict(doc)] if doc else [])
+
+    async def delete_one(self, flt):
+        self.docs.pop(self._doc_key(flt), None)
+        return _FakeUpdateResult()
+
+    async def create_index(self, *args, **kwargs):
+        self.indexes.append((args, kwargs))
+        return "index"
+
+
+class _FakeDB:
+    def __init__(self):
+        self.colls: dict[str, _FakeCollection] = {}
+
+    def __getitem__(self, name):
+        return self.colls.setdefault(name, _FakeCollection(name))
+
+
+class _FakeMongoClient:
+    def __init__(self):
+        self.dbs: dict[str, _FakeDB] = {}
+
+    def __getitem__(self, name):
+        return self.dbs.setdefault(name, _FakeDB())
+
+
+def _registry_model(monkeypatch):
+    from models import MediaConversionModel
+
+    for var in ("BOT_ID", "BOT_USERNAME", "BOT_NAME"):
+        monkeypatch.delenv(var, raising=False)
+    return MediaConversionModel(_FakeMongoClient(), db_name="test", bot_id=None)
+
+
+def test_the_registry_upserts_one_document_per_media(monkeypatch):
+    model = _registry_model(monkeypatch)
+
+    asyncio.run(model.remember_media("uid-1", {"size": 10, "input_key": "k"}))
+    asyncio.run(model.remember_media("uid-1", {"file_id": "BAAC"}))
+
+    doc = asyncio.run(model.lookup_media("uid-1"))
+    # The second write adds to the first, it does not replace it...
+    assert doc["input_key"] == "k"
+    assert doc["file_id"] == "BAAC"
+    # ...and neither write may blank a field it does not know about.
+    assert doc["size"] == 10
+    assert doc["updated_at"] is not None
+
+
+def test_lookup_strips_the_bson_object_id(monkeypatch):
+    """An ObjectId would not survive the trip into the Redis tier."""
+    model = _registry_model(monkeypatch)
+    model._media_registry_coll.docs["uid-2"] = {"input_key": "k", "_id": object()}
+
+    doc = asyncio.run(model.lookup_media("uid-2"))
+
+    assert "_id" not in doc
+    assert doc["input_key"] == "k"
+
+
+def test_an_unknown_media_is_no_document(monkeypatch):
+    model = _registry_model(monkeypatch)
+    assert asyncio.run(model.lookup_media("never-seen")) is None
+    assert asyncio.run(model.lookup_media("")) is None
+    assert asyncio.run(model.remember_media("", {"size": 1})) is False
+
+
+def test_forget_removes_the_document(monkeypatch):
+    model = _registry_model(monkeypatch)
+    asyncio.run(model.remember_media("uid-3", {"size": 1}))
+    assert asyncio.run(model.forget_media("uid-3")) is True
+    assert asyncio.run(model.lookup_media("uid-3")) is None
+
+
+class _BrokenCollection:
+    """A collection whose every operation fails, as an unreachable Mongo does."""
+
+    name = "media_registry"
+
+    def find(self, *args, **kwargs):
+        raise RuntimeError("mongo unreachable")
+
+    async def update_one(self, *args, **kwargs):
+        raise RuntimeError("mongo unreachable")
+
+    async def delete_one(self, *args, **kwargs):
+        raise RuntimeError("mongo unreachable")
+
+
+def test_a_mongo_failure_is_never_fatal(monkeypatch):
+    """The registry only ever saves a download; it must not cost a job."""
+    model = _registry_model(monkeypatch)
+    model._media_registry_coll.fail_update = True
+    assert asyncio.run(model.remember_media("uid-4", {"size": 1})) is False
+
+    model.media_registry.collection = _BrokenCollection()
+    assert asyncio.run(model.lookup_media("uid-5")) is None
+    assert asyncio.run(model.forget_media("uid-5")) is False
+
+
+def test_the_registry_is_indexed_and_pruned(monkeypatch):
+    model = _registry_model(monkeypatch)
+    asyncio.run(model.ensure_indexes())
+
+    indexes = model._media_registry_coll.indexes
+    assert (("file_unique_id",), {"unique": True}) in indexes
+    ttl = [kwargs for args, kwargs in indexes if args == ("updated_at",)]
+    assert ttl and ttl[0]["expireAfterSeconds"] > 0
+
+
 # ── pipeline wiring ─────────────────────────────────────────────────────
 
 
@@ -197,7 +497,10 @@ def test_pipeline_reuses_a_bare_byte_hit_without_remember():
     src = read_source("utils", "bigfile_pipeline.py")
 
     assert "_bytes_hit" in src
-    assert "if not _reused and not _bytes_hit:" in src
+    # The disk download is the fallback for every path that did not already
+    # produce a source: not reused, not served from the byte tier, and not
+    # streamed straight into storage.
+    assert "if not _reused and not _bytes_hit and not _streamed:" in src
 
 
 def test_bot_api_path_reuses_every_tier():

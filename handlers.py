@@ -2156,6 +2156,50 @@ class EnhancedMediaHandler:
             logger.debug("handlers: failed to cache file_id for %s", media_type)
             return False
 
+    @staticmethod
+    def _is_stale_file_id(error) -> bool:
+        """Whether *error* means Telegram refused the file_id itself.
+
+        Tells the two reactions apart: drop the token and upload fresh (it is
+        dead), or leave the cache alone and let the failure surface (a flood wait
+        or a network error was never the token's fault).
+        """
+        try:
+            from utils.file_id_cache import is_stale_file_id
+
+            return bool(is_stale_file_id(error))
+        except Exception:
+            return False
+
+    async def _forget_cached_file_id(
+        self,
+        media_type: str,
+        *,
+        file_unique_id: str | None = None,
+        file_path: str | None = None,
+    ) -> None:
+        """Drop a file_id Telegram refused, so the next send uploads fresh.
+
+        A cached file_id is only a saving while a dead one costs a retry: without
+        this, a token Telegram has revoked makes every delivery of that media
+        fail, and the more durable the cache the more chances there are to hit
+        one.
+        """
+        try:
+            from utils.file_id_cache import invalidate_file_id
+
+            await invalidate_file_id(
+                media_type,
+                file_unique_id=file_unique_id,
+                file_path=file_path,
+            )
+            logger.info(
+                "handlers: dropped the refused %s file_id; the next send uploads fresh",
+                media_type,
+            )
+        except Exception:
+            logger.debug("handlers: could not invalidate a refused %s file_id", media_type)
+
     # ── Video delivery helper: send_video with rich metadata ──────────────
     async def _send_video_result(
         self,
@@ -2229,19 +2273,31 @@ class EnhancedMediaHandler:
                     _send_kwargs["width"] = _vid_width
                 if _vid_height is not None:
                     _send_kwargs["height"] = _vid_height
-                if _thumb_path:
-                    try:
-                        with open(_thumb_path, "rb") as _tf:
-                            _send_kwargs["thumb"] = _tf
+                try:
+                    if _thumb_path:
+                        try:
+                            with open(_thumb_path, "rb") as _tf:
+                                _send_kwargs["thumb"] = _tf
+                                _msg = await bot.send_video(**_send_kwargs)
+                        except Exception:
+                            # The thumb may be what Telegram objected to, not the
+                            # token: retry without it and keep the retry's message
+                            # (this used to drop the result, leaving _msg unbound).
+                            _send_kwargs.pop("thumb", None)
                             _msg = await bot.send_video(**_send_kwargs)
-                    except Exception:
-                        await bot.send_video(**_send_kwargs)
+                    else:
+                        _msg = await bot.send_video(**_send_kwargs)
+                except Exception as _cached_exc:
+                    if not self._is_stale_file_id(_cached_exc):
+                        raise
+                    # The token is dead: drop it and fall through to a real
+                    # upload, so caching can never cost a delivery.
+                    await self._forget_cached_file_id("video", file_unique_id=file_unique_id)
                 else:
-                    _msg = await bot.send_video(**_send_kwargs)
-                _sent_file_id = getattr(_msg, "video", None)
-                if _sent_file_id and hasattr(_sent_file_id, "file_id"):
-                    _sent_file_id = _sent_file_id.file_id
-                return _sent_file_id
+                    _sent_file_id = getattr(_msg, "video", None)
+                    if _sent_file_id and hasattr(_sent_file_id, "file_id"):
+                        _sent_file_id = _sent_file_id.file_id
+                    return _sent_file_id
 
         # ── Send with all available metadata (fresh upload) ──
         try:
@@ -2311,15 +2367,21 @@ class EnhancedMediaHandler:
                     "handlers: using cached file_id for photo (chat_id=%s), avoiding re-upload",
                     chat_id,
                 )
-                _msg = await bot.send_photo(
-                    chat_id=chat_id,
-                    photo=_cached_file_id,
-                    caption=caption,
-                )
-                _sent_file_id = getattr(_msg, "photo", None)
-                if _sent_file_id and hasattr(_sent_file_id, "file_id"):
-                    _sent_file_id = _sent_file_id[-1].file_id  # Last photo is highest res
-                return _sent_file_id
+                try:
+                    _msg = await bot.send_photo(
+                        chat_id=chat_id,
+                        photo=_cached_file_id,
+                        caption=caption,
+                    )
+                except Exception as _cached_exc:
+                    if not self._is_stale_file_id(_cached_exc):
+                        raise
+                    await self._forget_cached_file_id("photo", file_unique_id=file_unique_id)
+                else:
+                    _sent_file_id = getattr(_msg, "photo", None)
+                    if _sent_file_id and hasattr(_sent_file_id, "file_id"):
+                        _sent_file_id = _sent_file_id[-1].file_id  # Last photo is highest res
+                    return _sent_file_id
 
         # ── Fresh upload ──
         try:
@@ -2386,11 +2448,17 @@ class EnhancedMediaHandler:
                     _send_kwargs["performer"] = performer
                 if filename:
                     _send_kwargs["filename"] = filename
-                _msg = await bot.send_audio(**_send_kwargs)
-                _sent_file_id = getattr(_msg, "audio", None)
-                if _sent_file_id and hasattr(_sent_file_id, "file_id"):
-                    _sent_file_id = _sent_file_id.file_id
-                return _sent_file_id
+                try:
+                    _msg = await bot.send_audio(**_send_kwargs)
+                except Exception as _cached_exc:
+                    if not self._is_stale_file_id(_cached_exc):
+                        raise
+                    await self._forget_cached_file_id("audio", file_unique_id=file_unique_id)
+                else:
+                    _sent_file_id = getattr(_msg, "audio", None)
+                    if _sent_file_id and hasattr(_sent_file_id, "file_id"):
+                        _sent_file_id = _sent_file_id.file_id
+                    return _sent_file_id
 
         # ── Fresh upload ──
         try:
@@ -2458,11 +2526,17 @@ class EnhancedMediaHandler:
                 }
                 if filename:
                     _send_kwargs["filename"] = filename
-                _msg = await bot.send_document(**_send_kwargs)
-                _sent_file_id = getattr(_msg, "document", None)
-                if _sent_file_id and hasattr(_sent_file_id, "file_id"):
-                    _sent_file_id = _sent_file_id.file_id
-                return _sent_file_id
+                try:
+                    _msg = await bot.send_document(**_send_kwargs)
+                except Exception as _cached_exc:
+                    if not self._is_stale_file_id(_cached_exc):
+                        raise
+                    await self._forget_cached_file_id("document", file_unique_id=file_unique_id)
+                else:
+                    _sent_file_id = getattr(_msg, "document", None)
+                    if _sent_file_id and hasattr(_sent_file_id, "file_id"):
+                        _sent_file_id = _sent_file_id.file_id
+                    return _sent_file_id
 
         # ── Fresh upload ──
         try:
@@ -3199,6 +3273,15 @@ class EnhancedMediaHandler:
                             #    queued and should NOT enqueue a duplicate. ──
                             if current_file is not None:
                                 current_file["_pipeline_job_id"] = _ingest.job_id
+                                # The ingest ffprobed the source itself, and its
+                                # verdict is the only place a large file's title
+                                # and performer can come from: this path never ran
+                                # the disk probe that fills ``_source_metadata``,
+                                # so every big file was delivered with a
+                                # filename-derived caption. Keep whatever the
+                                # session already had when the ingest had nothing.
+                                if _ingest.source_metadata:
+                                    current_file["_source_metadata"] = dict(_ingest.source_metadata)
                                 # Also persist the S3 input_key so that
                                 # _ensure_current_file_downloaded's early-return
                                 # check (input_key or path.exists) catches this
@@ -3623,7 +3706,14 @@ class EnhancedMediaHandler:
                         if _stored_ok:
                             current_file["input_key"] = _stored_key
                             current_file["path"] = None
-                            current_file["_source_metadata"] = {}
+                            # The metadata captured when this media was ingested
+                            # belongs to *this* media, and it is what the caption
+                            # and the audio tags are built from. This path used to
+                            # blank it, so every repeat - the second style applied
+                            # to a file, and every batch file after the first -
+                            # delivered with the filename instead of the title and
+                            # performer the file actually carries.
+                            current_file.setdefault("_source_metadata", {})
                             session["current_file"] = current_file
                             with contextlib.suppress(Exception):
                                 self._persist_session(user_id)
@@ -3676,6 +3766,10 @@ class EnhancedMediaHandler:
                         name=current_file.get("name"),
                         storage="s3",
                         data=_payload,
+                        # The location token the upload came from: it is what lets
+                        # a later step forward the media inside Telegram instead
+                        # of fetching it down to this box again.
+                        file_id=current_file.get("id"),
                     )
             except Exception:
                 logger.debug("handlers: failed to remember remote media in cache")
@@ -3767,6 +3861,7 @@ class EnhancedMediaHandler:
                         name=current_file.get("name"),
                         storage="local",
                         data=_payload,
+                        file_id=current_file.get("id"),
                     )
             except Exception:
                 logger.debug("handlers: failed to remember media in cache")
@@ -4671,6 +4766,7 @@ class EnhancedMediaHandler:
                                     name=os.path.basename(photo_path),
                                     storage="local",
                                     data=_payload,
+                                    file_id=getattr(file_obj, "file_id", None),
                                 )
                         except Exception:
                             logger.debug("handlers: failed to remember photo in cache")
@@ -6367,11 +6463,23 @@ class EnhancedMediaHandler:
                                 f["_pipeline_ffmpeg_args"] = list(_bulk_args)
                                 f["_pipeline_conversion_type"] = _plan["convert_type"]
                                 f["_pipeline_output_ext"] = _bulk_ext
-                                f["_pipeline_caption"] = (
+                                _bulk_fallback_caption = (
                                     f"✅ Audio extracted ({_plan['extract_bitrate']})"
                                     if _bulk_ext == ".mp3"
                                     else f"Bulk conversion finished for {f.get('name') or f.get('id')}"
                                 )
+                                # A file that carries tags keeps its metadriven
+                                # caption in a batch too - the same one the
+                                # single-file actions build - so the title and
+                                # performer survive Apply Bulk instead of every
+                                # result arriving with one generic line. A file
+                                # with no tags at all keeps the batch wording.
+                                _bulk_tag_caption = (
+                                    _metadata_caption(f)
+                                    if (f.get("_source_metadata") or f.get("source_metadata"))
+                                    else ""
+                                )
+                                f["_pipeline_caption"] = _bulk_tag_caption or _bulk_fallback_caption
                                 f["_pipeline_batch_id"] = _batch_id
                                 f["_pipeline_batch_seq"] = _batch_seq
                                 f["_pipeline_batch_total"] = _batch_total

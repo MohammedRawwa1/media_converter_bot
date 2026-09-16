@@ -164,6 +164,49 @@ async def _cache_file_id(
         return False
 
 
+def _is_stale_file_id(error) -> bool:
+    """Whether *error* means Telegram refused the file_id itself.
+
+    Tells the two reactions apart: drop the token and upload fresh (it is dead),
+    or leave the cache alone and let the failure surface (a flood wait or a
+    network error was never the token's fault).
+    """
+    try:
+        from utils import file_id_cache
+
+        return bool(file_id_cache.is_stale_file_id(error))
+    except Exception:
+        return False
+
+
+async def _forget_cached_file_id(
+    media_type: str,
+    *,
+    file_unique_id: str | None = None,
+    file_path: str | None = None,
+) -> None:
+    """Drop a file_id Telegram refused, so the next delivery uploads fresh.
+
+    A cached file_id is only a saving while a dead one costs a retry: without
+    this, a revoked token makes every delivery of that media fail, and the more
+    durable the cache the more chances there are to hit one.
+    """
+    try:
+        from utils import file_id_cache
+
+        await file_id_cache.invalidate_file_id(
+            media_type,
+            file_unique_id=file_unique_id,
+            file_path=file_path,
+        )
+        logger.info(
+            "Worker: dropped the refused %s file_id; the next delivery uploads fresh",
+            media_type,
+        )
+    except Exception:
+        logger.debug("ffmpeg_worker: could not invalidate a refused %s file_id", media_type)
+
+
 # Cache for output probe results to avoid double ffprobe/thumbnail generation.
 # Keyed by output file path; values are (video_meta, thumb_path).
 _output_probe_cache: dict[str, tuple[dict | None, str | None]] = {}
@@ -180,6 +223,10 @@ _output_probe_cache: dict[str, tuple[dict | None, str | None]] = {}
 STORAGE_DOWNLOAD_TIMEOUT_SECONDS = float(os.environ.get("STORAGE_DOWNLOAD_TIMEOUT_SECONDS", "900"))
 STORAGE_DOWNLOAD_MIN_BYTES_PER_SECOND = float(os.environ.get("STORAGE_DOWNLOAD_MIN_BYTES_PER_SECOND", str(256 * 1024)))
 STORAGE_DOWNLOAD_MAX_SECONDS = float(os.environ.get("STORAGE_DOWNLOAD_MAX_SECONDS", str(6 * 3600)))
+# How long the header-only range GET may take before it is abandoned. The probe
+# is advisory - it can only ever produce a warning - so it must never be able to
+# hold the worker's one conversion slot (and its batch's lock) open.
+STORAGE_PROBE_TIMEOUT_SECONDS = float(os.environ.get("STORAGE_PROBE_TIMEOUT_SECONDS", "60"))
 
 
 def _storage_download_timeout_seconds(size_bytes) -> float:
@@ -423,20 +470,28 @@ async def _send_video_result(
                     _send_kwargs["width"] = vid_width
                 if vid_height is not None:
                     _send_kwargs["height"] = vid_height
-                if thumb_path:
-                    try:
-                        with open(thumb_path, "rb") as _tf:
-                            _send_kwargs["thumbnail"] = _tf
+                try:
+                    if thumb_path:
+                        try:
+                            with open(thumb_path, "rb") as _tf:
+                                _send_kwargs["thumbnail"] = _tf
+                                _msg = await bot.send_video(**_send_kwargs)
+                        except Exception:
+                            _send_kwargs.pop("thumbnail", None)
                             _msg = await bot.send_video(**_send_kwargs)
-                    except Exception:
-                        _send_kwargs.pop("thumbnail", None)
+                    else:
                         _msg = await bot.send_video(**_send_kwargs)
+                except Exception as _cached_exc:
+                    if not _is_stale_file_id(_cached_exc):
+                        raise
+                    # The token is dead: drop it and fall through to a real
+                    # upload, so caching can never cost a delivery.
+                    await _forget_cached_file_id("video", file_unique_id=file_unique_id)
                 else:
-                    _msg = await bot.send_video(**_send_kwargs)
-                _sent_file_id = getattr(_msg, "video", None)
-                if _sent_file_id and hasattr(_sent_file_id, "file_id"):
-                    _sent_file_id = _sent_file_id.file_id
-                return _sent_file_id
+                    _sent_file_id = getattr(_msg, "video", None)
+                    if _sent_file_id and hasattr(_sent_file_id, "file_id"):
+                        _sent_file_id = _sent_file_id.file_id
+                    return _sent_file_id
 
         # No cached file_id - upload the file fresh
         with open(file_path, "rb") as _fh:
@@ -1172,6 +1227,23 @@ async def handle_job(job: dict):
                         job["original_filename"] = _sval("original_filename")
                     if not job.get("output_filename") and _sval("output_filename"):
                         job["output_filename"] = _sval("output_filename")
+                    # Source provenance written by the big-file pipeline: the
+                    # ingest already probed the whole media before it stored
+                    # anything, and it knows the Telegram copy the userbot
+                    # fetched from. Both are read here so the worker neither
+                    # repeats the probe against storage nor assumes the bucket is
+                    # the only place the bytes exist.
+                    for _field in (
+                        "source_duration",
+                        "source_format",
+                        "source_chat_id",
+                        "source_message_id",
+                        "file_unique_id",
+                    ):
+                        if not job.get(_field) and _sval(_field):
+                            job[_field] = _sval(_field)
+                    if _sval("input_header_only") is not None:
+                        job["input_header_only"] = _sval("input_header_only")
             except Exception:
                 logger.debug("ffmpeg worker: operation failed")
             try:
@@ -1231,6 +1303,74 @@ async def handle_job(job: dict):
         if _library_source_cache_path(input_key):
             with contextlib.suppress(Exception):
                 await record_source_cache(True, nbytes=os.path.getsize(input_path))
+    # ── The bucket may hold only a header ──
+    # With ``PIPELINE_SOURCE_UPLOAD=header`` the stored object is a couple of
+    # megabytes of container, and the media itself is on Telegram. Encoding the
+    # header would produce a two-megabyte "video", so it is never downloaded as
+    # a source: the bytes are read from local disk or over MTProto.
+    if (
+        str(job.get("input_header_only") or "").strip().lower() in ("1", "true", "yes", "on")
+        and input_key
+        and (not input_path or not os.path.exists(input_path))
+    ):
+        logger.info(
+            "Job %s: %s is only the probe header, not the media; reading the source from Telegram",
+            job_id,
+            input_key,
+        )
+        input_key = None
+
+    # ── Telegram first: the media is already there ──
+    # The userbot fetched this file through the relay chat, and that copy is
+    # still in it. Reading it over MTProto costs no bucket egress, so it is
+    # preferred over pulling a whole stored copy back out; a stored object stays
+    # the last resort for a worker with no session to read it with.
+    if not input_path or not os.path.exists(input_path):
+        _tg_chat = job.get("source_chat_id")
+        _tg_msg = job.get("source_message_id")
+        if _tg_chat and _tg_msg:
+            try:
+                from utils.userbot_downloader import download_forward_via_userbot
+
+                _tg_dir = os.path.join(getattr(config, "TEMP_PATH", "storage/temp"))
+                os.makedirs(_tg_dir, exist_ok=True)
+                _tg_dest = os.path.join(
+                    _tg_dir,
+                    f"{job_id}_src{file_utils.safe_extension(job.get('original_filename') or '', '.mp4')}",
+                )
+                logger.info(
+                    "Job %s: fetching the source over Telegram (%s/%s) instead of storage",
+                    job_id,
+                    _tg_chat,
+                    _tg_msg,
+                )
+                _tg_ok = await download_forward_via_userbot(
+                    chat_id=_tg_chat,
+                    message_id=int(_tg_msg),
+                    dest_path=_tg_dest,
+                    file_unique_id=job.get("file_unique_id"),
+                    user_id=job.get("user_id"),
+                )
+                if _tg_ok and os.path.exists(_tg_dest) and os.path.getsize(_tg_dest) > 0:
+                    input_path = _tg_dest
+                    job["input_path"] = input_path
+                    logger.info(
+                        "Job %s: source fetched over Telegram (%dMB)",
+                        job_id,
+                        os.path.getsize(_tg_dest) // (1024 * 1024),
+                    )
+                else:
+                    logger.warning(
+                        "Job %s: the Telegram fetch returned nothing; falling back to storage",
+                        job_id,
+                    )
+            except Exception:
+                logger.warning(
+                    "Job %s: the Telegram fetch failed; falling back to storage",
+                    job_id,
+                    exc_info=True,
+                )
+
     if input_key and (not input_path or not os.path.exists(input_path)):
         # ── Shared source cache ──
         # One media is one library object, and every operation on it resolves to
@@ -1420,53 +1560,76 @@ async def handle_job(job: dict):
             except Exception:
                 pass
 
-        # ── Range-probe: inspect the first 2 MB before pulling the whole file ──
-        # Container headers (MP4 moov, MKV SegmentInfo, AVI RIFF header) live
-        # in the first few MB.  ffprobe on a 2 MB slice catches most corrupt /
-        # truncated files before they burn the full egress budget.
+        # ── Source check before pulling the whole file ──
+        # The ingest ffprobed the entire media *before* it stored anything and
+        # left that verdict in this job's hash, so it is what is trusted here: it
+        # costs no egress and it is exact.
+        #
+        # The storage range-probe therefore only runs when there is no verdict.
+        # When it does run, a slice without a duration is *not* a failure: an MP4
+        # whose moov atom sits at the end (not faststart) legitimately reports no
+        # duration in its first 2 MB while being perfectly playable, and treating
+        # that as "corrupt" killed good jobs mid-batch - the apply saw a terminal
+        # error and went straight on to fetch the next file. The full download
+        # below validates whatever it actually fetched.
+        _declared_duration = job.get("source_duration")
+        _declared_format = job.get("source_format")
         _probe_slice_path = f"{temp_input_path}.probe"
-        try:
-            range_ok = await backend.download_range(
+        if _declared_duration or _declared_format:
+            logger.info(
+                "Source check: %s was probed at ingest (dur=%s, format=%s, job %s); skipping the storage range-probe",
                 input_key,
-                _probe_slice_path,
-                end=2_097_151,
-            )
-            if range_ok and os.path.exists(_probe_slice_path) and os.path.getsize(_probe_slice_path) > 0:
-                from utils.ffmpeg_runner import probe_media
-
-                probe = await probe_media(_probe_slice_path)
-                if not probe or not probe.get("duration"):
-                    logger.warning(
-                        "Range-probe: ffprobe found no duration for %s (job %s) — source may be corrupt",
-                        input_key,
-                        job_id,
-                    )
-                    await _set_job_state(
-                        job_id,
-                        "error",
-                        "source appears corrupt or unsupported",
-                        progress=0,
-                    )
-                    with contextlib.suppress(OSError):
-                        os.remove(_probe_slice_path)
-                    return
-                logger.debug(
-                    "Range-probe: source %s looks valid (dur=%.1fs, job %s)",
-                    input_key,
-                    probe.get("duration", 0),
-                    job_id,
-                )
-        except Exception:
-            # Range GET or ffprobe failure is non-fatal — fall through to the
-            # full download which has its own ffprobe validation.
-            logger.debug(
-                "Range-probe failed for %s (job %s); proceeding to full download",
-                input_key,
+                _declared_duration or "?",
+                _declared_format or "?",
                 job_id,
             )
-        finally:
-            with contextlib.suppress(OSError):
-                os.remove(_probe_slice_path)
+        else:
+            try:
+                range_ok = await asyncio.wait_for(
+                    backend.download_range(
+                        input_key,
+                        _probe_slice_path,
+                        end=2_097_151,
+                    ),
+                    timeout=STORAGE_PROBE_TIMEOUT_SECONDS,
+                )
+                if range_ok and os.path.exists(_probe_slice_path) and os.path.getsize(_probe_slice_path) > 0:
+                    from utils.ffmpeg_runner import probe_media
+
+                    probe = await probe_media(_probe_slice_path)
+                    if not probe or not probe.get("duration"):
+                        logger.warning(
+                            "Range-probe: no duration in the first 2MB of %s (job %s) - "
+                            "this is normal for a container whose header sits at the end; "
+                            "proceeding to the full download",
+                            input_key,
+                            job_id,
+                        )
+                    else:
+                        logger.debug(
+                            "Range-probe: source %s looks valid (dur=%.1fs, job %s)",
+                            input_key,
+                            probe.get("duration", 0),
+                            job_id,
+                        )
+            except TimeoutError:
+                logger.warning(
+                    "Range-probe timed out after %.0fs for %s (job %s); proceeding to the full download",
+                    STORAGE_PROBE_TIMEOUT_SECONDS,
+                    input_key,
+                    job_id,
+                )
+            except Exception:
+                # Range GET or ffprobe failure is non-fatal — fall through to the
+                # full download which has its own ffprobe validation.
+                logger.debug(
+                    "Range-probe failed for %s (job %s); proceeding to full download",
+                    input_key,
+                    job_id,
+                )
+            finally:
+                with contextlib.suppress(OSError):
+                    os.remove(_probe_slice_path)
 
         # retry/backoff for transient storage/download issues
         download_retries = int(os.environ.get("DOWNLOAD_RETRIES", "3"))
@@ -1560,7 +1723,12 @@ async def handle_job(job: dict):
             # enough. Without this the job stayed "processing" for the rest of its
             # TTL, so its watchdog never showed the failure and a bulk apply waited
             # out its whole job budget for a member that was already over.
-            await _set_job_state(job_id, "error", "could not fetch the source from storage", progress=0)
+            _fetch_error = (
+                "the source is not on this worker and could not be read from Telegram"
+                if str(job.get("input_header_only") or "").strip().lower() in ("1", "true", "yes", "on")
+                else "could not fetch the source from storage"
+            )
+            await _set_job_state(job_id, "error", _fetch_error, progress=0)
             return
     # (re)use any job-provided retry count
     retries = int(job.get("retries", 0))

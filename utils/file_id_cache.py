@@ -18,6 +18,18 @@ Key design decisions:
 - The cache is keyed by content hash/file_unique_id, not by filename
 - Falls back gracefully when Redis is unavailable
 
+The entry is kept in two tiers, the same way the media registry is: Redis for
+latency, and the ``file_id_registry`` MongoDB collection for durability. Redis
+is a cache - it can be flushed, evicted, or be unreachable - and losing a
+file_id means uploading the very same bytes to Telegram all over again.
+
+Reuse is **self-healing**. Telegram can refuse a token it handed out earlier
+(``wrong file identifier``, an expired file reference), so every consumer of a
+cached file_id must be ready for it to be rejected: :func:`is_stale_file_id`
+says whether a failure was about the token, :func:`invalidate_file_id` drops it,
+and the send is retried from the file. Caching a token is only a saving while a
+dead one costs a retry rather than a failed delivery.
+
 Usage:
     from utils import file_id_cache
 
@@ -35,6 +47,10 @@ Usage:
 
 from __future__ import annotations
 
+import contextlib
+import datetime
+
+_NOW_UTC = datetime.datetime.now(tz=datetime.timezone.utc)
 import hashlib
 import logging
 import os
@@ -59,6 +75,11 @@ def _file_id_key(media_type: str, content_identity: str) -> str:
     return f"{_cache_prefix(media_type)}{content_identity}"
 
 
+def registry_key(media_type: str, content_identity: str) -> str:
+    """The durable registry's key for the same pair the Redis key encodes."""
+    return f"{media_type}:{content_identity}"
+
+
 async def _get_cache():
     """Get the Redis cache client, or None if unavailable."""
     try:
@@ -67,6 +88,109 @@ async def _get_cache():
         return await get_cache()
     except Exception:
         return None
+
+
+def registry_enabled() -> bool:
+    """Whether the durable MongoDB tier is on (``FILE_ID_REGISTRY_ENABLED=0`` off).
+
+    Only the durable half is switched here; every Redis path behaves exactly as
+    it did before, which is what makes it safe to turn off when Mongo is
+    unavailable.
+    """
+    return os.getenv("FILE_ID_REGISTRY_ENABLED", "1").strip().lower() not in ("0", "false", "no", "off")
+
+
+async def _db_model():
+    """The bot's MongoDB model, when one has been registered at startup."""
+    try:
+        from utils.telethon_session import get_db_model
+
+        return get_db_model()
+    except Exception:
+        return None
+
+
+async def _durable_get(media_type: str, content_identity: str) -> str | None:
+    """Read a file_id from MongoDB - the tier Redis cannot lose."""
+    if not registry_enabled():
+        return None
+    model = await _db_model()
+    if model is None or not hasattr(model, "lookup_file_id"):
+        return None
+    try:
+        doc = await model.lookup_file_id(registry_key(media_type, content_identity))
+    except Exception:
+        logger.debug("file_id_cache: durable lookup failed for %s/%s", media_type, content_identity[:16])
+        return None
+    if not isinstance(doc, dict):
+        return None
+    file_id = doc.get("file_id")
+    return str(file_id) if file_id else None
+
+
+async def _durable_set(media_type: str, content_identity: str, file_id: str, ttl: int) -> bool:
+    """Mirror a file_id into MongoDB with the caller's own deadline."""
+    if not registry_enabled():
+        return False
+    model = await _db_model()
+    if model is None or not hasattr(model, "remember_file_id"):
+        return False
+    entry = {
+        "media_type": media_type,
+        "content_identity": content_identity,
+        "file_id": file_id,
+        # The document's own expiry, so the registry honors the TTL the caller
+        # passed instead of a single collection-wide one.
+        "expires_at": _NOW_UTC + datetime.timedelta(seconds=max(1, int(ttl))),
+    }
+    try:
+        return bool(await model.remember_file_id(registry_key(media_type, content_identity), entry))
+    except Exception:
+        logger.debug("file_id_cache: durable store failed for %s/%s", media_type, content_identity[:16])
+        return False
+
+
+async def _durable_del(media_type: str, content_identity: str) -> bool:
+    """Drop a file_id from MongoDB (best-effort); True when it is gone."""
+    if not registry_enabled():
+        return False
+    model = await _db_model()
+    if model is None or not hasattr(model, "forget_file_id"):
+        return False
+    try:
+        return bool(await model.forget_file_id(registry_key(media_type, content_identity)))
+    except Exception:
+        logger.debug("file_id_cache: durable invalidate failed for %s/%s", media_type, content_identity[:16])
+        return False
+
+
+# Telegram's wording when it will not accept a token it handed out earlier: the
+# file_id was revoked, or the file reference it decodes to has expired. Anything
+# else - a flood wait, a network error, a closed file handle - is a reason to
+# retry, not a reason to throw away a good token.
+_STALE_FILE_ID_MARKERS = (
+    "wrong file identifier",
+    "file identifier",
+    "file_reference",
+    "file reference",
+    "file not found",
+    "invalid file",
+    "file is not found",
+)
+
+
+def is_stale_file_id(error) -> bool:
+    """Whether *error* means Telegram refused the file_id itself.
+
+    Callers use this to decide between two very different reactions: drop the
+    token and upload fresh (it is dead), or leave the cache alone and retry (it
+    was never the problem).
+    """
+    try:
+        text = str(error).lower()
+    except Exception:
+        return False
+    return any(marker in text for marker in _STALE_FILE_ID_MARKERS)
 
 
 def _compute_content_hash(file_path: str | None = None, file_unique_id: str | None = None) -> str | None:
@@ -125,10 +249,11 @@ async def get_file_id(
         return None
 
     client = await _get_cache()
-    if client is None:
-        return None
-
     key = _file_id_key(media_type, content_identity)
+    if client is None:
+        # Redis being unreachable is precisely when the durable tier matters.
+        return await _durable_get(media_type, content_identity)
+
     try:
         cached = await client.get(key)
         if cached:
@@ -138,7 +263,19 @@ async def get_file_id(
     except Exception:
         logger.debug("file_id_cache: failed to read cache for %s", key)
 
-    return None
+    # A Redis miss only proves Redis forgot. The durable tier is the record of
+    # what Telegram already has, and a hit there is re-seeded into Redis so the
+    # next delivery is one round trip again.
+    durable = await _durable_get(media_type, content_identity)
+    if durable:
+        logger.info(
+            "file_id_cache: durable registry HIT for %s/%s - reseeded the Redis tier",
+            media_type,
+            content_identity[:16],
+        )
+        with contextlib.suppress(Exception):
+            await client.set(key, durable, ttl=FILE_ID_CACHE_TTL_SECONDS)
+    return durable
 
 
 async def store_file_id(
@@ -175,19 +312,22 @@ async def store_file_id(
         return False
 
     client = await _get_cache()
-    if client is None:
-        return False
-
     key = _file_id_key(media_type, content_identity)
     use_ttl = ttl or FILE_ID_CACHE_TTL_SECONDS
 
-    try:
-        await client.set(key, file_id, ttl=use_ttl)
-        logger.debug("file_id_cache: stored file_id for %s/%s (TTL=%ss)", media_type, content_identity[:16], use_ttl)
-        return True
-    except Exception:
-        logger.debug("file_id_cache: failed to store file_id for %s", key)
-        return False
+    stored = False
+    if client is not None:
+        try:
+            await client.set(key, file_id, ttl=use_ttl)
+            logger.debug("file_id_cache: stored file_id for %s/%s (TTL=%ss)", media_type, content_identity[:16], use_ttl)
+            stored = True
+        except Exception:
+            logger.debug("file_id_cache: failed to store file_id for %s", key)
+
+    # The durable tier is written whether or not Redis answered. If either tier
+    # took the token the media is reusable, so that alone counts.
+    durable = await _durable_set(media_type, content_identity, file_id, use_ttl)
+    return stored or durable
 
 
 async def invalidate_file_id(
@@ -220,17 +360,21 @@ async def invalidate_file_id(
         return False
 
     client = await _get_cache()
-    if client is None:
-        return False
-
     key = _file_id_key(media_type, content_identity)
-    try:
-        await client.delete(key)
-        logger.debug("file_id_cache: invalidated %s/%s", media_type, content_identity[:16])
-        return True
-    except Exception:
-        logger.debug("file_id_cache: failed to invalidate %s", key)
-        return False
+    dropped = False
+    if client is not None:
+        try:
+            await client.delete(key)
+            logger.debug("file_id_cache: invalidated %s/%s", media_type, content_identity[:16])
+            dropped = True
+        except Exception:
+            logger.debug("file_id_cache: failed to invalidate %s", key)
+
+    # The durable copy has to go too: leaving it behind would answer the next
+    # delivery with the very token that was just refused, so the healing would
+    # undo itself on the following send.
+    durable = await _durable_del(media_type, content_identity)
+    return dropped or durable
 
 
 async def send_cached_media(
@@ -296,19 +440,38 @@ async def send_cached_media(
             if file_param:
                 send_kwargs[file_param] = cached_file_id
 
-            message = await send_method_func(**send_kwargs)
-            result["success"] = True
-            result["used_cached"] = True
-            result["file_id"] = getattr(message, "video", None) or getattr(message, "photo", None)
-            if hasattr(result["file_id"], "file_id"):
-                result["file_id"] = result["file_id"].file_id
-            elif hasattr(message, "document") and hasattr(message.document, "file_id"):
-                result["file_id"] = message.document.file_id
-            elif hasattr(message, "audio") and hasattr(message.audio, "file_id"):
-                result["file_id"] = message.audio.file_id
-            elif hasattr(message, "voice") and hasattr(message.voice, "file_id"):
-                result["file_id"] = message.voice.file_id
-        else:
+            try:
+                message = await send_method_func(**send_kwargs)
+            except Exception as cached_exc:
+                if not is_stale_file_id(cached_exc):
+                    # A flood wait or a network error is not the token's fault:
+                    # leave the cache alone and let the caller decide what to do.
+                    raise
+                logger.info(
+                    "file_id_cache: Telegram refused the cached %s file_id (%s); dropping it and uploading fresh",
+                    media_type,
+                    cached_exc,
+                )
+                await invalidate_file_id(
+                    media_type,
+                    file_unique_id=file_unique_id,
+                    file_path=file_path,
+                    content_identity=content_identity,
+                )
+                cached_file_id = None
+            else:
+                result["success"] = True
+                result["used_cached"] = True
+                result["file_id"] = getattr(message, "video", None) or getattr(message, "photo", None)
+                if hasattr(result["file_id"], "file_id"):
+                    result["file_id"] = result["file_id"].file_id
+                elif hasattr(message, "document") and hasattr(message.document, "file_id"):
+                    result["file_id"] = message.document.file_id
+                elif hasattr(message, "audio") and hasattr(message.audio, "file_id"):
+                    result["file_id"] = message.audio.file_id
+                elif hasattr(message, "voice") and hasattr(message.voice, "file_id"):
+                    result["file_id"] = message.voice.file_id
+        if not cached_file_id:
             # No cache hit - upload the file fresh
             logger.info("file_id_cache: uploading fresh %s for %s", media_type, chat_id)
 

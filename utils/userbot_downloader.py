@@ -1011,6 +1011,220 @@ async def _attempt_recovery_download(
     return False
 
 
+async def _resolve_message_via_telethon(client, chat_id: int | str, message_id: int, *, target=None):
+    """Resolve the message carrying the media for ``chat_id``/``message_id``.
+
+    The one implementation of Telethon peer resolution: the smart entity
+    resolver first, the raw target second, then the DM fallback - a Bot API DM
+    ``chat_id`` is the *user's* id, while MTProto needs the bot's own id to see
+    that conversation at all. Returns the messages when the result actually
+    holds media, otherwise ``None``.
+    """
+    if target is None:
+        target = await _normalize_target(chat_id, client)
+
+    # Use smart entity resolution for better channel/chat handling
+    resolved_entity = await _resolve_telethon_entity(client, chat_id)
+    msgs = None
+    if resolved_entity is not None:
+        try:
+            logger.info(
+                "userbot: Telethon trying get_messages via resolved entity (id=%s, ids=%s)",
+                getattr(resolved_entity, "id", None),
+                message_id,
+            )
+            msgs = await client.get_messages(resolved_entity, ids=message_id)
+        except Exception as e:
+            logger.warning(
+                "userbot: get_messages via resolved entity failed: %s; trying raw target",
+                e,
+            )
+            msgs = None
+
+    # If entity resolution didn't work, fall back to direct get_messages
+    if msgs is None:
+        try:
+            logger.info(
+                "userbot: Telethon trying get_messages(target=%s, ids=%s)",
+                target,
+                message_id,
+            )
+            msgs = await client.get_messages(target, ids=message_id)
+        except Exception as e:
+            logger.exception("userbot: get_messages direct by id failed: %s", e)
+            msgs = None
+
+    _telethon_msgs = None
+    if msgs:
+        msg = msgs[0] if isinstance(msgs, (list, tuple)) else msgs
+        logger.info(
+            "userbot: Telethon direct lookup resolved target=%s msg_id=%s media=%s",
+            target,
+            getattr(msg, "id", None),
+            bool(getattr(msg, "media", None)),
+        )
+        if getattr(msg, "media", None):
+            _telethon_msgs = msgs
+        else:
+            logger.debug("userbot: message found but no media: %s/%s", target, message_id)
+
+    # ── DM fallback: Bot API chat_id maps to user ID in DMs, but MTProto
+    # needs the **bot's** user ID.  Try resolving the bot from BOT_TOKEN.
+    if _telethon_msgs is None and _is_user_dm_chat(chat_id):
+        bot_user_id = _get_bot_user_id()
+        if bot_user_id is not None and bot_user_id != abs(int(chat_id)):
+            try:
+                logger.info(
+                    "userbot: Telethon DM chat detected (chat_id=%s), trying bot entity (bot_id=%s)",
+                    chat_id,
+                    bot_user_id,
+                )
+                # Use _resolve_telethon_entity which has built-in dialog scan fallback
+                bot_entity = await _resolve_telethon_entity(client, bot_user_id)
+                if bot_entity is not None:
+                    logger.info("userbot: Telethon resolved bot entity, trying get_messages from bot DM")
+                    bot_msgs = await client.get_messages(bot_entity, ids=message_id)
+                    if bot_msgs:
+                        bot_msg = bot_msgs[0] if isinstance(bot_msgs, (list, tuple)) else bot_msgs
+                        if getattr(bot_msg, "media", None):
+                            _telethon_msgs = bot_msgs
+                            logger.info(
+                                "userbot: Telethon DM fallback resolved msg %s/%s with media",
+                                bot_user_id,
+                                message_id,
+                            )
+            except Exception as e:
+                logger.warning("userbot: Telethon bot entity resolution failed: %s", e)
+
+    return _telethon_msgs
+
+
+async def download_media_to_sink(
+    chat_id: int | str,
+    message_id: int,
+    sink,
+    *,
+    expected_size: int | None = None,
+    progress_callback=None,
+    user_id: int | None = None,
+) -> bool:
+    """Stream a Telegram file straight into *sink*, with no local copy.
+
+    The sink is what storage handed back from ``open_upload_sink``: Telethon
+    writes each MTProto chunk into it as the chunk arrives, and it awaits a
+    write whose return value is awaitable - which is how a multipart sink
+    applies back-pressure to the download instead of buffering the media.
+
+    The **caller owns the sink's lifecycle**: open it before calling, ``close``
+    it on ``True``, ``abort`` it on ``False``. This path is Telethon-only -
+    Pyrogram's ``download_media`` accepts a path and can only ever write to disk
+    - so a ``False`` means "fall back to the disk download", never "the upload
+    failed for good".
+    """
+    if TelegramClient is None or sink is None:
+        logger.debug("userbot: Telethon unavailable; cannot stream into a sink")
+        return False
+
+    from utils.telethon_session import (
+        build_telethon_client,
+        get_db_model,
+        get_telethon_session_string_for_user,
+        get_userbot_credentials,
+    )
+
+    chunk_size_kb = get_download_chunk_size_kb()
+    try:
+        api_id, api_hash = get_userbot_credentials()
+    except Exception as e:
+        # No userbot configured at all: a normal state for a deploy that only
+        # uses the Bot API. It is a "no" from this path, never an error.
+        logger.info("userbot: no userbot credentials (%s); cannot stream into a sink", e)
+        return False
+    try:
+        session_str = await get_telethon_session_string_for_user(user_id=user_id, db_model=get_db_model())
+    except Exception:
+        session_str = None
+
+    client = build_telethon_client(api_id, api_hash, session_str=session_str)
+    if client is None:
+        logger.debug("userbot: no Telethon session for streaming")
+        return False
+
+    try:
+        logger.info("userbot: starting Telethon client to stream %s/%s into storage", chat_id, message_id)
+        await client.start()
+        target = await _normalize_target(chat_id, client)
+        msgs = await _resolve_message_via_telethon(client, chat_id, message_id, target=target)
+        if not msgs:
+            logger.info("userbot: could not resolve %s/%s for streaming", chat_id, message_id)
+            return False
+
+        await sink.open()
+        logger.info(
+            "userbot: streaming %s/%s into %s",
+            target,
+            message_id,
+            getattr(sink, "key", "?"),
+        )
+        watch = _ProgressWatch()
+        dl_kwargs = {
+            "file": sink,
+            "progress_callback": watch.wrap(progress_callback),
+        }
+        try:
+            await _wait_download_or_stall(
+                asyncio.create_task(client.download_media(msgs[0], **dl_kwargs, part_size_kb=chunk_size_kb)),
+                watch,
+            )
+        except TypeError:
+            # part_size_kb was removed in Telethon v1.35+.
+            logger.debug("userbot: Telethon does not support part_size_kb, retrying without")
+            await _wait_download_or_stall(
+                asyncio.create_task(client.download_media(msgs[0], **dl_kwargs)),
+                watch,
+            )
+
+        written = int(sink.tell() or 0)
+        if written <= 0:
+            logger.warning("userbot: streaming %s/%s wrote nothing", chat_id, message_id)
+            return False
+        if expected_size and written < int(expected_size):
+            # A short read is a truncated transfer, and the whole point of the
+            # bucket object is that it is the complete source: refuse it so the
+            # caller can abort the upload and retry from disk.
+            logger.warning(
+                "userbot: streaming %s/%s wrote %d bytes but %s were expected - truncated, refusing",
+                chat_id,
+                message_id,
+                written,
+                expected_size,
+            )
+            return False
+        if expected_size and written != int(expected_size):
+            # Longer than Telegram announced: the bytes are all there, and a size
+            # Telegram merely rounded is not a reason to throw away a good copy.
+            logger.warning(
+                "userbot: streaming %s/%s wrote %d bytes against %s announced (accepting)",
+                chat_id,
+                message_id,
+                written,
+                expected_size,
+            )
+        logger.info(
+            "userbot: streamed %dMB for %s/%s into storage",
+            written // (1024 * 1024),
+            chat_id,
+            message_id,
+        )
+        return True
+    except Exception as e:
+        logger.warning("userbot: streaming download failed for %s/%s: %s", chat_id, message_id, e)
+        return False
+    finally:
+        with contextlib.suppress(Exception):
+            await client.disconnect()
+
+
 async def _download_with_telethon(
     chat_id: int | str,
     message_id: int,
@@ -1066,79 +1280,9 @@ async def _download_with_telethon(
             target,
         )
 
-        # Use smart entity resolution for better channel/chat handling
-        resolved_entity = await _resolve_telethon_entity(client, chat_id)
-        if resolved_entity is not None:
-            try:
-                logger.info(
-                    "userbot: Telethon trying get_messages via resolved entity (id=%s, ids=%s)",
-                    getattr(resolved_entity, "id", None),
-                    message_id,
-                )
-                msgs = await client.get_messages(resolved_entity, ids=message_id)
-            except Exception as e:
-                logger.warning(
-                    "userbot: get_messages via resolved entity failed: %s; trying raw target",
-                    e,
-                )
-                msgs = None
-        else:
-            msgs = None
-
-        # If entity resolution didn't work, fall back to direct get_messages
-        if msgs is None:
-            try:
-                logger.info(
-                    "userbot: Telethon trying get_messages(target=%s, ids=%s)",
-                    target,
-                    message_id,
-                )
-                msgs = await client.get_messages(target, ids=message_id)
-            except Exception as e:
-                logger.exception("userbot: get_messages direct by id failed: %s", e)
-                msgs = None
-
-        _telethon_msgs = None
-        if msgs:
-            msg = msgs[0] if isinstance(msgs, (list, tuple)) else msgs
-            logger.info(
-                "userbot: Telethon direct lookup resolved target=%s msg_id=%s media=%s",
-                target,
-                getattr(msg, "id", None),
-                bool(getattr(msg, "media", None)),
-            )
-            if getattr(msg, "media", None):
-                _telethon_msgs = msgs
-            else:
-                logger.debug("userbot: message found but no media: %s/%s", target, message_id)
-
-        # ── DM fallback: Bot API chat_id maps to user ID in DMs, but MTProto
-        # needs the **bot's** user ID.  Try resolving the bot from BOT_TOKEN.
-        if _telethon_msgs is None and _is_user_dm_chat(chat_id):
-            bot_user_id = _get_bot_user_id()
-            if bot_user_id is not None and bot_user_id != abs(int(chat_id)):
-                try:
-                    logger.info(
-                        "userbot: Telethon DM chat detected (chat_id=%s), trying bot entity (bot_id=%s)",
-                        chat_id,
-                        bot_user_id,
-                    )
-                    # Use _resolve_telethon_entity which has built-in dialog scan fallback
-                    bot_entity = await _resolve_telethon_entity(client, bot_user_id)
-                    if bot_entity is not None:
-                        logger.info("userbot: Telethon resolved bot entity, trying get_messages from bot DM")
-                        bot_msgs = await client.get_messages(bot_entity, ids=message_id)
-                        if bot_msgs:
-                            bot_msg = bot_msgs[0] if isinstance(bot_msgs, (list, tuple)) else bot_msgs
-                            if getattr(bot_msg, "media", None):
-                                _telethon_msgs = bot_msgs
-                                logger.info(
-                                    "userbot: Telethon DM fallback resolved msg %s/%s with media",
-                                    bot_user_id,
-                                    message_id,
-                                )
-                except Exception as e:
-                    logger.warning("userbot: Telethon bot entity resolution failed: %s", e)
+        # Peer resolution is shared with the streaming path: one implementation,
+        # so a fix here (or there) fixes both.
+        _telethon_msgs = await _resolve_message_via_telethon(client, chat_id, message_id, target=target)
 
         if _telethon_msgs:
             msg = _telethon_msgs[0] if isinstance(_telethon_msgs, (list, tuple)) else _telethon_msgs

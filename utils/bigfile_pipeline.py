@@ -47,6 +47,44 @@ DEFAULT_BOT_API_MAX_BYTES = config.BOT_API_MAX_BYTES
 # the file is not going to arrive anyway. 0 disables the bound.
 PIPELINE_DOWNLOAD_TIMEOUT_SECONDS = float(os.getenv("PIPELINE_DOWNLOAD_TIMEOUT_SECONDS", "1800"))
 
+
+def _env_positive_int(name: str, default: int) -> int:
+    """Read a positive int env var, tolerating an unset, empty or garbage value.
+
+    ``int(os.getenv(...))`` raises on the empty string a ``.env`` file leaves
+    behind, which would take the whole bot down at import time.
+    """
+    try:
+        value = int(str(os.getenv(name) or "").strip())
+    except (TypeError, ValueError):
+        return default
+    return value if value > 0 else default
+
+
+# How much of a fetched source is kept in the bucket.
+#
+# The bucket is a *copy*, never the transport for a job. The media itself is
+# already on Telegram (that is how the userbot fetched it, and the relay copy it
+# came from stays in the relay chat), and Pyrogram/Telethon read it from there
+# for free - so the only thing the bucket has to hold is a small reference:
+#
+#   header - the first PIPELINE_HEADER_BYTES of the file, which is every common
+#            container header (MP4 ``moov``, MKV ``SegmentInfo``, AVI ``RIFF``).
+#            Default: a 500 MB video no longer costs 500 MB of stored bytes and
+#            the whole-file read-back that used to inflate the egress counter.
+#   full   - the whole file, as before, plus the local path on the job so a
+#            worker sharing this disk never reads it back out again.
+#   stream - the whole file, but written *while it downloads*: Telethon's chunks
+#            go through a multipart sink straight into the bucket, so no full
+#            local copy is ever needed and storage is the source of truth for a
+#            worker on any host. Costs one read-back; see PIPELINE_HEADER_BYTES
+#            for the zero-egress default.
+#   local  - nothing at all is uploaded; the job carries the local path only.
+PIPELINE_SOURCE_UPLOAD = (os.getenv("PIPELINE_SOURCE_UPLOAD") or "header").strip().lower()
+if PIPELINE_SOURCE_UPLOAD not in ("header", "full", "local", "stream"):
+    PIPELINE_SOURCE_UPLOAD = "header"
+PIPELINE_HEADER_BYTES = _env_positive_int("PIPELINE_HEADER_BYTES", 2 * 1024 * 1024)
+
 # Files up to this size (200MB) get streamed through memory instead of temp disk
 # Imports — all guarded for optional dependencies
 try:
@@ -71,6 +109,52 @@ def _remove_partial(path: str | None) -> None:
         logger.debug("BigFilePipeline: could not remove partial download %s", path)
 
 
+def _read_head_bytes(path: str, limit: int) -> bytes:
+    """Read at most *limit* bytes from the front of a file.
+
+    A container header is all the bucket needs to hold, so the whole file is
+    never read into memory to make one.
+    """
+    with open(path, "rb") as fh:
+        return fh.read(limit)
+
+
+def _flatten_source_meta(meta: dict) -> dict:
+    """Flatten an ffprobe result into the job's ``source_*`` fields.
+
+    Shared by every path that probes a source, so the worker always reads one
+    shape no matter which mode produced the job.
+    """
+    if not meta:
+        return {}
+    return {
+        "source_duration": str(meta.get("duration", "")),
+        "source_fps": str(meta.get("fps", "")),
+        "source_video_codec": str(meta.get("video_codec", "")),
+        "source_audio_codec": str(meta.get("audio_codec", "")),
+        "source_width": str(meta.get("width", "")),
+        "source_height": str(meta.get("height", "")),
+        "source_video_bitrate": str(meta.get("video_bitrate", "")),
+        "source_audio_bitrate": str(meta.get("audio_bitrate", "")),
+        "source_rotation": str(meta.get("rotation", "")),
+        "source_creation_time": str(meta.get("creation_time", "")),
+        "source_language": str(meta.get("language", "")),
+        "source_chapters": str(meta.get("chapters", 0)),
+        "source_format": str(meta.get("format_name", "")),
+    }
+
+
+def _header_object_key(input_s3_key: str) -> str:
+    """The storage key of a source's header-only probe object.
+
+    A distinct name on purpose: a probe object must never be mistaken for - or
+    overwrite - the full ``.../source`` object a previous run may have stored.
+    """
+    if input_s3_key.endswith("/source"):
+        return f"{input_s3_key[: -len('source')]}header"
+    return f"{input_s3_key}/header"
+
+
 @dataclass
 class IngestResult:
     """Result of a big file ingestion attempt."""
@@ -79,6 +163,11 @@ class IngestResult:
     job_id: str | None = None
     s3_key: str | None = None
     error: str | None = None
+    # The ingest's own ffprobe of the source, verbatim. The caller puts it on the
+    # session's current_file as ``_source_metadata``, which is what the captions
+    # and the audio tags are built from - without it a large file is delivered
+    # with a filename-derived caption instead of the title/performer it carries.
+    source_metadata: dict | None = None
 
 
 class BigFilePipeline:
@@ -156,12 +245,41 @@ class BigFilePipeline:
         # so traversal/arbitrary suffixes can't reach the on-disk temp path.
         ext = file_utils.safe_extension(original_filename or "", ".bin")
 
+        # Where the source lands on local disk, and whether it is stored whole,
+        # as a header, or not at all. Both are decided here because every path
+        # that can produce a source - the disk download, the byte cache, a reuse
+        # - has to be able to hand its path to the job.
+        temp_dir = os.path.abspath(os.path.join(os.getenv("STORAGE_PATH", "storage"), "temp"))
+        temp_path: str | None = os.path.join(temp_dir, f"{job_id}_src{ext}")
+        _header_only = self._storage is not None and PIPELINE_SOURCE_UPLOAD == "header"
+        # The same switch the Bot API path uses (handlers.REUSE_LOCAL_INPUT): the
+        # worker usually runs in this container, so keeping the file lets it read
+        # the source off disk instead of pulling it back out of the bucket. The
+        # hint is safe to lose - the worker falls back to Telegram, then storage.
+        _keep_local_input = (
+            os.getenv("REUSE_LOCAL_INPUT", "1").strip().lower()
+            not in (
+                "0",
+                "false",
+                "no",
+                "off",
+            )
+            or PIPELINE_SOURCE_UPLOAD == "local"
+        )
+
         # Where the input lands. With the media cache on, the key is derived from
         # the media identity rather than the job id, so a *repeat* of the same
         # file maps to the same object and can be reused instead of downloaded
         # from Telegram and uploaded again.
         _library_key = media_cache.media_library_key(file_unique_id) if file_unique_id else None
-        _shared_input = bool(_library_key and media_cache.cache_enabled())
+        # Only a whole object can be shared between jobs. A header is a probe
+        # reference, not a source, so `header`/`local` runs keep the media
+        # library out of it entirely. `stream` stores a whole object too, so it
+        # gets the same shared key - the media only ever has to leave Telegram
+        # once, whichever job asked for it first.
+        _shared_input = bool(
+            _library_key and media_cache.cache_enabled() and PIPELINE_SOURCE_UPLOAD in ("full", "stream")
+        )
         input_s3_key = _library_key if _shared_input else f"inputs/{job_id}/source"
 
         actual_size = 0
@@ -169,6 +287,8 @@ class BigFilePipeline:
         _reused = False
         _bytes_hit = False
         _source_meta_fields = {}
+        # The raw probe (title/performer included), carried out to the caller.
+        _source_meta_raw: dict = {}
 
         # ── Reuse a media that already entered the pipe ──
         # Same file_unique_id AND same byte size => the earlier input is still
@@ -205,23 +325,71 @@ class BigFilePipeline:
                         len(cached_data) // (1024 * 1024),
                     )
                     actual_size = len(cached_data)
-                    if self._storage is not None:
-                        await self._storage.upload_bytes(cached_data, input_s3_key)
-                    s3_key = input_s3_key
+                    if PIPELINE_SOURCE_UPLOAD == "full":
+                        if self._storage is not None:
+                            await self._storage.upload_bytes(cached_data, input_s3_key)
+                        s3_key = input_s3_key
+                    else:
+                        # Nothing but a probe reference goes to the bucket in
+                        # these modes, and a header is not a source - so the
+                        # cached body is written out for the local handoff.
+                        os.makedirs(temp_dir, exist_ok=True)
+                        with open(temp_path, "wb") as _fh:
+                            _fh.write(cached_data)
+                        s3_key = None
                     _bytes_hit = True
             except Exception as e:
                 logger.debug("BigFilePipeline: byte cache check failed: %s", e)
+
+        # ── Stream straight into storage (PIPELINE_SOURCE_UPLOAD=stream) ──
+        # The MTProto download writes the bucket itself: Telethon hands each
+        # chunk to a multipart sink, so the media never needs a full local copy
+        # and the object becomes the source of truth for a worker on any host.
+        # Only the container header is kept in memory long enough to probe it,
+        # which is how the job still carries real ``source_*`` metadata without a
+        # second read of anything. A failure here is not fatal: nothing partial is
+        # left in the bucket and the disk path below takes over.
+        _streamed = False
+        if (
+            not _reused
+            and not _bytes_hit
+            and PIPELINE_SOURCE_UPLOAD == "stream"
+            and self._storage is not None
+            and hasattr(self._storage, "open_upload_sink")
+        ):
+            try:
+                _stream = await self._stream_source_to_storage(
+                    chat_id=chat_id,
+                    message_id=message_id,
+                    input_s3_key=input_s3_key,
+                    file_unique_id=file_unique_id,
+                    original_filename=original_filename,
+                    expected_size=file_size,
+                    progress_callback=progress_callback,
+                    cancel_check=cancel_check,
+                    user_id=user_id,
+                    temp_dir=temp_dir,
+                )
+            except asyncio.CancelledError:
+                return IngestResult(ok=False, error="batch cancelled")
+            except Exception as e:
+                logger.warning("BigFilePipeline: streaming upload failed (%s); falling back to disk", e)
+                _stream = None
+            if _stream:
+                _streamed = True
+                s3_key = _stream["s3_key"]
+                actual_size = _stream["size"]
+                _source_meta_fields = _stream["meta_fields"]
+                _source_meta_raw = dict(_stream.get("meta") or {})
 
         # ── Disk-based download (single Pyrogram call, always used) ──
         # The previous in-memory path (download_bytes_via_userbot) often failed for files
         # 20-200MB, causing a fallback disk download that looked like two Pyrogram calls.
         # Now we always use the single disk-based path with progress callback support.
-        if not _reused and not _bytes_hit:
+        if not _reused and not _bytes_hit and not _streamed:
             try:
-                temp_dir = os.path.abspath(os.path.join(os.getenv("STORAGE_PATH", "storage"), "temp"))
                 os.makedirs(temp_dir, exist_ok=True)
 
-                temp_path = os.path.join(temp_dir, f"{job_id}_src{ext}")
                 logger.info(
                     "BigFilePipeline: downloading via Pyrogram chat=%s msg=%s size=%dMB -> %s",
                     chat_id,
@@ -264,21 +432,8 @@ class BigFilePipeline:
                 # Include source_metadata in the job payload dict for the worker
                 # (will be merged into Redis hash by enqueue_job below — single atomic hset)
                 if _source_meta:
-                    _source_meta_fields = {
-                        "source_duration": str(_source_meta.get("duration", "")),
-                        "source_fps": str(_source_meta.get("fps", "")),
-                        "source_video_codec": str(_source_meta.get("video_codec", "")),
-                        "source_audio_codec": str(_source_meta.get("audio_codec", "")),
-                        "source_width": str(_source_meta.get("width", "")),
-                        "source_height": str(_source_meta.get("height", "")),
-                        "source_video_bitrate": str(_source_meta.get("video_bitrate", "")),
-                        "source_audio_bitrate": str(_source_meta.get("audio_bitrate", "")),
-                        "source_rotation": str(_source_meta.get("rotation", "")),
-                        "source_creation_time": str(_source_meta.get("creation_time", "")),
-                        "source_language": str(_source_meta.get("language", "")),
-                        "source_chapters": str(_source_meta.get("chapters", 0)),
-                        "source_format": str(_source_meta.get("format_name", "")),
-                    }
+                    _source_meta_raw = dict(_source_meta)
+                    _source_meta_fields = _flatten_source_meta(_source_meta)
 
                 # The media descriptor is written once, after the upload, by
                 # media_cache.remember() below - it carries the storage key the
@@ -296,40 +451,63 @@ class BigFilePipeline:
             if cancel_check and cancel_check():
                 return IngestResult(ok=False, error="batch cancelled")
 
-            # Upload to S3 (the shared media key when caching is on)
+            # ── Keep a reference in the bucket, hand the source to the job ──
+            # What is stored depends on PIPELINE_SOURCE_UPLOAD: the whole file
+            # (``full``), its container header (``header``, the default), or
+            # nothing (``local``). The local path travels on the job either way,
+            # so a worker that shares this disk re-reads the bytes it already has
+            # instead of pulling a second copy of the media out of storage.
+            #
+            # ``stream`` never reaches here: its download already wrote the
+            # object and the descriptor, which is what put it in the disk-block
+            # above - so there is nothing left to store for it.
+            _upload_enabled = self._storage is not None and PIPELINE_SOURCE_UPLOAD != "local"
             try:
-                if self._storage is not None:
-                    logger.info("BigFilePipeline: uploading to S3 key=%s", input_s3_key)
-                    await self._storage.upload_file(temp_path, input_s3_key)
-                    s3_key = input_s3_key
-                    logger.info("BigFilePipeline: S3 upload complete")
-                    # Read the body for the small-media cache *before* the temp
-                    # file is removed below.
-                    _payload = None
-                    if (
-                        media_cache.cache_enabled()
-                        and file_unique_id
-                        and actual_size
-                        and actual_size <= media_cache.bytes_cache_limit()
-                    ):
-                        with contextlib.suppress(Exception), open(temp_path, "rb") as _fh:
-                            _payload = _fh.read()
-                    await media_cache.remember(
-                        file_unique_id,
-                        size=actual_size,
-                        input_key=input_s3_key,
-                        name=original_filename,
-                        storage="s3",
-                        data=_payload,
-                    )
-                    # Immediately clean up temp file
-                    try:
-                        if os.path.exists(temp_path):
-                            os.remove(temp_path)
-                            logger.info("BigFilePipeline: cleaned up temp file %s", temp_path)
-                    except Exception as cleanup_err:
-                        logger.warning("BigFilePipeline: failed to clean up temp file %s: %s", temp_path, cleanup_err)
-                else:
+                if _upload_enabled:
+                    _stored_key = _header_object_key(input_s3_key) if _header_only else input_s3_key
+                    if _header_only:
+                        _head = _read_head_bytes(temp_path, PIPELINE_HEADER_BYTES)
+                        await self._storage.upload_bytes(_head, _stored_key)
+                        # Deliberately *not* reported as this job's storage key:
+                        # callers persist the key and reuse it as a source, and a
+                        # header is not a source. Nothing downloads it either -
+                        # the worker's own probe can, but only as a last resort.
+                        s3_key = None
+                        logger.info(
+                            "BigFilePipeline: stored the %dKB header of the source at %s "
+                            "(the media itself stays on Telegram)",
+                            len(_head) // 1024,
+                            _stored_key,
+                        )
+                    else:
+                        logger.info("BigFilePipeline: uploading to S3 key=%s", _stored_key)
+                        await self._storage.upload_file(temp_path, _stored_key)
+                        s3_key = _stored_key
+                        logger.info("BigFilePipeline: S3 upload complete")
+
+                    # Only a whole object may be handed to a future job as a
+                    # reusable source. A header entry would let the reuse path
+                    # answer "already have it" with two megabytes of container.
+                    if not _header_only:
+                        _payload = None
+                        if (
+                            media_cache.cache_enabled()
+                            and file_unique_id
+                            and actual_size
+                            and actual_size <= media_cache.bytes_cache_limit()
+                        ):
+                            with contextlib.suppress(Exception), open(temp_path, "rb") as _fh:
+                                _payload = _fh.read()
+                        await media_cache.remember(
+                            file_unique_id,
+                            size=actual_size,
+                            input_key=_stored_key,
+                            name=original_filename,
+                            storage="s3",
+                            data=_payload,
+                            duration=_source_meta.get("duration"),
+                        )
+                elif self._storage is None:
                     # No S3 — keep the file locally
                     s3_key = temp_path
                     logger.info("BigFilePipeline: no S3 backend, using local path: %s", temp_path)
@@ -339,10 +517,19 @@ class BigFilePipeline:
                         path=temp_path,
                         name=original_filename,
                         storage="local",
+                        duration=_source_meta.get("duration"),
+                    )
+                else:
+                    # ``local`` mode with a backend configured: deliberately
+                    # nothing is stored. The job is fed from this disk.
+                    s3_key = None
+                    logger.info(
+                        "BigFilePipeline: PIPELINE_SOURCE_UPLOAD=local - keeping the source on disk only (%s)",
+                        temp_path,
                     )
             except Exception as e:
                 logger.exception("BigFilePipeline: S3 upload failed: %s", e)
-                s3_key = temp_path
+                s3_key = temp_path if self._storage is None else None
 
         # Step 3: Enqueue processing job
         try:
@@ -358,11 +545,32 @@ class BigFilePipeline:
             _source_stem = os.path.splitext(_safe_source_name)[0] or f"file_{job_id}"
             _output_filename = f"{_source_stem}{_out_ext}"
 
+            # Hand the local copy to the job as well as the stored key: a worker
+            # that shares this filesystem reads the bytes it already has, and
+            # only one that does not has to touch the bucket at all.
+            _local_source = temp_path if (_keep_local_input and temp_path and os.path.exists(temp_path)) else None
+            if not _local_source:
+                # Reuse is off: the copy has served its purpose (it is in the
+                # bucket, or it was never wanted there) and is removed as before.
+                with contextlib.suppress(Exception):
+                    if temp_path and os.path.exists(temp_path):
+                        os.remove(temp_path)
             # Build the job payload
             job = {
                 "job_id": job_id,
-                "input_key": s3_key if self._storage is not None else None,
-                "input_path": s3_key if self._storage is None else None,
+                # A header-only object is left off the payload entirely: it is
+                # not the media, and the worker's job is to encode the media.
+                "input_key": s3_key if (self._storage is not None and not _header_only) else None,
+                "input_path": _local_source if _local_source else (s3_key if self._storage is None else None),
+                # Where the userbot fetched this file from. The relay copy is
+                # still on Telegram, so a worker that cannot see this disk can
+                # read the media over MTProto (no bucket egress) before it
+                # considers pulling a stored object back out.
+                "source_chat_id": chat_id,
+                "source_message_id": message_id,
+                # A stored object that is only a header is a probe reference:
+                # no worker may ever encode from it.
+                "input_header_only": 1 if _header_only else 0,
                 # chat_id for delivery = user_id (the person who should receive
                 # the processed result). The original chat_id was used for download
                 # (may be a relay group) but the result must go to the user's DM.
@@ -428,11 +636,142 @@ class BigFilePipeline:
 
             logger.info("BigFilePipeline: job %s enqueued (input_key=%s)", job_id, s3_key)
 
-            return IngestResult(ok=True, job_id=job_id, s3_key=s3_key)
+            return IngestResult(
+                ok=True,
+                job_id=job_id,
+                s3_key=s3_key,
+                source_metadata=_source_meta_raw or None,
+            )
 
         except Exception as e:
             logger.exception("BigFilePipeline: enqueue failed: %s", e)
             return IngestResult(ok=False, error=f"Enqueue error: {e}")
+
+    async def _stream_source_to_storage(
+        self,
+        *,
+        chat_id: int,
+        message_id: int,
+        input_s3_key: str,
+        file_unique_id: str | None,
+        original_filename: str | None,
+        expected_size: int,
+        progress_callback: Callable[[int, int], None] | None,
+        cancel_check: Callable[[], bool] | None,
+        user_id: int | None,
+        temp_dir: str,
+    ) -> dict | None:
+        """Stream the Telegram file into storage while it is still downloading.
+
+        The bytes go through a multipart sink (:meth:`open_upload_sink`), so the
+        media is never staged on local disk: storage holds the source of truth
+        and a worker on any host can read it back. Only the container header is
+        tapped on the way past, and it is probed from a throwaway file so the job
+        still carries the ``source_*`` metadata the worker expects.
+
+        Returns ``{"s3_key", "size", "meta_fields"}`` on success. On any failure
+        the multipart upload is aborted - there is no half-written object for a
+        later job to mistake for a source - and ``None`` is returned so the
+        caller can fall back to the disk download.
+        """
+        from utils.storage import HeadCaptureSink
+        from utils.userbot_downloader import download_media_to_sink
+
+        sink = await self._storage.open_upload_sink(input_s3_key)
+        head_sink = HeadCaptureSink(sink, PIPELINE_HEADER_BYTES)
+        # A throwaway path for the header: the probe needs a real file, and this
+        # one is removed again no matter how the probe ends.
+        probe_path = os.path.join(temp_dir, f"stream_head_{uuid.uuid4().hex}.bin")
+        try:
+            os.makedirs(temp_dir, exist_ok=True)
+            await head_sink.open()
+            logger.info(
+                "BigFilePipeline: streaming %s/%s straight into %s",
+                chat_id,
+                message_id,
+                input_s3_key,
+            )
+
+            # Cancellation has to interrupt the transfer itself, not just be
+            # noticed once it finishes: a batch cancel during a 500MB stream must
+            # not wait for the whole file. This mirrors the disk path's wrapper.
+            def _stream_progress(sent: int, total: int):
+                if cancel_check and cancel_check():
+                    raise asyncio.CancelledError("batch cancelled during stream upload")
+                if progress_callback:
+                    progress_callback(sent, total)
+
+            ok = await download_media_to_sink(
+                chat_id,
+                message_id,
+                head_sink,
+                expected_size=expected_size or None,
+                progress_callback=_stream_progress,
+                user_id=user_id,
+            )
+            if not ok:
+                await head_sink.abort()
+                return None
+            if cancel_check and cancel_check():
+                await head_sink.abort()
+                raise asyncio.CancelledError("batch cancelled during stream upload")
+
+            size = int(head_sink.tell() or 0)
+            if size <= 0:
+                # Nothing to complete: an empty object is worse than no object,
+                # because a job would later find it and treat it as a source.
+                await head_sink.abort()
+                return None
+            key = await head_sink.close()
+
+            head = head_sink.head
+            meta: dict = {}
+            if head:
+                try:
+                    with open(probe_path, "wb") as fh:
+                        fh.write(head)
+                    from utils.ffmpeg_runner import probe_media
+
+                    meta = await probe_media(probe_path) or {}
+                except Exception:
+                    logger.debug("BigFilePipeline: header probe failed; the worker will probe the source it fetches")
+
+            # The object is the whole source, so unlike a header-only run it can
+            # be reused later - that is exactly what makes this the source of
+            # truth. A small file whose entire body fit in the capture is also
+            # worth keeping in Redis so a repeat needs storage at all.
+            await media_cache.remember(
+                file_unique_id,
+                size=size,
+                input_key=key,
+                name=original_filename,
+                storage="s3",
+                data=head if head and size <= len(head) else None,
+                duration=meta.get("duration"),
+            )
+            logger.info(
+                "BigFilePipeline: streamed %dMB into storage as %s (no local copy)",
+                size // (1024 * 1024),
+                key,
+            )
+            return {
+                "s3_key": key,
+                "size": size,
+                "meta_fields": _flatten_source_meta(meta),
+                # The raw probe, so the caller can hand the media's own title and
+                # performer to the caption builder.
+                "meta": meta,
+            }
+        except asyncio.CancelledError:
+            with contextlib.suppress(Exception):
+                await head_sink.abort()
+            raise
+        except Exception:
+            with contextlib.suppress(Exception):
+                await head_sink.abort()
+            raise
+        finally:
+            _remove_partial(probe_path)
 
     async def _download_via_pyrogram(
         self,

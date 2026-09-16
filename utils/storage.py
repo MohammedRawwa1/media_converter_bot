@@ -13,9 +13,11 @@ Usage example:
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import os
 import shutil
+import tempfile
 import time
 from abc import ABC, abstractmethod
 from typing import Any
@@ -38,6 +40,410 @@ except Exception:
 import config
 
 logger = logging.getLogger(__name__)
+
+
+# ── Streaming uploads ───────────────────────────────────────────────────────
+#
+# Until this existed, the only way bytes could reach the bucket was from a path
+# (a file that had finished downloading to local disk) or from a complete
+# in-memory buffer. That made a full local copy of every media unavoidable, and
+# put S3 in the position of a mirror written *after* the fact rather than the
+# place the source lives. A sink is the other half: a writable target a producer
+# can hand its chunks to as they arrive.
+#
+# The sink interface is shaped by what the producers actually call:
+# Telethon's ``download_media(file=<sink>)`` writes with ``f.write(chunk)``,
+# awaits the result **if it is awaitable**, calls ``f.tell()`` for its progress
+# callback and ``f.flush()`` at the end. So ``write()`` returning a coroutine is
+# how back-pressure is applied without blocking the event loop, and ``tell()``
+# has to report the bytes written so far.
+
+
+class UploadSink(ABC):
+    """A writable target for bytes produced elsewhere (e.g. an MTProto download)."""
+
+    #: The storage key this sink completes to.
+    key: str
+
+    @abstractmethod
+    async def open(self) -> None:
+        """Prepare the target (create the multipart upload, open the temp file)."""
+
+    @abstractmethod
+    def write(self, chunk: bytes) -> Any | None:
+        """Accept a chunk. May return an awaitable the caller should await."""
+
+    @abstractmethod
+    def tell(self) -> int:
+        """Bytes accepted so far (Telethon's progress callback reads this)."""
+
+    def flush(self) -> None:  # noqa: B027 - an optional hook, not a required override
+        """No-op hook: Telethon calls this when it is done writing."""
+
+    @abstractmethod
+    async def close(self) -> str:
+        """Finish the upload and return the completed key."""
+
+    @abstractmethod
+    async def abort(self) -> None:
+        """Discard everything written; never leaves a partial object behind."""
+
+    async def awrite(self, chunk: bytes) -> None:
+        """Accept a chunk from async code, applying back-pressure."""
+        pending = self.write(chunk)
+        if pending is not None:
+            await pending
+
+
+class BufferedUploadSink(UploadSink):
+    """Fallback sink: write to a temp file, upload it whole on close.
+
+    Every backend gets streaming *support* this way - the bytes are staged on
+    disk locally instead of in RAM - while backends that can do better (S3, via
+    :class:`S3UploadSink`) override :meth:`AsyncStorageBackend.open_upload_sink`.
+    """
+
+    def __init__(self, backend: AsyncStorageBackend, key: str, suffix: str = ""):
+        self._backend = backend
+        self.key = key
+        self._suffix = suffix
+        self._path: str | None = None
+        self._written = 0
+        self._closed = False
+
+    async def open(self) -> None:
+        if self._path is None:
+            fd, path = tempfile.mkstemp(prefix="uploadsink_", suffix=self._suffix or ".part")
+            os.close(fd)
+            self._path = path
+
+    def write(self, chunk: bytes) -> Any | None:
+        if not chunk:
+            return None
+        if self._path is None:
+            raise RuntimeError("UploadSink.open() must be awaited before writing")
+        with open(self._path, "ab") as fh:
+            fh.write(chunk)
+        self._written += len(chunk)
+        return None
+
+    def tell(self) -> int:
+        return self._written
+
+    async def close(self) -> str:
+        if self._closed:
+            return self.key
+        if self._path is None or not os.path.exists(self._path):
+            raise RuntimeError(f"nothing was written for {self.key}")
+        if self._written <= 0:
+            raise RuntimeError(f"nothing was written for {self.key}")
+        path = self._path
+        try:
+            await self._backend.upload_file(path, self.key)
+        finally:
+            with contextlib.suppress(OSError):
+                os.remove(path)
+            self._closed = True
+        return self.key
+
+    async def abort(self) -> None:
+        if self._path:
+            with contextlib.suppress(OSError):
+                os.remove(self._path)
+        self._closed = True
+
+
+class HeadCaptureSink(UploadSink):
+    """Wrap a sink and keep the first ``limit`` bytes for a local probe.
+
+    Streaming a source straight into storage means there is no local file left
+    to ffprobe. ffprobe only needs the container header for duration/codec
+    questions on the common formats, so this tap keeps exactly that much in
+    memory while still forwarding every byte to the wrapped sink. The captured
+    head is what the ingest writes to disk as the *probe* copy - it is never
+    treated as the media itself.
+    """
+
+    def __init__(self, sink: UploadSink, limit: int):
+        self._sink = sink
+        self.key = sink.key
+        self._limit = max(0, int(limit))
+        self._head = bytearray()
+
+    @property
+    def head(self) -> bytes:
+        """The first ``limit`` bytes that passed through, in order."""
+        return bytes(self._head)
+
+    @property
+    def wrapped(self) -> UploadSink:
+        """The sink the bytes actually go to."""
+        return self._sink
+
+    async def open(self) -> None:
+        await self._sink.open()
+
+    def write(self, chunk: bytes) -> Any | None:
+        if chunk and len(self._head) < self._limit:
+            self._head += chunk[: self._limit - len(self._head)]
+        return self._sink.write(chunk)
+
+    def tell(self) -> int:
+        return self._sink.tell()
+
+    def flush(self) -> None:
+        self._sink.flush()
+
+    async def close(self) -> str:
+        return await self._sink.close()
+
+    async def abort(self) -> None:
+        await self._sink.abort()
+
+
+class _BlockingS3Client:
+    """Run a synchronous boto3 client's calls in worker threads.
+
+    Lets one multipart sink implementation serve both the aioboto3 and the
+    boto3-only deployments instead of maintaining two.
+    """
+
+    def __init__(self, client):
+        self._client = client
+
+    def __getattr__(self, name):
+        target = getattr(self._client, name)
+
+        async def _call(**kwargs):
+            return await asyncio.to_thread(target, **kwargs)
+
+        return _call
+
+
+class S3UploadSink(UploadSink):
+    """Multipart-upload sink: Telegram chunks land in S3 as they arrive.
+
+    An S3 multipart upload is opened on the first write, each filled part is
+    uploaded in parallel (up to ``S3_UPLOAD_PARTS_IN_FLIGHT``) with the same
+    retry/backoff knobs as every other S3 operation here, and the object is
+    completed on :meth:`close`. Bytes held in memory are bounded by
+    ``max_inflight_bytes``: once that much is queued, :meth:`write` returns an
+    awaitable that the caller awaits before producing more, so a download that
+    outruns the bucket throttles the download instead of exhausting the box.
+
+    On any failure the multipart upload is aborted, so a failed download leaves
+    no half-object behind for a later job to pick up as if it were complete.
+    """
+
+    #: S3's minimum size for every part except the last.
+    MIN_PART_BYTES = 5 * 1024 * 1024
+    #: boto3's own default threshold, so behaviour matches ``upload_file``.
+    DEFAULT_PART_BYTES = 8 * 1024 * 1024
+
+    def __init__(
+        self,
+        backend: S3AsyncBackend,
+        key: str,
+        *,
+        part_size: int | None = None,
+        content_type: str | None = None,
+        max_inflight_bytes: int | None = None,
+    ):
+        self._backend = backend
+        self.key = key
+        self._part_size = max(self.MIN_PART_BYTES, int(part_size or S3UploadSink.DEFAULT_PART_BYTES))
+        self._content_type = content_type
+        self._max_inflight = int(
+            max_inflight_bytes
+            if max_inflight_bytes is not None
+            else _env_int("S3_UPLOAD_MAX_BUFFERED_MB", 256) * 1024 * 1024
+        )
+        self._parallel = max(1, _env_int("S3_UPLOAD_PARTS_IN_FLIGHT", 4))
+        self._buffer = bytearray()
+        self._written = 0
+        self._inflight = 0
+        self._upload_id: str | None = None
+        self._parts: dict[int, str] = {}
+        self._pending: set[asyncio.Task] = set()
+        self._error: BaseException | None = None
+        self._client_ctx = None
+        self._client = None
+        self._sem: asyncio.Semaphore | None = None
+        self._upload_lock: asyncio.Lock | None = None
+        self._closed = False
+        # Part numbers are claimed in ``write``/``close``, which only ever run on
+        # the event loop thread, so a plain counter cannot hand the same number
+        # to two parts.
+        self._next_part = 1
+
+    # ── lifecycle ────────────────────────────────────────────────────────
+
+    async def open(self) -> None:
+        if self._client is not None:
+            return
+        self._sem = asyncio.Semaphore(self._parallel)
+        self._client_ctx = self._backend._multipart_client()
+        self._client = await self._client_ctx.__aenter__()
+
+    async def _ensure_upload(self) -> str:
+        """Open the multipart upload once, no matter how many parts race for it.
+
+        Parts upload concurrently, and every one of them calls this before its
+        ``upload_part``. Without the lock each racer saw ``_upload_id is None``
+        while awaiting and opened its *own* multipart upload, so a single sink
+        scattered its parts across several uploads and only the last one could
+        ever be completed - the rest were left behind. The double check inside
+        the lock keeps it to exactly one create per sink.
+        """
+        if self._upload_id:
+            return self._upload_id
+        if self._upload_lock is None:
+            self._upload_lock = asyncio.Lock()
+        async with self._upload_lock:
+            if self._upload_id:
+                return self._upload_id
+            await self.open()
+            kwargs: dict[str, Any] = {"Bucket": self._backend.bucket, "Key": self.key}
+            if self._content_type:
+                kwargs["ContentType"] = self._content_type
+            resp = await self._client.create_multipart_upload(**kwargs)
+            self._upload_id = resp["UploadId"]
+            logger.info(
+                "s3 sink: multipart upload opened for %s (part=%dMB)", self.key, self._part_size // (1024 * 1024)
+            )
+            return self._upload_id
+
+    def write(self, chunk: bytes) -> Any | None:
+        """Buffer a chunk; return an awaitable when the caller must slow down."""
+        if not chunk:
+            return None
+        self._buffer += chunk
+        self._written += len(chunk)
+        while len(self._buffer) >= self._part_size:
+            self._submit_part(bytes(self._buffer[: self._part_size]))
+            del self._buffer[: self._part_size]
+        if self._inflight >= self._max_inflight:
+            return self._wait_for_capacity()
+        return None
+
+    async def _wait_for_capacity(self) -> None:
+        while self._inflight >= self._max_inflight and self._pending:
+            await asyncio.sleep(0.05)
+        if self._error is not None:
+            raise self._error
+
+    def tell(self) -> int:
+        return self._written
+
+    def _submit_part(self, data: bytes) -> None:
+        """Queue one part; the upload runs as its own task."""
+        self._inflight += len(data)
+        part_number = self._next_part
+        self._next_part += 1
+        task = asyncio.get_running_loop().create_task(self._upload_part(part_number, data))
+        self._pending.add(task)
+        task.add_done_callback(self._pending.discard)
+
+    async def _upload_part(self, part_number: int, data: bytes) -> None:
+        try:
+            async with self._sem:
+                upload_id = await self._ensure_upload()
+                resp = await self._retry(
+                    lambda: self._client.upload_part(
+                        Bucket=self._backend.bucket,
+                        Key=self.key,
+                        PartNumber=part_number,
+                        UploadId=upload_id,
+                        Body=data,
+                    ),
+                    what=f"upload_part {part_number}",
+                )
+                self._parts[part_number] = resp["ETag"]
+                logger.debug("s3 sink: part %d uploaded (%dMB)", part_number, len(data) // (1024 * 1024))
+        except BaseException as exc:  # noqa: BLE001 - recorded and re-raised at close
+            self._error = exc
+            logger.warning("s3 sink: part %d failed for %s: %s", part_number, self.key, exc)
+        finally:
+            self._inflight = max(0, self._inflight - len(data))
+
+    async def _retry(self, call, *, what: str):
+        retries = _env_int("S3_OP_RETRIES", 3)
+        backoff_base = float(os.getenv("S3_OP_BACKOFF_BASE", "1") or 1)
+        max_backoff = float(os.getenv("S3_OP_BACKOFF_MAX", "60") or 60)
+        last: BaseException | None = None
+        for attempt in range(1, retries + 1):
+            try:
+                return await call()
+            except Exception as exc:  # noqa: PERF203 - the retry loop is the point
+                last = exc
+                if attempt == retries:
+                    break
+                backoff = min(max_backoff, backoff_base * (2 ** (attempt - 1)))
+                logger.warning(
+                    "s3 sink: %s attempt %d/%d failed (%s); retrying in %.1fs", what, attempt, retries, exc, backoff
+                )
+                await asyncio.sleep(backoff)
+        raise last if last is not None else RuntimeError(f"{what} failed")
+
+    async def close(self) -> str:
+        if self._closed:
+            return self.key
+        try:
+            if self._buffer:
+                self._submit_part(bytes(self._buffer))
+                self._buffer.clear()
+            if self._pending:
+                await asyncio.gather(*list(self._pending), return_exceptions=True)
+            if self._error is not None:
+                raise self._error
+            if not self._parts:
+                raise RuntimeError(f"nothing was written for {self.key}")
+            upload_id = await self._ensure_upload()
+            await self._retry(
+                lambda: self._client.complete_multipart_upload(
+                    Bucket=self._backend.bucket,
+                    Key=self.key,
+                    UploadId=upload_id,
+                    MultipartUpload={"Parts": [{"PartNumber": n, "ETag": e} for n, e in sorted(self._parts.items())]},
+                ),
+                what="complete_multipart_upload",
+            )
+            self._closed = True
+            logger.info(
+                "s3 sink: completed %s (%dMB in %d part(s))",
+                self.key,
+                self._written // (1024 * 1024),
+                len(self._parts),
+            )
+            return self.key
+        except BaseException:
+            await self.abort()
+            raise
+        finally:
+            await self._release_client()
+
+    async def abort(self) -> None:
+        for task in list(self._pending):
+            task.cancel()
+        if self._pending:
+            with contextlib.suppress(Exception):
+                await asyncio.gather(*list(self._pending), return_exceptions=True)
+        if self._upload_id and self._client is not None:
+            with contextlib.suppress(Exception):
+                await self._client.abort_multipart_upload(
+                    Bucket=self._backend.bucket,
+                    Key=self.key,
+                    UploadId=self._upload_id,
+                )
+                logger.info("s3 sink: aborted the upload of %s; nothing was left behind", self.key)
+        self._closed = True
+        await self._release_client()
+
+    async def _release_client(self) -> None:
+        ctx, self._client_ctx, self._client = self._client_ctx, None, None
+        if ctx is not None:
+            with contextlib.suppress(Exception):
+                await ctx.__aexit__(None, None, None)
 
 
 class AsyncStorageBackend(ABC):
@@ -83,6 +489,26 @@ class AsyncStorageBackend(ABC):
         """
         return None
 
+    async def open_upload_sink(
+        self,
+        key: str,
+        *,
+        part_size: int | None = None,
+        content_type: str | None = None,
+        max_inflight_bytes: int | None = None,
+    ) -> UploadSink:
+        """Open a writable target that uploads to *key* as bytes arrive.
+
+        The default stages the stream in a local temp file and uploads it whole
+        on close, which is correct everywhere and good enough for a local path.
+        S3 overrides this with a real multipart sink so a producer (an MTProto
+        download, a URL fetch) never needs a full local copy first.
+
+        Callers must ``await sink.open()`` before writing and either
+        ``await sink.close()`` or ``await sink.abort()`` when finished.
+        """
+        return BufferedUploadSink(self, key)
+
     @abstractmethod
     async def list_keys(self, prefix: str = "") -> list[dict[str, Any]]:
         """List keys under a prefix, returning key name, last_modified, and size.
@@ -117,6 +543,14 @@ class AsyncStorageBackend(ABC):
         callers are expected to catch that rather than treat it as zero usage.
         """
         raise NotImplementedError("storage usage is not supported by this backend")
+
+
+def _env_int(name: str, default: int) -> int:
+    """Read an int env var, tolerating unset/empty/garbage values."""
+    try:
+        return int(float(str(os.getenv(name) or "").strip()))
+    except (TypeError, ValueError):
+        return default
 
 
 def _usage_group(key: str, depth: int) -> str:
@@ -641,6 +1075,43 @@ class S3AsyncBackend(AsyncStorageBackend):
                 # Use deterministic jitter (based on attempt number) to avoid S311 insecure-random warning
                 _jitter = (attempt * 9973) % 1000 / 1000  # deterministic fractional jitter
                 await asyncio.sleep(backoff + _jitter)
+
+    async def open_upload_sink(
+        self,
+        key: str,
+        *,
+        part_size: int | None = None,
+        content_type: str | None = None,
+        max_inflight_bytes: int | None = None,
+    ) -> UploadSink:
+        """A multipart sink, so bytes reach the bucket while they are produced."""
+        if not key:
+            raise ValueError("key must not be empty")
+        if not self.bucket:
+            raise ValueError(f"Invalid S3 bucket name: {self.bucket}")
+        return S3UploadSink(
+            self,
+            key,
+            part_size=part_size,
+            content_type=content_type,
+            max_inflight_bytes=max_inflight_bytes,
+        )
+
+    @contextlib.asynccontextmanager
+    async def _multipart_client(self):
+        """An S3 client for a long-lived multipart upload.
+
+        aioboto3 clients are async context managers, so one is held open for the
+        whole upload rather than per part; the boto3-only path is wrapped so its
+        blocking calls run in a thread.
+        """
+        if self._use_aioboto3:
+            async with self._session.client("s3", **self._client_kwargs()) as client:
+                yield client
+            return
+        if boto3 is None:
+            raise RuntimeError("boto3 is required for S3 operations when aioboto3 is not installed")
+        yield _BlockingS3Client(boto3.client("s3", **self._client_kwargs()))
 
     async def upload_file_streaming(self, src_path: str, dest_key: str) -> str:
         src_path = os.path.abspath(src_path)

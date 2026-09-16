@@ -1604,7 +1604,11 @@ class SourceFetchTests(unittest.IsolatedAsyncioTestCase):
         # handle_job's retry loop, plus the helper's own definition.
         self.assertGreaterEqual(src.count("_set_job_state("), 5)
         self.assertIn('_set_job_state(job_id, "error", "the source is missing from storage"', src)
-        self.assertIn('_set_job_state(job_id, "error", "could not fetch the source from storage"', src)
+        # The fetch failure still writes the hash; which wording it uses is
+        # decided at the call site, because a job whose stored object is only a
+        # probe header has to say where the media should have come from.
+        self.assertIn('_set_job_state(job_id, "error", _fetch_error', src)
+        self.assertIn('"could not fetch the source from storage"', src)
         self.assertIn('"processing failed", progress=0, channel=progress_channel', src)
         self.assertIn('str(info or "conversion failed"),', src)
 

@@ -266,8 +266,15 @@ For Railway's 1 GB box the shipped `.env.example` is tuned to: `MAX_CONCURRENT_F
 | `MEDIA_CACHE_ENABLED` | `1` | Reuse media that already entered the pipe instead of re-downloading it |
 | `MEDIA_CACHE_TTL_SECONDS` | `86400` | How long a media descriptor stays in Redis |
 | `MEDIA_CACHE_BYTES_MAX_MB` | `32` | Largest media body kept verbatim in Redis (larger files reuse the storage key) |
+| `MEDIA_REGISTRY_ENABLED` | `1` | Mirror every media descriptor into the durable MongoDB tier, so a Redis flush or restart cannot send a media back to Telegram for a second download |
+| `MEDIA_REGISTRY_TTL_SECONDS` | `2592000` | How long a descriptor stays in the MongoDB media registry (30 days) |
 | `PRESENCE_TTL_SECONDS` | `300` | How long a user counts as "online" after their last interaction |
 | `REUSE_LOCAL_INPUT` | `1` | Keep the source on disk after uploading it, so a worker in the same container reads it instead of downloading it back out of S3 (one full copy of the media of egress saved per job) |
+| `PIPELINE_SOURCE_UPLOAD` | `header` | What the big-file pipeline stores for a source: `header` keeps only its first `PIPELINE_HEADER_BYTES` as a probe reference, `full` stores the whole file after the download finishes, `stream` writes the whole file **while** it downloads (storage is the source of truth, no local copy), `local` stores nothing. In `header`/`local` the media is read over Telegram, so a large video costs no bucket egress at all |
+| `PIPELINE_HEADER_BYTES` | `2097152` | How much of a source the `header` object carries (2 MB covers MP4 `moov`, MKV `SegmentInfo` and AVI `RIFF` headers). In `stream` mode it is also how much of the stream is tapped for the ffprobe that fills the job's `source_*` metadata |
+| `S3_UPLOAD_PARTS_IN_FLIGHT` | `4` | Multipart parts a streaming upload keeps in flight at once |
+| `S3_UPLOAD_MAX_BUFFERED_MB` | `256` | Bytes a streaming upload may hold before it makes the producer wait (back-pressure) |
+| `STORAGE_PROBE_TIMEOUT_SECONDS` | `60` | Bound on the worker's header range-GET when it has to probe storage itself (it is skipped entirely when the ingest already ffprobed the file) |
 
 ### S3 / MinIO / R2
 | Variable | Description |
@@ -460,14 +467,27 @@ stale entry is dropped):
 
 - **small media** (≤ `MEDIA_CACHE_BYTES_MAX_MB`) are stored verbatim in Redis, so
 the repeat skips even the storage round trip;
-- **large media** are stored once under a shared key
-(`inputs/library/<hash>/source`) and that key is reused. Jobs fed from it are
-marked `cleanup_input=False`, so the shared object survives for the next request
-and is **not** deleted when one job finishes. Every operation on that media —
-stream capture, audio extract + compress, any command button — resolves to the
-same key, so it stays **one object** no matter how many styles are applied.
+- **large media** are handed to the worker as the file the pipeline already
+  downloaded (see `REUSE_LOCAL_INPUT`), then — if that copy is gone — fetched
+  over Telegram, and only after that read from the bucket. With
+  `PIPELINE_SOURCE_UPLOAD=header` (the default)
+  the bucket never holds the video at all — just a 2 MB container header under
+  `inputs/library/<hash>/header`, which a probe can inspect and nothing will ever
+  try to encode. `PIPELINE_SOURCE_UPLOAD=full` restores the old behaviour: one
+  whole object per media under `inputs/library/<hash>/source`, reused by every
+  later operation on it (jobs fed from a shared key are marked
+  `cleanup_input=False`, so the object survives for the next request), which is
+  what a worker with no Telegram session to read it with needs.
 
-One object per media is what makes a repeat cheap, and two things used to
+The descriptor is kept in two tiers. Redis holds the hot copy for latency, and
+the `media_registry` MongoDB collection holds the record: Redis is a cache, so
+it may be flushed, evicted, or be unreachable, and a bare Redis miss used to
+mean fetching a byte-identical file from Telegram again. A durable hit is
+re-seeded into Redis and carries the Telegram location token (`file_id`) the
+media was fetched with. `MEDIA_REGISTRY_ENABLED=0` leaves every Redis path
+exactly as it was.
+
+One object per media is what makes a repeat cheap, and three things used to
 break it:
 
 - the hourly sweep deleted everything under `inputs/`, library included, one
@@ -483,9 +503,51 @@ break it:
   age, and it lives in a subdirectory so the startup sweep (which only removes
   loose files) cannot race an in-flight job. Only shared library keys are cached;
   a per-job input never is.
+- the worker used to decide whether a source was usable from a 2 MB ranged read
+  of the bucket. A container whose `moov` atom sits at the end (an MP4 that was
+  never faststart-ed) reports no duration in its first 2 MB while being perfectly
+  playable, and a job whose probe said otherwise was failed as *corrupt* — which,
+  in a bulk apply, looked exactly like "it finished the download and then started
+  fetching the next file instead of encoding". The probe is now skipped whenever
+  the ingest already ffprobed the whole file (its verdict travels on the job
+  hash), and when it does run a duration-less slice is a warning, never a
+  failure.
 
 Set `MEDIA_CACHE_ENABLED=0` to disable reuse entirely and go back to per-job
 inputs.
+
+### Streaming a source into storage (`PIPELINE_SOURCE_UPLOAD=stream`)
+
+The default (`header`) keeps a whole copy of the media out of the bucket at the
+cost of needing a Telegram session on the worker's host. `stream` is the other
+trade: the object in the bucket *is* the source of truth, so a worker on any
+host can read it, and the media is written there by the download itself rather
+than by a second pass over a finished local file.
+
+What makes that possible is `AsyncStorageBackend.open_upload_sink()`. It hands
+back an `UploadSink` — a writable target that completes to a storage key — and
+`S3UploadSink` implements it as an S3 multipart upload: parts go up as they fill,
+concurrently (up to `S3_UPLOAD_PARTS_IN_FLIGHT`), and the upload is *aborted* on
+any failure so a half-written object is never left for a later job to mistake for
+a source. Every other backend gets `BufferedUploadSink`, which stages the stream
+in a temp file, so no backend is left without streaming support.
+
+Telethon is what drives it: `client.download_media(..., file=sink)` writes each
+MTProto chunk into the sink and awaits the back-pressure it returns, so a
+download that outruns the bucket throttles the download instead of filling RAM
+(`S3_UPLOAD_MAX_BUFFERED_MB`). **Pyrogram cannot do this** — its
+`download_media` takes a path (`os.path.split`) and can only write to disk — so
+this path is Telethon-only, and a failure anywhere in it falls back to the disk
+download without leaving anything partial behind.
+
+`HeadCaptureSink` taps the first `PIPELINE_HEADER_BYTES` of the stream on the way
+past and writes them to a throwaway file, which the ingest ffprobes to fill the
+job's `source_*` metadata. The tap never becomes the job's source: in `stream`
+mode the job carries the whole-object key and no local path.
+
+`stream` uses the same shared `inputs/library/<hash>/source` key as `full`, so
+the media leaves Telegram once and every later operation on it reuses that
+object.
 
 ### Thumbnail and audio metadata on delivery
 

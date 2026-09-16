@@ -90,6 +90,8 @@ class MediaConversionModel(FillableModel):
         self._stats_coll = self.db[f"{prefix}stats"]
         self._sessions_coll = self.db[f"{prefix}sessions"]
         self._schedules_coll = self.db[f"{prefix}schedules"]
+        self._media_registry_coll = self.db[f"{prefix}media_registry"]
+        self._file_id_registry_coll = self.db[f"{prefix}file_id_registry"]
 
         # ── QueryBuilder instances (Go/Java-style prepared statements) ──
         # These enforce parameterized queries with NoSQL injection prevention.
@@ -126,6 +128,54 @@ class MediaConversionModel(FillableModel):
         self.schedules = QueryBuilder(
             collection=self._schedules_coll,
             fillable_fields={"run_at", "status", "bot_id", "created_at", "finished_at", "_id"},
+            guarded_fields=self.guarded,
+        )
+        # The durable file_id registry: the Telegram token a media was delivered
+        # under, keyed by the same content identity the Redis tier uses. Kept for
+        # the same reason as the media registry - Redis is allowed to disappear,
+        # and losing this means uploading the very same bytes to Telegram again.
+        # Each document carries its own ``expires_at`` because callers pass their
+        # own TTL: a fixed collection-wide TTL would quietly hand back a token
+        # for longer than the caller asked it to live.
+        self.file_id_registry = QueryBuilder(
+            collection=self._file_id_registry_coll,
+            fillable_fields={
+                "cache_key",
+                "bot_id",
+                "media_type",
+                "content_identity",
+                "file_id",
+                "updated_at",
+                "expires_at",
+            },
+            guarded_fields=self.guarded,
+        )
+        # The durable media registry: where a Telegram media already lives,
+        # keyed by Telegram's stable ``file_unique_id``. Redis keeps the hot copy
+        # for latency, but Redis is a cache - it can be flushed, evicted, or be
+        # unreachable entirely - and none of that should mean downloading a
+        # byte-identical file from Telegram all over again. This is the record
+        # that survives it.
+        self.media_registry = QueryBuilder(
+            collection=self._media_registry_coll,
+            fillable_fields={
+                "file_unique_id",
+                "bot_id",
+                "size",
+                "input_key",
+                "path",
+                "name",
+                "storage",
+                # The Telegram file_id the media arrived under, so a later step
+                # can hand Telegram the token it already knows instead of
+                # uploading the bytes again.
+                "file_id",
+                # The source duration the ingest probed, when it had a copy to
+                # probe: a worker can then skip its own ffprobe of the source.
+                "duration",
+                "cached_at",
+                "updated_at",
+            },
             guarded_fields=self.guarded,
         )
 
@@ -174,6 +224,24 @@ class MediaConversionModel(FillableModel):
             # Schedules: index by run_at and status for efficient queries
             with contextlib.suppress(Exception):
                 await self._schedules_coll.create_index([("run_at", 1), ("status", 1)])
+
+            # Media registry: one document per media identity, keyed by the id
+            # Telegram guarantees to keep stable for a file, and pruned by a TTL
+            # so the collection tracks the storage lifecycle instead of growing
+            # forever.
+            with contextlib.suppress(Exception):
+                await self._media_registry_coll.create_index("file_unique_id", unique=True)
+            with contextlib.suppress(Exception):
+                _registry_ttl = int(os.getenv("MEDIA_REGISTRY_TTL_SECONDS", str(30 * 24 * 60 * 60)))
+                await self._media_registry_coll.create_index("updated_at", expireAfterSeconds=_registry_ttl)
+
+            # File_id registry: one document per (media type, content identity),
+            # expiring on its own per-document deadline so a caller's TTL is
+            # honored exactly rather than rounded up to a global one.
+            with contextlib.suppress(Exception):
+                await self._file_id_registry_coll.create_index("cache_key", unique=True)
+            with contextlib.suppress(Exception):
+                await self._file_id_registry_coll.create_index("expires_at", expireAfterSeconds=0)
 
         except Exception as e:
             logger.warning("Failed to ensure indexes: %s", e)
@@ -602,6 +670,118 @@ class MediaConversionModel(FillableModel):
         except Exception as e:
             logger.error(f"Error getting storage usage: {e}")
             return {"total_input_size": 0, "total_output_size": 0, "total_files": 0, "compression_ratio": 0}
+
+    async def remember_media(self, file_unique_id: str, entry: dict[str, Any]) -> bool:
+        """Upsert the durable descriptor for a media identity.
+
+        Best-effort by design: callers use this to *avoid* a download, so a
+        Mongo outage costs a re-download, never a job. ``None`` values are
+        dropped so an upsert never blanks a field a richer caller filled in.
+        """
+        if not file_unique_id:
+            return False
+        try:
+            fields = {k: v for k, v in dict(entry).items() if v is not None}
+            fields.pop("_id", None)
+            fields["file_unique_id"] = file_unique_id
+            fields["updated_at"] = datetime.utcnow()
+            if self.bot_id is not None:
+                fields["bot_id"] = self.bot_id
+            await self.media_registry.update(
+                {"file_unique_id": file_unique_id},
+                {"$set": fields},
+                upsert=True,
+            )
+            return True
+        except Exception as e:
+            logger.debug("Media registry: could not remember %s: %s", file_unique_id, e)
+            return False
+
+    async def lookup_media(self, file_unique_id: str) -> dict[str, Any] | None:
+        """The durable descriptor for a media identity, or ``None`` when unseen."""
+        if not file_unique_id:
+            return None
+        try:
+            doc = await self.media_registry.select({"file_unique_id": file_unique_id}).first()
+        except Exception as e:
+            logger.debug("Media registry: could not look up %s: %s", file_unique_id, e)
+            return None
+        if not isinstance(doc, dict):
+            return None
+        # ``_id`` is a BSON ObjectId: it is not part of the descriptor and would
+        # not survive the JSON trip into the Redis tier.
+        doc.pop("_id", None)
+        return doc or None
+
+    async def forget_media(self, file_unique_id: str) -> bool:
+        """Drop the durable descriptor for a media identity."""
+        if not file_unique_id:
+            return False
+        try:
+            await self.media_registry.delete({"file_unique_id": file_unique_id})
+            return True
+        except Exception as e:
+            logger.debug("Media registry: could not forget %s: %s", file_unique_id, e)
+            return False
+
+    async def remember_file_id(self, cache_key: str, entry: dict[str, Any]) -> bool:
+        """Upsert a delivered media's Telegram file_id so a repeat can reuse it.
+
+        ``entry`` carries its own ``expires_at``; the collection's TTL index reads
+        that field, so the caller's TTL is what the document actually lives for.
+        Best-effort: this only ever saves an upload.
+        """
+        if not cache_key:
+            return False
+        try:
+            fields = {k: v for k, v in dict(entry).items() if v is not None}
+            fields.pop("_id", None)
+            fields["cache_key"] = cache_key
+            fields["updated_at"] = datetime.utcnow()
+            if self.bot_id is not None:
+                fields["bot_id"] = self.bot_id
+            await self.file_id_registry.update(
+                {"cache_key": cache_key},
+                {"$set": fields},
+                upsert=True,
+            )
+            return True
+        except Exception as e:
+            logger.debug("file_id registry: could not remember %s: %s", cache_key, e)
+            return False
+
+    async def lookup_file_id(self, cache_key: str) -> dict[str, Any] | None:
+        """The durable file_id record for a cache key, or ``None`` when unseen.
+
+        A document whose ``expires_at`` has passed is reported as missing rather
+        than returned: MongoDB's TTL monitor only sweeps periodically, so relying
+        on it alone would hand back a token the caller already declared dead.
+        """
+        if not cache_key:
+            return None
+        try:
+            doc = await self.file_id_registry.select({"cache_key": cache_key}).first()
+        except Exception as e:
+            logger.debug("file_id registry: could not look up %s: %s", cache_key, e)
+            return None
+        if not isinstance(doc, dict):
+            return None
+        doc.pop("_id", None)
+        expires_at = doc.get("expires_at")
+        if isinstance(expires_at, datetime) and expires_at <= datetime.utcnow():
+            return None
+        return doc or None
+
+    async def forget_file_id(self, cache_key: str) -> bool:
+        """Drop the durable file_id record for a cache key."""
+        if not cache_key:
+            return False
+        try:
+            await self.file_id_registry.delete({"cache_key": cache_key})
+            return True
+        except Exception as e:
+            logger.debug("file_id registry: could not forget %s: %s", cache_key, e)
+            return False
 
     async def cleanup_old_data(self, days: int = 30) -> int:
         """Clean up data older than specified days."""
