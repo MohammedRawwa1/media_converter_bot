@@ -120,6 +120,57 @@ _BATCH_MEMBER_POLL_SECONDS = 3.0
 _TERMINAL_JOB_STATUSES = frozenset({"done", "completed", "error", "failed", "cancelled", "canceled"})
 
 
+# How long a watcher keeps trying to write a *terminal* status the flood gate
+# swallowed before it gives up. The watcher is a detached task, not a handler, so
+# waiting is safe - but it is still bounded, because a day-long penalty must not
+# pin a task for a message nobody is watching any more.
+_FLOOD_TERMINAL_MAX_WAIT_SECONDS = float(os.getenv("TELEGRAM_FLOOD_TERMINAL_MAX_WAIT_SECONDS", "3600"))
+# How long a progress watcher keeps polling after ``ffmpeg:job:<id>`` stops
+# existing. The hash is deliberately kept until the watcher reads the terminal
+# status, so an empty read means it is never coming back.
+_WATCH_JOB_MISSING_MAX_SECONDS = float(os.getenv("WATCH_JOB_MISSING_MAX_SECONDS", "600"))
+
+
+class _EditUnchanged:
+    """Returned by ``safe_edit`` when the message already showed that exact text.
+
+    Telegram answers a repeated edit with a 400, and the edit has effectively
+    succeeded: the message is showing what the caller wanted. Saying so (instead
+    of reporting the same ``None`` as a dropped edit) is what lets a progress
+    watcher tell "nothing to do" from "that write never happened".
+    """
+
+    __slots__ = ()
+
+    def __bool__(self) -> bool:
+        return True
+
+    def __repr__(self) -> str:
+        return "<edit: message already showed this text>"
+
+
+EDIT_UNCHANGED = _EditUnchanged()
+
+
+def _edit_target_ids(query, progress_msg=None) -> tuple[int | None, int | None]:
+    """Return (chat_id, message_id) of the message a progress edit renders onto.
+
+    Progress watchers can be started from a callback query or handed an explicit
+    message; either way the pair identifies the one message they share, which is
+    what the edit coalescer and the flood gate key on.
+    """
+    for source in (progress_msg, getattr(query, "message", None)):
+        if source is None:
+            continue
+        chat_id = getattr(getattr(source, "chat", None), "id", None)
+        if chat_id is None:
+            chat_id = getattr(source, "chat_id", None)
+        message_id = getattr(source, "message_id", None)
+        if chat_id is not None and message_id is not None:
+            return chat_id, message_id
+    return None, None
+
+
 def _extract_large_file_source(current_file: dict | None) -> tuple[int | None, int | None]:
     """Return (chat_id, message_id) for the source message used by the big-file pipeline.
 
@@ -841,6 +892,7 @@ class EnhancedMediaHandler:
         self.conversion_semaphore = asyncio.Semaphore(max_concurrent_conversions)
         self._max_conversions = max_concurrent_conversions
         self.active_conversions: dict[int, str] = {}  # user_id -> task_name
+        self._active_conversion_count: dict[int, int] = {}  # user_id -> running count
         # Telemetry for malformed callbacks
         self.bad_callback_counts: dict[str, int] = {}
 
@@ -866,8 +918,28 @@ class EnhancedMediaHandler:
             logger.debug("handlers: Redis cache for media analysis, user preferences, and file metadata")
 
     async def _cleanup_session(self, user_id: int):
-        """Cleanup user session asynchronously."""
+        """Cleanup user session asynchronously.
+
+        With concurrent_updates, a handler may still be using this session
+        when the inactivity timer fires.  We reschedule if the user has an
+        active conversion — the conversion's own timeout handles the real
+        cleanup.
+        """
         if user_id not in self.user_sessions:
+            return
+
+        # A conversion is still running for this user — don't tear down the
+        # session out from under it.
+        if user_id in self.active_conversions:
+            try:
+                loop = asyncio.get_running_loop()
+                handle = loop.call_later(
+                    self._session_timeout_seconds,
+                    lambda: asyncio.create_task(self._cleanup_session(user_id)),
+                )
+                self.session_timeouts[user_id] = handle
+            except RuntimeError:
+                pass
             return
 
         session = self.user_sessions[user_id]
@@ -1065,6 +1137,7 @@ class EnhancedMediaHandler:
                 logger.debug("_watch_job_progress could not connect to redis: %s", e)
                 return
             last_text = None
+            _hash_missing_since = None  # set while ffmpeg:job:<id> reads back empty
 
             # ── T14: Subscribe to Redis pub/sub for instant progress updates ──
             #    Falls back to polling when pub/sub is unavailable.
@@ -1081,33 +1154,71 @@ class EnhancedMediaHandler:
 
             _last_edit_time = [0.0]
             _min_edit_interval = 2.0  # Minimum seconds between Telegram edits
+            _terminal_pending_since = None  # set once a terminal status is being retried
 
-            async def _edit(text, **kwargs):
+            # Several watchers (this one per job, the batch member watcher, the
+            # big-file pipeline) can render onto the same message. The coalescer
+            # keeps them from stacking their edits into Telegram's per-chat limit;
+            # the gate stops us calling at all while a flood window is open.
+            from utils.rate_limiter import telegram_edit_coalescer, telegram_flood_gate
+
+            _edit_chat_id, _edit_message_id = _edit_target_ids(query, progress_msg)
+            _flood_scope = telegram_flood_gate.scope_for_chat(_edit_chat_id)
+
+            async def _edit(text, force: bool = False, **kwargs) -> bool:
                 """Edit either progress_msg or the callback query message.
 
                 Throttled to avoid hitting Telegram's429 rate limit.
                 Handles RetryAfter (429), BadRequest, and network errors.
+
+                ``force`` bypasses the pacing so a terminal status always lands.
+
+                Returns True when the message is showing ``text`` afterwards - a
+                dropped edit has to be distinguishable, because a terminal status
+                nobody wrote is the difference between a finished job and a
+                progress bar frozen at 40%.
                 """
                 from telegram.error import RetryAfter as _RetryAfter
 
+                if telegram_edit_coalescer.should_skip(
+                    _edit_chat_id, _edit_message_id, text, _min_edit_interval, force=force
+                ):
+                    # Either this message was just edited, or it already shows this
+                    # text; only the second one means nothing is left to do.
+                    return telegram_edit_coalescer.shows(_edit_chat_id, _edit_message_id, text)
+                if await telegram_flood_gate.should_drop_inline(_flood_scope):
+                    return False  # Telegram has stopped accepting writes to this chat
+
                 now = time.time()
-                if (now - _last_edit_time[0]) < _min_edit_interval:
-                    return  # Skip this edit to avoid429
+                if not force and (now - _last_edit_time[0]) < _min_edit_interval:
+                    return False  # Skip this edit to avoid429
                 _last_edit_time[0] = now
                 if progress_msg:
                     try:
                         await progress_msg.edit_text(text, **kwargs)
+                        telegram_edit_coalescer.record(_edit_chat_id, _edit_message_id, text)
+                        return True
                     except _RetryAfter as e:
-                        _wait = getattr(e, "retry_after", None) or 5
-                        logger.warning("_edit:429 on progress_msg, waiting %ss", _wait)
-                        await asyncio.sleep(_wait + 0.5)
+                        _left = await telegram_flood_gate.note(
+                            getattr(e, "retry_after", None) or 5, _flood_scope
+                        )
+                        logger.warning("_edit:429 on progress_msg, window=%.0fs", _left)
+                        if _left <= telegram_flood_gate.inline_max:
+                            await asyncio.sleep(_left + 0.5)
                         _last_edit_time[0] = time.time()  # reset throttle after wait
+                        return False
                     except BadRequest:
-                        pass  # Message not modified etc.
+                        # "Message is not modified" and friends: the text is there.
+                        return True
                     except Exception:
                         logger.debug("_edit: progress_msg edit failed")
+                        return False
                 else:
-                    await self.safe_edit(query, text, **kwargs)
+                    _result = await self.safe_edit(query, text, **kwargs)
+                    if _result is not None:
+                        telegram_edit_coalescer.record(_edit_chat_id, _edit_message_id, text)
+                        return True
+                    return False
 
             while True:
                 try:
@@ -1129,8 +1240,23 @@ class EnhancedMediaHandler:
                     data = await r.hgetall(f"ffmpeg:job:{job_id}")
                     # hgetall returns bytes keys/values when using aioredis
                     if not data:
+                        # The hash is the only thing this watcher reads, so once it
+                        # is gone there is nothing left to render and polling it
+                        # forever just holds a Redis connection per user. That is
+                        # reachable now that a deferred delivery keeps a job
+                        # ``processing`` for hours: the hash can expire underneath
+                        # the watcher, and it must give up rather than spin.
+                        if _hash_missing_since is None:
+                            _hash_missing_since = time.time()
+                        elif (time.time() - _hash_missing_since) > _WATCH_JOB_MISSING_MAX_SECONDS:
+                            logger.debug(
+                                "_watch_job_progress: job %s hash is gone; stopping the watcher",
+                                job_id,
+                            )
+                            break
                         await asyncio.sleep(poll_interval)
                         continue
+                    _hash_missing_since = None
                     # decode
                     info = {
                         k.decode() if isinstance(k, bytes) else k: v.decode() if isinstance(v, bytes) else v
@@ -1184,12 +1310,29 @@ class EnhancedMediaHandler:
                         kb = InlineKeyboardMarkup(
                             [[InlineKeyboardButton("❌ Cancel", callback_data=f"cancel_job:{job_id}")]]
                         )
-                    if text != last_text:
-                        await _edit(text, reply_markup=kb)
+                    _terminal = status in ("done", "error", "cancelled")
+                    # Only claim the text once the message really shows it: a dropped
+                    # edit that advanced last_text would never be retried, and the
+                    # user would keep the stale one.
+                    if text != last_text and await _edit(text, force=_terminal, reply_markup=kb):
                         last_text = text
 
-                    if status in ("done", "error", "cancelled"):
-                        break
+                    if _terminal:
+                        if last_text == text:
+                            break
+                        # The terminal status was swallowed (a flood window is
+                        # open on this chat). Keep polling so it lands when the
+                        # window closes, bounded so a day-long penalty cannot pin
+                        # this task forever.
+                        if _terminal_pending_since is None:
+                            _terminal_pending_since = time.time()
+                        elif (time.time() - _terminal_pending_since) > _FLOOD_TERMINAL_MAX_WAIT_SECONDS:
+                            logger.warning(
+                                "Job %s finished but its final message could not be written "
+                                "(Telegram flood control on this chat); leaving the last one",
+                                job_id,
+                            )
+                            break
 
                 except Exception:
                     logger.debug("Error polling job hash for %s", job_id)
@@ -1679,13 +1822,25 @@ class EnhancedMediaHandler:
             return None
 
     async def _run_with_concurrency_limit(self, user_id: int, task_name: str, coroutine):
-        """Run a conversion task with concurrency limiting."""
+        """Run a conversion task with concurrency limiting.
+
+        Overlapping conversions for the same user are tracked with a per-user
+        counter so that one file finishing does not erase another's entry.
+        """
         async with self.conversion_semaphore:
             self.active_conversions[user_id] = task_name
+            self._active_conversion_count[user_id] = (
+                self._active_conversion_count.get(user_id, 0) + 1
+            )
             try:
                 return await coroutine
             finally:
-                self.active_conversions.pop(user_id, None)
+                count = self._active_conversion_count.get(user_id, 0) - 1
+                if count <= 0:
+                    self.active_conversions.pop(user_id, None)
+                    self._active_conversion_count.pop(user_id, None)
+                else:
+                    self._active_conversion_count[user_id] = count
 
     def get_active_conversions(self) -> dict[int, str]:
         """Get all active conversions."""
@@ -1695,24 +1850,50 @@ class EnhancedMediaHandler:
         """Safely edit a callback-query message, ignoring 'Message is not modified'
         and handling Telegram429 rate limits with exponential backoff.
 
-        Returns the API result or None if the edit was a no-op.
+        A flood window longer than the gate's inline maximum is never slept off: a
+        long 429 means Telegram has stopped accepting writes to this chat, so
+        blocking the handler for hours only makes the bot look dead. The edit is
+        dropped instead, and the gate keeps the next calls from firing.
+
+        Returns the API result, ``EDIT_UNCHANGED`` when the message already showed
+        that text, or None when the edit was dropped.
         """
         from telegram.error import NetworkError, RetryAfter, TimedOut
+
+        from utils.rate_limiter import telegram_flood_gate
+
+        _chat_id, _message_id = _edit_target_ids(query)
+        _scope = telegram_flood_gate.scope_for_chat(_chat_id)
+        if await telegram_flood_gate.should_drop_inline(_scope):
+            logger.debug(
+                "safe_edit: skipped, Telegram flood control open for %.0fs more (scope=%s)",
+                await telegram_flood_gate.remaining(_scope),
+                _scope,
+            )
+            return None
 
         _max_retries = 3
         for _attempt in range(_max_retries):
             try:
                 return await query.edit_message_text(text, **kwargs)
             except RetryAfter as e:
-                # Telegram429 — respect the retry-after delay
-                _wait = getattr(e, "retry_after", None) or 5
+                _left = await telegram_flood_gate.note(getattr(e, "retry_after", None) or 5, _scope)
+                if _left > telegram_flood_gate.inline_max:
+                    logger.warning(
+                        "safe_edit: Telegram flood control for %.0fs; dropping the edit instead of "
+                        "blocking the handler (scope=%s)",
+                        _left,
+                        _scope,
+                    )
+                    return None
+                # Short window — worth waiting out, then retrying the edit.
                 logger.warning(
                     "safe_edit: Telegram rate limit (429), waiting %ss before retry (attempt %d/%d)",
-                    _wait,
+                    _left,
                     _attempt + 1,
                     _max_retries,
                 )
-                await asyncio.sleep(_wait + 0.5)  # small buffer
+                await asyncio.sleep(_left + 0.5)  # small buffer
                 continue
             except BadRequest as e:
                 msg = str(e)
@@ -1737,7 +1918,7 @@ class EnhancedMediaHandler:
 
                 if "Message is not modified" in msg or "specified new message content" in msg:
                     logger.debug("Ignored MessageNotModified error during edit")
-                    return None
+                    return EDIT_UNCHANGED
 
                 # Fall back to sending a new message if editing fails for other reasons
                 try:
@@ -2379,7 +2560,14 @@ class EnhancedMediaHandler:
             r = await _watch_redis()
         except Exception:
             return
+
+        from utils.rate_limiter import telegram_edit_coalescer, telegram_flood_gate
+
+        _chat_id, _message_id = _edit_target_ids(query)
+        _flood_scope = telegram_flood_gate.scope_for_chat(_chat_id)
+
         last_text = None
+        _terminal_pending_since = None  # set once a terminal status is being retried
         try:
             while True:
                 info: dict = {}
@@ -2392,12 +2580,44 @@ class EnhancedMediaHandler:
                         for k, v in (data or {}).items()
                     }
                 text = _batch_member_text(batch_id, index, total, name, info)
+                _terminal = str(info.get("status") or "").lower() in _TERMINAL_JOB_STATUSES
+                # The job watcher and the big-file pipeline render onto this same
+                # message, so go through the shared coalescer and the flood gate
+                # rather than editing on our own schedule.
+                _sent = False
                 if text != last_text:
-                    with contextlib.suppress(Exception):
-                        await self.safe_edit(query, text, reply_markup=_batch_stop_markup(batch_id))
-                    last_text = text
-                if str(info.get("status") or "").lower() in _TERMINAL_JOB_STATUSES:
-                    return
+                    if telegram_edit_coalescer.should_skip(
+                        _chat_id, _message_id, text, _BATCH_MEMBER_POLL_SECONDS, force=_terminal
+                    ):
+                        # Nothing to send only when that text is already on screen.
+                        _sent = telegram_edit_coalescer.shows(_chat_id, _message_id, text)
+                    elif not await telegram_flood_gate.should_drop_inline(_flood_scope):
+                        with contextlib.suppress(Exception):
+                            _sent = (
+                                await self.safe_edit(query, text, reply_markup=_batch_stop_markup(batch_id))
+                            ) is not None
+                        if _sent:
+                            telegram_edit_coalescer.record(_chat_id, _message_id, text)
+                    if _sent:
+                        # Only claim a text the message is actually showing, so a
+                        # status the gate swallowed is retried next poll.
+                        last_text = text
+                if _terminal:
+                    if last_text == text:
+                        return
+                    # A finished file whose final line could not be written keeps
+                    # this watcher alive until the flood window closes; the apply
+                    # rewrites the message anyway, so the wait is bounded.
+                    if _terminal_pending_since is None:
+                        _terminal_pending_since = time.time()
+                    elif (time.time() - _terminal_pending_since) > _FLOOD_TERMINAL_MAX_WAIT_SECONDS:
+                        logger.warning(
+                            "Batch %s: file %s finished but its stage could not be written "
+                            "(Telegram flood control on this chat)",
+                            batch_id,
+                            job_id,
+                        )
+                        return
                 await asyncio.sleep(_BATCH_MEMBER_POLL_SECONDS)
         except asyncio.CancelledError:
             raise

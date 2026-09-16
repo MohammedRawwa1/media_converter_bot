@@ -8,6 +8,7 @@ import tempfile
 import time
 import unittest
 import uuid
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from utils import batch_pipeline
@@ -357,6 +358,9 @@ class _FakeBot:
 
     async def edit_message_text(self, chat_id=None, message_id=None, text=None, **kwargs):
         self.edited.append((chat_id, message_id, text))
+        # Real PTB returns the edited Message; a falsy result tells callers
+        # the edit was dropped (e.g. flood control), which would spin the watcher.
+        return type("Edited", (), {"message_id": message_id or 0})()
 
     async def delete_message(self, chat_id=None, message_id=None, **kwargs):
         self.deleted.append((chat_id, message_id))
@@ -1485,7 +1489,10 @@ class BulkPipelineWatchTests(unittest.IsolatedAsyncioTestCase):
         class _Query:
             async def edit_message_text(self, text, **kwargs):
                 edited.append(text)
-                return None
+                # PTB returns the edited Message, and the stage watcher reads a
+                # falsy result as "the edit was dropped, retry it" - so a fake that
+                # returns None would look like a chat Telegram is refusing to edit.
+                return SimpleNamespace(message_id=1)
 
         class _Redis:
             def __init__(self, rows):
@@ -1829,6 +1836,150 @@ class GhostClaimTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             redis.hashes["ffmpeg:job:job-9"]["worker"], batch_pipeline.worker_identity()
         )
+
+
+class ActiveConversionRaceTests(unittest.IsolatedAsyncioTestCase):
+    """Two files for the same user must not clobber each other's tracking.
+
+    Without a per-user counter, coroutine A finishing would pop the entry
+    that coroutine B set, leaving B's conversion untracked.
+    """
+
+    def _handler(self):
+        from handlers import EnhancedMediaHandler
+
+        return object.__new__(EnhancedMediaHandler)
+
+    async def test_overlapping_conversions_both_tracked(self):
+        handler = self._handler()
+        handler.converter = None
+        handler.conversion_semaphore = asyncio.Semaphore(5)
+        handler.active_conversions = {}
+        handler._active_conversion_count = {}
+
+        gate1 = asyncio.Event()
+        gate2 = asyncio.Event()
+
+        async def slow(gate):
+            await gate.wait()
+
+        # Start two conversions for the same user.
+        t1 = asyncio.create_task(
+            handler._run_with_concurrency_limit(42, "file_a", slow(gate1))
+        )
+        t2 = asyncio.create_task(
+            handler._run_with_concurrency_limit(42, "file_b", slow(gate2))
+        )
+        await asyncio.sleep(0)  # let both acquire the semaphore
+
+        # Both are running; the counter should be 2.
+        self.assertEqual(handler._active_conversion_count.get(42), 2)
+        self.assertIn(42, handler.active_conversions)
+        self.assertEqual(len(handler.active_conversions), 1)
+
+        # Finish the first; the second must still be tracked.
+        gate1.set()
+        await asyncio.sleep(0)
+        await t1
+        self.assertIn(42, handler.active_conversions)
+        self.assertEqual(handler._active_conversion_count.get(42), 1)
+
+        # Finish the second; entry fully cleaned up.
+        gate2.set()
+        await asyncio.sleep(0)
+        await t2
+        self.assertNotIn(42, handler.active_conversions)
+        self.assertNotIn(42, handler._active_conversion_count)
+
+    async def test_single_conversion_cleans_up_normally(self):
+        handler = self._handler()
+        handler.converter = None
+        handler.conversion_semaphore = asyncio.Semaphore(5)
+        handler.active_conversions = {}
+        handler._active_conversion_count = {}
+
+        async def quick():
+            return "done"
+
+        result = await handler._run_with_concurrency_limit(99, "single", quick())
+        self.assertEqual(result, "done")
+        self.assertNotIn(99, handler.active_conversions)
+        self.assertNotIn(99, handler._active_conversion_count)
+
+    async def test_second_file_overwrites_task_name_while_first_runs(self):
+        handler = self._handler()
+        handler.converter = None
+        handler.conversion_semaphore = asyncio.Semaphore(5)
+        handler.active_conversions = {}
+        handler._active_conversion_count = {}
+
+        gate1 = asyncio.Event()
+        gate2 = asyncio.Event()
+
+        async def slow(gate):
+            await gate.wait()
+
+        t1 = asyncio.create_task(
+            handler._run_with_concurrency_limit(7, "file_1", slow(gate1))
+        )
+        await asyncio.sleep(0)
+
+        # active_conversions shows file_1.
+        self.assertEqual(handler.active_conversions[7], "file_1")
+        self.assertEqual(handler._active_conversion_count[7], 1)
+
+        # Second file starts — overwrites the name but increments the counter.
+        t2 = asyncio.create_task(
+            handler._run_with_concurrency_limit(7, "file_2", slow(gate2))
+        )
+        await asyncio.sleep(0)
+        self.assertEqual(handler.active_conversions[7], "file_2")
+        self.assertEqual(handler._active_conversion_count[7], 2)
+
+        # First finishes — must NOT erase the entry.
+        gate1.set()
+        await asyncio.sleep(0)
+        await t1
+        self.assertIn(7, handler.active_conversions)
+        self.assertEqual(handler._active_conversion_count[7], 1)
+
+        # Second finishes — entry fully cleaned up.
+        gate2.set()
+        await asyncio.sleep(0)
+        await t2
+        self.assertNotIn(7, handler.active_conversions)
+        self.assertNotIn(7, handler._active_conversion_count)
+
+    async def test_different_users_do_not_interfere(self):
+        handler = self._handler()
+        handler.converter = None
+        handler.conversion_semaphore = asyncio.Semaphore(5)
+        handler.active_conversions = {}
+        handler._active_conversion_count = {}
+
+        gate = asyncio.Event()
+
+        async def slow():
+            await gate.wait()
+
+        t1 = asyncio.create_task(
+            handler._run_with_concurrency_limit(1, "a", slow())
+        )
+        t2 = asyncio.create_task(
+            handler._run_with_concurrency_limit(2, "b", slow())
+        )
+        await asyncio.sleep(0)
+
+        self.assertEqual(len(handler.active_conversions), 2)
+        self.assertEqual(handler._active_conversion_count[1], 1)
+        self.assertEqual(handler._active_conversion_count[2], 1)
+
+        gate.set()
+        await asyncio.sleep(0)
+        await t1
+        await t2
+
+        self.assertEqual(len(handler.active_conversions), 0)
 
 
 if __name__ == "__main__":

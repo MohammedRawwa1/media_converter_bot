@@ -154,6 +154,43 @@ def _is_user_dm_chat(chat_id: int | str) -> bool:
         return False
 
 
+# Media types Pyrogram's download_media() accepts. Everything else Telegram can
+# attach to a message - a poll, a location, a link preview - is reported by
+# ``msg.media`` too, but downloading it raises ValueError.
+_DOWNLOADABLE_MEDIA_NAMES = frozenset(
+    {"PHOTO", "VIDEO", "AUDIO", "DOCUMENT", "ANIMATION", "VOICE", "VIDEO_NOTE", "STICKER"}
+)
+
+
+def _has_downloadable_media(msg) -> bool:
+    """Whether *msg* carries media Pyrogram can actually fetch.
+
+    ``msg.media`` is truthy for anything Telegram attaches, so testing it alone
+    picks up messages that only carry a link preview / poll / location. Downloading
+    one of those raises "This message doesn't contain any downloadable media",
+    which - in the candidate loops - used to be read as "the download failed"
+    and stopped the search before the peer that actually holds the file was
+    tried. Ask for a document or a photo instead.
+    """
+    if msg is None or getattr(msg, "empty", False):
+        return False
+
+    media = getattr(msg, "media", None)
+    if not media:
+        return False
+
+    try:
+        from pyrogram.enums import MessageMediaType
+    except Exception:  # pragma: no cover - pyrogram missing or older layout
+        MessageMediaType = None
+
+    if MessageMediaType is not None and isinstance(media, MessageMediaType):
+        return getattr(media, "name", "").upper() in _DOWNLOADABLE_MEDIA_NAMES
+
+    # Not the parsed enum: fall back to the payload download_media() consumes.
+    return bool(getattr(msg, "document", None) or getattr(msg, "photo", None))
+
+
 async def _resolve_pyrogram_peer(client, peer_id: int | str) -> int:
     """Resolve a peer ID to get Pyrogram's cached entity (with access_hash).
 
@@ -1534,14 +1571,13 @@ async def _download_bytes_with_pyrogram(
 
                 if messages:
                     msg = messages[0] if isinstance(messages, list) else messages
-                    if msg and getattr(msg, "media", None):
-                        _has_media = bool(getattr(msg, "media", None))
+                    if _has_downloadable_media(msg):
                         logger.info(
                             "userbot: Pyrogram in-memory downloading %s/%s (peer=%s, media=%s)",
                             _peer,
                             message_id,
                             _peer,
-                            _has_media,
+                            bool(getattr(msg, "media", None)),
                         )
                         dl_kwargs = {"in_memory": True}
                         if progress_callback is not None:
@@ -1599,8 +1635,10 @@ async def _download_bytes_with_pyrogram(
                             message_id,
                         )
                     else:
+                        # Media but nothing downloadable: this peer is not the chat
+                        # that holds the file, so let the loop try the next one.
                         logger.info(
-                            "userbot: Pyrogram in-memory msg %s/%s no media (peer=%s)",
+                            "userbot: Pyrogram in-memory msg %s/%s has no downloadable media (peer=%s)",
                             _peer,
                             message_id,
                             _peer,
@@ -1624,7 +1662,7 @@ async def _download_bytes_with_pyrogram(
                             channel_peer,
                             message_id,
                         )
-                        if msg is not None and getattr(msg, "media", None):
+                        if _has_downloadable_media(msg):
                             dl_kwargs = {"in_memory": True}
                             if progress_callback is not None:
                                 dl_kwargs["progress"] = progress_callback
@@ -1815,11 +1853,12 @@ async def _download_with_pyrogram(
                 if messages:
                     msg = messages[0] if isinstance(messages, list) else messages
                     if msg:
-                        _has_media = bool(getattr(msg, "media", None))
+                        _has_media = _has_downloadable_media(msg)
                         logger.info(
-                            "userbot: Pyrogram get_messages returned msg id=%s peer=%s has_media=%s",
+                            "userbot: Pyrogram get_messages returned msg id=%s peer=%s media=%s downloadable=%s",
                             getattr(msg, "id", None),
                             _peer,
+                            bool(getattr(msg, "media", None)),
                             _has_media,
                         )
                         if _has_media:
@@ -1846,12 +1885,17 @@ async def _download_with_pyrogram(
                             message_id,
                             _peer,
                         )
-                        # File was found but download failed — break out to avoid re-downloading
-                        # from another peer (the message is correct, download itself failed)
+                        # The message does carry a file, so this peer is the right
+                        # one and the download itself failed - break out to avoid
+                        # re-downloading the same file from another peer.
                         break
                     else:
+                        # A message with media but nothing downloadable means this
+                        # peer resolved to the wrong chat (the Bot API user id maps
+                        # to the account's own peer, not the DM with the bot), so
+                        # keep going - the next candidate holds the real file.
                         logger.info(
-                            "userbot: Pyrogram message %s/%s found but has no media (peer=%s)",
+                            "userbot: Pyrogram message %s/%s has no downloadable media (peer=%s); trying the next peer",
                             _peer,
                             message_id,
                             _peer,
@@ -1880,7 +1924,7 @@ async def _download_with_pyrogram(
                         )
                         if msg is not None:
                             _found_msg = True
-                            if getattr(msg, "media", None):
+                            if _has_downloadable_media(msg):
                                 logger.info(
                                     "userbot: raw API got msg %s with media, downloading...",
                                     message_id,
@@ -1938,7 +1982,7 @@ async def _download_with_pyrogram(
                 channel_peer,
                 message_id,
             )
-            if msg is None or not getattr(msg, "media", None):
+            if not _has_downloadable_media(msg):
                 return None
             if await _download_and_ensure_path(client, msg, dest_path, progress_callback=progress_callback):
                 return True
@@ -1953,7 +1997,7 @@ async def _download_with_pyrogram(
                     message_id,
                 )
                 async for msg in client.get_chat_history(_peer, limit=50):
-                    if getattr(msg, "id", None) == message_id and getattr(msg, "media", None):
+                    if getattr(msg, "id", None) == message_id and _has_downloadable_media(msg):
                         logger.info(
                             "userbot: Pyrogram found msg %s/%s in history (peer=%s)",
                             _peer,
@@ -1997,7 +2041,7 @@ async def _download_with_pyrogram(
                         messages = await client.get_messages(_resolved_id, message_ids=[message_id])
                         if messages:
                             msg = messages[0] if isinstance(messages, list) else messages
-                            if msg and getattr(msg, "media", None):
+                            if _has_downloadable_media(msg):
                                 _found_msg = True
                                 if await _download_and_ensure_path(
                                     client, msg, dest_path, progress_callback=progress_callback

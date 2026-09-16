@@ -6,6 +6,7 @@ Rate limiting utilities for Telegram API and bot operations.
 import asyncio
 import contextlib
 import logging
+import os
 import time
 from collections import defaultdict
 
@@ -201,6 +202,375 @@ class TelegramAPIRateLimiter:
             "global": self.global_limiter.get_stats(),
             "per_user": self.per_user_limiter.get_stats(user_id) if user_id else self.per_user_limiter.get_stats(),
         }
+
+
+# ── Telegram flood-control gate ──────────────────────────────────────────────
+# Telegram answers a burst of edits/sends with a 429 "Flood control exceeded.
+# Retry in N seconds" where N is sometimes measured in *hours* (27 000+ has been
+# observed on this bot). Sleeping that value inline parks whatever coroutine hit
+# it - a handler, a watcher - for the whole window, which is how the bot ends up
+# looking dead while getUpdates keeps answering 200.
+#
+# The gate records the window so callers can decide instead of blocking: drop a
+# progress edit, give up on a send. Nothing is ever slept longer than
+# ``inline_max``.
+
+FLOOD_WAIT_INLINE_MAX = float(os.getenv("TELEGRAM_FLOOD_INLINE_MAX_SECONDS", "30"))
+
+# Windows are mirrored into Redis so the bot and the worker - separate containers
+# sharing one bot token and one Telegram budget - honour each other's penalties.
+# Each process keeps its own copy as well: the local view answers a check without
+# a round trip, and a missing Redis (or a dead one) degrades to process-local
+# behaviour instead of blocking the write path.
+FLOOD_KEY_PREFIX = os.getenv("TELEGRAM_FLOOD_KEY_PREFIX", "ffmpeg:flood:")
+FLOOD_RESYNC_SECONDS = float(os.getenv("TELEGRAM_FLOOD_RESYNC_SECONDS", "1.0"))
+FLOOD_REDIS_BACKOFF_SECONDS = float(os.getenv("TELEGRAM_FLOOD_REDIS_BACKOFF_SECONDS", "30"))
+
+# Extend-only, in one round trip: the stored value is the window's absolute end
+# (unix seconds) and its TTL is what is left of it. A later, smaller retry_after
+# - Telegram's countdown decays on every 429 - must not reopen the gate early,
+# and two processes noting the same flood must not shorten each other's window.
+_FLOOD_EXTEND_LUA = """
+local now = tonumber(ARGV[1])
+local deadline = tonumber(ARGV[2])
+local current = redis.call('GET', KEYS[1])
+if current and tonumber(current) >= deadline then
+    return math.ceil(tonumber(current) - now)
+end
+local ttl = math.ceil(deadline - now)
+if ttl < 1 then ttl = 1 end
+redis.call('SET', KEYS[1], ARGV[2], 'EX', ttl)
+return ttl
+"""
+
+
+async def shared_flood_redis():
+    """Shared Redis client for the flood gate, or None when it is not available.
+
+    Resolved through the module global at call time so ``job_queue.get_redis`` can
+    be patched in tests, and so an unreachable Redis is reported as "no shared
+    view" rather than raised.
+    """
+    factory = globals().get("get_redis")
+    if factory is None:
+        return None
+    try:
+        return await factory()
+    except Exception:
+        return None
+
+
+def _flood_namespace() -> str:
+    """Namespace shared keys per bot so two bots on one Redis never share windows.
+
+    The Bot API id is the first segment of the token and is not a secret; only
+    that segment is used.
+    """
+    token = os.getenv("BOT_TOKEN") or ""
+    if ":" in token:
+        return token.split(":", 1)[0]
+    return "default"
+
+
+class TelegramFloodGate:
+    """Record of open Telegram flood-control windows, shared between processes.
+
+    Windows are per chat, because that is how Telegram enforces them: a penalty
+    earned in one busy chat must not silence every other chat, which is what
+    folding a chat window into a shared scope would do. ``GLOBAL`` is only for
+    callers that cannot name a chat at all.
+
+    Every method is async and consults the shared backend; the class is only ever
+    attached to Redis by a process that owns one (:meth:`attach_redis`), so tests
+    and one-off scripts stay purely in memory.
+    """
+
+    GLOBAL = "global"
+
+    def __init__(
+        self,
+        inline_max: float | None = None,
+        redis_factory=None,
+        resync_interval: float = FLOOD_RESYNC_SECONDS,
+    ):
+        self.inline_max = FLOOD_WAIT_INLINE_MAX if inline_max is None else float(inline_max)
+        self.resync_interval = float(resync_interval)
+        self._redis_factory = redis_factory
+        # scope -> monotonic deadline, this process's view of the window
+        self._until: dict[str, float] = {}
+        # scope -> monotonic time of the last shared read (keeps the read rate down)
+        self._last_read: dict[str, float] = {}
+        # monotonic time until which the shared backend is considered unavailable
+        self._backend_down_until = 0.0
+
+    def attach_redis(self, factory=shared_flood_redis) -> None:
+        """Share windows through ``factory`` (``async () -> client | None``).
+
+        Called once at process start by the bot and the worker. Detached - the
+        default - the gate never performs I/O.
+        """
+        self._redis_factory = factory
+
+    @staticmethod
+    def scope_for_chat(chat_id=None) -> str:
+        """Return the gate scope for a chat id (``global`` when unknown)."""
+        if chat_id is None:
+            return TelegramFloodGate.GLOBAL
+        return f"chat:{chat_id}"
+
+    async def note(self, retry_after, scope: str = GLOBAL) -> float:
+        """Record a flood window and return the seconds it spans.
+
+        The window is published for the other processes and extended, never
+        shortened: the longest window anyone holds wins.
+        """
+        try:
+            seconds = float(retry_after)
+        except (TypeError, ValueError):
+            seconds = 0.0
+        if seconds <= 0:
+            return 0.0
+
+        # A hard cap keeps a bogus retry_after from wedging the gate for days.
+        seconds = min(seconds, 24 * 3600.0)
+        self._remember(scope, seconds)
+        shared = await self._publish(scope, seconds)
+        if shared > seconds:
+            # Another container is already holding a longer window for this chat.
+            self._remember(scope, shared)
+            seconds = shared
+        return seconds
+
+    async def remaining(self, scope: str = GLOBAL) -> float:
+        """Seconds left on the longest window known for ``scope`` (0 when open)."""
+        await self._sync(scope)
+        now = time.monotonic()
+        return max(0.0, self._until.get(scope, 0.0) - now)
+
+    async def is_open(self, scope: str = GLOBAL) -> bool:
+        return await self.remaining(scope) > 0.0
+
+    async def should_drop_inline(self, scope: str = GLOBAL) -> bool:
+        """Whether a caller should skip its API call entirely.
+
+        True while a window longer than ``inline_max`` is open: the call would
+        only collect another 429, so the caller is better off dropping it.
+        """
+        return await self.remaining(scope) > self.inline_max
+
+    async def wait(self, scope: str = GLOBAL, max_wait: float | None = None) -> float:
+        """Wait out a flood window, never longer than ``max_wait``.
+
+        Returns the seconds still remaining once the wait returns: 0 when the
+        window closed, > 0 when it is still open and the caller should give up.
+        """
+        limit = self.inline_max if max_wait is None else float(max_wait)
+        left = await self.remaining(scope)
+        if left <= 0.0:
+            return 0.0
+        if left > limit:
+            return left
+        await asyncio.sleep(left + 0.5)
+        return await self.remaining(scope)
+
+    def reset(self) -> None:
+        """Clear the local view (used by tests; the shared keys keep their TTL)."""
+        self._until.clear()
+        self._last_read.clear()
+        self._backend_down_until = 0.0
+
+    def snapshot(self) -> dict[str, float]:
+        """Remaining seconds per scope, for health/metrics output."""
+        now = time.monotonic()
+        return {k: round(max(0.0, v - now), 1) for k, v in self._until.items()}
+
+    # ── shared backend ───────────────────────────────────────────────────────
+
+    def _remember(self, scope: str, seconds: float) -> None:
+        """Keep the longest window seen, in monotonic time."""
+        deadline = time.monotonic() + seconds
+        if deadline > self._until.get(scope, 0.0):
+            self._until[scope] = deadline
+        self._prune()
+
+    def _key(self, scope: str) -> str:
+        return f"{FLOOD_KEY_PREFIX}{_flood_namespace()}:{scope}"
+
+    async def _client(self):
+        """A shared client, or None while the backend is unattached/unreachable.
+
+        A failure backs the gate off for a while: a dead Redis must not add a
+        connection attempt to every progress edit.
+        """
+        if self._redis_factory is None:
+            return None
+        if time.monotonic() < self._backend_down_until:
+            return None
+        client = await self._redis_factory()
+        if client is None:
+            self._backend_down_until = time.monotonic() + FLOOD_REDIS_BACKOFF_SECONDS
+        return client
+
+    @staticmethod
+    async def _release(client) -> None:
+        """Give the shared client back (``job_queue``'s proxy close is a no-op)."""
+        with contextlib.suppress(Exception):
+            await client.close()
+
+    async def _publish(self, scope: str, seconds: float) -> float:
+        """Store this window for the other processes; returns its effective span."""
+        client = await self._client()
+        if client is None:
+            return 0.0
+        now = time.time()
+        try:
+            result = await client.eval(_FLOOD_EXTEND_LUA, 1, self._key(scope), now, now + seconds)
+            return float(result or 0.0)
+        except Exception:
+            logger.debug("flood gate: could not publish a %.0fs window for %s", seconds, scope)
+            self._backend_down_until = time.monotonic() + FLOOD_REDIS_BACKOFF_SECONDS
+            return 0.0
+        finally:
+            await self._release(client)
+
+    async def _sync(self, scope: str) -> None:
+        """Adopt a window another process opened (at most one read per interval)."""
+        if self._redis_factory is None:
+            return
+        now = time.monotonic()
+        last = self._last_read.get(scope)
+        if last is not None and (now - last) < self.resync_interval:
+            return
+        self._last_read[scope] = now
+        if len(self._last_read) > 512:
+            self._prune()
+
+        client = await self._client()
+        if client is None:
+            return
+        try:
+            raw = await client.get(self._key(scope))
+        except Exception:
+            logger.debug("flood gate: could not read the shared window for %s", scope)
+            self._backend_down_until = time.monotonic() + FLOOD_REDIS_BACKOFF_SECONDS
+            return
+        finally:
+            await self._release(client)
+
+        if not raw:
+            return
+        try:
+            remaining = float(raw) - time.time()
+        except (TypeError, ValueError):
+            return
+        if remaining > 0:
+            self._remember(scope, remaining)
+
+    def _prune(self) -> None:
+        now = time.monotonic()
+        for key, deadline in list(self._until.items()):
+            if deadline <= now:
+                self._until.pop(key, None)
+        if len(self._last_read) > 512:
+            cutoff = now - max(60.0, self.resync_interval * 10)
+            for key, when in list(self._last_read.items()):
+                if when < cutoff:
+                    self._last_read.pop(key, None)
+
+
+# One gate per process. The bot and the worker both attach it to Redis at start
+# up so neither can keep writing while the other is serving a flood control.
+telegram_flood_gate = TelegramFloodGate()
+
+
+class TelegramEditCoalescer:
+    """Keep several watchers from editing one message into a 429.
+
+    Telegram counts an edit like a message, so N watchers each pacing themselves
+    to 2-3s still exceed one edit per second on the same chat when they all
+    render onto the same message. The allowance here is per ``(chat_id,
+    message_id)``, so the watchers that share a message share it.
+
+    What a message currently shows is only learned from :meth:`record`, which
+    callers run *after* Telegram accepted the edit. Deciding a skip from a text
+    this class merely predicted would suppress a real update - and a message id
+    that has since been deleted and reposted would look like a duplicate of
+    whatever used to sit there, which is why :meth:`forget` exists.
+    """
+
+    def __init__(self, min_interval: float = 2.5, max_tracked: int = 512):
+        self.min_interval = float(min_interval)
+        self.max_tracked = int(max_tracked)
+        # (chat_id, message_id) -> (last_sent_monotonic, text_digest)
+        self._last: dict[tuple, tuple[float, int]] = {}
+
+    def should_skip(
+        self, chat_id, message_id, text, min_interval: float | None = None, force: bool = False
+    ) -> bool:
+        """Whether this edit should be dropped instead of sent.
+
+        Skipped when it would repeat the text already on the message (Telegram
+        answers an unchanged edit with a 400, so a repeat is dropped whatever the
+        caller asked for), or when the message was last rendered less than
+        ``min_interval`` ago. ``force`` lifts only that pacing, which is how a
+        terminal status gets through even if it lands inside the interval of the
+        update before it. A caller with no message to key on is never skipped.
+        """
+        if chat_id is None or message_id is None:
+            return False
+
+        last = self._last.get((chat_id, message_id))
+        if last is None:
+            return False
+
+        last_time, last_digest = last
+        if hash(text) == last_digest:
+            return True
+
+        gap = self.min_interval if min_interval is None else float(min_interval)
+        return not force and (time.monotonic() - last_time) < gap
+
+    def shows(self, chat_id, message_id, text) -> bool:
+        """Whether the message is already showing exactly ``text``.
+
+        Lets a caller tell a skip that lost nothing (the text is on screen) from
+        one that has to be retried (the pacing or the flood gate dropped it).
+        """
+        if chat_id is None or message_id is None:
+            return False
+        last = self._last.get((chat_id, message_id))
+        return last is not None and last[1] == hash(text)
+
+    def record(self, chat_id, message_id, text) -> None:
+        """Remember what Telegram now shows on the message."""
+        if chat_id is None or message_id is None:
+            return
+        self._last[(chat_id, message_id)] = (time.monotonic(), hash(text))
+        if len(self._last) > self.max_tracked:
+            self._prune()
+
+    def forget(self, chat_id, message_id) -> None:
+        """Drop what is remembered about a message that no longer exists."""
+        self._last.pop((chat_id, message_id), None)
+
+    def reset(self) -> None:
+        self._last.clear()
+
+    def _prune(self) -> None:
+        # Drop the stalest entries; a long-running bot renders many messages.
+        now = time.monotonic()
+        keep = max(60.0, self.min_interval * 20)
+        for key, (when, _) in list(self._last.items()):
+            if (now - when) > keep:
+                self._last.pop(key, None)
+        if len(self._last) > self.max_tracked:
+            oldest = sorted(self._last.items(), key=lambda item: item[1][0])
+            for key, _ in oldest[: len(self._last) - self.max_tracked]:
+                self._last.pop(key, None)
+
+
+# Shared across every watcher/handler in the process.
+telegram_edit_coalescer = TelegramEditCoalescer()
 
 
 class ConversionRateLimiter:

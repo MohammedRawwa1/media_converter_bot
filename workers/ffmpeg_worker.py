@@ -37,7 +37,7 @@ from tasks import (
     merge_videos,
     trim_media,
 )
-from utils import batch_pipeline, eventbus, file_utils, job_store
+from utils import batch_pipeline, deferred_delivery, eventbus, file_utils, job_store
 from utils.eventbus import (
     JOB_CANCELLED,
     JOB_COMPLETED,
@@ -47,8 +47,18 @@ from utils.eventbus import (
     is_rabbitmq_job,
 )
 from utils.file_utils import safe_rmtree
+from utils.rate_limiter import telegram_edit_coalescer, telegram_flood_gate
 
 logger = logging.getLogger(__name__)
+
+# Every Bot this worker builds sends through the shared flood gate, so a window
+# earned here (or by the bot process) stops the write before it costs a 429.
+try:
+    from utils.telegram_flood_request import flood_gated_request
+except Exception:  # pragma: no cover - PTB request layer unavailable
+
+    def flood_gated_request(**kwargs):
+        return None
 
 try:
     from utils.storage import get_storage_backend
@@ -556,6 +566,362 @@ async def _probe_audio_delivery(out_path: str, delivery_name: str) -> dict | Non
     return meta
 
 
+# ── Deferred delivery ────────────────────────────────────────────────────────
+# Delivery is the last step of a job, so a Telegram flood window landing on it
+# used to cost the user the file outright: the job was finalized as "delivery
+# failed" and nothing ever retried it, even though the window closes on its own
+# within hours and the converted output is still on disk. A refused delivery on
+# a chat whose window is open is now handed to the deferred queue
+# (``utils.deferred_delivery``) and retried from here - no re-download, no second
+# encode, and no re-send once somebody else has delivered it.
+
+_DEFERRED_MESSAGE = (
+    "📦 Delivery queued — Telegram is rate limiting this chat. "
+    "The file will be sent automatically as soon as that clears."
+)
+_DEFERRED_SWEEP_SECONDS = float(os.getenv("DEFERRED_DELIVERY_SWEEP_SECONDS", "30"))
+_DEFERRED_RETRY_BACKOFF_SECONDS = float(os.getenv("DEFERRED_DELIVERY_RETRY_BACKOFF_SECONDS", "120"))
+_DEFERRED_SWEEP_LIMIT = int(os.getenv("DEFERRED_DELIVERY_SWEEP_LIMIT", "5"))
+
+
+def _deferred_media_kind(record: dict) -> str:
+    """How a deferred output has to be sent: audio, video, or a plain file."""
+    name = record.get("delivery_name") or record.get("output") or ""
+    try:
+        from utils.userbot_uploader import is_audio_delivery_output
+
+        if is_audio_delivery_output(name, media_kind=record.get("media_kind")):
+            return "audio"
+    except Exception:
+        logger.debug("deferred delivery: audio detection unavailable for %s", name)
+    if os.path.splitext(name)[1].lower() in (".mp4", ".mkv", ".mov", ".webm", ".avi"):
+        return "video"
+    return "document"
+
+
+async def _defer_delivery(
+    job,
+    *,
+    chat_id,
+    output,
+    delivery_name,
+    media_kind,
+    caption,
+    reason,
+    get_url=None,
+    output_key=None,
+) -> float:
+    """Queue a refused delivery for later. Returns the window it is waiting on.
+
+    A failure with no open window for the chat is a *real* failure - a forbidden
+    chat, a file Telegram will not take - so it keeps the old
+    ``delivery failed`` outcome. Only a window this bot is actually serving is
+    worth waiting out, because that one closes by itself.
+    """
+    remaining = await telegram_flood_gate.remaining(telegram_flood_gate.scope_for_chat(chat_id))
+    if remaining <= 0:
+        return 0.0
+
+    horizon = deferred_delivery.DEFAULT_HORIZON_SECONDS
+    record = {
+        "job_id": job.get("job_id"),
+        "chat_id": chat_id,
+        "output": os.path.abspath(output) if output else None,
+        "output_key": output_key,
+        "delivery_name": delivery_name,
+        "media_kind": media_kind,
+        "caption": caption,
+        "link_url": get_url,
+        "cleanup_output": bool(job.get("cleanup_output", False)),
+        "reason": reason,
+    }
+    if not await deferred_delivery.defer(record, due_in=min(remaining + 1.0, horizon), horizon=horizon):
+        return 0.0
+    return remaining
+
+
+async def _resolve_deferred_output(record: dict) -> str | None:
+    """The file to send: the local output, else the copy in storage.
+
+    A result that was going to be delivered from this container was never
+    uploaded - nothing else would ever read it - so the file on disk is the only
+    copy that exists and it has to still be there. The storage fallback covers
+    the cases where a copy does exist (link delivery on, or a job with no chat).
+    """
+    path = record.get("output")
+    if path and os.path.exists(path) and os.path.getsize(path) > 0:
+        return path
+
+    key = record.get("output_key")
+    if not key or get_storage_backend is None:
+        return None
+    try:
+        backend = await get_storage_backend()
+        dest = os.path.join(config.TEMP_PATH, f"deferred_{record.get('job_id')}_{os.path.basename(str(key))}")
+        os.makedirs(os.path.dirname(dest), exist_ok=True)
+        if await backend.download_file(key, dest) and os.path.exists(dest) and os.path.getsize(dest) > 0:
+            record["_downloaded"] = dest
+            return dest
+    except Exception:
+        logger.warning("deferred delivery: could not fetch %s for job %s", key, record.get("job_id"))
+    return None
+
+
+async def _send_deferred_output(record: dict, path: str) -> bool:
+    """Send one deferred result. True when Telegram accepted it."""
+    bot_token = getattr(config, "BOT_TOKEN", None)
+    chat_id = record.get("chat_id")
+    if not bot_token or not chat_id or not path:
+        return False
+
+    try:
+        size = os.path.getsize(path)
+    except Exception:
+        size = 0
+    limit = int(getattr(config, "BOT_API_MAX_BYTES", 0) or 0)
+    if limit and size > limit:
+        logger.warning(
+            "deferred delivery: job %s output is %.1fMB, past the Bot API limit (%dMB)",
+            record.get("job_id"),
+            size / (1024 * 1024),
+            limit // (1024 * 1024),
+        )
+        return False
+
+    name = record.get("delivery_name") or os.path.basename(path)
+    caption = record.get("caption") or None
+    kind = _deferred_media_kind(record)
+    logger.info(
+        "deferred delivery: sending %s for job %s (%s, %.1fMB)",
+        name,
+        record.get("job_id"),
+        kind,
+        size / (1024 * 1024),
+    )
+
+    async with Bot(token=bot_token, request=flood_gated_request()) as bot:
+        if kind == "audio":
+            meta = await _probe_audio_delivery(path, name) or {}
+            with open(path, "rb") as fh:
+                await bot.send_audio(
+                    chat_id=chat_id,
+                    audio=fh,
+                    caption=caption,
+                    filename=name,
+                    title=(meta.get("title") or os.path.splitext(name)[0])[:64],
+                    performer=(meta.get("performer") or "")[:64],
+                    duration=int(meta["duration"]) if meta.get("duration") else None,
+                )
+        elif kind == "video":
+            meta, thumb = await _probe_output_metadata(path)
+            kwargs: dict = {}
+            for field in ("duration", "width", "height"):
+                value = (meta or {}).get(field)
+                if value:
+                    kwargs[field] = int(value)
+            if thumb:
+                kwargs["thumbnail"] = thumb
+            try:
+                with open(path, "rb") as fh:
+                    await bot.send_video(
+                        chat_id=chat_id,
+                        video=fh,
+                        caption=caption,
+                        filename=name,
+                        supports_streaming=True,
+                        **kwargs,
+                    )
+            finally:
+                if thumb:
+                    with contextlib.suppress(Exception):
+                        os.remove(thumb)
+        else:
+            with open(path, "rb") as fh:
+                await bot.send_document(chat_id=chat_id, document=fh, caption=caption, filename=name)
+    return True
+
+
+async def _finish_deferred(record: dict, *, ok: bool, message: str) -> None:
+    """Record a deferred delivery's outcome and drop it from the queue.
+
+    The job hash is what the bot's progress watcher polls, so writing the
+    terminal status here is what finally renders the result: the ``processing``
+    status the deferral left behind is what kept that watcher alive.
+    """
+    job_id = record.get("job_id")
+    if not job_id:
+        return
+
+    status = "done" if ok else "error"
+    with contextlib.suppress(Exception):
+        r = await get_redis()
+        try:
+            await r.hset(
+                f"ffmpeg:job:{job_id}",
+                mapping={
+                    "status": status,
+                    "progress": "100",
+                    "message": message,
+                    "delivered": "1" if ok else "0",
+                    "delivery_deferred": "0",
+                },
+            )
+        finally:
+            with contextlib.suppress(Exception):
+                await r.close()
+    with contextlib.suppress(Exception):
+        await publish_update(
+            f"ffmpeg:progress:{job_id}",
+            {"job_id": job_id, "progress": 100, "message": message, "status": status},
+        )
+    with contextlib.suppress(Exception):
+        await emit_event(
+            JOB_COMPLETED if ok else JOB_FAILED,
+            job={"job_id": job_id},
+            payload={"status": status, "message": message, "progress": 100},
+            source="worker",
+        )
+
+    # Free the disk the attempt was holding. A *delivered* result is removed when
+    # the job asked for that; an abandoned one is deliberately kept, because a
+    # failed delivery means this file is the user's only copy and deleting it is
+    # what would make the failure permanent.
+    if record.get("_downloaded"):
+        with contextlib.suppress(Exception):
+            os.remove(record["_downloaded"])
+    if ok and record.get("cleanup_output") and record.get("output"):
+        with contextlib.suppress(Exception):
+            os.remove(record["output"])
+
+    await deferred_delivery.clear(job_id)
+
+
+async def _deliver_deferred_record(record: dict) -> str:
+    """One deferred attempt: "delivered", "deferred" or "abandoned"."""
+    from telegram.error import RetryAfter
+
+    job_id = record.get("job_id")
+    remaining = await telegram_flood_gate.remaining(telegram_flood_gate.scope_for_chat(record.get("chat_id")))
+    if remaining > 0:
+        # The window is still open - Telegram told us so on the last attempt, and
+        # it may even have been extended by the other container since.
+        await deferred_delivery.update(job_id, due_in=remaining + 1.0, reason="still rate limited")
+        return "deferred"
+
+    if await _job_already_delivered({"job_id": job_id}):
+        # Something else got the file through (a broker redelivery, an operator's
+        # requeue, a stop/resume): never send a second copy.
+        await _finish_deferred(record, ok=True, message="delivered to Telegram")
+        return "delivered"
+
+    created_at = float(record.get("created_at") or 0)
+    horizon = float(record.get("horizon") or deferred_delivery.DEFAULT_HORIZON_SECONDS)
+    if created_at and (time.time() - created_at) > horizon:
+        logger.warning(
+            "deferred delivery: job %s waited past its %.0fh window; giving up (output kept at %s)",
+            job_id,
+            horizon / 3600,
+            record.get("output"),
+        )
+        await _finish_deferred(
+            record,
+            ok=False,
+            message="delivery failed: the Telegram rate limit outlasted the retry window",
+        )
+        return "abandoned"
+
+    attempts = int(record.get("attempts") or 0) + 1
+    path = await _resolve_deferred_output(record)
+    ok = False
+    if path:
+        try:
+            ok = await _send_deferred_output(record, path)
+        except RetryAfter as exc:
+            # The window reopened (or the other container found one) between the
+            # check above and the send. This attempt cost nothing and the file is
+            # still fine, so wait the window out instead of spending one of the
+            # few attempts we allow.
+            _left = await telegram_flood_gate.note(
+                getattr(exc, "retry_after", None) or 5,
+                telegram_flood_gate.scope_for_chat(record.get("chat_id")),
+            )
+            logger.info(
+                "deferred delivery: job %s re-gated for %.0fs; not counting an attempt",
+                job_id,
+                _left,
+            )
+            await deferred_delivery.update(job_id, due_in=_left + 1.0, reason="re-gated")
+            return "deferred"
+        except Exception:
+            logger.exception("deferred delivery: send failed for job %s (attempt %s)", job_id, attempts)
+    if ok:
+        await _finish_deferred(record, ok=True, message="delivered to Telegram (retried after rate limiting)")
+        return "delivered"
+
+    if attempts >= deferred_delivery.MAX_ATTEMPTS:
+        await _finish_deferred(record, ok=False, message="delivery failed after retrying past the rate limit")
+        return "abandoned"
+
+    logger.warning(
+        "deferred delivery: attempt %s/%s for job %s did not land; retrying in %.0fs",
+        attempts,
+        deferred_delivery.MAX_ATTEMPTS,
+        job_id,
+        _DEFERRED_RETRY_BACKOFF_SECONDS,
+    )
+    await deferred_delivery.update(
+        job_id,
+        due_in=_DEFERRED_RETRY_BACKOFF_SECONDS,
+        attempts=attempts,
+        reason="retry after a failed attempt",
+    )
+    return "deferred"
+
+
+async def _sweep_deferred_deliveries(*, limit: int | None = None) -> dict:
+    """Retry the deliveries rate limiting pushed past their send.
+
+    Skipped while a conversion is running: this container's memory ceiling is
+    about a conversion *plus* an upload, and the delivery is not going anywhere -
+    the queue keeps it, and the next pass picks it up.
+    """
+    counts = {"delivered": 0, "deferred": 0, "abandoned": 0, "skipped": 0}
+    if _jobs_in_flight > 0:
+        counts["skipped"] = 1
+        return counts
+
+    records = await deferred_delivery.claim_due(limit=limit or _DEFERRED_SWEEP_LIMIT)
+    for record in records:
+        try:
+            outcome = await _deliver_deferred_record(record)
+        except Exception:
+            logger.exception("deferred delivery: attempt for job %s raised", record.get("job_id"))
+            outcome = "deferred"
+        counts[outcome] = counts.get(outcome, 0) + 1
+    return counts
+
+
+async def _deferred_delivery_sweeper(stop_event: asyncio.Event | None = None) -> None:
+    """Background task: keep resolving deferred deliveries while the worker runs.
+
+    The first pass runs immediately, so a redeploy resumes whatever a previous
+    container had to hand off rather than waiting for the queue to be touched.
+    """
+    while True:
+        try:
+            counts = await _sweep_deferred_deliveries()
+            if counts["delivered"] or counts["abandoned"]:
+                logger.info("deferred delivery sweep: %s", counts)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("deferred delivery sweep failed")
+        try:
+            await asyncio.sleep(_DEFERRED_SWEEP_SECONDS)
+        except asyncio.CancelledError:
+            raise
+
+
 async def _forward_pubsub_listener(stop_event: asyncio.Event | None, event: asyncio.Event) -> None:
     """Background task: subscribe to forward publish channel and set `event` when a notification arrives.
 
@@ -1013,6 +1379,76 @@ async def handle_job(job: dict):
             else "fetching source from storage"
         )
         await _set_job_state(job_id, "processing", _fetch_note, progress=0, channel=progress_channel)
+
+        # ── HEAD pre-flight: short-circuit when the key is already gone ──
+        # Without this, a deleted source burns every download attempt (each
+        # pulling bytes from the wire) before the error is surfaced.
+        try:
+            if not await backend.exists(input_key):
+                logger.warning(
+                    "Source pre-flight: key %s no longer exists in storage (job %s)",
+                    input_key,
+                    job_id,
+                )
+                await _set_job_state(
+                    job_id, "error",
+                    "the source is missing from storage",
+                    progress=0,
+                )
+                return
+        except Exception:
+            # exists() may not be implemented by every backend; a failure
+            # here is non-fatal — fall through to the download loop.
+            logger.debug(
+                "Source pre-flight head_object failed for %s (job %s); proceeding to download",
+                input_key,
+                job_id,
+            )
+
+        # ── Range-probe: inspect the first 2 MB before pulling the whole file ──
+        # Container headers (MP4 moov, MKV SegmentInfo, AVI RIFF header) live
+        # in the first few MB.  ffprobe on a 2 MB slice catches most corrupt /
+        # truncated files before they burn the full egress budget.
+        _probe_slice_path = f"{temp_input_path}.probe"
+        try:
+            range_ok = await backend.download_range(
+                input_key, _probe_slice_path, end=2_097_151,
+            )
+            if range_ok and os.path.exists(_probe_slice_path) and os.path.getsize(_probe_slice_path) > 0:
+                from utils.ffmpeg_runner import probe_media
+
+                probe = await probe_media(_probe_slice_path)
+                if not probe or not probe.get("duration"):
+                    logger.warning(
+                        "Range-probe: ffprobe found no duration for %s (job %s) — source may be corrupt",
+                        input_key,
+                        job_id,
+                    )
+                    await _set_job_state(
+                        job_id, "error",
+                        "source appears corrupt or unsupported",
+                        progress=0,
+                    )
+                    with contextlib.suppress(OSError):
+                        os.remove(_probe_slice_path)
+                    return
+                logger.debug(
+                    "Range-probe: source %s looks valid (dur=%.1fs, job %s)",
+                    input_key,
+                    probe.get("duration", 0),
+                    job_id,
+                )
+        except Exception:
+            # Range GET or ffprobe failure is non-fatal — fall through to the
+            # full download which has its own ffprobe validation.
+            logger.debug(
+                "Range-probe failed for %s (job %s); proceeding to full download",
+                input_key,
+                job_id,
+            )
+        finally:
+            with contextlib.suppress(OSError):
+                os.remove(_probe_slice_path)
 
         # retry/backoff for transient storage/download issues
         download_retries = int(os.environ.get("DOWNLOAD_RETRIES", "3"))
@@ -1961,6 +2397,9 @@ async def handle_job(job: dict):
                         chat_id = job.get("chat_id")
                         caption = job.get("caption")
                         sent = False
+                        # Set when a flood window forces this delivery to be
+                        # retried later instead of finalized as failed.
+                        _deferred_window = None
                         enable_userbot = config.ENABLE_USERBOT
                         bot_token = getattr(config, "BOT_TOKEN", None)
 
@@ -1996,7 +2435,7 @@ async def handle_job(job: dict):
                                 try:
                                     job_type = job.get("type") if isinstance(job, dict) else None
                                     if file_size > bot_api_max_bytes or (job_type and job_type != "generate_sample"):
-                                        async with Bot(token=bot_token) as bot:
+                                        async with Bot(token=bot_token, request=flood_gated_request()) as bot:
                                             text = f"Your video is ready: {get_url}"
                                             await bot.send_message(chat_id=chat_id, text=text)
                                         logger.info("Sent presigned URL to chat %s for job %s", chat_id, job_id)
@@ -2102,7 +2541,7 @@ async def handle_job(job: dict):
                                     )
                                     try:
                                         # Use async Bot API methods directly and close the client when done
-                                        async with Bot(token=bot_token) as bot:
+                                        async with Bot(token=bot_token, request=flood_gated_request()) as bot:
                                             if kind == "zip":
                                                 # Attempt to attach a thumbnail when available
                                                 # Local copy first: this run produced the thumbnail
@@ -2487,19 +2926,44 @@ async def handle_job(job: dict):
                         # busy hour would hold one per job until then).
                         _cleanup_local_thumb(job)
 
+                        # A delivery only Telegram's flood window refused is not a
+                        # lost delivery: hand it to the deferred queue, which sends
+                        # it once the window closes. Reported as still "processing"
+                        # so the progress watcher stays alive and renders the result
+                        # when the file actually goes out.
+                        if not sent and chat_id:
+                            _deferred_window = await _defer_delivery(
+                                job,
+                                chat_id=chat_id,
+                                output=out,
+                                output_key=dest,
+                                delivery_name=_delivery_name,
+                                media_kind=_media_kind,
+                                caption=caption,
+                                get_url=get_url,
+                                reason="telegram flood control",
+                            )
+
                         # Set final job status on Redis hash so _watch_job_progress (and web UI) can see it.
                         try:
-                            _final_status = "done" if sent else "error"
-                            _final_msg = "delivered to Telegram" if sent else "delivery failed"
+                            if _deferred_window:
+                                _final_status = "processing"
+                                _final_msg = _DEFERRED_MESSAGE
+                            else:
+                                _final_status = "done" if sent else "error"
+                                _final_msg = "delivered to Telegram" if sent else "delivery failed"
                             # Lifecycle event: the job reached its end. Published
                             # before the Redis hash is deleted, and best-effort, so
                             # the log records the outcome even if the UI state goes.
-                            await emit_event(
-                                JOB_COMPLETED if sent else JOB_FAILED,
-                                job=job,
-                                payload={"status": _final_status, "message": _final_msg, "progress": 100},
-                                source="worker",
-                            )
+                            # A deferred delivery has not ended, so it emits nothing
+                            # here - the sweep emits the terminal event it reaches.
+                            if _deferred_window is None:
+                                await emit_event(
+                                    JOB_COMPLETED if sent else JOB_FAILED,
+                                    job=job,
+                                    payload={"status": _final_status, "message": _final_msg, "progress": 100},
+                                    source="worker",
+                                )
                             _r = await get_redis()
                             try:
                                 await _r.hset(
@@ -2512,6 +2976,9 @@ async def handle_job(job: dict):
                                         # after this point must not convert and send
                                         # it a second time (see _job_already_delivered).
                                         "delivered": "1" if sent else "0",
+                                        # Tells the sweeper (and an operator reading the
+                                        # hash) that a retry is queued for this job.
+                                        "delivery_deferred": "1" if _deferred_window else "0",
                                     },
                                 )
                                 await publish_update(
@@ -2530,12 +2997,20 @@ async def handle_job(job: dict):
                             finally:
                                 with contextlib.suppress(Exception):
                                     await _r.close()
-                            logger.info(
-                                "Job %s: final status=%s message=%s (Redis hash deleted)",
-                                job_id,
-                                _final_status,
-                                _final_msg,
-                            )
+                            if _deferred_window:
+                                logger.info(
+                                    "Job %s: delivery deferred for ~%.0fs (Telegram flood control); "
+                                    "the worker will retry the send",
+                                    job_id,
+                                    _deferred_window,
+                                )
+                            else:
+                                logger.info(
+                                    "Job %s: final status=%s message=%s (Redis hash deleted)",
+                                    job_id,
+                                    _final_status,
+                                    _final_msg,
+                                )
                         except Exception:
                             logger.debug("ffmpeg worker: operation failed")
 
@@ -2543,7 +3018,10 @@ async def handle_job(job: dict):
                         logger.exception("Failed to send result via Telegram")
 
                     try:
-                        if job.get("cleanup_output", False) and out and os.path.exists(out):
+                        # A deferred delivery still needs this file: it is the only
+                        # copy when nothing else reads the result. The sweeper
+                        # removes it once the send actually lands.
+                        if not _deferred_window and job.get("cleanup_output", False) and out and os.path.exists(out):
                             os.remove(out)
                     except Exception:
                         logger.debug("ffmpeg worker: in _probe()")
@@ -3249,17 +3727,39 @@ async def _set_batch_message(bot, r, batch_id, chat_id, stored, text):
     keyboard = _batch_cancel_keyboard(batch_id)
     parsed = _parse_batch_message_ref(stored) if stored else None
     if parsed is not None:
+        _edit_chat_id, _edit_message_id = parsed[0], parsed[1]
+        _flood_scope = telegram_flood_gate.scope_for_chat(_edit_chat_id)
+        # The bot's own watchers edit this same bar, so stay off the wire entirely
+        # while a flood window is open. min_interval=0 because every report here is
+        # a discrete event (file n of m finished): dropping one would leave the bar
+        # a file behind. Only an exact repeat of the current text is skipped.
+        if telegram_edit_coalescer.should_skip(
+            _edit_chat_id, _edit_message_id, text, min_interval=0.0
+        ):
+            return stored
+        if await telegram_flood_gate.should_drop_inline(_flood_scope):
+            return stored
         try:
             await bot.edit_message_text(
-                chat_id=parsed[0], message_id=parsed[1], text=text, reply_markup=keyboard
+                chat_id=_edit_chat_id, message_id=_edit_message_id, text=text, reply_markup=keyboard
             )
+            telegram_edit_coalescer.record(_edit_chat_id, _edit_message_id, text)
             return stored
         except RetryAfter as exc:
-            with contextlib.suppress(Exception):
-                await asyncio.sleep((getattr(exc, "retry_after", None) or 5) + 0.5)
+            # Never sleep off a long window here: the bar simply stays at its last
+            # text until Telegram lets the bot write again.
+            _left = await telegram_flood_gate.note(getattr(exc, "retry_after", None) or 5, _flood_scope)
+            logger.warning(
+                "ffmpeg worker: Telegram flood control for %.0fs; keeping the batch bar for %s as is",
+                _left,
+                batch_id,
+            )
             return stored
         except BadRequest:
-            # Gone (deleted, or past the edit window) - post a replacement below.
+            # Gone (deleted, or past the edit window) - post a replacement below,
+            # and drop what we knew about the id since it is about to be reused for
+            # a message with no relation to the text that used to be there.
+            telegram_edit_coalescer.forget(_edit_chat_id, _edit_message_id)
             logger.debug("ffmpeg worker: batch message for %s is gone, reposting", batch_id)
         except Exception:
             logger.debug("ffmpeg worker: could not edit batch message for %s", batch_id)
@@ -3306,7 +3806,7 @@ async def _batch_live_progress(job: dict) -> None:
         return
     last_text = None
     try:
-        async with Bot(token=bot_token) as bot:
+        async with Bot(token=bot_token, request=flood_gated_request()) as bot:
             while True:
                 try:
                     state = await _batch_state(r, batch_id, job)
@@ -3390,7 +3890,7 @@ async def _report_batch_progress(job: dict) -> None:
         if not bot_token or total <= 0:
             return
 
-        async with Bot(token=bot_token) as bot:
+        async with Bot(token=bot_token, request=flood_gated_request()) as bot:
             # Last file (or a replayed counter): the batch is over, so the
             # message has served its purpose and comes down.
             if done >= total:
@@ -3433,6 +3933,8 @@ async def _delete_batch_message(bot, redis, msg_key: str, stored) -> None:
     parsed = _parse_batch_message_ref(stored) if stored else None
     deleted = True
     if parsed is not None:
+        with contextlib.suppress(Exception):
+            telegram_edit_coalescer.forget(parsed[0], parsed[1])
         try:
             from telegram.error import BadRequest
         except Exception:
@@ -3724,6 +4226,15 @@ async def worker_loop(stop_event: asyncio.Event | None = None, *, allow_restart:
     except Exception:
         forward_task = None
 
+    # Retry the deliveries a Telegram flood window refused. A separate task, so a
+    # busy queue (which defers the sweep) never loses them: the queue keeps them.
+    deferred_task = None
+    try:
+        deferred_task = asyncio.create_task(_deferred_delivery_sweeper(stop_event))
+    except Exception:
+        deferred_task = None
+        logger.debug("ffmpeg worker: deferred delivery sweeper not started")
+
     # Optional RabbitMQ consumer. Enabled by EVENTBUS_QUEUE_BACKEND=rabbitmq with
     # a non-zero rollout; the Redis loop below keeps running either way, because
     # during a rollout both queues hold jobs.
@@ -3774,6 +4285,13 @@ async def worker_loop(stop_event: asyncio.Event | None = None, *, allow_restart:
                     await forward_task
         except Exception:
             logger.debug("ffmpeg worker: ensure forward listener is cancelled")
+        try:
+            if deferred_task:
+                deferred_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await deferred_task
+        except Exception:
+            logger.debug("ffmpeg worker: ensure the deferred delivery sweeper is cancelled")
         # Stop the broker consumer and close both adapters so an in-flight
         # message is redelivered instead of being acked by a dying process.
         try:
@@ -3856,6 +4374,13 @@ async def _init_cache():
 def main():
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
+
+    # Share Telegram flood-control windows with the bot process (same bot token,
+    # same Redis): a penalty this worker earns in a chat has to stop the bot from
+    # writing into that chat too, and the reverse.
+    from utils.rate_limiter import telegram_flood_gate
+
+    telegram_flood_gate.attach_redis()
 
     stop_event = asyncio.Event()
 

@@ -1489,10 +1489,24 @@ def _build_request(
     but some releases/forks reject it — retrying without it keeps the
     builder working on any supported version.
 
+    The class used is the flood-gated variant, so every API call the bot makes
+    is checked against the shared flood window before it goes out (see
+    ``utils/telegram_flood_request``). Falls back to the plain request when that
+    module cannot be imported.
+
     Returns ``None`` when no Request class is importable so callers can
     fall back to their default behavior.
     """
-    if Request is None:
+    request_class = Request
+    try:
+        from utils.telegram_flood_request import FloodGatedRequest
+
+        if FloodGatedRequest is not None and Request is not None:
+            request_class = FloodGatedRequest
+    except Exception:
+        logger.debug("Flood gate: gated request unavailable; using the plain request")
+
+    if request_class is None:
         return None
     kwargs = {
         "pool_timeout": pool_timeout,
@@ -1500,11 +1514,11 @@ def _build_request(
         "read_timeout": read_timeout,
     }
     try:
-        return Request(connection_pool_size=connection_pool_size, **kwargs)
+        return request_class(connection_pool_size=connection_pool_size, **kwargs)
     except TypeError:
         # Some PTB releases reject connection_pool_size; fall back gracefully.
         logger.info("Request() rejected connection_pool_size; building request without it")
-        return Request(**kwargs)
+        return request_class(**kwargs)
 
 
 async def main(background: bool = False) -> None:
@@ -1518,6 +1532,16 @@ async def main(background: bool = False) -> None:
     if not BOT_TOKEN:
         logger.error("BOT_TOKEN not set in environment variables!")
         raise ValueError("BOT_TOKEN is required. Set it in .env file.")
+
+    # Share Telegram flood-control windows with the worker process (same bot
+    # token, same Redis): a penalty earned here has to stop the worker from
+    # editing that chat's progress bar, and the reverse.
+    try:
+        from utils.rate_limiter import telegram_flood_gate
+
+        telegram_flood_gate.attach_redis()
+    except Exception:
+        logger.debug("Flood gate: no shared backend attached (staying process-local)")
 
     # Create the Application for PTB v20+
     # Build a Bot with a custom Request to increase the HTTP connection pool
@@ -1547,10 +1571,14 @@ async def main(background: bool = False) -> None:
             read_timeout=http_read_timeout,
         )
         bot_instance = Bot(token=BOT_TOKEN, request=req)
-        application = Application.builder().bot(bot_instance).build()
+        application = Application.builder().bot(bot_instance).concurrent_updates(
+            int(os.environ.get("CONCURRENT_UPDATES", "8"))
+        ).build()
     except Exception:
         # Fallback to default behavior
-        application = Application.builder().token(BOT_TOKEN).build()
+        application = Application.builder().token(BOT_TOKEN).concurrent_updates(
+            int(os.environ.get("CONCURRENT_UPDATES", "8"))
+        ).build()
 
     # Allow forcing polling even when WEBHOOK_URL is set (useful for local/dev runs)
     force_polling = os.environ.get("FORCE_POLLING", "").lower() in ("1", "true", "yes")
@@ -3023,6 +3051,25 @@ try:
             logger.exception("health: probe collection failed")
             payload = {"status": "degraded", "redis": None, "broker": None, "eventbus": None}
 
+        # A Telegram flood window is otherwise invisible: the bot looks healthy
+        # while every send to one chat is being refused, and the only way to tell
+        # was to read the logs. Same for the deliveries waiting on one.
+        flood = {"open": 0, "scopes": {}, "deferred_deliveries": -1}
+        try:
+            from utils.rate_limiter import telegram_flood_gate
+
+            windows = {scope: left for scope, left in telegram_flood_gate.snapshot().items() if left > 0}
+            flood["open"] = len(windows)
+            flood["scopes"] = dict(sorted(windows.items(), key=lambda item: -item[1])[:10])
+        except Exception:
+            logger.debug("health: flood gate snapshot failed")
+        try:
+            from utils import deferred_delivery
+
+            flood["deferred_deliveries"] = await deferred_delivery.pending()
+        except Exception:
+            logger.debug("health: deferred delivery count failed")
+
         # Always HTTP 200: this endpoint backs the platform healthcheck and the
         # keep-alive ping, so a degraded pipe must be visible in the body rather
         # than restarting a container that is still converting files.
@@ -3034,6 +3081,7 @@ try:
                 "startup_time": BOT_STARTED_AT,
                 "error": getattr(app.state, "startup_error", None),
                 "redis_keys": redis_keys,
+                "telegram_flood": flood,
             }
         )
         return payload

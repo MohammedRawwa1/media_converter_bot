@@ -49,6 +49,15 @@ class AsyncStorageBackend(ABC):
     async def download_file(self, key: str, dest_path: str) -> bool:
         """Download a storage object `key` to local `dest_path`. Return True on success."""
 
+    async def download_range(self, key: str, dest_path: str, end: int = 2_097_151) -> bool:
+        """Download only the first ``end + 1`` bytes of ``key`` to ``dest_path``.
+
+        Used for Range-probe pre-flights: inspect container headers with
+        ffprobe without pulling the full object.  Returns ``True`` on
+        success, ``False`` when the backend does not support range GETs.
+        """
+        return False
+
     @abstractmethod
     async def generate_presigned_post(self, key: str, expires: int | None = None) -> dict[str, Any]:
         """Return a dict with presigned POST upload info (url/fields) or raise when unsupported."""
@@ -64,6 +73,15 @@ class AsyncStorageBackend(ABC):
     @abstractmethod
     async def exists(self, key: str) -> bool:
         """Return True if object `key` exists in storage, False otherwise."""
+
+    async def get_file_size(self, key: str) -> int | None:
+        """Return the object size in bytes via a HEAD request, or ``None``.
+
+        The default implementation falls back to ``None``; backends that
+        support ``head_object`` (S3, IDrive e2) override this to return
+        the real ``ContentLength`` without downloading the object.
+        """
+        return None
 
     @abstractmethod
     async def list_keys(self, prefix: str = "") -> list[dict[str, Any]]:
@@ -736,6 +754,55 @@ class S3AsyncBackend(AsyncStorageBackend):
                 _jitter = (attempt * 9973) % 1000 / 1000  # deterministic fractional jitter
                 await asyncio.sleep(backoff + _jitter)
 
+    async def download_range(self, key: str, dest_path: str, end: int = 2_097_151) -> bool:
+        """Download only bytes 0–*end* of *key* (a Range GET).
+
+        The first 2 MB is enough for every common container header (MP4
+        ``moov``, MKV ``SegmentInfo``, AVI ``RIFF`` header).  Returns True
+        on success; the caller runs ffprobe on the slice.
+        """
+        retries = int(os.getenv("S3_OP_RETRIES", "2"))
+        backoff_base = float(os.getenv("S3_OP_BACKOFF_BASE", "1"))
+        max_backoff = float(os.getenv("S3_OP_BACKOFF_MAX", "30"))
+
+        for attempt in range(1, retries + 1):
+            try:
+                range_header = f"bytes=0-{end}"
+                if self._use_aioboto3:
+                    async with self._session.client("s3", **self._client_kwargs()) as client:
+                        resp = await client.get_object(
+                            Bucket=self.bucket, Key=key, Range=range_header,
+                        )
+                        body = await resp["Body"].read()
+                    os.makedirs(os.path.dirname(dest_path) or ".", exist_ok=True)
+                    with open(dest_path, "wb") as fh:
+                        fh.write(body)
+                    return True
+
+                if boto3 is None:
+                    raise RuntimeError("boto3 is required for S3 operations when aioboto3 is not installed")
+
+                def _sync_range():
+                    client = boto3.client("s3", **self._client_kwargs())
+                    resp = client.get_object(
+                        Bucket=self.bucket, Key=key, Range=range_header,
+                    )
+                    return resp["Body"].read()
+
+                body = await asyncio.to_thread(_sync_range)
+                os.makedirs(os.path.dirname(dest_path) or ".", exist_ok=True)
+                with open(dest_path, "wb") as fh:
+                    fh.write(body)
+                return True
+
+            except Exception as e:
+                logger.debug("S3 range-GET attempt %s/%s failed for key %s: %s", attempt, retries, key, e)
+                if attempt == retries:
+                    return False
+                backoff = min(max_backoff, backoff_base * (2 ** (attempt - 1)))
+                _jitter = (attempt * 9973) % 1000 / 1000
+                await asyncio.sleep(backoff + _jitter)
+
     async def _record_download_egress(self, dest_path: str) -> None:
         """Count the bytes a download just pulled out of the bucket.
 
@@ -873,6 +940,42 @@ class S3AsyncBackend(AsyncStorageBackend):
                 backoff = min(max_backoff, backoff_base * (2 ** (attempt - 1)))
                 # Use deterministic jitter (based on attempt number) to avoid S311 insecure-random warning
                 _jitter = (attempt * 9973) % 1000 / 1000  # deterministic fractional jitter
+                await asyncio.sleep(backoff + _jitter)
+
+    async def get_file_size(self, key: str) -> int | None:
+        """Return the object size in bytes via ``head_object``, or ``None``.
+
+        One HEAD request replaces a full download when only the size is
+        needed (e.g. timeout scaling, egress budget checks).
+        """
+        if not key:
+            return None
+
+        retries = int(os.getenv("S3_OP_RETRIES", "3"))
+        backoff_base = float(os.getenv("S3_OP_BACKOFF_BASE", "1"))
+        max_backoff = float(os.getenv("S3_OP_BACKOFF_MAX", "60"))
+        for attempt in range(1, retries + 1):
+            try:
+                if self._use_aioboto3:
+                    async with self._session.client("s3", **self._client_kwargs()) as client:
+                        resp = await client.head_object(Bucket=self.bucket, Key=key)
+                    return resp.get("ContentLength")
+
+                if boto3 is None:
+                    raise RuntimeError("boto3 is required for S3 operations when aioboto3 is not installed")
+
+                def _sync_head_size():
+                    client = boto3.client("s3", **self._client_kwargs())
+                    resp = client.head_object(Bucket=self.bucket, Key=key)
+                    return resp.get("ContentLength")
+
+                return await asyncio.to_thread(_sync_head_size)
+            except Exception as e:
+                logger.debug("S3 head_object size attempt %s/%s failed for key %s: %s", attempt, retries, key, e)
+                if attempt == retries:
+                    return None
+                backoff = min(max_backoff, backoff_base * (2 ** (attempt - 1)))
+                _jitter = (attempt * 9973) % 1000 / 1000
                 await asyncio.sleep(backoff + _jitter)
 
     # ─────────────────────────────────────────────────────────────────────────
