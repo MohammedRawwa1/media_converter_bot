@@ -1596,6 +1596,7 @@ class EnhancedMediaHandler:
                 "current_file": session.get("current_file"),
                 "merge_list": session.get("merge_list", []),
                 "bulk_list": session.get("bulk_list", []),
+                "_bulk_apply_started_at": session.get("_bulk_apply_started_at"),
             }
             # Write locally for fast local recovery
             try:
@@ -5182,11 +5183,22 @@ class EnhancedMediaHandler:
                 # Try to load persisted session (useful when running multiple workers)
                 persisted = self._load_persisted_session(user_id)
                 if persisted:
+                    # If the persisted apply guard is older than the guard window,
+                    # treat it as expired and clear it to avoid a stale lock.
+                    _persisted_guard = persisted.get("_bulk_apply_started_at")
+                    if _persisted_guard:
+                        try:
+                            _guard_age = time.time() - float(_persisted_guard)
+                            if _guard_age >= _BULK_APPLY_GUARD_SECONDS:
+                                _persisted_guard = None
+                        except (TypeError, ValueError):
+                            _persisted_guard = None
                     self.user_sessions[user_id] = {
                         "files": {},
                         "current_file": persisted.get("current_file"),
                         "merge_list": persisted.get("merge_list", []),
                         "bulk_list": persisted.get("bulk_list", []),
+                        "_bulk_apply_started_at": _persisted_guard,
                     }
                 else:
                     self.user_sessions[user_id] = {"files": {}, "current_file": None}
@@ -6519,6 +6531,8 @@ class EnhancedMediaHandler:
                 total_cleared = len(_seen)
                 sess["bulk_list"] = []
                 sess["merge_list"] = []
+                # Also clear the apply guard in case it's stuck
+                sess.pop("_bulk_apply_started_at", None)
                 try:
                     self._persist_session(user_id)
                 except Exception:
