@@ -3229,6 +3229,20 @@ async def worker_loop(stop_event: asyncio.Event | None = None, *, allow_restart:
     # Start healthcheck server for Railway
     await _start_healthcheck_server()
 
+    # This process just booted, so it cannot own any claim yet - and on Railway
+    # the old process is already gone, so nothing else holds one either. Any
+    # slot/lock a previous deploy left behind is a ghost: release them now so
+    # the first job after a redeploy never waits out a 15-minute TTL on a claim
+    # whose owner died with the old container.
+    try:
+        _redis_for_sweep = await get_redis()
+        freed = await batch_pipeline.sweep_ghost_claims(_redis_for_sweep)
+    except Exception as _exc:  # never block startup on Redis trouble
+        logger.debug("Ghost-claim sweep skipped at startup: %s", _exc)
+    else:
+        if freed:
+            logger.warning("Ghost-claim sweep at startup: released %s", freed)
+
     # Announce this worker's memory so the dashboard has a figure from the start.
     await _publish_worker_rss(force=True)
 

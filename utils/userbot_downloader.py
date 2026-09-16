@@ -48,9 +48,80 @@ def _safe_path_token(value) -> str:
 
 
 # Module-level default timeouts for download operations.
-# Configurable via TELETHON_DOWNLOAD_TIMEOUT and PYROGRAM_DOWNLOAD_TIMEOUT env vars (default 600s = 10 min).
+# TELETHON_DOWNLOAD_TIMEOUT/PYROGRAM_DOWNLOAD_TIMEOUT are legacy wall-clock caps
+# kept for compatibility; downloads are now governed by STALL detection below -
+# a slow-but-flowing transfer is alive, a silent one is dead.
 TELETHON_DOWNLOAD_TIMEOUT = int(os.getenv("TELETHON_DOWNLOAD_TIMEOUT", "600"))
 PYROGRAM_DOWNLOAD_TIMEOUT = int(os.getenv("PYROGRAM_DOWNLOAD_TIMEOUT", "600"))
+
+# A download is only timed out when NO bytes have arrived for this long. It has
+# to comfortably exceed Telegram's flood sleeps (PYROGRAM_SLEEP_THRESHOLD=30s:
+# pyrogram dozes inside the RPC without progress callbacks firing), so 120s.
+# The old fixed 600s wall clock killed flood-throttled big files and restarted
+# them from byte zero - the exact "second video crawls" symptom.
+DOWNLOAD_STALL_SECONDS = float(os.getenv("DOWNLOAD_STALL_SECONDS", "120"))
+# Absolute ceiling for one download attempt (bytes may trickle forever without
+# ever stalling). Generous: a 2GB file at 200KB/s takes ~2.8h.
+DOWNLOAD_HARD_SECONDS = float(os.getenv("DOWNLOAD_HARD_SECONDS", "7200"))
+_STALL_POLL_SECONDS = 10.0
+
+
+class _ProgressWatch:
+    """Track a download's last-byte time and wrap progress callbacks.
+
+    The wrapper forwards to the caller's callback untouched - including its
+    async-ness, which Pyrogram checks with iscoroutinefunction on the callback
+    it is handed, so an async user callback must stay async.
+    """
+
+    def __init__(self):
+        self.loop = asyncio.get_running_loop()
+        self.started = self.loop.time()
+        self.last_activity = self.started
+
+    def wrap(self, user_progress):
+        if user_progress is not None and asyncio.iscoroutinefunction(user_progress):
+            async def _progress(current, total, *args):
+                self.last_activity = self.loop.time()
+                return await user_progress(current, total, *args)
+        else:
+            def _progress(current, total, *args):
+                self.last_activity = self.loop.time()
+                if user_progress is not None:
+                    return user_progress(current, total, *args)
+        return _progress
+
+
+async def _wait_download_or_stall(dl_task, watch) -> object:
+    """Await a download task, raising TimeoutError only when it has stalled.
+
+    Progress callbacks keep ``watch.last_activity`` fresh, so any transfer that
+    is still receiving bytes runs to completion no matter how slow Telegram
+    serves it. Only DOWNLOAD_STALL_SECONDS of total silence (or the hard cap)
+    cancels the task and raises - the caller's retry loop then treats it like
+    the old wall-clock timeout.
+    """
+    hard_deadline = (
+        watch.loop.time() + DOWNLOAD_HARD_SECONDS if DOWNLOAD_HARD_SECONDS > 0 else None
+    )
+    while True:
+        try:
+            # shield: an expired poll must not cancel the still-running download
+            return await asyncio.wait_for(asyncio.shield(dl_task), timeout=_STALL_POLL_SECONDS)
+        except TimeoutError:
+            now = watch.loop.time()
+            if dl_task.done():
+                return dl_task.result()
+            if hard_deadline is not None and now >= hard_deadline:
+                dl_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await dl_task
+                raise
+            if now - watch.last_activity >= DOWNLOAD_STALL_SECONDS:
+                dl_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await dl_task
+                raise
 
 
 def _get_bot_user_id() -> int | None:
@@ -364,17 +435,23 @@ async def _download_media_with_retry(
     delays = [5, 15, 45, 120, 300]
 
     for attempt in range(max_retries):
+        # Stall-aware wait: inject our counting progress callback (forwarding to
+        # the caller's, if any) so silence and slowness are distinguishable.
+        _watch = _ProgressWatch()
+        _kwargs = dict(dl_kwargs)
+        _kwargs["progress"] = _watch.wrap(_kwargs.get("progress"))
         try:
-            return await asyncio.wait_for(
-                client.download_media(msg, **dl_kwargs),
-                timeout=PYROGRAM_DOWNLOAD_TIMEOUT,
+            return await _wait_download_or_stall(
+                asyncio.create_task(client.download_media(msg, **_kwargs)),
+                _watch,
             )
         except TimeoutError:
             logger.warning(
-                "userbot: download_media attempt %d/%d timed out after %ds, retrying",
+                "userbot: download_media attempt %d/%d stalled (%ds without bytes, elapsed %ds), retrying",
                 attempt + 1,
                 max_retries,
-                PYROGRAM_DOWNLOAD_TIMEOUT,
+                int(DOWNLOAD_STALL_SECONDS),
+                int(_watch.loop.time() - _watch.started),
             )
             if attempt < max_retries - 1:
                 wait = delays[min(attempt, len(delays) - 1)]
@@ -1043,15 +1120,19 @@ async def _download_with_telethon(
                             dl_kwargs["progress_callback"] = progress_callback
                         # part_size_kb removed in Telethon v1.35+; catch TypeError and retry without
                         try:
-                            _dl_result = await asyncio.wait_for(
-                                client.download_media(msg, **dl_kwargs, part_size_kb=chunk_size_kb),
-                                timeout=TELETHON_DOWNLOAD_TIMEOUT,
+                            _watch = _ProgressWatch()
+                            _dl_result = await _wait_download_or_stall(
+                                asyncio.create_task(
+                                    client.download_media(msg, **dl_kwargs, part_size_kb=chunk_size_kb)
+                                ),
+                                _watch,
                             )
                         except TypeError:
                             logger.debug("userbot: Telethon does not support part_size_kb, retrying without")
-                            _dl_result = await asyncio.wait_for(
-                                client.download_media(msg, **dl_kwargs),
-                                timeout=TELETHON_DOWNLOAD_TIMEOUT,
+                            _watch = _ProgressWatch()
+                            _dl_result = await _wait_download_or_stall(
+                                asyncio.create_task(client.download_media(msg, **dl_kwargs)),
+                                _watch,
                             )
                         dl_result = _dl_result
                         _reconcile_download_path(dl_result, dest_path)

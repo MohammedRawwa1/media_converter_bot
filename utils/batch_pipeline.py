@@ -930,11 +930,24 @@ async def try_acquire_batch_lock(redis, batch_id, job_id) -> bool:
     """
     key = batch_lock_key(batch_id)
     owner = str(job_id or "")
+    ttl_ms = int(BATCH_LOCK_TTL_SECONDS * 1000)
     try:
-        acquired = await redis.set(
-            key, owner, nx=True, px=int(BATCH_LOCK_TTL_SECONDS * 1000)
-        )
-        return bool(acquired)
+        if await redis.set(key, owner, nx=True, px=ttl_ms):
+            return True
+        holder = await redis.get(key)
+        holder = holder.decode() if isinstance(holder, (bytes, bytearray)) else holder
+        if holder and await _slot_owner_is_gone(redis, holder):
+            # The batch's previous runner died (or finished without releasing):
+            # a ghost claim would freeze the whole batch for its full TTL.
+            if await redis.eval(_STEAL_STALE_SLOT_SCRIPT, 1, key, holder, owner, ttl_ms):
+                logger.warning(
+                    "batch_pipeline: stole stale batch lock %s from gone job %s (for job %s)",
+                    batch_id,
+                    holder,
+                    owner,
+                )
+                return True
+        return False
     except Exception:
         logger.warning(
             "batch_pipeline: could not acquire lock for batch %s (running anyway)", batch_id
@@ -952,6 +965,74 @@ async def release_batch_lock(redis, batch_id, job_id) -> bool:
     except Exception:
         logger.debug("batch_pipeline: failed to release lock %s", key)
         return False
+
+
+async def sweep_ghost_claims(redis=None) -> dict:
+    """Release every claim whose owner has no live job behind it.
+
+    A slot or batch lock outlives its job whenever a worker dies between the
+    claim and the release - crash, OOM kill, or a deploy - and from then on
+    every new job defers on "slot busy" until the claim's TTL expires. The
+    steal paths in acquire_ffmpeg_slot/try_acquire_batch_lock cover the common
+    case (owner hash deleted or terminal); this sweep catches the rest - an
+    owner still marked ``running`` because it died mid-encode - and it runs at
+    worker startup, before any consumer or queue loop can race it.
+    """
+    if redis is None:
+        return {"slots": 0, "locks": 0}
+    freed = {"slots": 0, "locks": 0}
+    # ``canceled`` included: the enum sits in the cancel path and the tombstone
+    # check accepts both spellings, so the sweep must too.
+    terminal = {"done", "completed", "error", "failed", "cancelled", "canceled"}
+    try:
+        # -- Conversion slots -------------------------------------------------
+        async for key in redis.scan_iter(match=f"{FFMPEG_SLOT_PREFIX}*", count=100):
+            holder = await redis.get(key)
+            holder = holder.decode() if isinstance(holder, (bytes, bytearray)) else holder
+            if not holder:
+                continue
+            try:
+                status = await redis.hget(f"{_JOB_HASH_PREFIX}{holder}", "status")
+            except Exception:
+                status = None
+            if status is not None:
+                status = status.decode() if isinstance(status, (bytes, bytearray)) else status
+            if status is not None and status not in terminal:
+                continue
+            if await redis.delete(key):
+                freed["slots"] += 1
+                logger.warning(
+                    "batch_pipeline: swept ghost claim %s (holder %s, status %s)",
+                    key,
+                    holder,
+                    status or "missing",
+                )
+        # -- Batch locks ------------------------------------------------------
+        async for key in redis.scan_iter(match=f"{BATCH_KEY_PREFIX}*:lock", count=100):
+            holder = await redis.get(key)
+            holder = holder.decode() if isinstance(holder, (bytes, bytearray)) else holder
+            if not holder:
+                continue
+            try:
+                status = await redis.hget(f"{_JOB_HASH_PREFIX}{holder}", "status")
+            except Exception:
+                status = None
+            if status is not None:
+                status = status.decode() if isinstance(status, (bytes, bytearray)) else status
+            if status is not None and status not in terminal:
+                continue
+            if await redis.delete(key):
+                freed["locks"] += 1
+                logger.warning(
+                    "batch_pipeline: swept ghost claim %s (holder %s, status %s)",
+                    key,
+                    holder,
+                    status or "missing",
+                )
+        return freed
+    except Exception:
+        logger.warning("batch_pipeline: ghost-claim sweep failed", exc_info=True)
+        return freed
 
 
 async def refresh_lock(redis, key, owner, ttl_seconds=None) -> bool:
@@ -1033,6 +1114,39 @@ def ffmpeg_slot_key(index: int) -> str:
     return f"{FFMPEG_SLOT_PREFIX}{int(index)}"
 
 
+# Compare-and-steal for a slot whose owner no longer exists: the takeover only
+# lands while the key still holds that exact dead owner, so a live holder can
+# never lose its slot to a racer.
+_STEAL_STALE_SLOT_SCRIPT = """
+local current = redis.call('get', KEYS[1])
+if current == ARGV[1] then
+    redis.call('set', KEYS[1], ARGV[2], 'px', ARGV[3])
+    return 1
+end
+return 0
+"""
+
+
+async def _slot_owner_is_gone(redis, owner: str) -> bool:
+    """Whether a slot's holder no longer has a live job behind it.
+
+    Every queued or running job has a hash from the moment it is prepared; the
+    hash is deleted when its result is delivered, and terminal statuses are
+    written when it fails or is cancelled. A slot held by a job id with no hash
+    (or a terminal one) is a ghost from a crashed or finished worker.
+    """
+    if not owner:
+        return False  # unknown holder: respect the TTL
+    try:
+        raw = await redis.hget(f"{_JOB_HASH_PREFIX}{owner}", "status")
+    except Exception:
+        return False
+    if raw is None:
+        return True
+    status = raw.decode() if isinstance(raw, (bytes, bytearray)) else raw
+    return status in _TERMINAL_JOB_STATUSES
+
+
 async def acquire_ffmpeg_slot(redis, job_id, *, slots=None, ttl_seconds=None):
     """Claim one global conversion slot.
 
@@ -1040,13 +1154,36 @@ async def acquire_ffmpeg_slot(redis, job_id, *, slots=None, ttl_seconds=None):
     slot is busy (the caller should defer the job), or ``-1`` when Redis errored
     so no slot could be checked - in that case the caller runs the job rather
     than stall the queue, and release is a no-op.
+
+    A busy slot whose owner no longer has a live job (worker died mid-run, or
+    the job finished without releasing) is stolen instead of honored: a ghost
+    claim would otherwise block every conversion until its full TTL ran out -
+    up to ``BATCH_LOCK_TTL_SECONDS`` of dead air after every deploy.
     """
     total = MAX_CONCURRENT_FFMPEG if slots is None else max(1, int(slots))
     ttl_ms = int((FFMPEG_SLOT_TTL_SECONDS if ttl_seconds is None else ttl_seconds) * 1000)
     owner = str(job_id or "")
     for index in range(total):
+        key = ffmpeg_slot_key(index)
         try:
-            if await redis.set(ffmpeg_slot_key(index), owner, nx=True, px=ttl_ms):
+            if await redis.set(key, owner, nx=True, px=ttl_ms):
+                return index
+            holder = await redis.get(key)
+            holder = holder.decode() if isinstance(holder, (bytes, bytearray)) else holder
+            if not holder:
+                # Expired between the attempt above and now - one retry wins it.
+                if await redis.set(key, owner, nx=True, px=ttl_ms):
+                    return index
+                continue
+            if not await _slot_owner_is_gone(redis, holder):
+                continue
+            if await redis.eval(_STEAL_STALE_SLOT_SCRIPT, 1, key, holder, owner, ttl_ms):
+                logger.warning(
+                    "batch_pipeline: stole stale ffmpeg slot %s from gone job %s (for job %s)",
+                    index,
+                    holder,
+                    owner,
+                )
                 return index
         except Exception:
             logger.warning("batch_pipeline: ffmpeg slot check failed; running job without a slot")
