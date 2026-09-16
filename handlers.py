@@ -3070,7 +3070,10 @@ class EnhancedMediaHandler:
             _temp_dir = getattr(config, "TEMP_PATH", "storage/temp")
             with contextlib.suppress(Exception):
                 os.makedirs(_temp_dir, exist_ok=True)
-            _temp_path = os.path.join(_temp_dir, f"src_{user_id}_{int(time.time())}{ext}")
+            # Keyed by job id rather than the upload second: the file is kept
+            # for the worker to reuse (see below), so two uploads must never
+            # share a name or one job could read the other's bytes.
+            _temp_path = os.path.join(_temp_dir, f"src_{user_id}_{_job_id}{ext}")
 
             # ── Media cache: reuse a copy already in object storage so a repeat of
             #    the same media skips both the Telegram download and the upload.
@@ -3156,17 +3159,42 @@ class EnhancedMediaHandler:
             # ── Source metadata stored on current_file; the callback handler
             #    will write it to Redis when the user picks an action. ──
 
-            # Clean up temp file
+            # The uploaded copy is deliberately left on disk when local reuse is
+            # on (the default). The worker usually runs in this very container,
+            # so a local copy means it can read the source instead of pulling
+            # the same bytes back out of storage - a full extra copy of the
+            # media out of the bucket for every job, which is pure egress and,
+            # on a large video, minutes of transfer before ffmpeg starts.
+            #
+            # `_local_input_path` is only a hint: the worker prefers it and falls
+            # straight back to `input_key` whenever the file is not there (a
+            # separate worker container, a restart, or the temp sweep), so
+            # nothing depends on it surviving. The worker deletes it after the
+            # job and the temp sweep reclaims any that are abandoned.
+            _keep_local_input = os.getenv("REUSE_LOCAL_INPUT", "1").strip().lower() not in (
+                "0",
+                "false",
+                "no",
+                "off",
+            )
             try:
-                os.remove(_temp_path)
-                logger.debug("handlers: cleaned up temp file %s", _temp_path)
+                _local_path = _temp_path if _keep_local_input and os.path.exists(_temp_path) else None
             except Exception:
-                pass
+                _local_path = None
+            if _local_path:
+                logger.debug("handlers: kept local source %s for reuse by the worker", _local_path)
+            else:
+                try:
+                    os.remove(_temp_path)
+                    logger.debug("handlers: cleaned up temp file %s", _temp_path)
+                except Exception:
+                    pass
 
             current_file["input_key"] = _input_key
             current_file["_source_job_id"] = _job_id
             current_file["_source_metadata"] = _source_meta
             current_file["path"] = None
+            current_file["_local_input_path"] = _local_path
 
             logger.info(
                 "Source ffprobe → S3: %s/%s → %s (dur=%s codec=%s %sx%s fps=%s rot=%s audio=%s)",
@@ -3825,7 +3853,7 @@ class EnhancedMediaHandler:
 
         # Enqueue conversion job to Redis so a worker handles heavy lifting
         # (Only reached for small files downloaded via Bot API, not pipeline jobs)
-        input_path = current_file["path"]
+        input_path = current_file["path"] or current_file.get("_local_input_path")
         output_ext = f".{target_format}"
         output_dir = getattr(config, "OUTPUT_PATH", "storage/output") if config else "storage/output"
         with contextlib.suppress(OSError):
@@ -6622,7 +6650,7 @@ class EnhancedMediaHandler:
         job_id = str(uuid.uuid4())
         job = {
             "job_id": job_id,
-            "input_path": current_file["path"],
+            "input_path": current_file["path"] or current_file.get("_local_input_path"),
             "input_key": current_file.get("input_key"),
             "output_path": output_path,
             # Keeps the delivered filename derived from the original name.
@@ -7280,7 +7308,7 @@ class EnhancedMediaHandler:
             job_id = str(uuid.uuid4())
             job = {
                 "job_id": job_id,
-                "input_path": current_file["path"],
+                "input_path": current_file["path"] or current_file.get("_local_input_path"),
                 "input_key": current_file.get("input_key"),
                 "output_path": output_path,
                 # Keeps the delivered filename derived from the original name.
@@ -7389,7 +7417,7 @@ class EnhancedMediaHandler:
         output_path = os.path.join(output_dir, f"{current_file['id']}_repaired.mp4")
         job = {
             "job_id": job_id,
-            "input_path": current_file["path"],
+            "input_path": current_file["path"] or current_file.get("_local_input_path"),
             "input_key": current_file.get("input_key"),
             "output_path": output_path,
             # Keeps the delivered filename derived from the original name.
@@ -7713,7 +7741,7 @@ class EnhancedMediaHandler:
         job = {
             "job_id": job_id,
             "type": "extract_streams",
-            "input_path": current_file["path"],
+            "input_path": current_file["path"] or current_file.get("_local_input_path"),
             "input_key": current_file.get("input_key"),
             "output_dir": out_dir,
             "archive_path": archive_path,

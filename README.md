@@ -267,6 +267,7 @@ For Railway's 1 GB box the shipped `.env.example` is tuned to: `MAX_CONCURRENT_F
 | `MEDIA_CACHE_TTL_SECONDS` | `86400` | How long a media descriptor stays in Redis |
 | `MEDIA_CACHE_BYTES_MAX_MB` | `32` | Largest media body kept verbatim in Redis (larger files reuse the storage key) |
 | `PRESENCE_TTL_SECONDS` | `300` | How long a user counts as "online" after their last interaction |
+| `REUSE_LOCAL_INPUT` | `1` | Keep the source on disk after uploading it, so a worker in the same container reads it instead of downloading it back out of S3 (one full copy of the media of egress saved per job) |
 
 ### S3 / MinIO / R2
 | Variable | Description |
@@ -277,6 +278,63 @@ For Railway's 1 GB box the shipped `.env.example` is tuned to: `MAX_CONCURRENT_F
 | `AWS_ACCESS_KEY_ID` | Access key |
 | `AWS_SECRET_ACCESS_KEY` | Secret key |
 | `PRESIGN_EXPIRES` | Presigned URL expiry in seconds (default `3600`) |
+| `S3_OUTPUTS_TTL` | How long a delivered result stays in the bucket before the hourly sweep removes it (default `86400`; `S3_INPUT_TTL`/`S3_UPLOADS_TTL`/`S3_FORWARDS_TTL` behave the same for their prefixes) |
+| `S3_LIBRARY_TTL` | How long the shared one-object-per-media library (`inputs/library/`) is kept (default `604800`). Exempt from `S3_INPUT_TTL`, so repeats of the same media keep hitting the same object |
+| `EGRESS_FREE_MULTIPLIER` | Free egress the provider grants, as a multiple of stored bytes (default `3`, which is IDrive e2's policy) |
+| `EGRESS_WATCH_PERCENT` | Ratio of the allowance at which the dashboard flags it and the admin is alerted (default `80`) |
+| `EGRESS_WARN_STEP_GB` | Log a warning every time this much egress accumulates in a billing cycle (default `50`) |
+| `EGRESS_CHECK_INTERVAL` | Seconds between egress checks by the watchdog (default `900`) |
+| `EGRESS_ALERT_MIN_INTERVAL` | Floor between two Telegram alerts, so a flapping ratio stays quiet (default `3600`) |
+
+A result is only copied into the bucket when something remote will read it: a
+job with no `chat_id` (the web uploader collects through a URL) or when
+`ENABLE_LINK_SEND` hands the user a presigned GET. A result that is delivered to
+Telegram from the same container is never uploaded, so it never becomes an
+object somebody can later download. Thumbnails attach from local disk for the
+same reason, falling back to the stored object only for a delivery that happens
+in another container.
+
+Egress is counted per billing cycle (UTC month) in Redis under
+`storage:egress:<YYYY-MM>:<kind>` and shown in `/session_status` as *Egress … of …
+free*, so the ratio the provider suspends on is visible before it is exceeded.
+`object` counts bytes actually pulled out of the bucket; `link` counts presigned
+GET URLs handed out (each fetch of one is another full copy as egress, and
+happens outside this process, so it is counted as a count rather than bytes).
+
+Those counters are per cycle and expire after `STORAGE_COUNTER_TTL_DAYS`
+(default 60), so a long-lived bucket does not accumulate one key per month per
+counter forever.
+
+The dashboard only helps somebody who already suspects a problem, so a watchdog
+(`utils/egress_monitor.py`) messages `ADMIN_USER_ID` when the cycle crosses
+`EGRESS_WATCH_PERCENT`, and again if it escalates past 100%. Alerts are raised
+once per severity per billing cycle - the announced severity is kept in Redis
+under `storage:egress:alert_state`, so a restart cannot repeat an alert the admin
+already has and a new month starts clean. The watchdog never raises: a metering
+failure is logged and retried on the next check.
+
+### Bounded in-memory state
+
+Both long-lived processes keep small in-memory maps that are keyed by something a
+caller controls, so each is explicitly bounded rather than evicted "when it gets
+large" somewhere implicit:
+
+| Where | Key | Bound |
+|---|---|---|
+| `utils/web_rate_limiter.py` | `(endpoint, client)` — the client key comes from `X-Forwarded-For`, i.e. the caller chooses it | idle buckets dropped after `WEB_RATE_LIMIT_BUCKET_TTL` (600s), hard cap `WEB_RATE_LIMIT_MAX_BUCKETS` (10000) |
+| `web/webapp.py` fallback job store | one entry per fallback conversion | `WEB_JOB_STORE_TTL_SECONDS` (3600) and `WEB_JOB_STORE_MAX_ENTRIES` (200) |
+
+The rate limiter prunes only once its map is at the cap (a full scan per request
+would defeat the limiter), and `cleanup_all` calls `prune()` hourly as an
+independent drain. The fallback store prunes on write, with the same hourly pass
+reaching it when the web app is loaded in that process.
+
+Other per-key maps were audited and are already bounded: `route_cache` (LRU at
+1000), `presence` and the event bus's progress throttle (prune above 1000/5000),
+the Telethon session cache (TTL), the WS client registries (removed on
+disconnect plus a stale sweep), `handlers.active_conversions` and
+`_download_cancel_flags` (try/finally), `METRICS` and `bad_callback_counts`
+(fixed key sets), and `ffmpeg:delayed` (members are `zrem`-ed when promoted).
 
 ### Event bus (all optional — off by default)
 | Variable | Default | Description |
@@ -405,12 +463,45 @@ the repeat skips even the storage round trip;
 - **large media** are stored once under a shared key
 (`inputs/library/<hash>/source`) and that key is reused. Jobs fed from it are
 marked `cleanup_input=False`, so the shared object survives for the next request
-and is **not** deleted when one job finishes.
+and is **not** deleted when one job finishes. Every operation on that media —
+stream capture, audio extract + compress, any command button — resolves to the
+same key, so it stays **one object** no matter how many styles are applied.
 
-Because those shared inputs are intentionally not deleted per job, pair the
-bucket with a **lifecycle rule** (e.g. expire `inputs/library/` after a few days)
-so the library cannot grow without bound. Set `MEDIA_CACHE_ENABLED=0` to disable
-reuse entirely and go back to per-job inputs.
+One object per media is what makes a repeat cheap, and two things used to
+break it:
+
+- the hourly sweep deleted everything under `inputs/`, library included, one
+  TTL after the first upload. `S3_LIBRARY_TTL` (default `604800`, 7 days) now
+  governs it and `cleanup_s3_inputs()` **excludes** `inputs/library/`, so the
+  object outlives the burst of operations on a media and no bucket lifecycle
+  rule is needed;
+- the worker pulled the whole media back out of the bucket for every job. It now
+  keeps a local copy at `storage/temp/library/<hash>/source<ext>` and reuses it:
+  the second and later operations read the source off disk, so those bytes leave
+  the bucket **once per media** instead of once per style. The cache is a cache —
+  the worker does not delete it when a job finishes, the temp sweep prunes it by
+  age, and it lives in a subdirectory so the startup sweep (which only removes
+  loose files) cannot race an in-flight job. Only shared library keys are cached;
+  a per-job input never is.
+
+Set `MEDIA_CACHE_ENABLED=0` to disable reuse entirely and go back to per-job
+inputs.
+
+### Thumbnail and audio metadata on delivery
+
+Both are derived from the file the worker just encoded, and neither costs a
+storage round trip:
+
+- **thumbnails** are attached from local disk (`_local_thumb_candidate`). The
+  user's own `/addthumb` cover is preferred over the worker's normalised copy, so
+  what they picked is delivered untouched; the copy stored in the bucket is capped
+  at `_THUMB_MAX_EDGE` (320px, the Bot API limit) and only ever downscaled. A
+  retry that lands in another container still falls back to `thumb_key` in storage;
+- **audio** player tags (`title`, `performer`, `duration`) are probed once in the
+  worker and passed to the uploader as a **complete** dict, with the media's own
+  name as the title fallback. A partial dict would be worse than none: the
+  uploader only probes when `audio_meta is None`, so a stub would suppress its
+  probe and lose the fields it fills in.
 
 The requeue tooling (`scripts/requeue_job.py`, `scripts/requeue_missing_jobs_once.py`)
 carries the stored owner (`chat_id`/`user_id`) onto the payload it rebuilds —

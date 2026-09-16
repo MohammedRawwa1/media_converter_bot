@@ -302,6 +302,13 @@ async def _probe_audio_metadata(path: str) -> dict:
     return meta
 
 
+# Public alias: the ffmpeg worker pre-probes the encoded output so the player
+# tags are read once, from the file it just produced, and passed in explicitly.
+async def probe_audio_metadata(path: str) -> dict:
+    """Public entry point for :func:`_probe_audio_metadata`."""
+    return await _probe_audio_metadata(path)
+
+
 async def _parallel_upload_file(
     client,
     file_path: str,

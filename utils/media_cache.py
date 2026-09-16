@@ -56,6 +56,20 @@ def bytes_cache_limit() -> int:
         return 32 * 1024 * 1024
 
 
+def shared_library_key(file_unique_id) -> str | None:
+    """The shared storage key for a media identity, or ``None`` when there is none.
+
+    The one place that decides whether a media gets a shared object: every
+    producer (the bot's handlers, the fetcher, the Telethon ingest) derives the
+    same key from the same ``file_unique_id``, so a file arriving through two
+    routes still ends up as **one** object instead of two. Returns ``None`` when
+    reuse is switched off, which leaves each caller on its per-job key.
+    """
+    if not cache_enabled():
+        return None
+    return media_library_key(file_unique_id)
+
+
 def media_library_key(file_unique_id) -> str | None:
     """The shared storage key for a media identity, or None when there is none.
 

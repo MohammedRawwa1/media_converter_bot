@@ -275,7 +275,50 @@ async def upload_telethon_log(suffix: str = "telethon_ingest.log"):
         return None
 
 
-async def _upload_and_enqueue(local_path: str, original_name: str, chat_id: int | None, message_id: int | None):
+def _shared_library_key(file_unique_id) -> str | None:
+    """The shared one-object-per-media storage key, or ``None`` when unavailable.
+
+    Derived exactly the way the bot's handlers derive it, so the same media
+    arriving through both routes lands on **one** object instead of two, and a
+    repeat of it reuses that object instead of uploading a fresh copy.
+    """
+    try:
+        from utils.media_cache import shared_library_key
+
+        return shared_library_key(file_unique_id)
+    except Exception:
+        return None
+
+
+def _message_media_identity(msg) -> str | None:
+    """A stable identity for the media in a Telethon message, or ``None``.
+
+    Prefers Telethon's ``unique_id`` (stable for a given file everywhere) and
+    falls back to the document id. Prefixed so it can never collide with a Bot
+    API ``file_unique_id``, and anything unexpected returns ``None`` so the
+    caller keeps its per-job key rather than sharing an object on a guess.
+    """
+    for holder in ("document", "video", "audio", "voice", "video_note", "sticker", "photo"):
+        obj = getattr(msg, holder, None)
+        if obj is None:
+            continue
+        for attr in ("unique_id", "id"):
+            try:
+                value = getattr(obj, attr, None)
+            except Exception:
+                value = None
+            if value:
+                return f"tl-{holder}-{value}"
+    return None
+
+
+async def _upload_and_enqueue(
+    local_path: str,
+    original_name: str,
+    chat_id: int | None,
+    message_id: int | None,
+    file_unique_id=None,
+):
     job_id = uuid.uuid4().hex
     size = None
     try:
@@ -291,7 +334,12 @@ async def _upload_and_enqueue(local_path: str, original_name: str, chat_id: int 
             return
 
         ts = time.gmtime()
-        key = f"uploads/{ts.tm_year}/{ts.tm_mon:02d}/{job_id}_{os.path.basename(local_path)}"
+        # One object per media: the shared key when the media has an identity, so
+        # a resend (or another style applied to it) reuses the same object. The
+        # per-job `uploads/` key stays as the fallback for anonymous media.
+        key = _shared_library_key(file_unique_id) or (
+            f"uploads/{ts.tm_year}/{ts.tm_mon:02d}/{job_id}_{os.path.basename(local_path)}"
+        )
         # Debug: log absolute path and existence before attempting upload
         try:
             abs_path = os.path.abspath(local_path)
@@ -382,6 +430,16 @@ async def _upload_and_enqueue(local_path: str, original_name: str, chat_id: int 
     except Exception:
         keep_local = False
 
+    # A local copy beats the bucket: hand the path to the worker so a colocated
+    # one reads the source off disk instead of pulling it back out of storage.
+    # The worker verifies the path exists, so a separate container just downloads
+    # as before - this is a hint, never an assumption.
+    _local_hint = (
+        {"input_path": local_path}
+        if keep_local and local_path and os.path.exists(local_path)
+        else {}
+    )
+
     job = {
         "job_id": job_id,
         "input_key": input_key,
@@ -393,6 +451,7 @@ async def _upload_and_enqueue(local_path: str, original_name: str, chat_id: int 
         # Let the worker decide whether to delete local input; here we
         # indicate whether the job should cleanup the input after processing.
         "cleanup_input": not keep_local,
+        **_local_hint,
     }
 
     # Optionally save metadata to MongoDB for Telethon ingestion (best-effort, non-blocking)
@@ -480,7 +539,11 @@ async def _process_forward_hash(forward_hash: str):
     # Upload & enqueue using same helper
     try:
         await _upload_and_enqueue(
-            tmp, meta.get("name"), meta.get("chat_id"), meta.get("message_id") or meta.get("msg_id")
+            tmp,
+            meta.get("name"),
+            meta.get("chat_id"),
+            meta.get("message_id") or meta.get("msg_id"),
+            file_unique_id=meta.get("file_unique_id"),
         )
     except Exception:
         logger.exception("telethon_ingest: upload/enqueue failed for %s", forward_hash)
@@ -814,7 +877,11 @@ async def main():
             # Upload & enqueue
             try:
                 await _upload_and_enqueue(
-                    tmp, fname, getattr(msg.chat, "id", None) or getattr(msg, "chat_id", None), getattr(msg, "id", None)
+                    tmp,
+                    fname,
+                    getattr(msg.chat, "id", None) or getattr(msg, "chat_id", None),
+                    getattr(msg, "id", None),
+                    file_unique_id=_message_media_identity(msg),
                 )
             except Exception:
                 logger.exception("Failed to upload/enqueue for %s", tmp)

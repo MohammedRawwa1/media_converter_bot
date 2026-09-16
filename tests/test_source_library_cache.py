@@ -1,0 +1,242 @@
+"""One media = one stored object, cached locally and reused by every operation.
+
+Covers the three pieces that make that true:
+
+* the local cache path derived from a shared library key (and only from one),
+* the storage janitor no longer deleting the library object out from under it,
+* the audio tags the player shows surviving the encode and the upload.
+"""
+
+import asyncio
+import inspect
+import os
+import sys
+import time
+
+import pytest
+
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+
+from tasks import cleanup_tasks as cleanup_mod  # noqa: E402
+from utils import media_cache  # noqa: E402
+from workers import ffmpeg_worker  # noqa: E402
+
+LIBRARY_KEY = media_cache.media_library_key("AgADBAADy6cxG4testFileUniqueId")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Local cache path derivation
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def test_library_key_maps_to_a_stable_cache_path():
+    first = ffmpeg_worker._library_source_cache_path(LIBRARY_KEY)
+    second = ffmpeg_worker._library_source_cache_path(LIBRARY_KEY)
+    assert first and first == second
+    assert "library" in first.replace("\\", "/")
+    # Same media, every operation: identical path, so the second style reuses it.
+    assert ffmpeg_worker._library_source_cache_path(LIBRARY_KEY) == first
+
+
+def test_extension_is_added_when_the_key_has_none():
+    """media_cache writes `source` with no suffix; ffmpeg still needs one."""
+    bare = ffmpeg_worker._library_source_cache_path(LIBRARY_KEY, ".mp4")
+    assert bare.endswith("source.mp4")
+    # An existing suffix is never doubled up.
+    with_ext = ffmpeg_worker._library_source_cache_path("inputs/library/abc123/source.mkv", ".mp4")
+    assert with_ext.endswith("source.mkv")
+
+
+def test_per_job_keys_are_never_cached_under_a_shared_name():
+    """A per-job object belongs to one job and must not be handed to another."""
+    assert ffmpeg_worker._library_source_cache_path("inputs/6f2b/source.mp4") is None
+    assert ffmpeg_worker._library_source_cache_path("outputs/job/out.mp4") is None
+    assert ffmpeg_worker._library_source_cache_path("") is None
+    assert ffmpeg_worker._library_source_cache_path(None) is None
+
+
+def test_traversal_and_odd_shapes_are_refused():
+    for key in (
+        "inputs/library/../../etc/source.mp4",
+        "inputs/library/ab/../../../x/source.mp4",
+        "inputs/library/ab/nested/source.mp4",
+        "inputs/library/ab",
+        "inputs/library/ab/",
+    ):
+        assert ffmpeg_worker._library_source_cache_path(key) is None, key
+
+
+def test_shared_cache_detection_matches_only_the_library_copy():
+    cached = ffmpeg_worker._library_source_cache_path(LIBRARY_KEY)
+    assert ffmpeg_worker._is_shared_source_cache(cached, LIBRARY_KEY) is True
+    # A per-job temp copy is disposable.
+    assert ffmpeg_worker._is_shared_source_cache("storage/temp/job1_src.mp4", LIBRARY_KEY) is False
+    assert ffmpeg_worker._is_shared_source_cache(None, LIBRARY_KEY) is False
+    assert ffmpeg_worker._is_shared_source_cache(cached, "inputs/6f2b/source.mp4") is False
+
+
+def test_job_reuses_the_cache_and_keeps_it_after_the_job():
+    """The source is downloaded into the cache, then deliberately not deleted."""
+    src = inspect.getsource(ffmpeg_worker.handle_job)
+    # The reuse check runs before the download and short-circuits it.
+    assert "_shared_cache_path = _library_source_cache_path(input_key)" in src
+    assert "reusing shared local source cache" in src
+    # Bytes that do arrive are written to the shared location, not a job-only one.
+    assert "_library_source_cache_path(input_key, ext)" in src
+    # And the post-job cleanup is guarded against removing it.
+    assert "_is_shared_source_cache(input_path" in src
+    assert "keeping shared source cache" in src
+
+
+def test_downloads_land_atomically_so_the_cache_cannot_hold_half_a_media():
+    """A cut connection must not leave a truncated file for later jobs to reuse."""
+    src = inspect.getsource(ffmpeg_worker.handle_job)
+    assert "os.replace(_part_path, temp_input_path)" in src
+    assert 'backend.download_file(input_key, _part_path)' in src
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Storage janitor: the library object survives the inputs sweep
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+class _FakeBackend:
+    def __init__(self, objects):
+        self.objects = objects
+        self.deleted = []
+
+    async def list_keys(self, prefix):
+        return [o for o in self.objects if o["key"].startswith(prefix)]
+
+    async def delete_keys(self, keys):
+        self.deleted.extend(keys)
+        return len(keys)
+
+
+def _install_backend(monkeypatch, objects):
+    backend = _FakeBackend(objects)
+
+    async def _get():
+        return backend
+
+    import utils.storage as storage_mod
+
+    monkeypatch.setattr(storage_mod, "get_storage_backend", _get)
+    monkeypatch.setattr(cleanup_mod.logger, "info", lambda *a, **k: None)
+    monkeypatch.setattr(cleanup_mod.config, "get_storage_backend_name", lambda: "s3")
+    return backend
+
+
+OLD = time.time() - 30 * 24 * 3600
+
+
+def test_inputs_sweep_skips_the_library(monkeypatch):
+    objects = [
+        {"key": "inputs/library/abc123/source", "last_modified": OLD},
+        {"key": "inputs/job1/source.mp4", "last_modified": OLD},
+    ]
+    backend = _install_backend(monkeypatch, objects)
+    manager = cleanup_mod.CleanupManager()
+
+    asyncio.run(manager.cleanup_s3_inputs())
+
+    assert backend.deleted == ["inputs/job1/source.mp4"]
+
+
+def test_library_objects_expire_on_their_own_longer_ttl(monkeypatch):
+    fresh = time.time() - 3600  # inside S3_LIBRARY_TTL, outside S3_INPUT_TTL
+    older = time.time() - 40 * 24 * 3600
+    objects = [
+        {"key": "inputs/library/fresh1/source", "last_modified": fresh},
+        {"key": "inputs/library/stale1/source", "last_modified": older},
+    ]
+    backend = _install_backend(monkeypatch, objects)
+    manager = cleanup_mod.CleanupManager()
+
+    asyncio.run(manager.cleanup_s3_library())
+
+    assert backend.deleted == ["inputs/library/stale1/source"]
+
+
+def test_library_prefix_is_shared_with_the_cache_module():
+    assert cleanup_mod.LIBRARY_KEY_PREFIX == media_cache.LIBRARY_KEY_PREFIX
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Audio tags on delivery
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def test_audio_probe_falls_back_to_the_media_name_for_the_title(tmp_path, monkeypatch):
+    src = tmp_path / "song.mp3"
+    src.write_bytes(b"not really audio")
+
+    async def _no_tags(path):
+        return {"duration": 12}
+
+    import utils.userbot_uploader as uploader
+
+    monkeypatch.setattr(uploader, "_probe_audio_metadata", _no_tags)
+    meta = asyncio.run(ffmpeg_worker._probe_audio_delivery(str(src), "My Song.mp3"))
+
+    assert meta is not None
+    assert meta["title"] == "My Song"
+    assert meta["duration"] == 12
+
+
+def test_audio_probe_keeps_real_tags(tmp_path, monkeypatch):
+    src = tmp_path / "song.mp3"
+    src.write_bytes(b"not really audio")
+
+    async def _tags(path):
+        return {"title": "Real Title", "performer": "Artist", "duration": 5}
+
+    import utils.userbot_uploader as uploader
+
+    monkeypatch.setattr(uploader, "_probe_audio_metadata", _tags)
+    meta = asyncio.run(ffmpeg_worker._probe_audio_delivery(str(src), "other.mp3"))
+
+    assert meta == {"title": "Real Title", "performer": "Artist", "duration": 5}
+
+
+def test_audio_probe_returns_none_rather_than_a_partial_dict(tmp_path, monkeypatch):
+    """A stub dict would suppress the uploader's own probe and lose its fields."""
+    missing = tmp_path / "gone.mp3"
+    assert asyncio.run(ffmpeg_worker._probe_audio_delivery(str(missing), "x.mp3")) is None
+
+    src = tmp_path / "song.mp3"
+    src.write_bytes(b"x")
+
+    async def _boom(path):
+        raise RuntimeError("ffprobe exploded")
+
+    import utils.userbot_uploader as uploader
+
+    monkeypatch.setattr(uploader, "_probe_audio_metadata", _boom)
+    assert asyncio.run(ffmpeg_worker._probe_audio_delivery(str(src), "x.mp3")) is None
+
+
+def test_delivery_sites_pass_the_audio_tags_through():
+    src = inspect.getsource(ffmpeg_worker.handle_job)
+    assert src.count("audio_meta=_pre_am") == 2
+    assert src.count("_probe_audio_delivery(out, _delivery_name)") == 2
+
+
+def test_uploader_exposes_a_public_probe_entry_point():
+    import utils.userbot_uploader as uploader
+
+    assert inspect.iscoroutinefunction(uploader.probe_audio_metadata)
+
+
+@pytest.mark.parametrize("name", ["thumb.jpg", "cover.png"])
+def test_public_probe_delegates(name, tmp_path, monkeypatch):
+    import utils.userbot_uploader as uploader
+
+    src = tmp_path / name
+    src.write_bytes(b"x")
+
+    async def _fake(path):
+        return {"seen": path}
+
+    monkeypatch.setattr(uploader, "_probe_audio_metadata", _fake)
+    assert asyncio.run(uploader.probe_audio_metadata(str(src))) == {"seen": str(src)}

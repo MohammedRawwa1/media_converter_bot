@@ -6,6 +6,7 @@ Main entry point for media conversion bot - Updated for PTB v20+
 import asyncio
 import functools
 import hashlib
+import html
 import inspect
 import json
 import logging
@@ -69,6 +70,7 @@ from utils import (
     presence,
 )
 from utils.confirm import NO_DATA, confirm_keyboard, is_cancel, parse_confirm, yes_data
+from utils.egress_monitor import start_egress_monitor, stop_egress_monitor
 from utils.error_handler import (
     get_error_handler,
     setup_comprehensive_logging,
@@ -258,40 +260,40 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     user_name = update.effective_user.first_name
 
     welcome_text = f"""
-🎬 **Welcome to Media Conversion Bot** 🎧
+🎬 <b>Welcome to Media Conversion Bot</b> 🎧
 
-Hello {_escape_markdown(user_name)}! Send a media file and choose an action from the menu.
+Hello {html.escape(user_name)}! Send a media file and choose an action from the menu.
 
-**⚡ Quick Commands:**
+<b>⚡ Quick Commands:</b>
 /help — Detailed feature guide
 /usersettings — Your preferences
 /cancel — Stop current operation
-/canceljob `<job_id>` — Cancel a pending job (space between /canceljob and the job ID)
+/canceljob <code>&lt;job_id&gt;</code> — Cancel a pending job (space between /canceljob and the job ID)
 
-**🔐 Login (for large file support):**
-/login `[phone]` — Login via Telethon (user account)
-/loginpyro `[phone]` — Login via Pyrogram (better 2FA)
+<b>🔐 Login (for large file support):</b>
+/login <code>[phone]</code> — Login via Telethon (user account)
+/loginpyro <code>[phone]</code> — Login via Pyrogram (better 2FA)
 /logout — Log out Telethon session
 /logoutpyro — Log out Pyrogram session
 /loginstatus — Check live session health
-/session_status — Queue, online users & session health (`/session_status live` for a real check)
+/session_status — Queue, online users &amp; session health (<code>/session_status live</code> for a real check)
 
-**📦 Bulk & URLs:**
+<b>📦 Bulk &amp; URLs:</b>
 /bulkmenu — Bulk URL processing
 
 Send me a file to get started! 🚀
 """
 
-    await update.message.reply_text(welcome_text, parse_mode="Markdown")
+    await update.message.reply_text(welcome_text, parse_mode="HTML")
     logger.info(f"User {user_id} ({user_name}) started the bot")
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Help command handler."""
     help_text = """
-📚 **Complete Feature List:**
+📚 <b>Complete Feature List:</b>
 
-**🎬 VIDEO PROCESSING:**
+<b>🎬 VIDEO PROCESSING:</b>
 • Convert to different formats (MP4, AVI, MOV, MKV, etc.)
 • Convert to MP3/audio formats
 • Compress with quality presets (High → Extreme)
@@ -307,7 +309,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 • Change bitrate
 • Edit metadata
 
-**🎧 AUDIO PROCESSING:**
+<b>🎧 AUDIO PROCESSING:</b>
 • Convert between formats (MP3, WAV, AAC, FLAC, OGG, M4A)
 • Adjust bitrate (64k-320k)
 • Normalize volume
@@ -317,7 +319,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 • Change sample rate
 • Adjust channels (mono/stereo)
 
-**🔧 UTILITIES:**
+<b>🔧 UTILITIES:</b>
 • Full media analysis and information
 • Create ZIP archives
 • Batch processing
@@ -325,32 +327,32 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 • Background processing
 • Auto-cleanup of old files
 
-**File Limits:**
+<b>File Limits:</b>
 • Maximum file size: 4GB
 • Processing time: Depends on file size
 • Results auto-delete after sending
 
-**🔐 Login Guide:**
-Use `/login [phone]` (Telethon) or `/loginpyro [phone]` (Pyrogram) to sign in with a Telegram user account. This enables large file processing.
+<b>🔐 Login Guide:</b>
+Use <code>/login [phone]</code> (Telethon) or <code>/loginpyro [phone]</code> (Pyrogram) to sign in with a Telegram user account. This enables large file processing.
 
 When you receive the verification code:
-• Type the digits **with spaces between them** — e.g. `"1 2 3 4 5"`
-• Typing them all together like `"12345"` **does not work** — you must use spaces
-• If 2FA is enabled, just type your **password normally**
-• The same applies to both Telethon (`/login`) and Pyrogram (`/loginpyro`) flows
+• Type the digits <b>with spaces between them</b> — e.g. <code>"1 2 3 4 5"</code>
+• Typing them all together like <code>"12345"</code> <b>does not work</b> — you must use spaces
+• If 2FA is enabled, just type your <b>password normally</b>
+• The same applies to both Telethon (<code>/login</code>) and Pyrogram (<code>/loginpyro</code>) flows
 
-**⚙️ Utility Commands:**
+<b>⚙️ Utility Commands:</b>
 /cancel — Cancel current operation
-/canceljob `<job_id>` — Cancel a queued or running job (space between /canceljob and the job ID)
+/canceljob <code>&lt;job_id&gt;</code> — Cancel a queued or running job (space between /canceljob and the job ID)
 /logout — Log out Telethon session
 /logoutpyro — Log out Pyrogram session
 /loginstatus — Check live session health
-/session_status — Queue, online users & session health (`/session_status live` for a real check)
+/session_status — Queue, online users &amp; session health (<code>/session_status live</code> for a real check)
 
-**Need help?** Just send a file and use the menus! 🎯
+<b>Need help?</b> Just send a file and use the menus! 🎯
 """
 
-    await update.message.reply_text(help_text, parse_mode="Markdown")
+    await update.message.reply_text(help_text, parse_mode="HTML")
 
 
 async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -658,8 +660,11 @@ def setup_handlers(application: Application) -> None:
                 latency = result.get("latency_ms") or "?"
                 return f"✅ **{name}** — Working\n   Phone: `{phone}`\n   DC: `{dc}` | Latency: `{latency}ms`"
             else:
-                err = (result.get("error") or "Not configured").replace("`", "")
-                return f"❌ **{name}** — `{err}`"
+                # Escaped rather than wrapped in backticks: an error string is
+                # free-form and a lone ``_``/``*`` in it would otherwise be an
+                # unterminated entity and fail the whole send.
+                err = _escape_markdown(result.get("error") or "Not configured")
+                return f"❌ **{name}** — {err}"
 
         # Get healthcheck interval from the checker
         check_interval = getattr(checker, "check_interval", 3600)
@@ -1697,6 +1702,20 @@ async def main(background: bool = False) -> None:
     except Exception as e:
         logger.error(f"Failed to start session healthcheck: {e}")
 
+    # Start the storage-egress watchdog. IDrive e2's free egress is a multiple of
+    # what you store, and exceeding it suspends the account, so the admin is told
+    # when the cycle crosses the watch line instead of finding out from the
+    # provider. Alerts are once per severity per billing cycle.
+    try:
+        start_egress_monitor(
+            admin_user_id=ADMIN_USER_ID,
+            bot_app=application,
+            check_interval=int(os.environ.get("EGRESS_CHECK_INTERVAL", "900")),
+        )
+        logger.info("Egress monitor started (interval=%ss)", os.environ.get("EGRESS_CHECK_INTERVAL", "900"))
+    except Exception as e:
+        logger.error(f"Failed to start egress monitor: {e}")
+
     # ── Eagerly persist env-var session strings to per-user JSON + MongoDB ──
     # After a redeploy the ephemeral per-user JSON files are empty, so this
     # seeds the owner's file right away instead of waiting for the healthcheck.
@@ -2200,6 +2219,12 @@ async def main(background: bool = False) -> None:
                     logger.info("Session healthcheck stop requested")
                 except Exception as e:
                     logger.error(f"Error stopping session healthcheck: {e}")
+
+                try:
+                    stop_egress_monitor()
+                    logger.info("Egress monitor stop requested")
+                except Exception as e:
+                    logger.error(f"Error stopping egress monitor: {e}")
 
                 if polling_task:
                     try:

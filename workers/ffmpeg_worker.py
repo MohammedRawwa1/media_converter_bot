@@ -54,6 +54,13 @@ try:
     from utils.storage import get_storage_backend
 except Exception:
     get_storage_backend = None
+
+try:
+    from utils.storage import record_source_cache
+except Exception:  # pragma: no cover - accounting is optional, never fatal
+
+    async def record_source_cache(*_args, **_kwargs):
+        return {}
 try:
     from utils.rate_limiter import ConversionRateLimiterRedis
 
@@ -392,6 +399,13 @@ async def _probe_output_metadata(out_path: str) -> tuple[dict | None, str | None
     _cached = _output_probe_cache.get(out_path)
     if _cached is not None:
         logger.debug("Worker: _probe_output_metadata cache HIT for %s", out_path)
+        _cached_meta, _cached_thumb = _cached
+        if _cached_thumb and not os.path.exists(_cached_thumb):
+            # The caller that consumed this probe removed its thumbnail directory,
+            # so hand back the metadata without a path to a file that is gone
+            # rather than a dead path a delivery would try to upload.
+            _cached = (_cached_meta, None)
+            _output_probe_cache[out_path] = _cached
         return _cached
 
     # ── Delegate to shared utility (single ffprobe + thumbnail call) ──
@@ -409,6 +423,31 @@ async def _probe_output_metadata(out_path: str) -> tuple[dict | None, str | None
         logger.debug("Worker: failed to cache probe result for %s", out_path)
 
     return video_meta, thumb_path
+
+
+async def _probe_audio_delivery(out_path: str, delivery_name: str) -> dict | None:
+    """Audio tags for the Telegram music player, or ``None`` to let the uploader probe.
+
+    Built once here, from the file the worker just encoded and the media's own
+    name, so the player shows a real title/performer/duration instead of whatever
+    a fresh encode happened to leave behind. The uploader only probes when
+    ``audio_meta`` is ``None``, so a *partial* dict would suppress that probe and
+    lose the fields it fills in - hence a complete dict or ``None``, never a stub.
+    """
+    if not out_path or not os.path.exists(out_path):
+        return None
+    try:
+        from utils.userbot_uploader import probe_audio_metadata
+
+        meta = dict(await probe_audio_metadata(out_path) or {})
+    except Exception:
+        # Probing is best-effort; None hands the work back to the uploader.
+        return None
+    # A converted file usually carries no title tag of its own, and Telegram shows
+    # the media name in the player, so fall back to it exactly as the uploader does.
+    if not meta.get("title"):
+        meta["title"] = os.path.splitext(os.path.basename(delivery_name or out_path))[0][:64]
+    return meta
 
 
 async def _forward_pubsub_listener(stop_event: asyncio.Event | None, event: asyncio.Event) -> None:
@@ -485,6 +524,113 @@ async def _forward_pubsub_listener(stop_event: asyncio.Event | None, event: asyn
                 await client.close()
         except Exception:
             logger.debug("ffmpeg worker: operation failed")
+
+
+# The size a thumbnail is stored at is a policy, not an accident of which call
+# site ran: the copy that goes into the bucket (web results, presigned links, the
+# Bot API path) has to stay inside the 320px the Bot API allows, and a frame the
+# worker generates is written at that same size. The user's own /addthumb file is
+# a deliberate choice of cover, so it is delivered raw when it is on disk instead
+# of being downsampled to the storage size.
+_THUMB_MAX_EDGE = 320
+
+_LIBRARY_KEY_PREFIX_FALLBACK = "inputs/library/"
+
+
+def _library_source_cache_path(input_key: str | None, ext: str = "") -> str | None:
+    """Local cache path for a shared library object, or ``None`` for any other key.
+
+    Library keys are content-addressed and shared: every operation on one media
+    (stream capture, audio extract, compress, any button) resolves to the same
+    ``inputs/library/<hash>/source`` object. Caching the bytes of that object on
+    local disk once therefore serves all of those operations, so the media only
+    travels out of the bucket the first time instead of once per style.
+
+    Returns ``None`` for every other key shape: a per-job object must never be
+    handed to a different job, and a crafted ``<hash>/<name>`` pair must not be
+    able to walk out of the cache directory.
+    """
+    if not input_key or not isinstance(input_key, str):
+        return None
+    try:
+        from utils import media_cache as _media_cache_mod
+
+        _prefix = _media_cache_mod.LIBRARY_KEY_PREFIX
+    except Exception:
+        _prefix = _LIBRARY_KEY_PREFIX_FALLBACK
+
+    key = input_key.replace("\\", "/").lstrip("/")
+    if not key.startswith(_prefix):
+        return None
+    parts = [p for p in key[len(_prefix) :].split("/") if p not in ("", ".")]
+    if len(parts) != 2:
+        return None
+    _hash, _name = parts
+    # Hash segment: hex from media_cache.media_library_key, but accept any plain
+    # token so a key written by an older/newer producer still hits the cache.
+    if not _hash or len(_hash) > 64 or ".." in _hash or not all(c.isalnum() or c in "_-" for c in _hash):
+        return None
+    if ".." in _name or os.path.basename(_name) != _name:
+        return None
+    # The stored key may carry no extension (media_cache writes `source`); the
+    # caller's extension keeps the cached file usable by ffmpeg and friends.
+    if ext and not os.path.splitext(_name)[1]:
+        _name = f"{_name}{ext}"
+    return os.path.join(getattr(config, "TEMP_PATH", "storage/temp"), "library", _hash, _name)
+
+
+def _is_shared_source_cache(input_path: str | None, input_key: str | None) -> bool:
+    """Whether *input_path* is the shared cache copy of the *input_key* object.
+
+    Used before deleting an input after a job: the per-job copy is disposable,
+    but the library copy is the whole point of the cache and has to survive.
+    """
+    cached = _library_source_cache_path(input_key)
+    if not cached or not input_path:
+        return False
+    return os.path.normpath(str(input_path)) == os.path.normpath(cached)
+
+
+def _cleanup_local_thumb(job: dict) -> None:
+    """Remove the private directory holding a job's local thumbnail copy.
+
+    Only a directory this worker created is ever removed (``worker_thumb_``),
+    and only when it is not a path the user's own files live in, so a custom
+    thumbnail kept in ``storage/thumbnails`` is never touched.
+    """
+    path = job.get("_local_thumb")
+    if not path or not isinstance(path, str):
+        return
+    try:
+        directory = os.path.dirname(os.path.abspath(path))
+        if os.path.basename(directory).startswith("worker_thumb_"):
+            safe_rmtree(directory)
+            job.pop("_local_thumb", None)
+    except Exception:
+        logger.debug("worker: could not remove the local thumbnail copy %s", path)
+
+
+def _local_thumb_candidate(job: dict) -> str | None:
+    """A thumbnail that is already on local disk, or ``None``.
+
+    Delivery only needs the bytes to attach to the Telegram upload, and the
+    worker normally produced this thumbnail itself moments earlier in the same
+    call, so the local copy is preferred over fetching the object back out of
+    storage. ``None`` deliberately leaves the caller's storage fallback in
+    place, which is what keeps a retry that lands in another container working.
+
+    The user's own thumbnail is checked before the worker's normalised copy: the
+    raw file is what they picked, and the stored variant has already been capped
+    to ``_THUMB_MAX_EDGE``. Entries that are not paths (an object key from an
+    earlier container) fail the ``os.path.exists`` test and fall through.
+    """
+    for cand in (job.get("thumbnail"), job.get("thumb"), job.get("_local_thumb")):
+        try:
+            if cand and os.path.exists(str(cand)):
+                return str(cand)
+        except Exception:
+            continue
+    return None
 
 
 async def handle_job(job: dict):
@@ -593,6 +739,46 @@ async def handle_job(job: dict):
     # If job references a remote storage key (S3/MinIO), prefer to download it
     # when the local `input_path` is missing or the file is not present on disk.
     input_key = job.get("input_key") or job.get("s3_key") or job.get("remote_key")
+    if input_key and input_path and os.path.exists(input_path):
+        # A usable local copy beats the bucket: this is the same object the
+        # producer uploaded, so reading it here saves a whole copy of the media
+        # of egress. It only ever holds when the worker shares a filesystem with
+        # that producer; otherwise `input_path` is absent or already gone and
+        # the download below is the only way to get the source.
+        logger.info(
+            "Job %s: reading source from local disk (%s); skipping storage download of %s",
+            job_id,
+            input_path,
+            input_key,
+        )
+        # Count it: a shared object served from disk is a fetch that never left
+        # the bucket, which is the whole point of one object per media.
+        if _library_source_cache_path(input_key):
+            with contextlib.suppress(Exception):
+                await record_source_cache(True, nbytes=os.path.getsize(input_path))
+    if input_key and (not input_path or not os.path.exists(input_path)):
+        # ── Shared source cache ──
+        # One media is one library object, and every operation on it resolves to
+        # that same key, so the bytes only have to leave the bucket once: the
+        # second style, the third button press and every repeat then read the
+        # source off local disk. Only library keys are cached - a per-job object
+        # belongs to that job alone and must never be served to another.
+        _shared_cache_path = _library_source_cache_path(input_key)
+        if _shared_cache_path and os.path.exists(_shared_cache_path) and os.path.getsize(_shared_cache_path) > 0:
+            logger.info(
+                "Job %s: reusing shared local source cache (%s); skipping storage download of %s",
+                job_id,
+                _shared_cache_path,
+                input_key,
+            )
+            input_path = _shared_cache_path
+            job["input_path"] = input_path
+            with contextlib.suppress(Exception):
+                await record_source_cache(True, nbytes=os.path.getsize(_shared_cache_path))
+            with contextlib.suppress(Exception):
+                # Keep it warm: the temp sweeps prune by mtime, and an in-use
+                # cache entry must not be pruned out from under the next job.
+                os.utime(_shared_cache_path, None)
     if input_key and (not input_path or not os.path.exists(input_path)):
         # prepare temp path
         temp_dir = os.path.join(getattr(config, "TEMP_PATH", "storage/temp"))
@@ -603,7 +789,13 @@ async def handle_job(job: dict):
             # attacker-supplied original_filenames can't inject odd suffixes
             # into the on-disk temp path.
             ext = file_utils.safe_extension(job.get("original_filename") or "", "")
-        temp_input_path = os.path.join(temp_dir, f"{job_id}_src{ext}")
+        temp_input_path = _library_source_cache_path(input_key, ext) or os.path.join(
+            temp_dir, f"{job_id}_src{ext}"
+        )
+        # A cache location lives in its own per-hash directory; the per-job path
+        # shares the existing temp dir. create the one that's missing.
+        with contextlib.suppress(Exception):
+            os.makedirs(os.path.dirname(temp_input_path), exist_ok=True)
 
         if get_storage_backend is None:
             raise RuntimeError("storage backend helper not available")
@@ -722,13 +914,21 @@ async def handle_job(job: dict):
         download_timeout = _storage_download_timeout_seconds(source_bytes)
         download_success = False
         last_exc = None
+        # Download through a sibling `.part` file and swap it in only once the
+        # bytes are all there. A cut connection or a crash must never leave a
+        # truncated file at the destination: for a shared library object that
+        # file is the cache later jobs read, and half a video would be processed
+        # as if it were the whole thing.
+        _part_path = f"{temp_input_path}.part"
+        with contextlib.suppress(Exception):
+            if os.path.exists(_part_path):
+                os.remove(_part_path)
         for attempt in range(1, download_retries + 1):
             try:
-                await asyncio.wait_for(
-                    backend.download_file(input_key, temp_input_path), timeout=download_timeout
-                )
+                await asyncio.wait_for(backend.download_file(input_key, _part_path), timeout=download_timeout)
                 # confirm file exists and has data
-                if os.path.exists(temp_input_path) and (os.path.getsize(temp_input_path) > 0):
+                if os.path.exists(_part_path) and (os.path.getsize(_part_path) > 0):
+                    os.replace(_part_path, temp_input_path)
                     download_success = True
                     break
             except TimeoutError:
@@ -745,12 +945,21 @@ async def handle_job(job: dict):
                 )
             except Exception as e:
                 last_exc = e
+            if not download_success:
+                with contextlib.suppress(Exception):
+                    os.remove(_part_path)
             # backoff before next attempt
             if attempt < download_retries:
                 await asyncio.sleep(backoff_base * (2 ** (attempt - 1)))
 
         if download_success:
             input_path = temp_input_path
+            # A shared object whose local copy was missing (first use, another
+            # container, or a swept cache): these are the bytes that had to leave
+            # the bucket, so they count as a miss against the cache.
+            if _is_shared_source_cache(temp_input_path, job.get("input_key") or input_key):
+                with contextlib.suppress(Exception):
+                    await record_source_cache(False)
             job["input_path"] = input_path
             job["_input_from_remote"] = True
             # persist indicator into Redis job hash for observability
@@ -1375,6 +1584,9 @@ async def handle_job(job: dict):
                     upload_success = False
                     dest = None
                     get_url = None
+                    # Whether a copy has to exist in the bucket at all. Set for real
+                    # below; the default is the conservative "yes".
+                    _needs_remote_copy = True
                     try:
                         # Only attempt when a storage backend helper is available
                         if get_storage_backend is not None:
@@ -1385,7 +1597,14 @@ async def handle_job(job: dict):
                         else:
                             backend = None
 
-                        if backend is not None and out and os.path.exists(out):
+                        # A result only needs a copy in the bucket when something
+                        # other than this container will read it: a job with no chat
+                        # has to be collected through a URL, and link delivery hands
+                        # the user a presigned GET. A result that is about to be sent
+                        # to Telegram from here is uploaded for nobody - and every
+                        # object we never create is egress nobody can spend later.
+                        _needs_remote_copy = bool(config.ENABLE_LINK_SEND or not job.get("chat_id"))
+                        if backend is not None and out and os.path.exists(out) and _needs_remote_copy:
                             try:
                                 # Choose a sensible destination key/path for outputs
                                 base = os.path.basename(out)
@@ -1455,13 +1674,18 @@ async def handle_job(job: dict):
                                                     )
                                             if _existing_thumb and os.path.exists(str(_existing_thumb)):
                                                 # ── T11: Keep original — Pillow resize/save ──
+                                                # The user's own cover is only ever capped, never
+                                                # upscaled: this is the copy other consumers
+                                                # (web/links/Bot API) get, so it must respect the
+                                                # Bot API limit while local delivery still prefers
+                                                # the untouched original.
                                                 try:
                                                     from PIL import Image as _PILImg
 
                                                     _td = tempfile.mkdtemp(prefix="worker_thumb_")
                                                     _tp = os.path.join(_td, "thumb.jpg")
                                                     _img = _PILImg.open(str(_existing_thumb))
-                                                    _img.thumbnail((320, 320), _PILImg.Resampling.LANCZOS)
+                                                    _img.thumbnail((_THUMB_MAX_EDGE, _THUMB_MAX_EDGE), _PILImg.Resampling.LANCZOS)
                                                     _img.save(_tp, "JPEG", quality=85, optimize=True)
                                                     if os.path.exists(_tp) and os.path.getsize(_tp) > 0:
                                                         _thumb_path = _tp
@@ -1493,7 +1717,7 @@ async def handle_job(job: dict):
                                                     from PIL import Image as _PILImg
 
                                                     _img = _PILImg.open(_thumb_path)
-                                                    _img.thumbnail((320, 320), _PILImg.Resampling.LANCZOS)
+                                                    _img.thumbnail((_THUMB_MAX_EDGE, _THUMB_MAX_EDGE), _PILImg.Resampling.LANCZOS)
                                                     _img.save(_thumb_path, "JPEG", quality=85, optimize=True)
                                                 except ImportError:
                                                     pass  # Pillow not available; use ffmpeg output as-is
@@ -1503,8 +1727,15 @@ async def handle_job(job: dict):
                                                 _thumb_s3_key = f"outputs/{job_id}/thumb.jpg"
                                                 try:
                                                     await backend.upload_file(_thumb_path, _thumb_s3_key)
+                                                    # `thumb_key` is the durable pointer for a delivery
+                                                    # that happens in another container. `thumbnail` is
+                                                    # deliberately NOT overwritten with the key: it is
+                                                    # the field delivery reads first, and storing a key
+                                                    # there is what made every send fetch the object
+                                                    # back out of storage for bytes already on disk.
                                                     mapping["thumb_key"] = _thumb_s3_key
-                                                    mapping["thumbnail"] = _thumb_s3_key
+                                                    with contextlib.suppress(Exception):
+                                                        job["_local_thumb"] = _thumb_path
                                                     logger.info("Worker: uploaded thumbnail to S3: %s", _thumb_s3_key)
                                                 except Exception as _thumb_err:
                                                     logger.warning(
@@ -1543,6 +1774,35 @@ async def handle_job(job: dict):
                                     )
                             except Exception:
                                 logger.exception("Failed to upload output for job %s", job_id)
+                        elif backend is not None and out and os.path.exists(out):
+                            logger.info(
+                                "Job %s: result kept out of storage - delivered to chat %s from this "
+                                "container and link delivery is disabled",
+                                job_id,
+                                job.get("chat_id"),
+                            )
+                            # The result message is still due, and the watcher keys it
+                            # off a truthy `output` (a `done` job with no output reads
+                            # as a failure). The local path is the honest answer here:
+                            # it is what delivery used, and when the bot shares this
+                            # container the watcher can probe it for the same metadata
+                            # the stored copy used to provide.
+                            try:
+                                r = await get_redis()
+                                try:
+                                    await r.hset(
+                                        f"ffmpeg:job:{job_id}",
+                                        mapping={
+                                            "output": str(out),
+                                            "out_bytes": str(os.path.getsize(out)),
+                                        },
+                                    )
+                                finally:
+                                    await r.close()
+                            except Exception:
+                                logger.debug(
+                                    "ffmpeg worker: could not record the local result path for %s", job_id
+                                )
                     except Exception:
                         logger.debug("ffmpeg worker: operation failed")
 
@@ -1563,7 +1823,11 @@ async def handle_job(job: dict):
                                     should_delete = False
                                     try:
                                         if backend is not None:
-                                            if upload_success:
+                                            # Safe to drop the local input when the result is
+                                            # safe somewhere: either it is in the bucket, or
+                                            # this job deliberately keeps no remote copy
+                                            # (delivered to Telegram inline, links off).
+                                            if upload_success or not _needs_remote_copy:
                                                 should_delete = True
                                         else:
                                             # no remote backend configured; safe to delete local input after processing
@@ -1572,7 +1836,17 @@ async def handle_job(job: dict):
                                         # conservative default: don't delete if uncertain
                                         should_delete = False
 
-                                    if should_delete:
+                                    if _is_shared_source_cache(input_path, job.get("input_key") or input_key):
+                                        # Shared cache, not this job's copy: later
+                                        # operations on the same media still want
+                                        # these bytes, and re-fetching them is the
+                                        # egress this cache exists to avoid.
+                                        logger.info(
+                                            "Job %s: keeping shared source cache %s for reuse",
+                                            job_id,
+                                            input_path,
+                                        )
+                                    elif should_delete:
                                         os.remove(input_path)
                     except Exception as e:
                         logger.warning(f"Failed to cleanup input file: {e}")
@@ -1641,10 +1915,14 @@ async def handle_job(job: dict):
                                     # (Telethon/Pyrogram). This preserves all video metadata (duration,
                                     # dimensions, thumbnail, codecs, streaming support) and works for
                                     # files of any size (no Bot API 50MB limit).
+                                    _pre_am = None
                                     if _media_kind == "audio":
-                                        # Audio has no video metadata/thumbnail to probe;
-                                        # the uploader reads the audio tags itself.
+                                        # Audio has no video metadata/thumbnail; its player
+                                        # tags are probed here so they come from the file
+                                        # this job just produced, tagged with the media's
+                                        # own name.
                                         _pre_vm, _pre_tp = (None, None)
+                                        _pre_am = await _probe_audio_delivery(out, _delivery_name)
                                     else:
                                         _pre_vm, _pre_tp = await _probe_output_metadata(out)
                                     try:
@@ -1655,6 +1933,7 @@ async def handle_job(job: dict):
                                             progress_callback=_up_cb,
                                             video_meta=_pre_vm,
                                             thumb_path=_pre_tp,
+                                            audio_meta=_pre_am,
                                             user_id=job.get("user_id"),
                                             media_kind=_media_kind,
                                             delivery_name=_delivery_name,
@@ -1720,11 +1999,14 @@ async def handle_job(job: dict):
                                         async with Bot(token=bot_token) as bot:
                                             if kind == "zip":
                                                 # Attempt to attach a thumbnail when available
-                                                thumb_path = None
+                                                # Local copy first: this run produced the thumbnail
+                                                # itself, so the object in the bucket would be a
+                                                # download of bytes we are already holding.
+                                                thumb_path = _local_thumb_candidate(job)
                                                 _temp_thumb = None
                                                 try:
                                                     # Prefer explicit job field
-                                                    cand = job.get("thumbnail")
+                                                    cand = None if thumb_path else job.get("thumbnail")
                                                     if cand:
                                                         if os.path.exists(cand):
                                                             thumb_path = cand
@@ -1757,7 +2039,11 @@ async def handle_job(job: dict):
                                                         try:
                                                             r = await get_redis()
                                                             stored = await r.hgetall(f"ffmpeg:job:{job_id}")
-                                                            sval = stored.get("thumbnail") or stored.get("thumb")
+                                                            sval = (
+                                                                stored.get("thumbnail")
+                                                                or stored.get("thumb")
+                                                                or stored.get("thumb_key")
+                                                            )
                                                             if sval:
                                                                 cand = sval
                                                                 if os.path.exists(cand):
@@ -1856,10 +2142,11 @@ async def handle_job(job: dict):
                                                     )
                                             elif kind == "video":
                                                 # Try to attach thumbnail (thumb) when available
-                                                thumb_path = None
+                                                # Local copy first - see _local_thumb_candidate.
+                                                thumb_path = _local_thumb_candidate(job)
                                                 _temp_thumb = None
                                                 try:
-                                                    cand = job.get("thumbnail")
+                                                    cand = None if thumb_path else job.get("thumbnail")
                                                     if cand:
                                                         if os.path.exists(cand):
                                                             thumb_path = cand
@@ -1891,7 +2178,11 @@ async def handle_job(job: dict):
                                                         try:
                                                             r = await get_redis()
                                                             stored = await r.hgetall(f"ffmpeg:job:{job_id}")
-                                                            sval = stored.get("thumbnail") or stored.get("thumb")
+                                                            sval = (
+                                                                stored.get("thumbnail")
+                                                                or stored.get("thumb")
+                                                                or stored.get("thumb_key")
+                                                            )
                                                             if sval:
                                                                 cand = sval
                                                                 if os.path.exists(cand):
@@ -1953,10 +2244,11 @@ async def handle_job(job: dict):
                                                 )
                                             else:
                                                 # non-video non-zip fallback
-                                                thumb_path = None
+                                                # Local copy first - see _local_thumb_candidate.
+                                                thumb_path = _local_thumb_candidate(job)
                                                 _temp_thumb = None
                                                 try:
-                                                    cand = job.get("thumbnail")
+                                                    cand = None if thumb_path else job.get("thumbnail")
                                                     if cand and os.path.exists(cand):
                                                         thumb_path = cand
                                                     elif cand:
@@ -2046,8 +2338,10 @@ async def handle_job(job: dict):
                                     # Direct userbot delivery (fallback): sends directly to user's DM via MTProto.
                                     # This preserves all video metadata and works for files of any size.
                                     _up_cb = _make_upload_progress_callback(job_id, progress_channel)
+                                    _pre_am = None
                                     if _media_kind == "audio":
                                         _pre_vm, _pre_tp = (None, None)
+                                        _pre_am = await _probe_audio_delivery(out, _delivery_name)
                                     else:
                                         _pre_vm, _pre_tp = await _probe_output_metadata(out)
                                     try:
@@ -2058,6 +2352,7 @@ async def handle_job(job: dict):
                                             progress_callback=_up_cb,
                                             video_meta=_pre_vm,
                                             thumb_path=_pre_tp,
+                                            audio_meta=_pre_am,
                                             user_id=job.get("user_id"),
                                             media_kind=_media_kind,
                                             delivery_name=_delivery_name,
@@ -2078,6 +2373,13 @@ async def handle_job(job: dict):
                             logger.warning(
                                 "Could not deliver output for job %s — neither Bot API nor userbot succeeded", job_id
                             )
+
+                        # The local thumbnail copy has served its purpose: it was
+                        # only ever an optimisation for this delivery. Remove the
+                        # private directory it lives in so a job cannot leave one
+                        # behind (the temp sweep would get it eventually, but a
+                        # busy hour would hold one per job until then).
+                        _cleanup_local_thumb(job)
 
                         # Set final job status on Redis hash so _watch_job_progress (and web UI) can see it.
                         try:

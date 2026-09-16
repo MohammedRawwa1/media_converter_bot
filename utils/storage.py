@@ -16,6 +16,7 @@ import asyncio
 import logging
 import os
 import shutil
+import time
 from abc import ABC, abstractmethod
 from typing import Any
 
@@ -116,6 +117,250 @@ def _usage_add(
     row = groups.setdefault(name, {"objects": 0, "bytes": 0})
     row["objects"] += 1
     row["bytes"] += size
+
+
+# ── Egress accounting ───────────────────────────────────────────────────────
+#
+# IDrive e2 - and the "free egress" policies in this class generally - grant
+# free egress worth a *multiple of what you store* per billing cycle (e2's is
+# 3x). The ratio is what gets an account suspended, not the absolute total, so
+# counting the bytes that leave the bucket is what turns "we were disabled for
+# an egress violation" into a number somebody can watch before it recurs.
+#
+# Two kinds are tracked because they are not the same measurement:
+#   * ``object`` - bytes this process pulled *out* of the bucket. Measured.
+#   * ``link``   - presigned GET URLs handed out. A *count*, not bytes: whether
+#     (or how often) a URL is fetched happens outside this process, so each one
+#     is at least one more copy of that object's bytes as egress.
+EGRESS_REDIS_PREFIX = "storage:egress"
+# The provider's free-egress allowance, as a multiple of stored bytes.
+EGRESS_FREE_MULTIPLIER = float(os.getenv("EGRESS_FREE_MULTIPLIER", "3"))
+# Log a warning every time this much egress accumulates within the cycle.
+EGRESS_WARN_STEP_BYTES = int(float(os.getenv("EGRESS_WARN_STEP_GB", "50")) * 1024**3)
+# The ratio of the allowance at which the dashboard starts flagging it.
+EGRESS_WATCH_PERCENT = float(os.getenv("EGRESS_WATCH_PERCENT", "80"))
+# Counters are written per cycle and read back by the dashboard, so they outlive
+# the cycle by a margin - then expire. Without this, one key per cycle per counter
+# would accumulate for the life of the bucket.
+COUNTER_TTL_SECONDS = int(float(os.getenv("STORAGE_COUNTER_TTL_DAYS", "60")) * 86400)
+
+# Kept in-process so the counter still moves when Redis is unreachable, and so
+# callers never depend on Redis to get a reading.
+_EGRESS_LOCAL: dict[str, int] = {}
+
+
+def egress_period(now: float | None = None) -> str:
+    """The billing-cycle bucket key for *now* - UTC, ``YYYY-MM``."""
+    return time.strftime("%Y-%m", time.gmtime(time.time() if now is None else now))
+
+
+def _egress_key(period: str, kind: str) -> str:
+    return f"{EGRESS_REDIS_PREFIX}:{period}:{kind}"
+
+
+def _egress_int(value) -> int:
+    """A counter read back from Redis, as an int (``None`` becomes 0)."""
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+async def record_egress(nbytes, *, kind: str = "object", period: str | None = None) -> int:
+    """Add to this cycle's egress counter, and return the new total.
+
+    Best-effort by design: metering must never be able to break a download, so
+    every failure here degrades to the process-local count.
+    """
+    try:
+        nbytes = int(nbytes)
+    except (TypeError, ValueError):
+        return 0
+    if nbytes <= 0:
+        return 0
+
+    period = period or egress_period()
+    key = _egress_key(period, kind)
+    total = _EGRESS_LOCAL.get(key, 0) + nbytes
+    _EGRESS_LOCAL[key] = total
+
+    try:
+        from utils.job_queue import get_redis
+
+        client = await get_redis()
+        total = int(await client.incrby(key, nbytes))
+        if COUNTER_TTL_SECONDS > 0:
+            try:
+                await client.expire(key, COUNTER_TTL_SECONDS)
+            except Exception:
+                # A counter without a TTL is untidy, not fatal.
+                logger.debug("egress: could not set a TTL on the %s counter", key)
+    except Exception:
+        logger.debug("egress: Redis counter unavailable; keeping the process-local total")
+
+    # One line per step, not per byte: a busy cycle must not turn the egress
+    # counter itself into a log flood.
+    if EGRESS_WARN_STEP_BYTES > 0 and (total // EGRESS_WARN_STEP_BYTES) != (
+        (total - nbytes) // EGRESS_WARN_STEP_BYTES
+    ):
+        logger.warning(
+            "egress: %s bytes have left storage this cycle (%s): %.1f GB against an "
+            "allowance of x%g stored bytes - check the free-egress policy before it is "
+            "exceeded again",
+            kind,
+            period,
+            total / 1024**3,
+            EGRESS_FREE_MULTIPLIER,
+        )
+    return total
+
+
+async def egress_snapshot(*, period: str | None = None, stored_bytes=None) -> dict:
+    """This cycle's egress, the free allowance, and how close we are to it.
+
+    ``stored_bytes`` comes from the caller's usage scan: the allowance is a
+    multiple of it, so without a reading the ratio is reported as unknown
+    rather than guessed.
+    """
+    period = period or egress_period()
+    snapshot: dict[str, Any] = {
+        "period": period,
+        "object_bytes": _EGRESS_LOCAL.get(_egress_key(period, "object"), 0),
+        "links_issued": _EGRESS_LOCAL.get(_egress_key(period, "link"), 0),
+        "stored_bytes": None,
+        "allowance_bytes": None,
+        "percent": None,
+        "status": "unknown",
+        "shared": False,
+    }
+
+    try:
+        from utils.job_queue import get_redis
+
+        client = await get_redis()
+        values = await client.mget(_egress_key(period, "object"), _egress_key(period, "link"))
+        if isinstance(values, (list, tuple)) and len(values) >= 2:
+            snapshot["object_bytes"] = _egress_int(values[0])
+            snapshot["links_issued"] = _egress_int(values[1])
+            snapshot["shared"] = True
+    except Exception:
+        logger.debug("egress: could not read the shared counter; reporting the local total")
+
+    try:
+        stored = int(stored_bytes) if stored_bytes is not None else None
+    except (TypeError, ValueError):
+        stored = None
+
+    if stored is not None and stored >= 0:
+        allowance = int(stored * EGRESS_FREE_MULTIPLIER)
+        snapshot["stored_bytes"] = stored
+        snapshot["allowance_bytes"] = allowance
+        if allowance > 0:
+            percent = snapshot["object_bytes"] * 100.0 / allowance
+            snapshot["percent"] = percent
+            if percent >= 100:
+                snapshot["status"] = "over"
+            elif percent >= EGRESS_WATCH_PERCENT:
+                snapshot["status"] = "watch"
+            else:
+                snapshot["status"] = "ok"
+        else:
+            # Nothing stored means no free egress at all, so any traffic at all
+            # is already over the allowance.
+            snapshot["status"] = "over" if snapshot["object_bytes"] else "ok"
+    return snapshot
+
+
+# ── Shared source cache accounting ───────────────────────────────────────────
+# One media is one library object, and every operation on it may read that object
+# again. A "hit" is a job served from the local copy of that object, so the bytes
+# never left the bucket; a "miss" is a job that had to pull them out. The ratio is
+# what tells you whether the cache is actually doing anything on a given workload,
+# and ``bytes_saved`` is the egress it avoided this cycle.
+SOURCE_CACHE_REDIS_PREFIX = "storage:source_cache"
+_SOURCE_CACHE_LOCAL: dict[str, int] = {}
+
+
+def _source_cache_key(period: str, field: str) -> str:
+    return f"{SOURCE_CACHE_REDIS_PREFIX}:{period}:{field}"
+
+
+async def record_source_cache(hit: bool, *, nbytes=0, period: str | None = None) -> dict:
+    """Count one source fetch as a cache *hit* or *miss*; return the new totals.
+
+    Best-effort like the egress counters: bookkeeping must never fail a job.
+    """
+    period = period or egress_period()
+    try:
+        nbytes = max(0, int(nbytes))
+    except (TypeError, ValueError):
+        nbytes = 0
+    field = "hits" if hit else "misses"
+
+    local_hits = _SOURCE_CACHE_LOCAL.get(_source_cache_key(period, "hits"), 0) + (1 if hit else 0)
+    local_misses = _SOURCE_CACHE_LOCAL.get(_source_cache_key(period, "misses"), 0) + (0 if hit else 1)
+    local_bytes = _SOURCE_CACHE_LOCAL.get(_source_cache_key(period, "bytes"), 0) + (nbytes if hit else 0)
+    _SOURCE_CACHE_LOCAL[_source_cache_key(period, "hits")] = local_hits
+    _SOURCE_CACHE_LOCAL[_source_cache_key(period, "misses")] = local_misses
+    _SOURCE_CACHE_LOCAL[_source_cache_key(period, "bytes")] = local_bytes
+
+    try:
+        from utils.job_queue import get_redis
+
+        client = await get_redis()
+        counter_key = _source_cache_key(period, field)
+        await client.incr(counter_key)
+        if hit and nbytes > 0:
+            await client.incrby(_source_cache_key(period, "bytes"), nbytes)
+        if COUNTER_TTL_SECONDS > 0:
+            for key in (
+                counter_key,
+                _source_cache_key(period, "hits"),
+                _source_cache_key(period, "misses"),
+                _source_cache_key(period, "bytes"),
+            ):
+                try:
+                    await client.expire(key, COUNTER_TTL_SECONDS)
+                except Exception:
+                    logger.debug("source cache: could not set a TTL on %s", key)
+    except Exception:
+        logger.debug("source cache: Redis counter unavailable; keeping the process-local totals")
+
+    return {"hits": local_hits, "misses": local_misses, "bytes": local_bytes}
+
+
+async def source_cache_snapshot(*, period: str | None = None) -> dict:
+    """This cycle's source-cache hits/misses and the bytes kept out of the bucket."""
+    period = period or egress_period()
+    snapshot: dict[str, Any] = {
+        "period": period,
+        "hits": _SOURCE_CACHE_LOCAL.get(_source_cache_key(period, "hits"), 0),
+        "misses": _SOURCE_CACHE_LOCAL.get(_source_cache_key(period, "misses"), 0),
+        "bytes_saved": _SOURCE_CACHE_LOCAL.get(_source_cache_key(period, "bytes"), 0),
+        "shared": False,
+    }
+
+    try:
+        from utils.job_queue import get_redis
+
+        client = await get_redis()
+        values = await client.mget(
+            _source_cache_key(period, "hits"),
+            _source_cache_key(period, "misses"),
+            _source_cache_key(period, "bytes"),
+        )
+        if isinstance(values, (list, tuple)) and len(values) >= 3:
+            snapshot["hits"] = _egress_int(values[0])
+            snapshot["misses"] = _egress_int(values[1])
+            snapshot["bytes_saved"] = _egress_int(values[2])
+            snapshot["shared"] = True
+    except Exception:
+        logger.debug("source cache: could not read the shared counters; reporting the local totals")
+
+    total = snapshot["hits"] + snapshot["misses"]
+    snapshot["fetches"] = total
+    snapshot["hit_percent"] = (snapshot["hits"] * 100.0 / total) if total else None
+    return snapshot
 
 
 class LocalStorageBackend(AsyncStorageBackend):
@@ -467,6 +712,7 @@ class S3AsyncBackend(AsyncStorageBackend):
                 if self._use_aioboto3:
                     async with self._session.client("s3", **self._client_kwargs()) as client:
                         await client.download_file(self.bucket, key, dest_path)
+                    await self._record_download_egress(dest_path)
                     return True
 
                 if boto3 is None:
@@ -477,6 +723,7 @@ class S3AsyncBackend(AsyncStorageBackend):
                     client.download_file(self.bucket, key, dest_path)
 
                 await asyncio.to_thread(_sync_download)
+                await self._record_download_egress(dest_path)
                 return True
 
             except Exception as e:
@@ -488,6 +735,29 @@ class S3AsyncBackend(AsyncStorageBackend):
                 # Use deterministic jitter (based on attempt number) to avoid S311 insecure-random warning
                 _jitter = (attempt * 9973) % 1000 / 1000  # deterministic fractional jitter
                 await asyncio.sleep(backoff + _jitter)
+
+    async def _record_download_egress(self, dest_path: str) -> None:
+        """Count the bytes a download just pulled out of the bucket.
+
+        The object is on local disk by this point, so its size *is* the egress -
+        measured rather than inferred from the key.
+        """
+        try:
+            await record_egress(os.path.getsize(dest_path))
+        except Exception:
+            logger.debug("egress: could not measure a download of %s", dest_path)
+
+    async def _record_link_issued(self) -> None:
+        """Count one presigned GET URL handed to a caller.
+
+        Not bytes: the fetch happens outside this process. It is recorded so a
+        cycle where delivery was handed to links is visible, since each fetch is
+        one more full copy of that object as egress.
+        """
+        try:
+            await record_egress(1, kind="link")
+        except Exception:
+            logger.debug("egress: could not count a presigned link")
 
     async def generate_presigned_post(self, key: str, expires: int | None = None) -> dict[str, Any]:
         expires = expires or config.PRESIGN_EXPIRES
@@ -521,6 +791,7 @@ class S3AsyncBackend(AsyncStorageBackend):
                 url = await client.generate_presigned_url(
                     "get_object", Params={"Bucket": self.bucket, "Key": key}, ExpiresIn=expires
                 )
+            await self._record_link_issued()
             return url
 
         if boto3 is None:
@@ -532,7 +803,9 @@ class S3AsyncBackend(AsyncStorageBackend):
                 "get_object", Params={"Bucket": self.bucket, "Key": key}, ExpiresIn=expires
             )
 
-        return await asyncio.to_thread(_sync_get)
+        url = await asyncio.to_thread(_sync_get)
+        await self._record_link_issued()
+        return url
 
     async def delete(self, key: str) -> bool:
         # Retry/backoff for deletes, but do not raise to avoid unhandled

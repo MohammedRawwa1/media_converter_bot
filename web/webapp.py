@@ -5,6 +5,7 @@ import os
 import re
 import subprocess
 import threading
+import time
 import traceback
 import uuid
 
@@ -66,8 +67,36 @@ try:
 except Exception:
     logger.debug("webapp: failed to parse MAX_CONTENT_LENGTH_BYTES")
 
-# In-memory fallback job store when Redis is not available (best-effort)
+# In-memory fallback job store when Redis is not available (best-effort).
+#
+# Bounded on purpose: an entry is written for every fallback conversion and read
+# back by job id for a while afterwards, and nothing ever removed one - so the
+# store grew by one dict per conversion for the life of the process. An entry is
+# kept for a window (long enough for a client to come back for its result) and
+# then dropped, with a hard cap as the backstop.
 JOB_STORE = {}
+JOB_STORE_TTL_SECONDS = int(os.environ.get("WEB_JOB_STORE_TTL_SECONDS", "3600"))
+JOB_STORE_MAX_ENTRIES = max(16, int(os.environ.get("WEB_JOB_STORE_MAX_ENTRIES", "200")))
+
+
+def _job_store_prune(now: float | None = None) -> int:
+    """Drop expired fallback-store entries, then enforce the cap. Returns the count."""
+    now = time.time() if now is None else now
+    removed = 0
+    if JOB_STORE_TTL_SECONDS > 0:
+        cutoff = now - JOB_STORE_TTL_SECONDS
+        for key in [k for k, v in JOB_STORE.items() if (v.get("created_at") or 0) < cutoff]:
+            JOB_STORE.pop(key, None)
+            removed += 1
+    if len(JOB_STORE) > JOB_STORE_MAX_ENTRIES:
+        keep = sorted(
+            JOB_STORE.items(), key=lambda kv: kv[1].get("created_at") or 0, reverse=True
+        )[: JOB_STORE_MAX_ENTRIES]
+        keep_keys = {k for k, _ in keep}
+        for key in [k for k in JOB_STORE if k not in keep_keys]:
+            JOB_STORE.pop(key, None)
+            removed += 1
+    return removed
 
 # Try to use async job queue helpers when available
 try:
@@ -639,7 +668,13 @@ def upload():
 
             def _worker(j):
                 jid = j["job_id"]
-                JOB_STORE[jid] = {"job_id": jid, "progress": 0.0, "status": "processing"}
+                JOB_STORE[jid] = {
+                    "job_id": jid,
+                    "progress": 0.0,
+                    "status": "processing",
+                    "created_at": time.time(),
+                }
+                _job_store_prune()
                 try:
                     conv = ExtendedMediaConverter()
                     loop = asyncio.new_event_loop()

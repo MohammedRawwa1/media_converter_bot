@@ -30,6 +30,8 @@ import logging
 import os
 import time
 
+from utils.markdown_utils import escape_markdown
+
 logger = logging.getLogger(__name__)
 
 # ──────────────────────────────────────────────────────────────────────
@@ -884,7 +886,9 @@ class SessionHealthChecker:
             "",
             f"{status_emoji} Status: `{'Alive' if result.get('alive') else 'Unhealthy'}`",
             f"\u23f1 Latency: `{result.get('latency_ms', 'N/A')} ms`",
-            f"\u26a0 Error: `{(result.get('error') or 'None').replace('`', '')}`",
+            # Escaped, not backticked: the error text is free-form, and a lone
+            # ``_``/``*`` inside it would be an unterminated Markdown entity.
+            f"\u26a0 Error: {escape_markdown(result.get('error') or 'None')}",
         ]
         if result.get("phone"):
             lines.append(f"\ud83d\udcf1 Phone: `{result['phone']}`")

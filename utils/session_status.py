@@ -125,6 +125,11 @@ async def collect_session_status(
     sessions = await _sessions_snapshot(user_id=user_id, live=live_sessions)
     memory = summarize_memory(_memory_snapshot())
     storage = await _storage_snapshot(force=force_storage)
+    if isinstance(storage, dict):
+        # Egress is a running counter in Redis, not part of the object scan, so
+        # it is read fresh every time - including when the scan itself failed,
+        # since that is when knowing the egress matters most.
+        storage["egress"] = await _storage_egress(storage.get("bytes"))
 
     me_id = _int_or_none(user_id)
     payload = summarize(
@@ -512,6 +517,55 @@ async def _storage_snapshot(*, force: bool = False) -> dict:
 
     await _write_storage_cache(snapshot)
     return snapshot
+
+
+async def _storage_egress(stored_bytes) -> dict | None:
+    """This cycle's egress against the provider's free allowance.
+
+    ``stored_bytes`` is the scan's total; the allowance is a multiple of it.
+    Never raises - a missing reading just leaves the ratio unknown.
+    """
+    try:
+        from utils.storage import egress_snapshot
+
+        return await asyncio.wait_for(
+            egress_snapshot(stored_bytes=stored_bytes), timeout=PROBE_TIMEOUT_SECONDS
+        )
+    except Exception:
+        logger.debug("session_status: egress snapshot failed")
+        return None
+
+
+async def _source_cache_stats() -> dict | None:
+    """How much source fetching the shared media cache avoided this cycle.
+
+    Counted in the worker, where the choice is made. Never raises.
+    """
+    try:
+        from utils.storage import source_cache_snapshot
+
+        return await asyncio.wait_for(source_cache_snapshot(), timeout=PROBE_TIMEOUT_SECONDS)
+    except Exception:
+        logger.debug("session_status: source cache snapshot failed")
+        return None
+
+
+async def storage_egress_report(*, force_storage: bool = False) -> dict:
+    """The storage snapshot plus this cycle's egress.
+
+    The same two readings the dashboard's Storage block is built from, exposed
+    for callers outside this module (the egress monitor) so an alert and the
+    dashboard can never disagree about the numbers.
+
+    ``force_storage`` re-lists the bucket; leave it off to reuse the cached scan
+    and pay a Redis read instead. Never raises.
+    """
+    storage = await _storage_snapshot(force=force_storage)
+    if not isinstance(storage, dict):
+        return {}
+    storage["egress"] = await _storage_egress(storage.get("bytes"))
+    storage["source_cache"] = await _source_cache_stats()
+    return storage
 
 
 async def _read_storage_cache() -> dict | None:
@@ -913,7 +967,10 @@ def _storage_section(storage: dict) -> list[str]:
     """Render the object count and bytes held in the storage backend."""
     lines = ["", "🗄 <b>Storage</b>"]
     if storage.get("error"):
+        # The egress block still belongs here: a failed object scan is exactly
+        # when it is worth seeing how much traffic the cycle has already run up.
         lines.append(f"• ⚠️ {_esc(storage['error'])}")
+        lines.extend(_egress_lines(storage))
         return lines
 
     backend = storage.get("backend") or "unknown"
@@ -941,6 +998,83 @@ def _storage_section(storage: dict) -> list[str]:
 
     if storage.get("cached"):
         lines.append(f"<i>cached scan — press {REFRESH_LABEL} for a fresh one</i>")
+
+    lines.extend(_egress_lines(storage))
+    return lines
+
+
+def _egress_lines(storage: dict) -> list[str]:
+    """Render this cycle's egress against the provider's free allowance.
+
+    The policy this exists for (IDrive e2's 3x-of-stored free egress) belongs to
+    the remote backend, so the local backend gets nothing rather than a ratio
+    that would not mean anything.
+    """
+    egress = storage.get("egress")
+    if (storage.get("backend") or "").lower() != "s3":
+        return []
+    cache_lines = _source_cache_lines(storage)
+    if not isinstance(egress, dict):
+        return cache_lines
+
+    status = egress.get("status")
+    icon = {"ok": "✅", "watch": "⚠️", "over": "🔴"}.get(status, "•")
+    period = _esc(egress.get("period") or "")
+    pulled = _bytes_human(egress.get("object_bytes"))
+    allowance = _int_or_none(egress.get("allowance_bytes"))
+    percent = egress.get("percent")
+
+    if allowance and isinstance(percent, (int, float)):
+        lines = [
+            f"• Egress {period}: <b>{pulled}</b> of <b>{_bytes_human(allowance)}</b> "
+            f"free ({percent:.0f}%) {icon}"
+        ]
+    else:
+        lines = [f"• Egress {period}: <b>{pulled}</b> {icon}"]
+
+    links = _int_or_none(egress.get("links_issued"))
+    if links:
+        lines.append(f"   – <b>{_num(links)}</b> presigned link(s) handed out — each fetch is more egress")
+    if status in ("watch", "over"):
+        lines.append(
+            "   – <i>the free allowance is a multiple of what you store: it grows with "
+            "stored bytes and shrinks when the bucket is emptied</i>"
+        )
+    if not egress.get("shared"):
+        lines.append("   – <i>process-local count only (Redis unavailable)</i>")
+    lines.extend(cache_lines)
+    return lines
+
+
+def _source_cache_lines(storage: dict) -> list[str]:
+    """Render how much of the source fetching the shared cache avoided.
+
+    A media is one library object, and every operation on it can read that object
+    again, so the interesting number is the split between jobs served from a local
+    copy (no bytes left the bucket) and jobs that had to pull it out. The saved
+    total is egress that was never spent, which is what the ratio above it is
+    measuring.
+    """
+    stats = storage.get("source_cache")
+    if not isinstance(stats, dict):
+        return []
+    fetches = _int_or_none(stats.get("fetches")) or 0
+    if not fetches:
+        return []
+
+    hits = _int_or_none(stats.get("hits")) or 0
+    percent = stats.get("hit_percent")
+    percent_text = f"{percent:.0f}%" if isinstance(percent, (int, float)) else "?"
+    icon = "✅" if isinstance(percent, (int, float)) and percent >= 50 else "⚠️"
+    period = _esc(stats.get("period") or "")
+
+    lines = [
+        f"   – Source cache {period}: <b>{_num(hits)}/{_num(fetches)}</b> source fetches "
+        f"served from disk ({percent_text}) {icon} — {_bytes_human(stats.get('bytes_saved'))} "
+        "never pulled from storage"
+    ]
+    if not stats.get("shared"):
+        lines.append("   – <i>counted per process (Redis unavailable)</i>")
     return lines
 
 

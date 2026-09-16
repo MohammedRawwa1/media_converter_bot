@@ -9,7 +9,17 @@ try:
 except Exception:
     config = None
 
+# Shared single source of truth for the library prefix. Falls back to the literal
+# so a partially importable tree cannot silently stop protecting the cache.
+try:
+    from utils.media_cache import LIBRARY_KEY_PREFIX
+except Exception:
+    LIBRARY_KEY_PREFIX = "inputs/library/"
+
 logger = logging.getLogger(__name__)
+
+# Directory placeholders that must never be treated as stale data.
+_PLACEHOLDER_FILES = frozenset({"README.md", ".gitkeep", ".gitignore"})
 
 
 class CleanupManager:
@@ -23,6 +33,13 @@ class CleanupManager:
         self.s3_input_ttl = int(os.getenv("S3_INPUT_TTL", str(24 * 3600)))
         self.s3_upload_ttl = int(os.getenv("S3_UPLOADS_TTL", str(24 * 3600)))
         self.s3_forward_ttl = int(os.getenv("S3_FORWARDS_TTL", str(48 * 3600)))
+        self.s3_output_ttl = int(os.getenv("S3_OUTPUTS_TTL", str(24 * 3600)))
+        # Shared media library (``inputs/library/<hash>/source``): one object per
+        # media, reused by every operation on it. Deliberately much longer than
+        # the per-job input TTL and exempt from that sweep - deleting it is what
+        # forced the next request for the same media to download and upload a
+        # fresh copy again, and it never went through the inputs/ janitor.
+        self.s3_library_ttl = int(os.getenv("S3_LIBRARY_TTL", str(7 * 24 * 3600)))
         # Redis job hash cleanup interval (30 minutes)
         self.redis_cleanup_interval = int(os.getenv("REDIS_CLEANUP_INTERVAL", str(30 * 60)))
         # Stale Redis job hash max age (24 hours)
@@ -67,10 +84,14 @@ class CleanupManager:
             "redis_dedup_keys": await self.cleanup_stale_dedup_keys(),
             "redis_lock_keys": await self.cleanup_stale_locks(),
             "empty_dirs": await self.cleanup_empty_directories(),
+            "rate_limit_buckets": self.cleanup_rate_limit_buckets(),
+            "web_job_store": self.cleanup_web_job_store(),
             # ── S3 / R2 remote cleanup ──
             "s3_inputs": await self.cleanup_s3_inputs(),
             "s3_uploads": await self.cleanup_s3_uploads(),
             "s3_forwards": await self.cleanup_s3_forwards(),
+            "s3_outputs": await self.cleanup_s3_outputs(),
+            "s3_library": await self.cleanup_s3_library(),
         }
 
         total_cleaned = sum(results.values())
@@ -108,6 +129,12 @@ class CleanupManager:
                 item_path = os.path.join(directory, item)
 
                 if os.path.isfile(item_path):
+                    if item in _PLACEHOLDER_FILES:
+                        # ``README.md``/``.gitkeep`` are how an empty storage
+                        # directory survives a checkout; they are not stale data
+                        # and deleting them is what removes a tracked file from
+                        # a working tree.
+                        continue
                     file_age = current_time - os.path.getmtime(item_path)
                     if file_age > max_age:
                         try:
@@ -161,9 +188,64 @@ class CleanupManager:
     # S3 / R2 remote cleanup helpers
     # ─────────────────────────────────────────────────────────────────────
 
+    def cleanup_rate_limit_buckets(self) -> int:
+        """Drop in-memory rate-limiter buckets for clients that have gone quiet.
+
+        The limiter is keyed by client IP (which the caller supplies through
+        ``X-Forwarded-For``), so without a periodic pruning pass it holds an entry
+        per address that ever called a public endpoint until it next hits its cap.
+        """
+        try:
+            from utils.web_rate_limiter import web_rate_limiter
+
+            pruned = int(web_rate_limiter.prune())
+            if pruned:
+                logger.info("rate limiter cleanup: dropped %d idle bucket(s)", pruned)
+            return pruned
+        except Exception:
+            logger.debug("cleanup: rate limiter prune unavailable")
+            return 0
+
+    def cleanup_web_job_store(self) -> int:
+        """Prune the web UI's in-memory fallback job store.
+
+        It prunes on write as well; this is the backstop for a process that has
+        gone quiet. Only touched when the module is already loaded - importing a
+        Flask app into a service that does not serve HTTP would be pure cost.
+        """
+        try:
+            import sys
+
+            webapp = sys.modules.get("web.webapp")
+            if webapp is None:
+                return 0
+            pruned = int(webapp._job_store_prune())
+            if pruned:
+                logger.info("web job store cleanup: dropped %d stale entr(ies)", pruned)
+            return pruned
+        except Exception:
+            logger.debug("cleanup: web job store prune unavailable")
+            return 0
+
     async def cleanup_s3_inputs(self) -> int:
-        """Clean old input files from S3 under the ``inputs/`` prefix."""
-        return await self._cleanup_s3_prefix("inputs/", self.s3_input_ttl)
+        """Clean old per-job input files from S3 under the ``inputs/`` prefix.
+
+        The shared library (``inputs/library/``) is excluded: it is a cache with
+        its own, longer TTL, and sweeping it here is what silently turned every
+        repeat of the same media back into a fresh download plus upload.
+        """
+        return await self._cleanup_s3_prefix(
+            "inputs/", self.s3_input_ttl, exclude_prefixes=(LIBRARY_KEY_PREFIX,)
+        )
+
+    async def cleanup_s3_library(self) -> int:
+        """Clean cached library objects older than ``S3_LIBRARY_TTL``.
+
+        One object per media, shared by every style/button applied to it. The
+        window is measured so the entry survives the normal burst of operations
+        on a media, then drops so the bucket is not a permanent archive.
+        """
+        return await self._cleanup_s3_prefix(LIBRARY_KEY_PREFIX, self.s3_library_ttl)
 
     async def cleanup_s3_uploads(self) -> int:
         """Clean old uploaded files from S3 under the ``uploads/`` prefix."""
@@ -173,8 +255,26 @@ class CleanupManager:
         """Clean old forward metadata files from S3 under the ``forwards/`` prefix."""
         return await self._cleanup_s3_prefix("forwards/", self.s3_forward_ttl)
 
-    async def _cleanup_s3_prefix(self, prefix: str, max_age_seconds: int) -> int:
-        """List objects under an S3 *prefix* and delete those older than *max_age_seconds*."""
+    async def cleanup_s3_outputs(self) -> int:
+        """Clean delivered results from S3 under the ``outputs/`` prefix.
+
+        Kept long enough to cover a job the user comes back for and any presigned
+        URL still in flight (``PRESIGN_EXPIRES`` is an hour by default), then
+        dropped. Without this the prefix only ever grew, so every result the bot
+        ever produced stayed in the bucket as an object something could later
+        download - which is exactly the egress this account was suspended over.
+        """
+        return await self._cleanup_s3_prefix("outputs/", self.s3_output_ttl)
+
+    async def _cleanup_s3_prefix(
+        self, prefix: str, max_age_seconds: int, exclude_prefixes: tuple[str, ...] = ()
+    ) -> int:
+        """List objects under an S3 *prefix* and delete those older than *max_age_seconds*.
+
+        Objects under any of *exclude_prefixes* are skipped: a caller sweeping a
+        broad prefix (``inputs/``) must not remove a nested prefix that has its
+        own lifecycle (``inputs/library/``).
+        """
         try:
             from utils.storage import get_storage_backend
 
@@ -190,7 +290,12 @@ class CleanupManager:
                 return 0
 
             now = time.time()
-            to_delete = [obj["key"] for obj in objects if (now - obj["last_modified"]) > max_age_seconds]
+            to_delete = [
+                obj["key"]
+                for obj in objects
+                if (now - obj["last_modified"]) > max_age_seconds
+                and not obj["key"].startswith(tuple(exclude_prefixes))
+            ]
 
             if not to_delete:
                 return 0
@@ -518,6 +623,8 @@ class CleanupManager:
 
         for item in os.listdir(temp_dir):
             item_path = os.path.join(temp_dir, item)
+            if os.path.isfile(item_path) and item in _PLACEHOLDER_FILES:
+                continue
             if os.path.isfile(item_path):
                 try:
                     file_age = current_time - os.path.getmtime(item_path)

@@ -33,6 +33,21 @@ except Exception:
 logger = logging.getLogger(__name__)
 
 
+def _shared_library_key(file_unique_id) -> str | None:
+    """The shared one-object-per-media storage key, or ``None`` when unavailable.
+
+    The bot's handlers derive this same key from the same ``file_unique_id``, so a
+    media that arrives as a forward and also reaches the bot directly is stored
+    once rather than twice, and a repeat of either route reuses that object.
+    """
+    try:
+        from utils.media_cache import shared_library_key
+
+        return shared_library_key(file_unique_id)
+    except Exception:
+        return None
+
+
 async def process_forward_hash(forward_hash: str):
     if not load_forward_metadata:
         logger.error("fetcher: forward_store not available")
@@ -95,7 +110,11 @@ async def process_forward_hash(forward_hash: str):
         if backend_name in ("s3", "r2") and get_storage_backend is not None:
             try:
                 backend = await get_storage_backend()
-                key = f"uploads/{job_uuid}_{os.path.basename(input_path)}"
+                # One object per media: the shared library key when the forward
+                # carries an identity, else the per-job `uploads/` key.
+                key = _shared_library_key(meta.get("file_unique_id")) or (
+                    f"uploads/{job_uuid}_{os.path.basename(input_path)}"
+                )
                 await backend.upload_file(input_path, key)
                 # remove local copy unless KEEP_LOCAL_UPLOADS set
                 if os.environ.get("KEEP_LOCAL_UPLOADS", "").lower() not in ("1", "true", "yes"):

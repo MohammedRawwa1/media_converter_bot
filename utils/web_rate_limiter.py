@@ -12,6 +12,7 @@ Usage:
 """
 
 import logging
+import os
 import threading
 import time
 
@@ -29,6 +30,16 @@ class WebRateLimiter:
         self._lock = threading.Lock()
         # buckets: {(endpoint, ip) -> (tokens, last_refill)}
         self.buckets: dict[tuple[str, str], tuple[float, float]] = {}
+        # A bucket is keyed by client, and every client we have never seen before
+        # mints a new one - and the client key comes from ``X-Forwarded-For``,
+        # which the caller supplies. So the map needs a bound or it grows forever:
+        # for a public endpoint that is every address that ever called it, and an
+        # attacker can choose the addresses. A bucket that has gone quiet holds
+        # nothing worth keeping (it starts full again the next time it is touched),
+        # so it is dropped on age, with a hard cap as the backstop for a burst of
+        # distinct clients that all arrive inside the TTL.
+        self.bucket_ttl = float(os.getenv("WEB_RATE_LIMIT_BUCKET_TTL", "600"))
+        self.max_buckets = max(16, int(os.getenv("WEB_RATE_LIMIT_MAX_BUCKETS", "10000")))
 
         # Default rate limits per endpoint (requests per second, burst capacity)
         self.endpoint_limits = {
@@ -76,10 +87,44 @@ class WebRateLimiter:
 
             if tokens >= 1.0:
                 self.buckets[key] = (tokens - 1.0, now)
-                return True
+                allowed = True
             else:
                 self.buckets[key] = (tokens, now)
-                return False
+                allowed = False
+
+            # Only when the map is at its cap, so the common request pays nothing
+            # for it: a full scan per admission would be the same as no limit.
+            if len(self.buckets) > self.max_buckets:
+                self._prune_buckets(now)
+            return allowed
+
+    def _prune_buckets(self, now: float) -> int:
+        """Drop buckets that have gone quiet; enforce the cap. Caller holds the lock.
+
+        Returns the number of buckets removed, for tests and diagnostics.
+        """
+        removed = 0
+        if self.bucket_ttl > 0:
+            cutoff = now - self.bucket_ttl
+            for stale in [k for k, (_tokens, last) in self.buckets.items() if last < cutoff]:
+                self.buckets.pop(stale, None)
+                removed += 1
+
+        # Still over the cap - a burst of distinct clients inside one TTL. Keep the
+        # most recently active half and drop the rest rather than evicting one per
+        # request, which would just re-scan on every call at the cap.
+        if len(self.buckets) > self.max_buckets:
+            keep = sorted(self.buckets.items(), key=lambda kv: kv[1][1], reverse=True)[
+                : self.max_buckets // 2
+            ]
+            removed += len(self.buckets) - len(keep)
+            self.buckets = dict(keep)
+        return removed
+
+    def prune(self) -> int:
+        """Drop idle buckets. Safe to call from a periodic task."""
+        with self._lock:
+            return self._prune_buckets(time.time())
 
     def get_retry_after(self, endpoint: str, client_ip: str = "global") -> float:
         """Get seconds until next token is available."""
