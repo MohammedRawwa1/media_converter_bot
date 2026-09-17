@@ -6,11 +6,13 @@ import json
 import logging
 import os
 import time
-from datetime import datetime
+from datetime import UTC, datetime
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto, Update
 from telegram.error import BadRequest
 from telegram.ext import ContextTypes, ConversationHandler
+
+from utils.time_utils import utc_iso
 
 # Try to import from local modules
 try:
@@ -1962,7 +1964,7 @@ class EnhancedMediaHandler:
             log_path = os.path.join(log_dir, "bad_callbacks.log")
 
             entry = {
-                "timestamp": datetime.utcnow().isoformat() + "Z",
+                "timestamp": utc_iso(),
                 "reason": reason,
                 "data": repr(data),
                 "user_id": user_id,
@@ -3896,7 +3898,7 @@ class EnhancedMediaHandler:
                 "name": current_file.get("name"),
                 "size": current_file.get("size"),
                 "type": current_file.get("type"),
-                "registered_at": datetime.utcnow().isoformat(),
+                "registered_at": utc_iso(),
             }
             fh = await save_forward_metadata(metadata)
             logger.info("Saved forward metadata id=%s for file_id=%s", fh, metadata.get("file_id"))
@@ -4919,7 +4921,8 @@ class EnhancedMediaHandler:
         else:
             # Telegram did not send a filename (common for gallery videos), so
             # use a readable timestamp instead of the old "<user>_<file_id>" blob.
-            default_name = f"video_{datetime.now().strftime('%Y%m%d_%H%M%S')}{ext}"
+            # UTC, so the name does not shift with the host's zone.
+            default_name = f"video_{datetime.now(UTC).strftime('%Y%m%d_%H%M%S')}{ext}"
         final_name = default_name
         thumb = None
         try:
@@ -5025,7 +5028,8 @@ class EnhancedMediaHandler:
         elif audio.title:
             default_name = audio.title
         else:
-            default_name = f"audio_{datetime.now().strftime('%Y%m%d_%H%M%S')}{ext}"
+            # UTC, so the name does not shift with the host's zone.
+            default_name = f"audio_{datetime.now(UTC).strftime('%Y%m%d_%H%M%S')}{ext}"
         final_name = default_name
         thumb = None
         try:
@@ -7139,7 +7143,7 @@ class EnhancedMediaHandler:
                             update_data = {"repr": repr(update)}
 
                         entry = {
-                            "timestamp": datetime.utcnow().isoformat() + "Z",
+                            "timestamp": utc_iso(),
                             "update_id": getattr(update, "update_id", None),
                             "callback_data": data,
                             "exception": repr(e),
@@ -7626,7 +7630,7 @@ class EnhancedMediaHandler:
         output_dir = getattr(config, "OUTPUT_PATH", "storage/output") if config else "storage/output"
         with contextlib.suppress(OSError):
             os.makedirs(output_dir, exist_ok=True)
-        output_path = os.path.join(output_dir, f"merged_{int(datetime.now().timestamp())}.mp4")
+        output_path = os.path.join(output_dir, f"merged_{int(datetime.now(UTC).timestamp())}.mp4")
         success = await self.converter.merge_videos(session["merge_list"], output_path)
         if success and os.path.exists(output_path):
             await self._send_video_result(
@@ -7666,16 +7670,16 @@ class EnhancedMediaHandler:
         output_dir = getattr(config, "OUTPUT_PATH", "storage/output") if config else "storage/output"
         with contextlib.suppress(OSError):
             os.makedirs(output_dir, exist_ok=True)
-        output_path = os.path.join(output_dir, f"merged_{int(datetime.now().timestamp())}.mp3")
+        output_path = os.path.join(output_dir, f"merged_{int(datetime.now(UTC).timestamp())}.mp3")
         success = await self.converter.merge_audios(session["merge_list"], output_path)
 
         if success and os.path.exists(output_path):
             # Use the first input's name as the base so the merge keeps a
             # recognisable (and streamable) audio filename.
             _first_name = session["current_file"].get("name") if session.get("current_file") else None
-            delivery_name = _audio_delivery_name(
-                _first_name or "Merged Audio", int(datetime.now().timestamp()), extension=".mp3"
-            )
+            # ``or "Merged Audio"`` already guarantees a non-empty name, so there is
+            # no empty stem for a fallback id to fill in.
+            delivery_name = _audio_delivery_name(_first_name or "Merged Audio", extension=".mp3")
             with open(output_path, "rb") as audio_file:
                 await context.bot.send_audio(
                     chat_id=update.effective_chat.id,
@@ -8877,7 +8881,7 @@ class EnhancedMediaHandler:
                     "file_name": file_info.get("name"),
                     "file_type": file_info.get("type"),
                     "file_size": file_info.get("size"),
-                    "timestamp": datetime.utcnow(),
+                    "timestamp": datetime.now(UTC),
                     "action": "upload",
                 }
 

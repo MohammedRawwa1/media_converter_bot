@@ -7,7 +7,7 @@ import os
 import shutil
 import subprocess
 from collections.abc import Callable
-from datetime import datetime
+from datetime import UTC, datetime
 
 try:
     import config
@@ -1349,7 +1349,17 @@ async def _download_with_telethon(
         if msg_date:
             try:
                 dt = datetime.fromisoformat(msg_date)
+                # Stored dates exist in two shapes: records written before the
+                # timezone cleanup are naive (``utcnow().isoformat()``) and newer
+                # ones are zone-suffixed. Both mean UTC, so pin the zone here
+                # instead of leaning on Telethon's own "naive means UTC" rule for
+                # ``offset_date`` - the instant must not depend on the host's
+                # local zone.
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=UTC)
             except Exception:
+                # Without this the date-scan fallback would just look unneeded.
+                logger.warning("userbot: unparseable msg_date %r; skipping the date-scan fallback", msg_date)
                 dt = None
             if dt is not None:
                 logger.debug("userbot: searching around date %s in %s", msg_date, target)

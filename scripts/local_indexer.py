@@ -9,7 +9,7 @@ Features:
 - Provide a small search CLI using a ranking heuristic.
 
 Requirements:
-- Python 3.8+
+- Python 3.12
 - `ffmpeg` / `ffprobe` available in PATH (optional: indexing still works without them).
 
 Usage examples:
@@ -24,9 +24,16 @@ import hashlib
 import json
 import re
 import subprocess
-from datetime import datetime
+import sys
 from pathlib import Path
 from typing import Any
+
+# Ensure project root is on sys.path so the local `utils` package is imported
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
+from utils.time_utils import utc_iso
 
 # --- Tokenizer (adapted from tg-index project notes) ---------------------------------
 _sep_re = re.compile(r"[\.\-_\[\]\(\)]+")
@@ -214,7 +221,7 @@ def make_id(path: Path) -> str:
 
 def save_index(index_path: Path, docs: list[dict[str, Any]]) -> None:
     payload = {
-        "generated_at": datetime.utcnow().isoformat() + "Z",
+        "generated_at": utc_iso(),
         "count": len(docs),
         "files": docs,
     }

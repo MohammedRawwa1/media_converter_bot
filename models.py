@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import logging
 import os
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 # Avoid importing pymongo at module import time; handle missing dependency
@@ -251,7 +251,7 @@ class MediaConversionModel(FillableModel):
         try:
             # Apply $fillable protection: strip non-fillable and guarded fields
             safe_data = self.filter_fillable(conversion_data)
-            safe_data["timestamp"] = datetime.utcnow()
+            safe_data["timestamp"] = datetime.now(UTC)
             if self.bot_id is not None:
                 safe_data["bot_id"] = self.bot_id
 
@@ -287,8 +287,8 @@ class MediaConversionModel(FillableModel):
                     "stats.total_input_size": conversion_data.get("input_size", 0),
                     "stats.total_output_size": conversion_data.get("output_size", 0),
                 },
-                "$set": {"last_activity": datetime.utcnow(), "username": conversion_data.get("username")},
-                "$setOnInsert": {"user_id": user_id, "first_seen": datetime.utcnow()},
+                "$set": {"last_activity": datetime.now(UTC), "username": conversion_data.get("username")},
+                "$setOnInsert": {"user_id": user_id, "first_seen": datetime.now(UTC)},
             }
             if self.bot_id is not None:
                 update_data.setdefault("$setOnInsert", {})["bot_id"] = self.bot_id
@@ -301,7 +301,7 @@ class MediaConversionModel(FillableModel):
     async def _update_daily_stats(self, conversion_data: dict[str, Any]):
         """Update daily statistics (parameterized via QueryBuilder)."""
         try:
-            today = datetime.utcnow().date().isoformat()
+            today = datetime.now(UTC).date().isoformat()
             action = conversion_data.get("action")
 
             update_data = {
@@ -374,7 +374,7 @@ class MediaConversionModel(FillableModel):
         """Get daily statistics."""
         try:
             if not date:
-                date = datetime.utcnow().date().isoformat()
+                date = datetime.now(UTC).date().isoformat()
 
             query = {"date": date}
             if self.bot_id is not None:
@@ -437,7 +437,7 @@ class MediaConversionModel(FillableModel):
         deployments.
         """
         try:
-            set_fields = {"updated_at": datetime.utcnow()}
+            set_fields = {"updated_at": datetime.now(UTC)}
             for key, value in session_data.items():
                 set_fields[f"session.{key}"] = value
             query = {"user_id": user_id}
@@ -548,7 +548,7 @@ class MediaConversionModel(FillableModel):
         try:
             # Apply $fillable protection
             safe_data = self.filter_fillable(activity)
-            safe_data.setdefault("created_at", datetime.utcnow())
+            safe_data.setdefault("created_at", datetime.now(UTC))
             safe_data.setdefault("status", "pending")
             if self.bot_id is not None:
                 safe_data["bot_id"] = self.bot_id
@@ -562,7 +562,7 @@ class MediaConversionModel(FillableModel):
         """Return activities with run_at <= upto and status pending."""
         try:
             if upto is None:
-                upto = datetime.utcnow()
+                upto = datetime.now(UTC)
             query = {"run_at": {"$lte": upto}, "status": "pending"}
             if self.bot_id is not None:
                 query["bot_id"] = self.bot_id
@@ -576,7 +576,7 @@ class MediaConversionModel(FillableModel):
         """Mark a scheduled activity as done (delete or set status=done)."""
         try:
             query = {"_id": ObjectId(activity_id)} if ObjectId is not None else {"_id": activity_id}
-            await self.schedules.update(query, {"$set": {"status": "done", "finished_at": datetime.utcnow()}})
+            await self.schedules.update(query, {"$set": {"status": "done", "finished_at": datetime.now(UTC)}})
             return True
         except Exception as e:
             logger.error("Error marking activity done %s: %s", activity_id, e)
@@ -684,7 +684,7 @@ class MediaConversionModel(FillableModel):
             fields = {k: v for k, v in dict(entry).items() if v is not None}
             fields.pop("_id", None)
             fields["file_unique_id"] = file_unique_id
-            fields["updated_at"] = datetime.utcnow()
+            fields["updated_at"] = datetime.now(UTC)
             if self.bot_id is not None:
                 fields["bot_id"] = self.bot_id
             await self.media_registry.update(
@@ -737,7 +737,7 @@ class MediaConversionModel(FillableModel):
             fields = {k: v for k, v in dict(entry).items() if v is not None}
             fields.pop("_id", None)
             fields["cache_key"] = cache_key
-            fields["updated_at"] = datetime.utcnow()
+            fields["updated_at"] = datetime.now(UTC)
             if self.bot_id is not None:
                 fields["bot_id"] = self.bot_id
             await self.file_id_registry.update(
@@ -768,8 +768,13 @@ class MediaConversionModel(FillableModel):
             return None
         doc.pop("_id", None)
         expires_at = doc.get("expires_at")
-        if isinstance(expires_at, datetime) and expires_at <= datetime.utcnow():
-            return None
+        if isinstance(expires_at, datetime):
+            # BSON dates come back naive (UTC), and a caller may hand in one that
+            # is already aware, so settle the zone before comparing.
+            if expires_at.tzinfo is None:
+                expires_at = expires_at.replace(tzinfo=UTC)
+            if expires_at <= datetime.now(UTC):
+                return None
         return doc or None
 
     async def forget_file_id(self, cache_key: str) -> bool:
@@ -786,7 +791,7 @@ class MediaConversionModel(FillableModel):
     async def cleanup_old_data(self, days: int = 30) -> int:
         """Clean up data older than specified days."""
         try:
-            cutoff_date = datetime.utcnow() - timedelta(days=days)
+            cutoff_date = datetime.now(UTC) - timedelta(days=days)
 
             # Delete old conversions
             query = {"timestamp": {"$lt": cutoff_date}}

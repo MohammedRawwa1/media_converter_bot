@@ -3,7 +3,6 @@ import json
 import os
 import re
 import uuid
-from datetime import datetime
 
 try:
     import config
@@ -12,6 +11,8 @@ except Exception:
 
 import contextlib
 import logging
+
+from utils.time_utils import utc_iso
 
 from .storage import get_storage_backend, get_storage_backend_sync
 
@@ -110,7 +111,7 @@ async def save_forward_metadata(metadata: dict) -> str:
     """
     fid = uuid.uuid4().hex
     data = dict(metadata)
-    data.setdefault("created_at", datetime.utcnow().isoformat())
+    data.setdefault("created_at", utc_iso())
 
     backend_name = config.get_storage_backend_name() if config else (os.getenv("STORAGE_BACKEND") or "local").lower()
     key = f"forwards/{fid}.json"

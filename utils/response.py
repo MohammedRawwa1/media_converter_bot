@@ -26,8 +26,9 @@ Usage:
 from __future__ import annotations
 
 import logging
-from datetime import datetime
 from typing import Any
+
+from utils.time_utils import utc_iso
 
 logger = logging.getLogger(__name__)
 
@@ -49,7 +50,7 @@ def ok(
         "ok": True,
         "message": message,
         "data": data,
-        "timestamp": datetime.utcnow().isoformat() + "Z",
+        "timestamp": utc_iso(),
     }
     if meta:
         body["meta"] = meta
@@ -80,7 +81,7 @@ def error(
             "status": status,
         },
         "data": None,
-        "timestamp": datetime.utcnow().isoformat() + "Z",
+        "timestamp": utc_iso(),
     }
     if details:
         body["error"]["details"] = details
@@ -112,7 +113,7 @@ def paginated(
             "has_next": page < total_pages,
             "has_prev": page > 1,
         },
-        "timestamp": datetime.utcnow().isoformat() + "Z",
+        "timestamp": utc_iso(),
     }
     return body
 

@@ -7,6 +7,7 @@ these run without any service.
 """
 
 import asyncio
+from datetime import UTC, datetime
 
 import pytest
 from source_helpers import read_source
@@ -354,10 +355,25 @@ class _FakeCollection:
                 return filters[field]
         raise KeyError(f"no known key field in {filters}")
 
+    @staticmethod
+    def _as_bson(value):
+        """What the driver hands back for a value that went into BSON.
+
+        A datetime is stored as the instant plus a zone *in the index*, but
+        PyMongo decodes it to a **naive** datetime by default. Keeping the aware
+        value here would let these tests compare two aware datetimes - a
+        comparison the real driver never gets to make, and one that hides a zone
+        mismatch rather than exposing it.
+        """
+        if isinstance(value, datetime) and value.tzinfo is not None:
+            return value.astimezone(UTC).replace(tzinfo=None)
+        return value
+
     async def update_one(self, flt, upd, upsert=False):
         if self.fail_update:
             raise RuntimeError("mongo down")
-        self.docs.setdefault(self._doc_key(flt), {}).update(upd["$set"])
+        stored = {field: self._as_bson(value) for field, value in upd["$set"].items()}
+        self.docs.setdefault(self._doc_key(flt), {}).update(stored)
         return _FakeUpdateResult()
 
     def find(self, flt, projection=None):

@@ -49,8 +49,6 @@ from __future__ import annotations
 
 import contextlib
 import datetime
-
-_NOW_UTC = datetime.datetime.now(tz=datetime.timezone.utc)
 import hashlib
 import logging
 import os
@@ -140,8 +138,11 @@ async def _durable_set(media_type: str, content_identity: str, file_id: str, ttl
         "content_identity": content_identity,
         "file_id": file_id,
         # The document's own expiry, so the registry honors the TTL the caller
-        # passed instead of a single collection-wide one.
-        "expires_at": _NOW_UTC + datetime.timedelta(seconds=max(1, int(ttl))),
+        # passed instead of a single collection-wide one. Read the clock here
+        # rather than at import: a long-running process would otherwise stamp
+        # every entry with a deadline relative to startup, which is already in
+        # the past once the bot has been up longer than the TTL.
+        "expires_at": datetime.datetime.now(tz=datetime.UTC) + datetime.timedelta(seconds=max(1, int(ttl))),
     }
     try:
         return bool(await model.remember_file_id(registry_key(media_type, content_identity), entry))
@@ -319,7 +320,9 @@ async def store_file_id(
     if client is not None:
         try:
             await client.set(key, file_id, ttl=use_ttl)
-            logger.debug("file_id_cache: stored file_id for %s/%s (TTL=%ss)", media_type, content_identity[:16], use_ttl)
+            logger.debug(
+                "file_id_cache: stored file_id for %s/%s (TTL=%ss)", media_type, content_identity[:16], use_ttl
+            )
             stored = True
         except Exception:
             logger.debug("file_id_cache: failed to store file_id for %s", key)

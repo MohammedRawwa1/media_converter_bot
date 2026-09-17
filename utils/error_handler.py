@@ -8,9 +8,10 @@ import asyncio
 import logging
 import traceback
 from collections.abc import Callable
-from datetime import datetime
 from functools import wraps
 from typing import Any
+
+from utils.time_utils import utc_iso
 
 logger = logging.getLogger(__name__)
 
@@ -90,7 +91,8 @@ class BotErrorHandler:
         Returns:
             Dictionary with error details and user message
         """
-        timestamp = datetime.now().isoformat()
+        # Z-suffixed UTC, not the bare local-time string this used to emit.
+        timestamp = utc_iso()
         error_category = self.categorize_error(exception, context)
         user_message = self.get_user_friendly_message(error_category)
 

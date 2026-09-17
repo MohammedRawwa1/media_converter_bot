@@ -8,10 +8,12 @@ import contextlib
 import logging
 import os
 import time
-from datetime import datetime
+from datetime import UTC, datetime
 from urllib.parse import urlparse
 
 import aiohttp
+
+from utils.time_utils import utc_iso
 
 logger = logging.getLogger(__name__)
 
@@ -88,7 +90,7 @@ class WebhookMonitor:
                             raise
 
                     self.check_count += 1
-                    self.last_check = datetime.now()
+                    self.last_check = datetime.now(UTC)
                     self.last_status_code = status
                     if status in (200, 404, 405):
                         self.is_healthy = True
@@ -122,7 +124,7 @@ class WebhookMonitor:
                             raise
 
                     self.check_count += 1
-                    self.last_check = datetime.now()
+                    self.last_check = datetime.now(UTC)
                     self.last_status_code = status
                     # Healthy responses (allow 200/404/405 as acceptable for probes)
                     if status in (200, 404, 405):
@@ -276,7 +278,7 @@ class WebhookMonitor:
         return {
             "healthy": self.is_healthy,
             "url": self.webhook_url,
-            "last_check": self.last_check.isoformat() if self.last_check else None,
+            "last_check": utc_iso(self.last_check) if self.last_check else None,
             "total_checks": self.check_count,
             "failed_checks": self.failed_checks,
             "consecutive_failures": self.consecutive_failures,

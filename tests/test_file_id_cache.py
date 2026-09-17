@@ -647,6 +647,17 @@ def _use_redis(monkeypatch, redis):
     return redis
 
 
+def _utcnow_naive() -> datetime.datetime:
+    """The shape a datetime has once BSON has round-tripped it.
+
+    The registry writes an aware UTC deadline; PyMongo stores the instant and
+    reads it back with no zone attached. Test deadlines have to be naive for the
+    same reason the stored ones are, or the comparison under test is not the one
+    that runs in production.
+    """
+    return datetime.datetime.now(datetime.UTC).replace(tzinfo=None)
+
+
 def test_a_redis_miss_is_not_believed_when_mongo_knows_the_file_id(monkeypatch):
     model = _use_model(monkeypatch, _registry_model(monkeypatch))
     redis = _use_redis(monkeypatch, _FakeRedis())
@@ -704,10 +715,12 @@ def test_the_document_carries_the_callers_own_deadline(monkeypatch):
     model = _use_model(monkeypatch, _registry_model(monkeypatch))
     _use_redis(monkeypatch, _FakeRedis())
 
-    now = datetime.datetime.now(datetime.timezone.utc)
+    now = _utcnow_naive()
     asyncio.run(file_id_cache.store_file_id("video", "tg_id", file_unique_id="UID3", ttl=600))
 
     expires_at = model._file_id_registry_coll.docs[file_id_cache.registry_key("video", "uid:UID3")]["expires_at"]
+    # BSON dropped the zone on the way in, exactly as the real driver would.
+    assert expires_at.tzinfo is None
     assert now + datetime.timedelta(seconds=590) <= expires_at <= now + datetime.timedelta(seconds=610)
 
 
@@ -726,7 +739,7 @@ def test_invalidate_clears_both_tiers(monkeypatch):
 
 def test_the_registry_can_be_switched_off(monkeypatch):
     model = _use_model(monkeypatch, _registry_model(monkeypatch))
-    redis = _use_redis(monkeypatch, _FakeRedis())
+    _use_redis(monkeypatch, _FakeRedis())
     asyncio.run(
         model.remember_file_id(
             file_id_cache.registry_key("video", "uid:OFF"),
@@ -748,7 +761,7 @@ def test_an_expired_document_is_reported_as_missing(monkeypatch):
     asyncio.run(
         model.remember_file_id(
             key,
-            {"file_id": "stale", "expires_at": datetime.datetime.utcnow() - datetime.timedelta(hours=1)},
+            {"file_id": "stale", "expires_at": _utcnow_naive() - datetime.timedelta(hours=1)},
         )
     )
     assert asyncio.run(model.lookup_file_id(key)) is None
@@ -756,7 +769,7 @@ def test_an_expired_document_is_reported_as_missing(monkeypatch):
     asyncio.run(
         model.remember_file_id(
             key,
-            {"file_id": "live", "expires_at": datetime.datetime.utcnow() + datetime.timedelta(hours=1)},
+            {"file_id": "live", "expires_at": _utcnow_naive() + datetime.timedelta(hours=1)},
         )
     )
     assert asyncio.run(model.lookup_file_id(key))["file_id"] == "live"
@@ -777,9 +790,7 @@ def test_the_file_id_registry_is_indexed(monkeypatch):
 
 
 def test_telegram_refusals_are_recognised():
-    assert file_id_cache.is_stale_file_id(
-        Exception("Bad Request: wrong file identifier/HTTP URL specified")
-    )
+    assert file_id_cache.is_stale_file_id(Exception("Bad Request: wrong file identifier/HTTP URL specified"))
     assert file_id_cache.is_stale_file_id(Exception("[400 FILE_REFERENCE_EXPIRED]"))
     assert file_id_cache.is_stale_file_id(Exception("Bad Request: file not found"))
 
