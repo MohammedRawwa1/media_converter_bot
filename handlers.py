@@ -2892,10 +2892,18 @@ class EnhancedMediaHandler:
                     _key_ok = True
                     try:
                         from utils.storage import get_storage_backend as _gsb_check
+                        from utils.storage import stored_object_is_intact as _stored_object_is_intact
 
                         _check_backend = await _gsb_check()
                         if _check_backend is not None:
-                            _key_ok = await _check_backend.exists(_stored_key)
+                            # Existence *and* size, both from a HEAD: the cached
+                            # object is validated before the descriptor is
+                            # trusted, so a swept (or replaced) object is a miss
+                            # rather than a job handed the wrong bytes. No
+                            # bytes leave the bucket to find that out.
+                            _key_ok = await _stored_object_is_intact(
+                                _check_backend, _stored_key, expected_size=_expected
+                            )
                     except Exception:
                         # Conservatively treat an unchecked key as valid, matching
                         # the stale-key guard elsewhere in this function.
@@ -3702,7 +3710,13 @@ class EnhancedMediaHandler:
                     if _stored_key:
                         _stored_ok = True
                         try:
-                            _stored_ok = await _backend.exists(_stored_key)
+                            # Validate before trusting the descriptor: existence
+                            # plus the stored size, both metadata-only.
+                            from utils.storage import stored_object_is_intact as _stored_object_is_intact
+
+                            _stored_ok = await _stored_object_is_intact(
+                                _backend, _stored_key, expected_size=current_file.get("size")
+                            )
                         except Exception:
                             _stored_ok = True
                         if _stored_ok:
@@ -3772,6 +3786,10 @@ class EnhancedMediaHandler:
                         # a later step forward the media inside Telegram instead
                         # of fetching it down to this box again.
                         file_id=current_file.get("id"),
+                        # The probe verdict from just above, so a repeat that is
+                        # answered from the cache still describes the media (the
+                        # caption's duration/codecs, the audio tags).
+                        source_meta=_source_meta or None,
                     )
             except Exception:
                 logger.debug("handlers: failed to remember remote media in cache")

@@ -251,6 +251,44 @@ def _job_source_bytes(job: dict) -> int:
         return 0
 
 
+async def _stored_source_for_job(job: dict) -> str | None:
+    """A validated whole-object key for this job's media, when one exists.
+
+    A ``header``-mode job is handed no object at all - the media is meant to come
+    from Telegram - so when that copy is unreadable (a relay copy that was pruned,
+    or a forward that failed and left coordinates a userbot cannot reach) there is
+    nothing on the job itself left to fall back to. The media registry is keyed on
+    the Telegram identity, which the job does carry, so it can still name a stored
+    copy: any producer may have written this media whole - the Bot-API path,
+    ``full``/``stream`` mode, or a promote-on-repeat.
+
+    Only an object that still exists *and* matches the job's recorded size is
+    adopted. A stale descriptor must not turn into a job fed the wrong bytes, so
+    the same evidence rules apply here as in the ingest gate.
+    """
+    file_unique_id = job.get("file_unique_id")
+    if not file_unique_id or get_storage_backend is None:
+        return None
+    expected = _job_source_bytes(job) or None
+    try:
+        from utils import media_cache
+        from utils.storage import stored_object_is_intact
+
+        entry = await media_cache.lookup(file_unique_id, expected_size=expected)
+        key = (entry or {}).get("input_key")
+        if not key:
+            return None
+        backend = await get_storage_backend()
+        if backend is None:
+            return None
+        if not await stored_object_is_intact(backend, key, expected_size=expected):
+            return None
+    except Exception:
+        logger.debug("ffmpeg worker: no stored copy to recover for job %s", job.get("job_id"))
+        return None
+    return key
+
+
 async def _check_upload_cancelled(job_id: str) -> bool:
     """Quick Redis check: return True if this job has been cancelled."""
     if not job_id:
@@ -1371,6 +1409,24 @@ async def handle_job(job: dict):
                     exc_info=True,
                 )
 
+    # ── Recover from the cache: the media may live under another name ──
+    # A header job carries no source object, so an unreadable Telegram copy used
+    # to be the end of it even when a stored copy of the same media existed - one
+    # written by a promote-on-repeat, by ``full``/``stream`` mode, or by the
+    # Bot-API path. The registry is keyed on the Telegram identity rather than on
+    # the job, which is what lets this run find those bytes. Adopting the key is
+    # all that is needed: the storage path below does the rest (HEAD pre-flight,
+    # shared local cache, atomic download).
+    if not input_key and (not input_path or not os.path.exists(input_path)):
+        _recovered_key = await _stored_source_for_job(job)
+        if _recovered_key:
+            input_key = _recovered_key
+            logger.info(
+                "Job %s: the Telegram copy was not readable; recovering the media from storage (%s)",
+                job_id,
+                _recovered_key,
+            )
+
     if input_key and (not input_path or not os.path.exists(input_path)):
         # ── Shared source cache ──
         # One media is one library object, and every operation on it resolves to
@@ -1724,7 +1780,8 @@ async def handle_job(job: dict):
             # TTL, so its watchdog never showed the failure and a bulk apply waited
             # out its whole job budget for a member that was already over.
             _fetch_error = (
-                "the source is not on this worker and could not be read from Telegram"
+                "the source could not be found: no local copy, unreadable on Telegram, "
+                "and no stored copy to recover it from"
                 if str(job.get("input_header_only") or "").strip().lower() in ("1", "true", "yes", "on")
                 else "could not fetch the source from storage"
             )

@@ -164,6 +164,18 @@ def test_library_prefix_is_shared_with_the_cache_module():
     assert cleanup_mod.LIBRARY_KEY_PREFIX == media_cache.LIBRARY_KEY_PREFIX
 
 
+def test_the_library_outlives_a_week_by_default(monkeypatch):
+    """A media re-submitted weeks later must still be a hit, not a re-download.
+
+    Expiring the shared object is the expensive side of the trade: the next
+    request then pays a full copy of the media in egress plus the upload, while
+    keeping it is one stored copy.
+    """
+    monkeypatch.delenv("S3_LIBRARY_TTL", raising=False)
+    manager = cleanup_mod.CleanupManager()
+    assert manager.s3_library_ttl >= 30 * 24 * 3600
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Audio tags on delivery
 # ─────────────────────────────────────────────────────────────────────────────

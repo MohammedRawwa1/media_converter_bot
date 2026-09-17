@@ -545,6 +545,46 @@ class AsyncStorageBackend(ABC):
         raise NotImplementedError("storage usage is not supported by this backend")
 
 
+async def stored_object_is_intact(
+    backend: AsyncStorageBackend, key: str | None, *, expected_size: int | None = None
+) -> bool:
+    """Cache evidence: is *key* actually in storage and the media we expect?
+
+    The two questions a reuse decision has to answer before it can skip a
+    Telegram download, and both are answered from metadata - a HEAD, never a
+    body read - so validating a cached object costs no egress:
+
+    * does the object still exist (a lifecycle rule or a sweep may have taken it),
+    * and when the expected size is known, is it the *same* media (a stored size
+      that disagrees is a different file that merely shared an id).
+
+    Deliberately forgiving: a backend that cannot report a size, or one that
+    errors on the probe, is treated as intact. The consequence of being wrong
+    here is one download; the consequence of a false negative is exactly the
+    re-download this gate exists to prevent, so the unknown must not read as a
+    miss.
+    """
+    if not key:
+        return False
+    try:
+        if not await backend.exists(key):
+            return False
+    except Exception:
+        return True
+    if not expected_size:
+        return True
+    try:
+        stored_size = await backend.get_file_size(key)
+    except Exception:
+        stored_size = None
+    if stored_size is None:
+        return True
+    try:
+        return int(stored_size) == int(expected_size)
+    except (TypeError, ValueError):
+        return True
+
+
 def _env_int(name: str, default: int) -> int:
     """Read an int env var, tolerating unset/empty/garbage values."""
     try:

@@ -137,11 +137,18 @@ def test_a_finished_job_forgets_its_throttle_state(eventbus_env):
 def test_throttle_state_does_not_grow_without_bound(eventbus_env):
     producer = FakeProducer()
     bus = _bus(eventbus_env, producer, KAFKA_EMIT_PROGRESS_EVENTS="true", KAFKA_PROGRESS_MIN_INTERVAL_MS=0)
-    for index in range(5200):
-        # Clock advances 10s per job, so old entries become prunable.
-        asyncio.run(
-            bus.emit_progress(messages.new_event(messages.JOB_PROGRESS, job_id=f"job-{index}"), now=1000.0 + index * 10)
-        )
+
+    async def _emit_many():
+        # One event loop for the whole run. This used to be one asyncio.run() per
+        # event, so most of the test's time went into 5,200 loop setups rather
+        # than into the pruning it is about.
+        for index in range(5200):
+            # Clock advances 10s per job, so old entries become prunable.
+            await bus.emit_progress(
+                messages.new_event(messages.JOB_PROGRESS, job_id=f"job-{index}"), now=1000.0 + index * 10
+            )
+
+    asyncio.run(_emit_many())
     # The map is pruned once it grows past its cap, keeping a long-running
     # worker's memory flat instead of accumulating one entry per job it has seen.
     assert len(bus._progress_seen) < 1000, len(bus._progress_seen)

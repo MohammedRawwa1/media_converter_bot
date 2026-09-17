@@ -192,6 +192,14 @@ def test_a_failed_download_records_nothing(monkeypatch, tmp_path):
     fake_boto3 = type("FakeBoto3", (), {"client": staticmethod(lambda *a, **k: _Broken())})
     monkeypatch.setattr(storage, "boto3", fake_boto3)
 
+    # The retry loop still runs all its attempts (that is worth covering), but
+    # without the waits: the backoff is not what this test is about, and three
+    # attempts' worth of it costs several seconds per run.
+    async def _instant(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(storage.asyncio, "sleep", _instant)
+
     backend = storage.S3AsyncBackend(bucket="a-bucket", endpoint_url="https://example.invalid")
     backend._use_aioboto3 = False
     backend._boto_config = None

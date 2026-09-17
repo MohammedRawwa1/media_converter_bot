@@ -68,7 +68,10 @@ def test_the_reuse_path_still_short_circuits_on_a_stored_key():
     """Keeping the tags must not have turned the reuse into a download."""
     src = read_source(*HANDLERS)
     assert 'current_file["input_key"] = _stored_key' in src
-    assert "_stored_ok = await _backend.exists(_stored_key)" in src
+    # The gate validates the object (existence + stored size) before it
+    # short-circuits, and still metadata-only, so the reuse costs no egress.
+    assert "_stored_ok = await _stored_object_is_intact(" in src
+    assert 'expected_size=current_file.get("size")' in src
 
 
 # ── the batch path must consult the per-file tags ───────────────────────

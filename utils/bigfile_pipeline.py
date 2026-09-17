@@ -85,12 +85,41 @@ if PIPELINE_SOURCE_UPLOAD not in ("header", "full", "local", "stream"):
     PIPELINE_SOURCE_UPLOAD = "header"
 PIPELINE_HEADER_BYTES = _env_positive_int("PIPELINE_HEADER_BYTES", 2 * 1024 * 1024)
 
+# Promote on repeat: a media whose first ingest stored only a probe header gets
+# its whole object written the *second* time it is requested. The first request
+# then costs 2 MB of storage and nothing else, and only media that actually come
+# back pay for a whole copy - which is the trade `header` mode exists to keep
+# open. Once promoted, every later request is served from the bucket by the same
+# validation gate, so the media stops being read over Telegram once per job.
+# `PIPELINE_PROMOTE_ON_REPEAT=0` restores pure header behaviour: evidence only,
+# every job reads the media over Telegram.
+PIPELINE_PROMOTE_ON_REPEAT_ENV = "PIPELINE_PROMOTE_ON_REPEAT"
+
+
+def _promote_on_repeat() -> bool:
+    """Whether a repeat of a header-only media is promoted to a whole object.
+
+    Read at call time rather than import, so a deployment can flip the switch
+    without a code change and both branches stay reachable in the tests.
+    """
+    value = (os.getenv(PIPELINE_PROMOTE_ON_REPEAT_ENV) or "").strip().lower()
+    if not value:
+        return True
+    return value not in ("0", "false", "no", "off")
+
+
 # Files up to this size (200MB) get streamed through memory instead of temp disk
 # Imports — all guarded for optional dependencies
 try:
-    from utils.storage import get_storage_backend
+    from utils.storage import get_storage_backend, stored_object_is_intact
+
 except Exception:
     get_storage_backend = None
+
+    async def stored_object_is_intact(*_args, **_kwargs):  # pragma: no cover - storage is absent
+        """No storage means there is nothing to validate against."""
+        return False
+
 
 try:
     from utils.cache import get_cache
@@ -272,45 +301,114 @@ class BigFilePipeline:
         # file maps to the same object and can be reused instead of downloaded
         # from Telegram and uploaded again.
         _library_key = media_cache.media_library_key(file_unique_id) if file_unique_id else None
-        # Only a whole object can be shared between jobs. A header is a probe
-        # reference, not a source, so `header`/`local` runs keep the media
-        # library out of it entirely. `stream` stores a whole object too, so it
+        # Only a whole object can be shared between jobs as a *source*. A header
+        # is a probe reference, not a source, so `header`/`local` runs keep the
+        # whole-media library out of it entirely (their probe header still gets a
+        # content-addressed key below). `stream` stores a whole object too, so it
         # gets the same shared key - the media only ever has to leave Telegram
         # once, whichever job asked for it first.
         _shared_input = bool(
             _library_key and media_cache.cache_enabled() and PIPELINE_SOURCE_UPLOAD in ("full", "stream")
         )
         input_s3_key = _library_key if _shared_input else f"inputs/{job_id}/source"
+        # The probe header is content-addressed as well whenever the media has an
+        # identity: one small object per media, at the same place the README
+        # documents, instead of a per-job slice nobody can ever find again. That
+        # is what makes "we have seen this media before" provable on a repeat -
+        # the descriptor points at it, and existence plus a ranged read is the
+        # evidence. A run without an identity keeps the per-job fallback key.
+        _header_key = _header_object_key(_library_key) if _library_key and media_cache.cache_enabled() else None
 
         actual_size = 0
         s3_key = input_s3_key
         _reused = False
+        _reuse_reason = None
+        _local_reuse_path = None
+        # Set by the gate below: this run re-fetches the media in order to store
+        # it whole, rather than only proving it was seen before.
+        _promote = False
         _bytes_hit = False
         _source_meta_fields = {}
         # The raw probe (title/performer included), carried out to the caller.
         _source_meta_raw: dict = {}
 
-        # ── Reuse a media that already entered the pipe ──
-        # Same file_unique_id AND same byte size => the earlier input is still
-        # the right one, so skip Pyrogram entirely.
+        # ── Validate before downloading ──
+        # Same file_unique_id AND same byte size => the earlier copy is still the
+        # right one, so Pyrogram is skipped entirely. Every tier is validated
+        # against storage first (existence, and the stored size when the backend
+        # can report it), because a descriptor whose object was swept or replaced
+        # is worse than a miss: it would hand the job the wrong bytes.
+        #
+        #   1. a whole object  (``full``/``stream``)  -> served from the bucket
+        #   2. a local copy    (``REUSE_LOCAL_INPUT``) -> read off this disk
+        #   3. a probe header  (``header``)            -> proof the ingest already
+        #      ran, so only the worker's own single read is left - the pipeline no
+        #      longer downloads the whole file a second time just to prove it was
+        #      here. A header is never handed over as a source. On a *repeat* it
+        #      instead promotes the media (see PIPELINE_PROMOTE_ON_REPEAT): the
+        #      second request is where a whole object starts paying for itself,
+        #      because from then on no job has to read Telegram.
         if media_cache.cache_enabled() and file_unique_id:
             _entry = await media_cache.lookup(file_unique_id, expected_size=file_size)
-            if _entry and _entry.get("input_key") and self._storage is not None:
-                with contextlib.suppress(Exception):
-                    if await self._storage.exists(_entry["input_key"]):
-                        s3_key = _entry["input_key"]
-                        actual_size = int(_entry.get("size") or file_size or 0)
-                        _reused = True
-            elif _entry and _entry.get("path") and self._storage is None and os.path.exists(_entry["path"]):
-                s3_key = _entry["path"]
+            _stored_key = (_entry or {}).get("input_key")
+            if _stored_key and self._storage is not None:
+                if await stored_object_is_intact(self._storage, _stored_key, expected_size=file_size):
+                    s3_key = _stored_key
+                    actual_size = int(_entry.get("size") or file_size or 0)
+                    _reused = True
+                    _reuse_reason = "stored source"
+            elif _stored_key and self._storage is None and os.path.exists(_stored_key):
+                s3_key = _stored_key
                 actual_size = int(_entry.get("size") or file_size or 0)
                 _reused = True
+                _reuse_reason = "stored source"
+            if not _reused:
+                _stored_path = (_entry or {}).get("path")
+                if _stored_path and os.path.exists(_stored_path):
+                    _local_reuse_path = _stored_path
+                    # No *validated* storage object backs this run, so the job
+                    # must not carry a key that may not exist: the path travels
+                    # as ``input_path`` and Telegram stays the fallback.
+                    s3_key = None
+                    actual_size = int(_entry.get("size") or file_size or 0)
+                    _reused = True
+                    _reuse_reason = "local copy"
+            if not _reused and self._storage is not None:
+                _stored_header = (_entry or {}).get("header_key")
+                if _stored_header and await stored_object_is_intact(self._storage, _stored_header):
+                    actual_size = int(_entry.get("size") or file_size or 0)
+                    if PIPELINE_SOURCE_UPLOAD == "header" and _library_key and _promote_on_repeat():
+                        # Second request for this media: download it once more and
+                        # store the whole object, so every later request (and
+                        # every style applied to it) is a bucket read instead of
+                        # a Telegram read. This is the only repeat that pays for
+                        # the media; the header stays as the evidence it was.
+                        _promote = True
+                        logger.info(
+                            "Job %s: %s came back - promoting it to a whole shared object at %s",
+                            job_id,
+                            file_unique_id,
+                            _library_key,
+                        )
+                    else:
+                        s3_key = None
+                        _reused = True
+                        _reuse_reason = "probe header"
             if _reused:
+                # The ingest's own probe verdict travels with the descriptor: a
+                # repeat must not lose the caption's duration/codecs/title just
+                # because the download it used to do is gone. A descriptor that
+                # somehow carries no verdict simply leaves the worker to probe.
+                _cached_meta = (_entry or {}).get("source_meta")
+                _source_meta = dict(_cached_meta) if isinstance(_cached_meta, dict) else {}
+                _source_meta_raw = dict(_source_meta)
+                _source_meta_fields = _flatten_source_meta(_source_meta)
                 logger.info(
-                    "BigFilePipeline: media cache HIT for %s (%dMB) - reusing %s",
+                    "Job %s: media cache HIT (%s) for %s (%dMB) - no Telegram download",
+                    job_id,
+                    _reuse_reason,
                     file_unique_id,
                     actual_size // (1024 * 1024),
-                    s3_key,
                 )
 
         # ── Byte cache (small media): skips Pyrogram even when the storage
@@ -464,8 +562,17 @@ class BigFilePipeline:
             _upload_enabled = self._storage is not None and PIPELINE_SOURCE_UPLOAD != "local"
             try:
                 if _upload_enabled:
-                    _stored_key = _header_object_key(input_s3_key) if _header_only else input_s3_key
-                    if _header_only:
+                    # What this run stores:
+                    #   a promoted repeat -> the shared whole-object key
+                    #   a header-only run -> the content-addressed probe header
+                    #   anything else     -> this run's own key (a whole object)
+                    if _promote and _library_key:
+                        _stored_key = _library_key
+                    elif _header_only:
+                        _stored_key = _header_key or _header_object_key(input_s3_key)
+                    else:
+                        _stored_key = input_s3_key
+                    if _header_only and not _promote:
                         _head = _read_head_bytes(temp_path, PIPELINE_HEADER_BYTES)
                         await self._storage.upload_bytes(_head, _stored_key)
                         # Deliberately *not* reported as this job's storage key:
@@ -485,10 +592,25 @@ class BigFilePipeline:
                         s3_key = _stored_key
                         logger.info("BigFilePipeline: S3 upload complete")
 
-                    # Only a whole object may be handed to a future job as a
-                    # reusable source. A header entry would let the reuse path
-                    # answer "already have it" with two megabytes of container.
-                    if not _header_only:
+                    # The descriptor is written in every mode, and it is what the
+                    # next submission's validation gate reads. Only a whole object
+                    # is handed over as ``input_key``: a header goes in
+                    # ``header_key``, so it proves the media was already ingested
+                    # without ever being mistaken for something to encode from.
+                    # A promotion writes the whole object, so its descriptor is
+                    # the whole-object one - the header is superseded.
+                    if _header_only and not _promote:
+                        await media_cache.remember(
+                            file_unique_id,
+                            size=actual_size,
+                            header_key=_stored_key,
+                            header_only=True,
+                            name=original_filename,
+                            storage="s3",
+                            duration=_source_meta.get("duration"),
+                            source_meta=_source_meta or None,
+                        )
+                    else:
                         _payload = None
                         if (
                             media_cache.cache_enabled()
@@ -506,6 +628,7 @@ class BigFilePipeline:
                             storage="s3",
                             data=_payload,
                             duration=_source_meta.get("duration"),
+                            source_meta=_source_meta or None,
                         )
                 elif self._storage is None:
                     # No S3 — keep the file locally
@@ -549,6 +672,10 @@ class BigFilePipeline:
             # that shares this filesystem reads the bytes it already has, and
             # only one that does not has to touch the bucket at all.
             _local_source = temp_path if (_keep_local_input and temp_path and os.path.exists(temp_path)) else None
+            if not _local_source and _local_reuse_path and os.path.exists(_local_reuse_path):
+                # A validated local copy from an earlier run: hand it over rather
+                # than making the worker fetch the same bytes again.
+                _local_source = _local_reuse_path
             if not _local_source:
                 # Reuse is off: the copy has served its purpose (it is in the
                 # bucket, or it was never wanted there) and is removed as before.
@@ -559,8 +686,9 @@ class BigFilePipeline:
             job = {
                 "job_id": job_id,
                 # A header-only object is left off the payload entirely: it is
-                # not the media, and the worker's job is to encode the media.
-                "input_key": s3_key if (self._storage is not None and not _header_only) else None,
+                # not the media, and the worker's job is to encode the media. A
+                # promoted run stored the media itself, so it hands the key over.
+                "input_key": s3_key if (self._storage is not None and (not _header_only or _promote)) else None,
                 "input_path": _local_source if _local_source else (s3_key if self._storage is None else None),
                 # Where the userbot fetched this file from. The relay copy is
                 # still on Telegram, so a worker that cannot see this disk can
@@ -570,7 +698,7 @@ class BigFilePipeline:
                 "source_message_id": message_id,
                 # A stored object that is only a header is a probe reference:
                 # no worker may ever encode from it.
-                "input_header_only": 1 if _header_only else 0,
+                "input_header_only": 1 if (_header_only and not _promote) else 0,
                 # chat_id for delivery = user_id (the person who should receive
                 # the processed result). The original chat_id was used for download
                 # (may be a relay group) but the result must go to the user's DM.
@@ -748,6 +876,7 @@ class BigFilePipeline:
                 storage="s3",
                 data=head if head and size <= len(head) else None,
                 duration=meta.get("duration"),
+                source_meta=meta or None,
             )
             logger.info(
                 "BigFilePipeline: streamed %dMB into storage as %s (no local copy)",

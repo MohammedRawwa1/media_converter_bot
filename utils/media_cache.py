@@ -265,8 +265,22 @@ async def remember(
     data: bytes | None = None,
     file_id=None,
     duration=None,
+    header_key=None,
+    header_only: bool = False,
+    source_meta: dict | None = None,
 ) -> bool:
-    """Record where this media already lives so a repeat skips the download."""
+    """Record where this media already lives so a repeat skips the download.
+
+    ``input_key`` is a whole object - a source. When only a probe header was
+    stored (``PIPELINE_SOURCE_UPLOAD=header``), the object goes in
+    ``header_key`` instead and ``header_only`` marks the entry: that is enough
+    evidence to prove the media was already ingested (existence + size), while
+    never being mistaken for something a job may encode from.
+
+    ``source_meta`` is the ingest's own ffprobe verdict. It travels with the
+    descriptor so a repeat that skips the download still has the duration /
+    codec / title the caption and the audio tags are built from.
+    """
     key = _entry_key(file_unique_id)
     if not key or not cache_enabled():
         return False
@@ -281,6 +295,10 @@ async def remember(
         "file_unique_id": key,
         "size": size_int,
         "input_key": input_key,
+        # A probe header is not a source: it is kept apart from ``input_key``
+        # on purpose, so no reuse path can hand it to a job as media.
+        "header_key": header_key,
+        "header_only": bool(header_only),
         "path": path,
         "name": name,
         "storage": storage,
@@ -291,6 +309,7 @@ async def remember(
         # ready for Telegram to refuse it).
         "file_id": file_id,
         "duration": duration,
+        "source_meta": dict(source_meta) if isinstance(source_meta, dict) else None,
         "cached_at": time.time(),
     }
     stored = False

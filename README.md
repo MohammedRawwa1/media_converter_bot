@@ -270,7 +270,8 @@ For Railway's 1 GB box the shipped `.env.example` is tuned to: `MAX_CONCURRENT_F
 | `MEDIA_REGISTRY_TTL_SECONDS` | `2592000` | How long a descriptor stays in the MongoDB media registry (30 days) |
 | `PRESENCE_TTL_SECONDS` | `300` | How long a user counts as "online" after their last interaction |
 | `REUSE_LOCAL_INPUT` | `1` | Keep the source on disk after uploading it, so a worker in the same container reads it instead of downloading it back out of S3 (one full copy of the media of egress saved per job) |
-| `PIPELINE_SOURCE_UPLOAD` | `header` | What the big-file pipeline stores for a source: `header` keeps only its first `PIPELINE_HEADER_BYTES` as a probe reference, `full` stores the whole file after the download finishes, `stream` writes the whole file **while** it downloads (storage is the source of truth, no local copy), `local` stores nothing. In `header`/`local` the media is read over Telegram, so a large video costs no bucket egress at all |
+| `PIPELINE_SOURCE_UPLOAD` | `header` | What the big-file pipeline stores for a source: `header` keeps only its first `PIPELINE_HEADER_BYTES` as a probe reference, `full` stores the whole file after the download finishes, `stream` writes the whole file **while** it downloads (storage is the source of truth, no local copy), `local` stores nothing. In `header`/`local` the media is read over Telegram, so a large video costs no bucket egress at all. Code default is `header`; `stream` is what makes a **repeat** of a media cost no Telegram traffic at all (one shared object per media, served from the bucket once validated) |
+| `PIPELINE_PROMOTE_ON_REPEAT` | `1` | On the second request for a media in `header` mode, store its whole object at the shared library key instead of only refreshing the probe header. First-time media keep costing 2 MB; media that come back stop being read over Telegram for every job. `0` restores pure header behaviour |
 | `PIPELINE_HEADER_BYTES` | `2097152` | How much of a source the `header` object carries (2 MB covers MP4 `moov`, MKV `SegmentInfo` and AVI `RIFF` headers). In `stream` mode it is also how much of the stream is tapped for the ffprobe that fills the job's `source_*` metadata |
 | `S3_UPLOAD_PARTS_IN_FLIGHT` | `4` | Multipart parts a streaming upload keeps in flight at once |
 | `S3_UPLOAD_MAX_BUFFERED_MB` | `256` | Bytes a streaming upload may hold before it makes the producer wait (back-pressure) |
@@ -286,7 +287,7 @@ For Railway's 1 GB box the shipped `.env.example` is tuned to: `MAX_CONCURRENT_F
 | `AWS_SECRET_ACCESS_KEY` | Secret key |
 | `PRESIGN_EXPIRES` | Presigned URL expiry in seconds (default `3600`) |
 | `S3_OUTPUTS_TTL` | How long a delivered result stays in the bucket before the hourly sweep removes it (default `86400`; `S3_INPUT_TTL`/`S3_UPLOADS_TTL`/`S3_FORWARDS_TTL` behave the same for their prefixes) |
-| `S3_LIBRARY_TTL` | How long the shared one-object-per-media library (`inputs/library/`) is kept (default `604800`). Exempt from `S3_INPUT_TTL`, so repeats of the same media keep hitting the same object |
+| `S3_LIBRARY_TTL` | How long the shared one-object-per-media library (`inputs/library/`) is kept (default `2592000`, 30 days). Exempt from `S3_INPUT_TTL`, so repeats of the same media keep hitting the same object |
 | `EGRESS_FREE_MULTIPLIER` | Free egress the provider grants, as a multiple of stored bytes (default `3`, which is IDrive e2's policy) |
 | `EGRESS_WATCH_PERCENT` | Ratio of the allowance at which the dashboard flags it and the admin is alerted (default `80`) |
 | `EGRESS_WARN_STEP_GB` | Log a warning every time this much egress accumulates in a billing cycle (default `50`) |
@@ -478,6 +479,43 @@ the repeat skips even the storage round trip;
   later operation on it (jobs fed from a shared key are marked
   `cleanup_input=False`, so the object survives for the next request), which is
   what a worker with no Telegram session to read it with needs.
+  `PIPELINE_SOURCE_UPLOAD=stream` writes that same shared object *while* the
+  download runs, which is the setting to prefer when repeats should never touch
+  Telegram: the validation gate finds the object (HEAD existence + size), hands
+  the job its key and skips the download, and the media leaves Telegram once,
+  ever — no second pass over a finished local file either.
+
+A media in `header` mode is **promoted on its second request**
+(`PIPELINE_PROMOTE_ON_REPEAT`): that repeat re-fetches the media once and stores
+it whole under the shared library key, so every later request — and every style
+applied to it — is a bucket read instead of a Telegram read per job. That is the
+middle ground between the two modes: media asked for once never cost more than
+their 2 MB header, and only media that actually come back pay for a whole copy.
+
+A `header` job whose Telegram copy is unreadable no longer fails outright. The
+media registry is keyed on the Telegram identity the job carries, so the worker
+can find a stored copy written by *any* producer — a promotion, `full`/`stream`,
+or the Bot-API path — and adopts it as the source once it validates (the object
+exists and its stored size agrees with the job's). Only when no such copy exists
+does the job fail, and the error says so.
+
+Every tier is **validated against storage before it is trusted** (see
+`storage.stored_object_is_intact`): the object has to still exist, and when the
+backend can report it, its stored size has to agree with the size Telegram just
+reported. Both answers come from a HEAD, so validating a cached media costs no
+egress — and a transient backend failure counts as "still there", because a
+false negative here is exactly the re-download this is for. A descriptor that
+fails the check is a miss: the media is downloaded and re-stored rather than
+handed to a job as the wrong bytes.
+
+The ingest leaves that evidence behind in **every** mode. `full`/`stream` store
+a whole object and remember it as the reusable `input_key`. `header` — and
+`local` — remember the media too, with the probe header in `header_key`
+(`inputs/library/<hash>/header`) and `header_only` set: that is enough to prove
+the media was already ingested and skip the redundant Pyrogram download on a
+repeat (only the worker's own single read is left, plus the cached probe verdict
+so the caption keeps its duration/title), while never letting a two-megabyte
+header be mistaken for something to encode from.
 
 The descriptor is kept in two tiers. Redis holds the hot copy for latency, and
 the `media_registry` MongoDB collection holds the record: Redis is a cache, so
@@ -491,7 +529,7 @@ One object per media is what makes a repeat cheap, and three things used to
 break it:
 
 - the hourly sweep deleted everything under `inputs/`, library included, one
-  TTL after the first upload. `S3_LIBRARY_TTL` (default `604800`, 7 days) now
+  TTL after the first upload. `S3_LIBRARY_TTL` (default `2592000`, 30 days) now
   governs it and `cleanup_s3_inputs()` **excludes** `inputs/library/`, so the
   object outlives the burst of operations on a media and no bucket lifecycle
   rule is needed;

@@ -24,7 +24,10 @@ FAIL = "[FAIL]"
 WARN = "[WARN]"
 
 
-async def test_relay_access():
+# Deliberately *not* named ``test_relay_access``: this needs live Telegram
+# credentials and the network, so pytest must never pick it up as a test. The
+# module is a runnable diagnostic - ``python scripts/test_relay_access.py``.
+async def check_relay_access():
     relay_chat_id = os.getenv("RELAY_CHAT_ID", "").strip()
     if not relay_chat_id:
         print(f"{FAIL} RELAY_CHAT_ID env var is not set!")
@@ -114,5 +117,5 @@ async def test_relay_access():
 
 
 if __name__ == "__main__":
-    success = asyncio.run(test_relay_access())
+    success = asyncio.run(check_relay_access())
     sys.exit(0 if success else 1)

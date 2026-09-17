@@ -39,7 +39,14 @@ class CleanupManager:
         # the per-job input TTL and exempt from that sweep - deleting it is what
         # forced the next request for the same media to download and upload a
         # fresh copy again, and it never went through the inputs/ janitor.
-        self.s3_library_ttl = int(os.getenv("S3_LIBRARY_TTL", str(7 * 24 * 3600)))
+        #
+        # 30 days, because a re-download is the expensive side of the trade: it is
+        # a full copy of the media in egress (the thing that gets a free-egress
+        # account suspended) plus the upload, while keeping the object is one
+        # stored copy - which also raises the allowance itself, since the free
+        # egress is a multiple of what is stored. The sweep still bounds the
+        # bucket, so it stays a cache rather than a permanent archive.
+        self.s3_library_ttl = int(os.getenv("S3_LIBRARY_TTL", str(30 * 24 * 3600)))
         # Redis job hash cleanup interval (30 minutes)
         self.redis_cleanup_interval = int(os.getenv("REDIS_CLEANUP_INTERVAL", str(30 * 60)))
         # Stale Redis job hash max age (24 hours)
