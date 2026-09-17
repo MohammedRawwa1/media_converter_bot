@@ -1,5 +1,6 @@
 import asyncio
 import contextlib
+import hashlib
 import json
 import logging
 import os
@@ -211,9 +212,11 @@ _PARALLEL_PART_SIZE: int = 512 * 1024
 _PARALLEL_WORKERS: int = 6
 # Files larger than this use SaveBigFilePart (vs SaveFilePart)
 _PARALLEL_BIG_FILE_THRESHOLD: int = 10 * 1024 * 1024
-# Max file size for in-memory parallel upload; beyond this we fall back to
-# sequential upload to avoid OOM from reading the entire file into memory.
-# Set to 0 or negative to disable the guard.
+# Above this size the parallel path is skipped and the file is handed to the
+# client's own streaming uploader instead. The parallel path reads one part at a
+# time straight off disk, so this is a policy threshold (a path known good on
+# very large files), not a memory guard.
+# Set to 0 or negative to always use the parallel path.
 _PARALLEL_MAX_MEMORY_BYTES: int = 500 * 1024 * 1024  # 500 MB
 
 # ── Audio delivery ──
@@ -309,6 +312,51 @@ async def probe_audio_metadata(path: str) -> dict:
     return await _probe_audio_metadata(path)
 
 
+def _part_count(file_size: int, part_size: int) -> int:
+    """Number of Telegram upload parts for a file of ``file_size`` bytes."""
+    part_size = max(1, int(part_size))
+    return max(1, (int(file_size) + part_size - 1) // part_size)
+
+
+def _file_parts(file_size: int, part_size: int) -> list[tuple[int, int, int]]:
+    """``(index, offset, length)`` for every part of a file of ``file_size`` bytes.
+
+    Together the parts cover the file exactly once: no gap, no overlap, and the
+    final part carries the remainder.
+    """
+    part_size = max(1, int(part_size))
+    return [
+        (i, i * part_size, min(part_size, file_size - i * part_size)) for i in range(_part_count(file_size, part_size))
+    ]
+
+
+def _md5_hex(file_path: str) -> str:
+    """MD5 of a file, read in blocks so it never lands in RAM whole.
+
+    Small files go up with ``SaveFilePart``, which wants the checksum; the big
+    file path uses ``InputFileBig``, which has no such field.
+    """
+    digest = hashlib.md5()  # noqa: S324 - a protocol field Telegram asks for, not security
+    with open(file_path, "rb") as f:
+        for block in iter(lambda: f.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _read_file_part(file_path: str, offset: int, length: int) -> bytes:
+    """Read exactly one part from disk, straight off the file.
+
+    Parts are read one at a time so only the parts actually in flight are ever
+    resident. Reading the whole file up front (and then slicing it into a list
+    of parts) held two full copies in RAM, which is what killed large deliveries
+    mid-upload on memory-tight containers: the process was OOM-killed with no
+    error and the job had to be re-run from the start.
+    """
+    with open(file_path, "rb") as f:
+        f.seek(offset)
+        return f.read(length)
+
+
 async def _parallel_upload_file(
     client,
     file_path: str,
@@ -338,10 +386,10 @@ async def _parallel_upload_file(
         ``InputFileBig`` for large files or ``InputFile`` for small files,
         ready to pass to ``client.send_file()`` as the ``file`` argument.
     """
-    # ── Memory guard: avoid loading huge files entirely into RAM ──
+    # ── Size policy: very large files use the client's own uploader ──
     if _PARALLEL_MAX_MEMORY_BYTES > 0 and file_size > _PARALLEL_MAX_MEMORY_BYTES:
         logger.warning(
-            "parallel_upload: file %s size %d exceeds memory guard %d — falling back to sequential",
+            "parallel_upload: file %s size %d is above the parallel threshold %d — falling back to sequential",
             file_path,
             file_size,
             _PARALLEL_MAX_MEMORY_BYTES,
@@ -354,14 +402,17 @@ async def _parallel_upload_file(
     from telethon.tl.types import InputFile, InputFileBig
 
     file_id = random.randrange(1 << 63)  # noqa: S311
-    total_parts = max(1, (file_size + part_size - 1) // part_size)
+    total_parts = _part_count(file_size, part_size)
     is_big = total_parts > 1024 or file_size > _PARALLEL_BIG_FILE_THRESHOLD
     sem = asyncio.Semaphore(workers)
     sent_bytes = 0
 
-    async def _upload_part(part_index: int, data: bytes) -> None:
+    async def _upload_part(part_index: int, offset: int, length: int) -> None:
         nonlocal sent_bytes
         async with sem:
+            # Read this part only, and only once the slot is held: the bytes of
+            # the parts still queued behind the semaphore stay on disk.
+            data = _read_file_part(file_path, offset, length)
             for attempt in range(3):
                 try:
                     if is_big:
@@ -391,16 +442,6 @@ async def _parallel_upload_file(
             if progress_callback:
                 progress_callback(sent_bytes, file_size)
 
-    # Read entire file into memory for chunking
-    with open(file_path, "rb") as f:
-        file_data = f.read()
-
-    chunks = []
-    for i in range(total_parts):
-        start = i * part_size
-        end = min(start + part_size, len(file_data))
-        chunks.append((i, file_data[start:end]))
-
     logger.info(
         "parallel_upload: file=%s size=%d parts=%d workers=%d is_big=%s",
         file_path,
@@ -410,7 +451,7 @@ async def _parallel_upload_file(
         is_big,
     )
 
-    await asyncio.gather(*[_upload_part(i, d) for i, d in chunks])
+    await asyncio.gather(*[_upload_part(i, offset, length) for i, offset, length in _file_parts(file_size, part_size)])
 
     # The uploaded file's name drives mime-type detection downstream, so use
     # the delivery name (original media name) when the caller supplied one.
@@ -418,7 +459,9 @@ async def _parallel_upload_file(
     if is_big:
         return InputFileBig(id=file_id, parts=total_parts, name=filename)
     else:
-        return InputFile(id=file_id, parts=total_parts, name=filename)
+        # InputFile (small files) requires the checksum; omitting it raised a
+        # TypeError that made every small delivery fall back to a slower path.
+        return InputFile(id=file_id, parts=total_parts, name=filename, md5_checksum=_md5_hex(file_path))
 
 
 async def _parallel_upload_file_pyrogram(
@@ -448,10 +491,10 @@ async def _parallel_upload_file_pyrogram(
         ``InputFileBig`` for large files or ``InputFile`` for small files,
         ready to pass to ``client.send_video()``.
     """
-    # ── Memory guard: avoid loading huge files entirely into RAM ──
+    # ── Size policy: very large files use the client's own uploader ──
     if _PARALLEL_MAX_MEMORY_BYTES > 0 and file_size > _PARALLEL_MAX_MEMORY_BYTES:
         logger.warning(
-            "pyrogram_parallel_upload: file %s size %d exceeds memory guard %d — falling back to sequential",
+            "pyrogram_parallel_upload: file %s size %d is above the parallel threshold %d — falling back to sequential",
             file_path,
             file_size,
             _PARALLEL_MAX_MEMORY_BYTES,
@@ -466,14 +509,17 @@ async def _parallel_upload_file_pyrogram(
     from pyrogram.raw.types import InputFileBig as _InputBig
 
     file_id = _random.randrange(1 << 63)  # noqa: S311
-    total_parts = max(1, (file_size + part_size - 1) // part_size)
+    total_parts = _part_count(file_size, part_size)
     is_big = total_parts > 1024 or file_size > _PARALLEL_BIG_FILE_THRESHOLD
     sem = asyncio.Semaphore(workers)
     sent_bytes = 0
 
-    async def _upload_part(part_index: int, data: bytes) -> None:
+    async def _upload_part(part_index: int, offset: int, length: int) -> None:
         nonlocal sent_bytes
         async with sem:
+            # Read this part only, and only once the slot is held: the bytes of
+            # the parts still queued behind the semaphore stay on disk.
+            data = _read_file_part(file_path, offset, length)
             for attempt in range(3):
                 try:
                     if is_big:
@@ -503,16 +549,6 @@ async def _parallel_upload_file_pyrogram(
             if progress_callback:
                 progress_callback(sent_bytes, file_size)
 
-    # Read entire file into memory for chunking
-    with open(file_path, "rb") as f:
-        file_data = f.read()
-
-    chunks = []
-    for i in range(total_parts):
-        start = i * part_size
-        end = min(start + part_size, len(file_data))
-        chunks.append((i, file_data[start:end]))
-
     logger.info(
         "pyrogram_parallel_upload: file=%s size=%d parts=%d workers=%d is_big=%s",
         file_path,
@@ -522,7 +558,7 @@ async def _parallel_upload_file_pyrogram(
         is_big,
     )
 
-    await asyncio.gather(*[_upload_part(i, d) for i, d in chunks])
+    await asyncio.gather(*[_upload_part(i, offset, length) for i, offset, length in _file_parts(file_size, part_size)])
 
     # The uploaded file's name drives mime-type detection downstream, so use
     # the delivery name (original media name) when the caller supplied one.
@@ -530,7 +566,9 @@ async def _parallel_upload_file_pyrogram(
     if is_big:
         return _InputBig(id=file_id, parts=total_parts, name=filename)
     else:
-        return _InputFile(id=file_id, parts=total_parts, name=filename)
+        # InputFile (small files) requires the checksum; omitting it raised a
+        # TypeError that made every small delivery fall back to a slower path.
+        return _InputFile(id=file_id, parts=total_parts, name=filename, md5_checksum=_md5_hex(file_path))
 
 
 async def _normalize_target(chat_id: int | str, client=None):
