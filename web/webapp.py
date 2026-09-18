@@ -1399,9 +1399,10 @@ def events(job_id):
 def get_input():
     """Token-protected endpoint to download files from the input folder.
 
-    Protection: prefer `DIAG_TOKEN` (header `X-DIAG-TOKEN` or `?token=`),
-    fallback to `UPLOAD_SECRET` (header `X-Upload-Token` or `?upload_token=`).
-    Use only for short-term debugging; remove after use.
+    Protection: prefer `DIAG_TOKEN` (header `X-DIAG-TOKEN`), fallback to
+    `UPLOAD_SECRET` (header `X-Upload-Token`). Both are read from a header or the
+    request body only — never the query string, which is copied into access logs
+    and `Referer` headers. Use only for short-term debugging; remove after use.
     Query params: `name` (filename in input dir).
     """
     # Rate limiting: prevent DoS/DDoS
@@ -1446,8 +1447,9 @@ def get_input():
 def internal_diag():
     """Token-protected diagnostic endpoint.
 
-    Set `DIAG_TOKEN` in the environment (random string). Call with header
-    `X-DIAG-TOKEN: <token>` or `?token=<token>`.
+    Set `DIAG_TOKEN` in the environment (random string). Call with the header
+    `X-DIAG-TOKEN: <token>` — the token is never read from the query string,
+    because a URL carries it into access logs and `Referer` headers.
     Returns masked env, Redis health, sample job list, optional job hash,
     and last lines from app `logs/` directory.
     """

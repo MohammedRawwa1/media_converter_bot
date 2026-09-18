@@ -1289,22 +1289,42 @@ def check_repo_hygiene(repo: Repo, profile: dict, suppressions: list[dict]) -> l
 
 
 def check_supply_chain_pins(repo: Repo, profile: dict, suppressions: list[dict]) -> list[Finding]:
-    """Flag requirements pinned with == but installed without hash verification."""
+    """Flag dependencies installed without hash verification.
+
+    Two shapes satisfy this: requirements.txt pinned with hashes directly, or a
+    hash-pinned lock that the install path actually consumes with
+    ``--require-hashes``. The second half of that check matters as much as the
+    first — a lock nobody installs is a document, not a control — so the
+    Dockerfile has to name the lock on a ``--require-hashes`` install line.
+    """
     out: list[Finding] = []
     text = repo.read_rel("requirements.txt") or ""
     # Honour an accepted deviation like every other check does, instead of
     # reporting a finding the profile has already adjudicated by hand.
     if suppressed("DEP-NO-HASHES", "requirements.txt", suppressions):
         return []
-    if "--require-hashes" not in text and "--hash=" not in text:
-        out.append(Finding(
-            rule="DEP-NO-HASHES", title="requirements.txt is not hash-pinned",
-            severity=Severity.LOW, owasp="A08:2021", layer="deps", category="SUPPLY_CHAIN",
-            verdict="CONFIRMED",
-            description="Without hashes, a compromised index or a tampered wheel installs silently.",
-            evidence="no --hash= entries in requirements.txt", file="requirements.txt", line=1,
-            fix="Generate a hash-pinned lock (pip-compile --generate-hashes) and install with --require-hashes.",
-        ))
+    if "--require-hashes" in text or "--hash=" in text:
+        return out
+    lock = repo.read_rel("requirements.lock") or ""
+    dockerfile = repo.read_rel("Dockerfile") or ""
+    lock_pinned = "--hash=sha256:" in lock
+    lock_installed = "requirements.lock" in dockerfile and "--require-hashes" in dockerfile
+    if lock_pinned and lock_installed:
+        return out
+    if lock_pinned and not lock_installed:
+        evidence = "requirements.lock is hash-pinned but no install line consumes it with --require-hashes"
+    elif lock and not lock_pinned:
+        evidence = "requirements.lock exists but carries no --hash= entries"
+    else:
+        evidence = "no --hash= entries in requirements.txt and no hash-pinned lock"
+    out.append(Finding(
+        rule="DEP-NO-HASHES", title="dependencies are not hash-pinned",
+        severity=Severity.LOW, owasp="A08:2021", layer="deps", category="SUPPLY_CHAIN",
+        verdict="CONFIRMED",
+        description="Without hashes, a compromised index or a tampered wheel installs silently.",
+        evidence=evidence, file="requirements.txt", line=1,
+        fix="Generate a hash-pinned lock (uv pip compile --generate-hashes, resolved for the deploy platform) and install it with --require-hashes.",
+    ))
     return out
 
 

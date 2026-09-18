@@ -149,7 +149,8 @@ git push origin main
 ├── railway.json             # Railway deployment manifest
 ├── Procfile                 # Process type definitions
 ├── runtime.txt              # Python 3.12.8
-├── requirements.txt         # Production dependencies
+├── requirements.txt         # Production dependencies (ranges, the source of truth)
+├── requirements.lock        # Hash-pinned closure of requirements.txt (what Docker installs)
 └── requirements-dev.txt     # Dev dependencies (linting, security)
 ```
 
@@ -380,6 +381,20 @@ See `.env.example` for the complete list of all supported environment variables.
 # Install dependencies
 pip install -r requirements.txt
 pip install -r requirements-dev.txt   # linting + security tools
+
+# The production image does not install requirements.txt directly. It installs
+# requirements.lock - the full transitive closure, every package pinned to an
+# exact version and a sha256 - with `--require-hashes`, so a tampered or
+# substituted wheel cannot install. It is resolved for the image's platform
+# (linux/amd64, Python 3.12), so on Windows or macOS keep using requirements.txt
+# or regenerate the lock for your own platform.
+#
+# After editing requirements.txt, regenerate the lock with the command recorded
+# in its header:
+#   uv pip compile requirements.txt --generate-hashes --python-version 3.12 \
+#     --python-platform x86_64-unknown-linux-gnu --output-file requirements.lock
+# CI fails if the two drift apart, or if any pinned entry loses its hash.
+pip install --require-hashes -r requirements.lock   # optional: verify it locally on Linux
 
 # Create a Pyrogram session (interactive)
 python scripts/create_pyrogram_session.py

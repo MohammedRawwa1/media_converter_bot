@@ -6,6 +6,7 @@
     "watchPatterns": [
       "**/*.py",
       "requirements.txt",
+      "requirements.lock",
       "Dockerfile",
       "**/railway.json",
       ".railwayignore",

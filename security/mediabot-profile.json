@@ -49,11 +49,6 @@
 
   "suppressions": [
     {
-      "rule": "DEP-NO-HASHES",
-      "glob": "requirements.txt",
-      "reason": "requirements.txt is the direct-dependency spec that the platform builder installs with a plain `pip install -r`, so hash-checking mode cannot be turned on there without a full transitive lock (all dependencies pinned and hashed together). Every specifier now carries an upper bound, and pip-audit + OSV advisories are ingested on each scan, so a tampered or vulnerable release is still caught. A generated hash-pinned lock is a tracked follow-up, not a dismissed risk."
-    },
-    {
       "rule": "S-GENERIC",
       "glob": ".env*",
       "reason": "dotenv files are the intended home for secrets and are git-ignored (checked separately by INFRA-GITIGNORE/INFRA-ENV-TRACKED)."

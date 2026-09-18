@@ -8,12 +8,18 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /app
 
-# Copy only requirements for Docker layer caching
-COPY requirements.txt ./
+# Copy only the dependency manifests, for Docker layer caching.
+# requirements.lock is the hash-pinned closure of requirements.txt, resolved for
+# this image (linux/amd64, Python 3.12) — installed with --require-hashes so a
+# tampered or substituted wheel cannot install. Regenerate it with the command in
+# its header after editing requirements.txt; CI fails if the two drift apart.
+COPY requirements.txt requirements.lock ./
 
-# Install all deps (no --user flag — default prefix /usr/local is in sys.path)
+# Install all deps (no --user flag — default prefix /usr/local is in sys.path).
+# pip/setuptools/wheel stay unpinned: they bootstrap the locked install below and
+# are not part of the application's dependency closure.
 RUN pip install --no-cache-dir --upgrade pip setuptools wheel \
-    && pip install --no-cache-dir -r requirements.txt
+    && pip install --no-cache-dir --require-hashes -r requirements.lock
 
 
 # ── Runtime stage: slim image with only runtime deps ──

@@ -41,7 +41,7 @@ async def _unregister(ws, job_id: str):
 
 
 async def _ws_handler(websocket, path):
-    # Parse path and query params (e.g. /ws/<job_id>?upload_token=xxx)
+    # Parse path and query params (e.g. /ws/<job_id>?job_token=xxx)
     parsed = urlparse(path)
     query_params = parse_qs(parsed.query)
 

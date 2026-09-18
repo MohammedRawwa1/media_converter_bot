@@ -277,7 +277,7 @@ function handleUpdate(j, jobId){
 
   if (j.status === 'done' && j.output){
     bar.className = 'bar bar-done'
-    const dlUrl = appendToken(`/download/${jobId}`)
+    const dlUrl = appendToken(`/download/${jobId}`, jobId)
     action.innerHTML = `<a href="${dlUrl}" class="btn">Download</a>`
     try{ if (eventSources[jobId]) eventSources[jobId].close() }catch(e){}
     delete eventSources[jobId]
@@ -315,9 +315,12 @@ function getUploadToken(){
 // own is not a credential. The shared upload token still rides along for the
 // routes that require the service credential.
 function appendToken(url, jobId){
+  // Only the per-job capability travels in the URL. The shared upload token is
+  // deliberately not appended: these routes do not read it from the query string
+  // (they authorize on the job's own capability), and a URL is copied into
+  // browser history, server logs and Referer headers, so a service-wide secret
+  // there is a leak with no benefit. It is sent in the POST /upload body instead.
   const params = []
-  const token = getUploadToken()
-  if (token) params.push('upload_token=' + encodeURIComponent(token))
   const jobToken = jobId ? jobTokens[jobId] : ''
   if (jobToken) params.push('job_token=' + encodeURIComponent(jobToken))
   if (!params.length) return url
