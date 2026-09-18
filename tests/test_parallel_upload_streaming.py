@@ -19,8 +19,12 @@ CHUNK = 1024
 
 
 def _md5(data: bytes) -> str:
-    # Telegram's protocol field for small-file uploads, not a security hash.
-    return hashlib.md5(data).hexdigest()  # noqa: S324
+    # Telegram's protocol checksum for small-file uploads, not a security hash.
+    # usedforsecurity=False says so in the call itself, which is what both ruff
+    # (S324) and bandit (B324, at HIGH) read. Without it this line only stayed
+    # quiet because .bandit excludes tests/, which is not a property of the code.
+    # Same reasoning as utils/userbot_uploader.py::_md5_hex.
+    return hashlib.md5(data, usedforsecurity=False).hexdigest()
 
 
 def _make_file(path: str, size: int) -> bytes:

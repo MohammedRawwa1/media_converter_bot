@@ -61,8 +61,7 @@ else:
 # unusable, so say so at startup instead of leaving it to be discovered by
 # whoever gets a 401.
 _MISSING_TOKENS = [
-    name for name in ("UPLOAD_SECRET", "DEBUG_SECRET", "DIAG_TOKEN")
-    if not (os.environ.get(name) or "").strip()
+    name for name in ("UPLOAD_SECRET", "DEBUG_SECRET", "DIAG_TOKEN") if not (os.environ.get(name) or "").strip()
 ]
 if _MISSING_TOKENS:
     logger.warning(

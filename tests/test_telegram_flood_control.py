@@ -149,10 +149,10 @@ class SharedFloodGateTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_one_bot_namespace_does_not_leak_into_another(self):
         scope = self.bot_gate.scope_for_chat(5)
-        with patch.dict("os.environ", {"BOT_TOKEN": "111:aaa"}):
+        with patch.dict("os.environ", {"BOT_TOKEN": "111:aaa"}):  # nosec B105  # throwaway token, not a credential
             await self.bot_gate.note(600, scope)
             key = self.bot_gate._key(scope)
-        with patch.dict("os.environ", {"BOT_TOKEN": "222:bbb"}):
+        with patch.dict("os.environ", {"BOT_TOKEN": "222:bbb"}):  # nosec B105  # throwaway token, not a credential
             self.assertNotEqual(key, self.bot_gate._key(scope))
 
     async def test_unreachable_backend_degrades_to_local_and_backs_off(self):

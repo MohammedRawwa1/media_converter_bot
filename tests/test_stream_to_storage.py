@@ -406,9 +406,7 @@ def test_stream_mode_puts_the_media_in_the_bucket_without_a_local_copy(monkeypat
 
 def test_stream_mode_can_still_skip_the_local_mirror(monkeypatch, tmp_path):
     """``REUSE_LOCAL_INPUT=0`` keeps the stream disk-free and cache-less."""
-    result, backend, jobs, streamed, hashes = _ingest(
-        monkeypatch, tmp_path, env={"REUSE_LOCAL_INPUT": "0"}
-    )
+    result, backend, jobs, streamed, hashes = _ingest(monkeypatch, tmp_path, env={"REUSE_LOCAL_INPUT": "0"})
 
     assert result.ok
     _, _, sink, _ = streamed[0]

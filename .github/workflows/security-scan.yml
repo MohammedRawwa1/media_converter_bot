@@ -15,6 +15,10 @@ concurrency:
 
 env:
   PYTHON_VERSION: "3.12"
+  # Only the fallback install below needs this: the job normally gets ruff from
+  # requirements-dev.txt, which pins the same version (ruff's report format
+  # changes between releases). Keep the two in sync.
+  RUFF_VERSION: "0.16.8"
 
 jobs:
   security-scan:
@@ -45,79 +49,19 @@ jobs:
             pip install \
               bandit \
               pip-audit \
-              ruff
+              "ruff==${RUFF_VERSION}"
           fi
 
       - name: Run Bandit security scan
         id: bandit
         shell: bash
-        run: |
-          BANDIT_ARGS=""
-
-          # `--ini` points at the [bandit] section (skips/exclude). `-c/--configfile`
-          # is a different thing entirely: the YAML plugin profile, which `.bandit`
-          # is not — passing it there makes bandit fail to parse the file and emit
-          # no report at all.
-          if [ -f .bandit ]; then
-            BANDIT_ARGS="--ini .bandit"
-          fi
-
-          bandit \
-            $BANDIT_ARGS \
-            -r . \
-            -f json \
-            -o bandit-report.json || true
-
-          if [ ! -f bandit-report.json ]; then
-            echo "::error::Bandit did not produce a report."
-            exit 1
-          fi
-
-          python <<'PY'
-          import json
-          import sys
-
-          with open("bandit-report.json", encoding="utf-8") as f:
-              report = json.load(f)
-
-          findings = report.get("results", [])
-
-          if not findings:
-              print("✅ Bandit: no findings")
-              sys.exit(0)
-
-          high = 0
-          medium = 0
-          low = 0
-
-          for issue in findings:
-              sev = issue["issue_severity"]
-
-              if sev == "HIGH":
-                  high += 1
-              elif sev == "MEDIUM":
-                  medium += 1
-              else:
-                  low += 1
-
-              print(
-                  f'[{sev}] '
-                  f'{issue["test_id"]}: '
-                  f'{issue["filename"]}:'
-                  f'{issue["line_number"]} - '
-                  f'{issue["issue_text"]}'
-              )
-
-          print(
-              f"::warning::Bandit found "
-              f"{len(findings)} issue(s): "
-              f"{high} HIGH, {medium} MEDIUM, {low} LOW"
-          )
-
-          if high:
-              print("::error::High-severity Bandit findings detected.")
-              sys.exit(1)
-          PY
+        # The gate itself lives in scripts/check_bandit.py so this job and a
+        # pre-push run cannot disagree about what "clean" means. It reads .bandit
+        # through `--ini`, fails on HIGH findings only, and refuses to pass when
+        # the config did not parse (which silently drops every skip). Run it
+        # locally the same way this step does:
+        #   python scripts/check_bandit.py
+        run: python scripts/check_bandit.py --output bandit-report.json
 
       - name: Upload Bandit report
         if: always()

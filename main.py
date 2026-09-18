@@ -3468,7 +3468,9 @@ try:
             data = await request.json()
             # Log the shape, not the payload: a Telegram update carries the
             # sender's user id, chat id, message text and any forwarded content.
-            logger.debug("Received webhook update (keys=%s)", sorted(data) if isinstance(data, dict) else type(data).__name__)
+            logger.debug(
+                "Received webhook update (keys=%s)", sorted(data) if isinstance(data, dict) else type(data).__name__
+            )
         except Exception as e:
             logger.error(f"Invalid JSON in webhook: {e}")
             raise HTTPException(status_code=400, detail="Invalid JSON") from e

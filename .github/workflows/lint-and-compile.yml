@@ -11,6 +11,10 @@ concurrency:
 
 env:
   PYTHON_VERSION: "3.12"
+  # Pinned exactly on purpose: `ruff format` output changes between releases,
+  # so an unpinned install reds this job on a commit that was clean when it
+  # was written. Keep in sync with requirements-dev.txt.
+  RUFF_VERSION: "0.16.8"
 
 jobs:
   lint:
@@ -32,94 +36,19 @@ jobs:
       - name: Install Ruff
         run: |
           python -m pip install --upgrade pip
-          pip install ruff
+          pip install "ruff==${RUFF_VERSION}"
+          # Record the exact version in the log: a format regression is almost
+          # always a version skew, and this is the first thing you would check.
+          ruff --version
 
-      - name: Run Ruff linter
-        id: ruff_lint
-        continue-on-error: true
-        run: |
-          ruff check . --config ruff.toml --output-format=github
-
-      - name: Check Ruff formatting
-        id: ruff_format
-        continue-on-error: true
-        run: |
-          ruff format . --config ruff.toml --check
-
-      - name: Run Python syntax check
-        id: pycompile
-        shell: bash
-        run: |
-          find . -name "*.py" \
-            -not -path "./.git/*" \
-            -not -path "./.venv/*" \
-            -not -path "./venv/*" \
-            -not -path "./env/*" \
-            -not -path "./__pycache__/*" \
-            -not -path "./.eggs/*" \
-            -not -path "./node_modules/*" \
-            -not -path "./.mypy_cache/*" \
-            -not -path "./.pytest_cache/*" \
-            -not -path "./.ruff_cache/*" \
-            -print0 | python -c "
-          import ast
-          import os
-          import sys
-
-          sys.stdout.reconfigure(encoding='utf-8', errors='replace')
-
-          issues = []
-
-          for item in sys.stdin.buffer.read().split(b'\0'):
-              if not item:
-                  continue
-
-              path = item.decode()
-
-              try:
-                  with open(path, encoding='utf-8', errors='replace') as f:
-                      ast.parse(f.read(), filename=path)
-              except SyntaxError as e:
-                  rel = os.path.relpath(path)
-                  print(f'::error file={rel}::SyntaxError: {e}')
-                  issues.append(rel)
-
-          if issues:
-              print(f'::error::{len(issues)} Python file(s) contain syntax errors.')
-              sys.exit(1)
-
-          print('✅ All Python files passed syntax checks.')
-          "
-
-      - name: Fail if Ruff failed
-        if: steps.ruff_lint.outcome == 'failure' || steps.ruff_format.outcome == 'failure'
-        run: exit 1
-
-      - name: Summary
-        if: always()
-        shell: bash
-        run: |
-          echo "========== LINT & COMPILE SUMMARY =========="
-
-          if [ "${{ steps.ruff_lint.outcome }}" = "success" ]; then
-            echo "Ruff lint:      ✅ passed"
-          else
-            echo "Ruff lint:      ❌ failed"
-          fi
-
-          if [ "${{ steps.ruff_format.outcome }}" = "success" ]; then
-            echo "Ruff format:    ✅ passed"
-          else
-            echo "Ruff format:    ❌ failed"
-          fi
-
-          if [ "${{ steps.pycompile.outcome }}" = "success" ]; then
-            echo "py_compile:     ✅ passed"
-          else
-            echo "py_compile:     ❌ syntax errors"
-          fi
-
-          echo "============================================"
+      - name: Run Ruff lint, Ruff format and the syntax check
+        # The checks themselves live in scripts/check_lint.py so this job and a
+        # pre-push run cannot disagree about what "clean" means. All three run even
+        # when one of them fails, the script prints the summary that this job used
+        # to assemble from step outcomes, and its exit code fails the step. Run it
+        # locally the same way this step does:
+        #   python scripts/check_lint.py
+        run: python scripts/check_lint.py
 
   tests:
     name: Unit tests

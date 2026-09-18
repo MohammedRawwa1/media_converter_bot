@@ -185,7 +185,7 @@ def test_producer_kwargs_carry_the_security_settings(eventbus_env):
         KAFKA_SECURITY_PROTOCOL="SASL_SSL",
         KAFKA_SASL_MECHANISM="SCRAM-SHA-256",
         KAFKA_SASL_USERNAME="user",
-        KAFKA_SASL_PASSWORD="secret",  # noqa: S106 - a throwaway value, not a credential
+        KAFKA_SASL_PASSWORD="secret",  # noqa: S106  # nosec B106 - a throwaway value, not a credential
     )
     kwargs = kafka.producer_kwargs(settings)
     assert kwargs["security_protocol"] == "SASL_SSL"

@@ -91,13 +91,13 @@ def test_job_summary_never_carries_credentials():
         "job_id": "j1",
         "chat_id": 555,
         "source_url": "https://cdn.example.com/a.mp4?token=leaked-token",
-        "aws_secret_access_key": "super-secret-key",
+        "aws_secret_access_key": "super-secret-key",  # nosec B105  # fixture value; this test asserts it is never summarised
         "pyrogram_session": "session-string-value",
         "extra": {
             "note": "kept",
             "s3_presign": "https://bucket.s3/obj?X-Amz-Signature=leaked-signature",
             "api_key": "leaked-api-key",
-            "upload_token": "leaked-upload-token",
+            "upload_token": "leaked-upload-token",  # nosec B105  # fixture value; this test asserts it is never summarised
         },
     }
     blob = json.dumps(messages.job_summary(job))

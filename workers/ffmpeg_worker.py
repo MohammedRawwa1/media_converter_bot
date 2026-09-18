@@ -1103,6 +1103,7 @@ async def _forward_pubsub_listener(stop_event: asyncio.Event | None, event: asyn
 # of being downsampled to the storage size.
 _THUMB_MAX_EDGE = 320
 
+
 def _library_source_cache_path(input_key: str | None, ext: str = "") -> str | None:
     """Local cache path for a shared library object, or ``None`` for any other key.
 
@@ -1469,9 +1470,7 @@ async def handle_job(job: dict):
         # The key usually has no suffix, so derive the extension the cache file
         # was written with exactly as the download path below does; the lookup
         # also accepts a sibling written with any other extension for this media.
-        _src_ext = os.path.splitext(input_key)[1] or file_utils.safe_extension(
-            job.get("original_filename") or "", ""
-        )
+        _src_ext = os.path.splitext(input_key)[1] or file_utils.safe_extension(job.get("original_filename") or "", "")
         _shared_cache_path = _find_library_source_cache(input_key, _src_ext)
         if _shared_cache_path:
             logger.info(

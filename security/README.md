@@ -105,7 +105,7 @@ equivalent (`INJ-CMD-FSTRING`, `INJ-NOSQL`, `INJ-PATH-LOCAL`) have no other guar
 at all — so the comment must name the class it is silencing:
 
 ```python
-os.system(cmd)             # nosec B605  # argv is a fixed literal
+os.system(cmd)  # nosec B605  # argv is a fixed literal
 cursor.execute(f"...{v}")  # nosec INJ-SQL  # v is an int from the schema
 ```
 

@@ -619,9 +619,9 @@ async def detect_filename(input_path: str, message=None) -> str:
                 # on PATH: FFPROBE_PATH wins, else the ffprobe sibling of whatever
                 # FFMPEG_PATH names, matching how the rest of the pipeline resolves
                 # it (utils/ffmpeg_runner.py, handlers.py).
-                ffprobe_bin = os.environ.get("FFPROBE_PATH") or os.environ.get(
-                    "FFMPEG_PATH", "ffmpeg"
-                ).replace("ffmpeg", "ffprobe")
+                ffprobe_bin = os.environ.get("FFPROBE_PATH") or os.environ.get("FFMPEG_PATH", "ffmpeg").replace(
+                    "ffmpeg", "ffprobe"
+                )
 
                 def _run_probe():
                     return subprocess.run(  # nosec B603  # literal ffprobe argv list

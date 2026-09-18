@@ -165,6 +165,7 @@ LOG_PATH = env_var or "/tmp"  # nosec B108 - /tmp is last fallback, prefers env 
 
 # For subprocess usage (whitelisted exes + list form, no shell=True)
 import subprocess  # nosec B404 - intentional, needed for PDF compression
+
 subprocess.run(cmd, check=True)  # nosec B603 - whitelisted exes + list form
 
 # For urlopen in test scripts (localhost only)
@@ -253,11 +254,13 @@ rg "os.getenv|environ.get|password|secret|token|crypto|hashlib|md5|sha1|sha256|h
 ```python
 # Good: secrets module for crypto randomness
 import secrets
+
 WEBHOOK_SECRET = secrets.token_urlsafe(32)
 
 # Bad: random module is not cryptographically secure
 import random
-WEBHOOK_SECRET = ''.join(random.choices(...))
+
+WEBHOOK_SECRET = "".join(random.choices(...))
 ```
 
 ---
@@ -468,8 +471,10 @@ Create a shared SSRF prevention module (`utils/url_validation.py`):
 
 ```python
 """URL validation utility for SSRF prevention."""
+
 from urllib.parse import urlparse
 import ipaddress
+
 
 def _validate_url_safe(url: str) -> bool:
     if not url or not isinstance(url, str):

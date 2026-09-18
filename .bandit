@@ -83,10 +83,22 @@ skips = B110,B112,B404
 #   security/        the audit scanner, whose rule tables deliberately contain
 #                    secret-shaped literals and fixed-argv git/pip-audit calls
 #   .vulnclaw-local/ vendored instance config and skill references
-#   tests/           dummy credentials, local servers and throwaway values
 #   .venv,/venv,env  installed dependencies
 #   __pycache__      compiled bytecode
+#
+# tests/ is deliberately NOT excluded. Excluding it made the directory a blind
+# spot, and the one HIGH finding to ever come from there (B324, the md5 helper in
+# tests/test_parallel_upload_streaming.py) stayed invisible to every local run
+# until the CI job went red. It is scanned like any other directory, and the two
+# classes of test-only noise are dealt with where each belongs:
+#   B101 asserts     accepted by scripts/check_bandit.py, the only place that can
+#                    scope a skip to tests/ - this file's `skips` are global, and
+#                    skipping B101 here would also silence an assert in production
+#                    code, where `python -O` deletes it.
+#   fixture values   the B105/B106 hits on throwaway values carry a per-line
+#                    `# nosec <id>` naming the check, the same way
+#                    scripts/check_eventbus_integration.py does.
 # Note: an `exclude` in this file REPLACES bandit's built-in default list rather
 # than extending it, so the entries bandit ships with .git/__pycache__/.tox/.eggs
 # are repeated here.
-exclude = ./.git,./.venv,./venv,./env,./security,./.vulnclaw-local,./tests,./__pycache__,./.tox,./.eggs,./node_modules
+exclude = ./.git,./.venv,./venv,./env,./security,./.vulnclaw-local,./__pycache__,./.tox,./.eggs,./node_modules

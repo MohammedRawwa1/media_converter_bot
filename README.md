@@ -373,6 +373,18 @@ See `.env.example` for the complete list of all supported environment variables.
 | **Lint & Compile** | Every push + PR | Ruff linting, Ruff format check, `py_compile` syntax validation |
 | **Security Scan** | Push/PR to `main` | Bandit static analysis, pip-audit dependency scan, Ruff linting, OWASP leak patterns, TruffleHog secret scanning |
 
+The gates are scripts, and each workflow calls its own, so the job and your
+machine run one implementation: `scripts/check_lint.py` (Ruff lint, Ruff format
+and the `py_compile` syntax check, all three always run) and
+`scripts/check_bandit.py` (the Bandit scan, which reads `.bandit` through `--ini`
+and fails only on HIGH findings). Both exit non-zero rather than reporting a pass
+when they could not actually run.
+
+`tests/` is scanned like any other directory — bandit's `B101` (assert) is
+accepted inside it and reported everywhere else, so the suite is not a blind
+spot. Excluding it was how a HIGH-severity md5 `B324` in a test helper stayed
+invisible to every local run until the CI job went red on it.
+
 ---
 
 ## 🛠 Development
@@ -401,6 +413,15 @@ python scripts/create_pyrogram_session.py
 
 # Verify all modules import cleanly
 python scripts/import_check.py
+
+# Lint gate: the Ruff lint, Ruff format and syntax checks CI runs, in one run.
+python scripts/check_lint.py
+python scripts/check_lint.py --target workers/     # narrow it while iterating
+
+# Security gate: the bandit check CI runs, for before you push.
+# 0 = clean, 1 = a HIGH finding, 2 = could not run (never a silent pass).
+python scripts/check_bandit.py
+python scripts/check_bandit.py --target workers/   # narrow it while iterating
 
 # Generate session string from env var
 python scripts/create_pyrogram_session.py --session "$PYROGRAM_SESSION"
