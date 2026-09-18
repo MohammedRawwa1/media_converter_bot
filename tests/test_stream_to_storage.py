@@ -334,13 +334,18 @@ def _install(monkeypatch, tmp_path, *, stream_ok=True, mode="stream", cancel_mid
     monkeypatch.setattr(job_queue, "get_redis", _get_redis)
     monkeypatch.setenv("STORAGE_PATH", str(tmp_path))
     monkeypatch.setenv("REUSE_LOCAL_INPUT", "1")
+    # The shared source cache path is derived from config.TEMP_PATH, so point it
+    # at the test directory instead of the checkout's own storage/temp.
+    monkeypatch.setattr(bigfile_pipeline.config, "TEMP_PATH", os.path.join(str(tmp_path), "temp"), raising=False)
     return backend, jobs, streamed, hashes
 
 
-def _ingest(monkeypatch, tmp_path, **kwargs):
+def _ingest(monkeypatch, tmp_path, env=None, **kwargs):
     # A cancel check belongs to the ingest call, not to the fakes.
     cancel_check = kwargs.pop("cancel_check", None)
     backend, jobs, streamed, hashes = _install(monkeypatch, tmp_path, **kwargs)
+    for _key, _value in (env or {}).items():
+        monkeypatch.setenv(_key, _value)
 
     async def _run_coro():
         pipeline = BigFilePipeline()
@@ -373,10 +378,18 @@ def test_stream_mode_puts_the_media_in_the_bucket_without_a_local_copy(monkeypat
     assert backend.sinks[0].aborted == 0
     assert backend.sinks[0].tell() == len(SOURCE_BYTES)
 
-    # The download was asked for the sink itself, not for a path.
+    # The download was asked for the sink itself, not for a path. With local
+    # reuse on, the stream is also mirrored into the shared source cache as it
+    # passes - that local copy is what lets even the *first* repeat skip the
+    # bucket read - so the sink is the head tap wrapped by a local tee.
     assert len(streamed) == 1
     _, _, sink, _ = streamed[0]
-    assert isinstance(sink, storage.HeadCaptureSink)
+    if isinstance(sink, storage.LocalFileTeeSink):
+        assert isinstance(sink.wrapped, storage.HeadCaptureSink)
+    else:
+        assert isinstance(sink, storage.HeadCaptureSink)
+    cached = media_cache.library_source_cache_path(expected_key, ".mp4")
+    assert cached and os.path.exists(cached)
 
     job = jobs[-1]
     assert job["input_key"] == expected_key
@@ -389,6 +402,30 @@ def test_stream_mode_puts_the_media_in_the_bucket_without_a_local_copy(monkeypat
     # The tapped header was probed, so the job still carries real metadata.
     assert hashes[-1]["source_duration"] == "12.5"
     assert hashes[-1]["source_width"] == "1920"
+
+
+def test_stream_mode_can_still_skip_the_local_mirror(monkeypatch, tmp_path):
+    """``REUSE_LOCAL_INPUT=0`` keeps the stream disk-free and cache-less."""
+    result, backend, jobs, streamed, hashes = _ingest(
+        monkeypatch, tmp_path, env={"REUSE_LOCAL_INPUT": "0"}
+    )
+
+    assert result.ok
+    _, _, sink, _ = streamed[0]
+    assert isinstance(sink, storage.HeadCaptureSink)
+    cached = media_cache.library_source_cache_path(media_cache.media_library_key("AgADCSIAAtbSIVE"), ".mp4")
+    assert cached is None or not os.path.exists(cached)
+
+
+def test_streamed_disk_download_populates_the_shared_cache(monkeypatch, tmp_path):
+    """A disk-mode fetch leaves the bytes in the shared cache for the next job."""
+    result, backend, jobs, streamed, hashes = _ingest(monkeypatch, tmp_path, mode="full")
+
+    assert result.ok
+    cached = media_cache.library_source_cache_path(result.s3_key, ".mp4")
+    assert cached and os.path.exists(cached)
+    with open(cached, "rb") as fh:
+        assert fh.read() == SOURCE_BYTES
 
 
 def test_the_streamed_head_is_probed_from_a_throwaway_file(monkeypatch, tmp_path):

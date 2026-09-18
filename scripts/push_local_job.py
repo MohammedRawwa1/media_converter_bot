@@ -49,7 +49,7 @@ def _ensure_sample_input(path: str):
             print("Creating sample test video at:", path)
             import subprocess
 
-            subprocess.run(cmd, check=True)
+            subprocess.run(cmd, check=True)  # nosec B603  # literal ffmpeg argv list
             return True
         except Exception as e:
             print("Failed to create sample file with ffmpeg:", e)

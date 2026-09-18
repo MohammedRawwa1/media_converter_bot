@@ -201,6 +201,84 @@ class HeadCaptureSink(UploadSink):
         await self._sink.abort()
 
 
+class LocalFileTeeSink(UploadSink):
+    """Wrap a sink and mirror every byte into a local cache file.
+
+    A source streamed straight into storage has no local copy, so a later job
+    on the same media would have to read the whole object back out of the
+    bucket. Tapping the stream writes that copy while the bytes are already
+    passing through. The file only appears under its final name once the upload
+    completed, so a truncated transfer is never left behind for a later job to
+    mistake for the media.
+    """
+
+    def __init__(self, sink: UploadSink, dest_path: str):
+        self._sink = sink
+        self.key = sink.key
+        self._dest = dest_path
+        self._tmp = f"{dest_path}.part"
+        self._fh = None
+        self._written = 0
+
+    @property
+    def wrapped(self) -> UploadSink:
+        """The sink the bytes are also forwarded to."""
+        return self._sink
+
+    async def open(self) -> None:
+        await self._sink.open()
+        os.makedirs(os.path.dirname(self._dest), exist_ok=True)
+        with contextlib.suppress(OSError):
+            if os.path.exists(self._tmp):
+                os.remove(self._tmp)
+        # Kept open across the whole transfer: one write syscall per chunk
+        # instead of an open/close per chunk. Closed in ``_finalize``/``abort``.
+        self._fh = open(self._tmp, "wb")  # noqa: SIM115
+
+    def write(self, chunk: bytes) -> Any | None:
+        if chunk and self._fh is not None:
+            self._fh.write(chunk)
+            self._written += len(chunk)
+        return self._sink.write(chunk)
+
+    def tell(self) -> int:
+        return self._sink.tell()
+
+    def flush(self) -> None:
+        if self._fh is not None:
+            with contextlib.suppress(Exception):
+                self._fh.flush()
+        self._sink.flush()
+
+    async def close(self) -> str:
+        key = await self._sink.close()
+        self._finalize()
+        return key
+
+    def _finalize(self) -> None:
+        if self._fh is not None:
+            with contextlib.suppress(Exception):
+                self._fh.close()
+            self._fh = None
+        if self._written > 0 and os.path.exists(self._tmp):
+            with contextlib.suppress(OSError):
+                os.replace(self._tmp, self._dest)
+        else:
+            with contextlib.suppress(OSError):
+                if os.path.exists(self._tmp):
+                    os.remove(self._tmp)
+
+    async def abort(self) -> None:
+        if self._fh is not None:
+            with contextlib.suppress(Exception):
+                self._fh.close()
+            self._fh = None
+        with contextlib.suppress(OSError):
+            if os.path.exists(self._tmp):
+                os.remove(self._tmp)
+        await self._sink.abort()
+
+
 class _BlockingS3Client:
     """Run a synchronous boto3 client's calls in worker threads.
 

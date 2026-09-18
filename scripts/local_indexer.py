@@ -164,7 +164,7 @@ def ffprobe_info(path: Path) -> dict[str, Any | None]:
             "json",
             str(path),
         ]
-        proc = subprocess.run(cmd, capture_output=True, text=True)
+        proc = subprocess.run(cmd, capture_output=True, text=True)  # nosec B603  # literal ffprobe argv list
         if proc.returncode != 0 or not proc.stdout:
             return {}
         data = json.loads(proc.stdout)
@@ -204,7 +204,7 @@ def create_thumbnail(path: Path, thumb_path: Path, time_offset: str = "00:00:01"
             "2",
             str(thumb_path),
         ]
-        proc = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        proc = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)  # nosec B603  # literal ffmpeg argv list
         return proc.returncode == 0 and thumb_path.exists()
     except Exception:
         return False

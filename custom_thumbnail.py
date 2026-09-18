@@ -1,20 +1,38 @@
 import contextlib
+import logging
 import os
 
 import aiofiles
 from telegram import Update
+from telegram.error import RetryAfter
 from telegram.ext import CallbackContext, CommandHandler
 
 import config
 from utils.confirm import confirm_keyboard
+
+logger = logging.getLogger(__name__)
 
 
 async def add_thumb(update: Update, context: CallbackContext):
     user_id = update.effective_user.id
     if update.message.reply_to_message and update.message.reply_to_message.photo:
         file_id = update.message.reply_to_message.photo[-1].file_id
-        file = await context.bot.get_file(file_id)
-        file_bytes = await file.download_as_bytearray()
+        # get_file/download are Bot API calls drawn from the chat's flood budget.
+        # A RetryAfter here means Telegram is already refusing writes, so answer
+        # once with something the user can act on rather than retrying into it.
+        try:
+            file = await context.bot.get_file(file_id)
+            file_bytes = await file.download_as_bytearray()
+        except RetryAfter as exc:
+            logger.warning(
+                "add_thumb: Telegram flood wait (%ss) for user %s",
+                getattr(exc, "retry_after", "?"),
+                user_id,
+            )
+            await update.message.reply_text(
+                "Telegram is rate-limiting this chat right now — please try again in a moment."
+            )
+            return
         # Use configured thumbnail path if available, else fallback
         thumb_dir = getattr(config, "THUMBNAIL_PATH", "storage/thumbnails")
         with contextlib.suppress(Exception):

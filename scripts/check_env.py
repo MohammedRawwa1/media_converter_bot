@@ -24,7 +24,7 @@ def check_bot_token():
 def check_ffmpeg_binary():
     path = os.getenv("FFMPEG_PATH", "ffmpeg")
     try:
-        proc = subprocess.run([path, "-version"], capture_output=True, text=True, timeout=5)
+        proc = subprocess.run([path, "-version"], capture_output=True, text=True, timeout=5)  # nosec B603  # literal [path, -version] argv
         if proc.returncode == 0:
             print(f'[OK] ffmpeg binary found at "{path}"')
             return True

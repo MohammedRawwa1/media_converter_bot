@@ -14,7 +14,9 @@ from flask import Flask, jsonify, request, send_file, send_from_directory
 from flask_cors import CORS
 
 import config
+from utils.job_access import JOB_CAPABILITY_PARAM, issue_job_token, job_token_ok
 from utils.url_validation import _validate_url_safe
+from utils.web_auth import debug_token_ok, diag_token_ok, upload_token_ok
 
 # Rate limiting for DoS/DDoS protection (token bucket per-endpoint per-IP)
 from utils.web_rate_limiter import get_client_ip, make_rate_limit_response, web_rate_limiter
@@ -29,10 +31,47 @@ try:
 except Exception:
     get_storage_backend_sync = None
 
-app = Flask(__name__, static_folder="static")
-CORS(app)
-
 logger = logging.getLogger(__name__)
+
+app = Flask(__name__, static_folder="static")
+
+# ── CORS ──────────────────────────────────────────────────────────────────
+# The web UI is served by this same app, so normal browser use is same-origin
+# and needs no CORS grant. A bare `CORS(app)` would let any website script the
+# job API (upload, presign, enqueue, status, download) from a victim's browser.
+# Only origins listed in CORS_ALLOWED_ORIGINS (comma-separated) are allowed;
+# when it is unset, no cross-origin access is granted at all.
+_CORS_ORIGINS_RAW = (os.environ.get("CORS_ALLOWED_ORIGINS") or "").strip()
+if _CORS_ORIGINS_RAW:
+    _CORS_ORIGINS = [origin.strip() for origin in _CORS_ORIGINS_RAW.split(",") if origin.strip()]
+    if "*" in _CORS_ORIGINS:
+        logger.warning(
+            "CORS_ALLOWED_ORIGINS contains '*' — any website can call this API from a "
+            "browser. Set an explicit origin list instead."
+        )
+    CORS(app, origins=_CORS_ORIGINS, supports_credentials=False)
+    logger.info("CORS: allowing origins %s", _CORS_ORIGINS)
+else:
+    logger.info("CORS: no CORS_ALLOWED_ORIGINS configured — same-origin requests only")
+
+# ── Auth posture ──────────────────────────────────────────────────────────
+# UPLOAD_SECRET / DEBUG_SECRET / DIAG_TOKEN are optional by design (a private
+# instance may run without them). An unset token is not a hole — the checks fail
+# closed (utils/web_auth.py) — but it does mean the routes those tokens guard are
+# unusable, so say so at startup instead of leaving it to be discovered by
+# whoever gets a 401.
+_MISSING_TOKENS = [
+    name for name in ("UPLOAD_SECRET", "DEBUG_SECRET", "DIAG_TOKEN")
+    if not (os.environ.get(name) or "").strip()
+]
+if _MISSING_TOKENS:
+    logger.warning(
+        "web UI: %s not set — requests to the surfaces they guard are refused "
+        "(fail closed, see utils/web_auth.py): "
+        "upload/presign/enqueue_from_url/status/download/events/diag. "
+        "Set them in production, or set ALLOW_UNAUTHENTICATED_WEB=1 to opt out.",
+        ", ".join(_MISSING_TOKENS),
+    )
 
 # storage paths
 INPUT_DIR = getattr(config, "INPUT_PATH", "storage/input")
@@ -144,6 +183,35 @@ def _run_async(coro):
     return _ensure_loop().run_until_complete(coro)
 
 
+# ── Per-job access capability helpers ──────────────────────────────────────
+# See utils/job_access.py for the model. Job-scoped reads are authorized by a
+# token that belongs to one job, not by the shared upload secret.
+
+
+def _job_access_ok(job_id: str) -> bool:
+    """True when the request carries this job's own access capability."""
+    incoming = request.headers.get("X-Job-Token") or request.args.get(JOB_CAPABILITY_PARAM)
+    try:
+        return bool(_run_async(job_token_ok(job_id, incoming)))
+    except Exception:
+        logger.exception("webapp: job capability check failed for %s", job_id)
+        return False
+
+
+def _job_access_payload(job_id: str) -> dict:
+    """Body for a newly created job: its id plus its access capability.
+
+    The plaintext capability is returned exactly once, here; only its digest is
+    stored (utils/job_access.py).
+    """
+    try:
+        capability = _run_async(issue_job_token(job_id))
+    except Exception:
+        logger.exception("webapp: could not mint a job capability for %s", job_id)
+        return {"job_id": job_id}
+    return {"job_id": job_id, JOB_CAPABILITY_PARAM: capability}
+
+
 # ── Upload progress publishing helper ──────────────────────────────────────
 
 
@@ -210,21 +278,16 @@ def upload():
         body, status, headers = make_rate_limit_response("upload", client_ip)
         return jsonify(body), status, headers
 
-    # Optional upload token protection: when `UPLOAD_SECRET` is set in the
-    # environment, require callers to include an `X-Upload-Token` header or
-    # provide `upload_token` as a form/query parameter with the same value.
-    upload_secret = os.environ.get("UPLOAD_SECRET")
-    if upload_secret:
-        incoming_token = (
-            request.headers.get("X-Upload-Token")
-            or request.form.get("upload_token")
-            or request.args.get("upload_token")
+    # Upload token protection. UPLOAD_SECRET fails closed when unset (see
+    # utils/web_auth.py), and the credential is read from a header or the request
+    # body only: a token in the query string leaks into access logs, browser
+    # history and Referer headers.
+    incoming_token = request.headers.get("X-Upload-Token") or request.form.get("upload_token")
+    if not upload_token_ok(incoming_token):
+        return (
+            jsonify({"error": "unauthorized", "detail": "missing or invalid upload token"}),
+            401,
         )
-        if not incoming_token or incoming_token != upload_secret:
-            return (
-                jsonify({"error": "unauthorized", "detail": "missing or invalid upload token"}),
-                401,
-            )
 
     forward_hash = request.form.get("forward_hash") or request.args.get("forward_hash")
     f = request.files.get("file")
@@ -562,7 +625,7 @@ def upload():
 
         t = threading.Thread(target=_bg_fetch_and_enqueue, args=(meta, input_path, job_id, request_id), daemon=True)
         t.start()
-        return jsonify({"job_id": job_id})
+        return jsonify(_job_access_payload(job_id))
 
     # Detect or sanitize the original filename. Prefer the uploaded name,
     # otherwise probe the file to derive a sensible name.
@@ -707,7 +770,7 @@ def upload():
             return jsonify(
                 {"error": "job queue not available on server", "detail": "Internal error. Check server logs."}
             ), 503
-    return jsonify({"job_id": job_id})
+    return jsonify(_job_access_payload(job_id))
 
 
 @app.route("/debug/telethon-log", methods=["GET"])
@@ -722,11 +785,9 @@ def telethon_log():
     if not web_rate_limiter.check_limit("debug_log", client_ip):
         body, status, headers = make_rate_limit_response("debug_log", client_ip)
         return jsonify(body), status, headers
-    debug_secret = os.environ.get("DEBUG_SECRET")
-    if debug_secret:
-        token = request.headers.get("X-Debug-Token") or request.args.get("debug_token")
-        if not token or token != debug_secret:
-            return jsonify({"error": "unauthorized"}), 401
+    token = request.headers.get("X-Debug-Token") or request.headers.get("X-DIAG-TOKEN")
+    if not debug_token_ok(token):
+        return jsonify({"error": "unauthorized"}), 401
 
     # Prefer synchronous backend helper if present, else attempt async helper
     backend = None
@@ -839,24 +900,18 @@ def presign():
     if not web_rate_limiter.check_limit("presign", client_ip):
         body, status, headers = make_rate_limit_response("presign", client_ip)
         return jsonify(body), status, headers
-    upload_secret = os.environ.get("UPLOAD_SECRET")
-    if upload_secret:
-        incoming_token = None
-        if request.is_json:
-            _body = request.get_json(silent=True)
-            if _body:
-                incoming_token = _body.get("upload_token")
-        if not incoming_token:
-            incoming_token = (
-                request.headers.get("X-Upload-Token")
-                or request.form.get("upload_token")
-                or request.args.get("upload_token")
-            )
-        if not incoming_token or incoming_token != upload_secret:
-            return (
-                jsonify({"error": "unauthorized", "detail": "missing or invalid upload token"}),
-                401,
-            )
+    incoming_token = None
+    if request.is_json:
+        _body = request.get_json(silent=True)
+        if _body:
+            incoming_token = _body.get("upload_token")
+    if not incoming_token:
+        incoming_token = request.headers.get("X-Upload-Token") or request.form.get("upload_token")
+    if not upload_token_ok(incoming_token):
+        return (
+            jsonify({"error": "unauthorized", "detail": "missing or invalid upload token"}),
+            401,
+        )
 
     filename = None
     try:
@@ -921,24 +976,18 @@ def enqueue_from_url():
     if not web_rate_limiter.check_limit("enqueue_url", client_ip):
         body, status, headers = make_rate_limit_response("enqueue_url", client_ip)
         return jsonify(body), status, headers
-    upload_secret = os.environ.get("UPLOAD_SECRET")
-    if upload_secret:
-        incoming_token = None
-        if request.is_json:
-            _body = request.get_json(silent=True)
-            if _body:
-                incoming_token = _body.get("upload_token")
-        if not incoming_token:
-            incoming_token = (
-                request.headers.get("X-Upload-Token")
-                or request.form.get("upload_token")
-                or request.args.get("upload_token")
-            )
-        if not incoming_token or incoming_token != upload_secret:
-            return (
-                jsonify({"error": "unauthorized", "detail": "missing or invalid upload token"}),
-                401,
-            )
+    incoming_token = None
+    if request.is_json:
+        _body = request.get_json(silent=True)
+        if _body:
+            incoming_token = _body.get("upload_token")
+    if not incoming_token:
+        incoming_token = request.headers.get("X-Upload-Token") or request.form.get("upload_token")
+    if not upload_token_ok(incoming_token):
+        return (
+            jsonify({"error": "unauthorized", "detail": "missing or invalid upload token"}),
+            401,
+        )
 
     data = request.get_json(silent=True) or {}
     source_url = data.get("source_url") or request.form.get("source_url") or request.args.get("source_url")
@@ -991,7 +1040,7 @@ def enqueue_from_url():
 
         t = threading.Thread(target=_bg_enqueue, args=(job, str(uuid.uuid4())), daemon=True)
         t.start()
-        return jsonify({"job_id": job_id})
+        return jsonify(_job_access_payload(job_id))
     else:
         return jsonify({"error": "job queue not available on server"}), 503
 
@@ -1030,15 +1079,15 @@ def status(job_id):
     if not job_id or not re.fullmatch(r"[A-Za-z0-9_-]+", job_id):
         return jsonify({"error": "invalid job_id"}), 400
 
-    # Optional auth: require the same upload_token when UPLOAD_SECRET is set
-    upload_secret = os.environ.get("UPLOAD_SECRET")
-    if upload_secret:
-        incoming_token = request.headers.get("X-Upload-Token") or request.args.get("upload_token")
-        if not incoming_token or incoming_token != upload_secret:
-            return (
-                jsonify({"error": "unauthorized", "detail": "missing or invalid upload token"}),
-                401,
-            )
+    # Authorization: a job is readable only by the holder of its own capability
+    # token (utils/job_access.py). The shared upload secret authorizes the
+    # service as a whole, which is not the same thing as one job, so it no
+    # longer stands in for a per-job check on a job-scoped route.
+    if not _job_access_ok(job_id):
+        return (
+            jsonify({"error": "unauthorized", "detail": "missing or invalid job token"}),
+            401,
+        )
 
     # Try to read Redis job hash
     try:
@@ -1150,15 +1199,15 @@ def download(job_id):
     if not job_id or not re.fullmatch(r"[A-Za-z0-9_-]+", job_id):
         return jsonify({"error": "invalid job_id"}), 400
 
-    # Optional auth: require the same upload_token when UPLOAD_SECRET is set
-    upload_secret = os.environ.get("UPLOAD_SECRET")
-    if upload_secret:
-        incoming_token = request.headers.get("X-Upload-Token") or request.args.get("upload_token")
-        if not incoming_token or incoming_token != upload_secret:
-            return (
-                jsonify({"error": "unauthorized", "detail": "missing or invalid upload token"}),
-                401,
-            )
+    # Authorization: a job is readable only by the holder of its own capability
+    # token (utils/job_access.py). The shared upload secret authorizes the
+    # service as a whole, which is not the same thing as one job, so it no
+    # longer stands in for a per-job check on a job-scoped route.
+    if not _job_access_ok(job_id):
+        return (
+            jsonify({"error": "unauthorized", "detail": "missing or invalid job token"}),
+            401,
+        )
 
     # Check Redis for output path
     try:
@@ -1248,15 +1297,15 @@ def events(job_id):
         body, status, headers = make_rate_limit_response("events", client_ip)
         return jsonify(body), status, headers
 
-    # Optional auth: require the same upload_token when UPLOAD_SECRET is set
-    upload_secret = os.environ.get("UPLOAD_SECRET")
-    if upload_secret:
-        incoming_token = request.headers.get("X-Upload-Token") or request.args.get("upload_token")
-        if not incoming_token or incoming_token != upload_secret:
-            return (
-                jsonify({"error": "unauthorized", "detail": "missing or invalid upload token"}),
-                401,
-            )
+    # Authorization: a job is readable only by the holder of its own capability
+    # token (utils/job_access.py). The shared upload secret authorizes the
+    # service as a whole, which is not the same thing as one job, so it no
+    # longer stands in for a per-job check on a job-scoped route.
+    if not _job_access_ok(job_id):
+        return (
+            jsonify({"error": "unauthorized", "detail": "missing or invalid job token"}),
+            401,
+        )
 
     logger.warning("Flask /events/%s called — DEPRECATED. Use FastAPI /events/%s instead.", job_id, job_id)
 
@@ -1360,22 +1409,14 @@ def get_input():
     if not web_rate_limiter.check_limit("get_input", client_ip):
         body, status, headers = make_rate_limit_response("get_input", client_ip)
         return jsonify(body), status, headers
-    diag_token = os.environ.get("DIAG_TOKEN")
-    upload_secret = os.environ.get("UPLOAD_SECRET")
+    # Credentials come from a header or the request body only (see /upload).
+    incoming_diag = request.headers.get("X-DIAG-TOKEN") or request.form.get("token")
+    incoming_upload = request.headers.get("X-Upload-Token") or request.form.get("upload_token")
 
-    incoming_diag = request.headers.get("X-DIAG-TOKEN") or request.args.get("token") or request.form.get("token")
-    incoming_upload = (
-        request.headers.get("X-Upload-Token") or request.args.get("upload_token") or request.form.get("upload_token")
-    )
-
-    # Validate token
-    if diag_token:
-        if incoming_diag != diag_token:
-            return jsonify({"error": "unauthorized"}), 401
-    else:
-        # if DIAG_TOKEN not set, require upload secret as fallback
-        if not upload_secret or incoming_upload != upload_secret:
-            return jsonify({"error": "unauthorized"}), 401
+    # Validate token: either credential is accepted, and both fail closed when
+    # their variable is unset (see utils/web_auth.py).
+    if not (diag_token_ok(incoming_diag) or upload_token_ok(incoming_upload)):
+        return jsonify({"error": "unauthorized"}), 401
 
     name = request.args.get("name") or request.args.get("filename") or request.form.get("name")
     if not name:
@@ -1415,11 +1456,10 @@ def internal_diag():
     if not web_rate_limiter.check_limit("diag", client_ip):
         body, status, headers = make_rate_limit_response("diag", client_ip)
         return jsonify(body), status, headers
-    token = os.environ.get("DIAG_TOKEN")
-    incoming = request.headers.get("X-DIAG-TOKEN") or request.args.get("token") or request.form.get("token")
-    if not token:
+    if not (os.environ.get("DIAG_TOKEN") or "").strip():
         return jsonify({"error": "DIAG_TOKEN not configured on server"}), 403
-    if incoming != token:
+    incoming = request.headers.get("X-DIAG-TOKEN") or request.form.get("token")
+    if not diag_token_ok(incoming):
         return jsonify({"error": "unauthorized"}), 401
 
     def mask_redis(u: str):
@@ -1477,7 +1517,7 @@ def internal_diag():
 
     # process listing (best-effort)
     try:
-        ps_out = subprocess.check_output(["/bin/ps", "aux"], stderr=subprocess.STDOUT, text=True)
+        ps_out = subprocess.check_output(["/bin/ps", "aux"], stderr=subprocess.STDOUT, text=True)  # nosec B603  # literal [/bin/ps, aux] argv
         result["ps"] = "\n".join(ps_out.splitlines()[:200])
     except Exception:
         result["ps"] = None

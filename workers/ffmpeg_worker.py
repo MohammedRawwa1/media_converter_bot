@@ -22,6 +22,7 @@ import hashlib
 import json
 import shutil
 import tempfile
+from urllib.parse import urlparse
 
 import aiohttp
 from prometheus_client import Counter, Gauge, Histogram, start_http_server
@@ -1102,9 +1103,6 @@ async def _forward_pubsub_listener(stop_event: asyncio.Event | None, event: asyn
 # of being downsampled to the storage size.
 _THUMB_MAX_EDGE = 320
 
-_LIBRARY_KEY_PREFIX_FALLBACK = "inputs/library/"
-
-
 def _library_source_cache_path(input_key: str | None, ext: str = "") -> str | None:
     """Local cache path for a shared library object, or ``None`` for any other key.
 
@@ -1114,37 +1112,64 @@ def _library_source_cache_path(input_key: str | None, ext: str = "") -> str | No
     local disk once therefore serves all of those operations, so the media only
     travels out of the bucket the first time instead of once per style.
 
-    Returns ``None`` for every other key shape: a per-job object must never be
-    handed to a different job, and a crafted ``<hash>/<name>`` pair must not be
-    able to walk out of the cache directory.
+    The derivation lives in :func:`utils.media_cache.library_source_cache_path`
+    so the worker and the producers that fill the cache cannot drift apart on
+    the name; this is the worker's stable entry point to it.
     """
-    if not input_key or not isinstance(input_key, str):
-        return None
     try:
         from utils import media_cache as _media_cache_mod
 
-        _prefix = _media_cache_mod.LIBRARY_KEY_PREFIX
+        return _media_cache_mod.library_source_cache_path(input_key, ext)
     except Exception:
-        _prefix = _LIBRARY_KEY_PREFIX_FALLBACK
+        logger.debug("ffmpeg worker: shared source cache path unavailable for %s", input_key)
+        return None
 
-    key = input_key.replace("\\", "/").lstrip("/")
-    if not key.startswith(_prefix):
-        return None
-    parts = [p for p in key[len(_prefix) :].split("/") if p not in ("", ".")]
-    if len(parts) != 2:
-        return None
-    _hash, _name = parts
-    # Hash segment: hex from media_cache.media_library_key, but accept any plain
-    # token so a key written by an older/newer producer still hits the cache.
-    if not _hash or len(_hash) > 64 or ".." in _hash or not all(c.isalnum() or c in "_-" for c in _hash):
-        return None
-    if ".." in _name or os.path.basename(_name) != _name:
-        return None
-    # The stored key may carry no extension (media_cache writes `source`); the
-    # caller's extension keeps the cached file usable by ffmpeg and friends.
-    if ext and not os.path.splitext(_name)[1]:
-        _name = f"{_name}{ext}"
-    return os.path.join(getattr(config, "TEMP_PATH", "storage/temp"), "library", _hash, _name)
+
+def _library_source_cache_paths(input_key: str | None, ext: str = "") -> list[str]:
+    """Every path a cached copy of *input_key* could occupy, most specific first.
+
+    The stored key usually carries no extension (media_cache writes ``source``),
+    while the cache file is written *with* the caller's extension so tools that
+    sniff by suffix work. Both names therefore have to be considered, otherwise
+    a lookup (no ext) and a write (with ext) never agree and the cache is dead.
+    """
+    base = _library_source_cache_path(input_key)
+    if not base:
+        return []
+    paths: list[str] = []
+    with_ext = _library_source_cache_path(input_key, ext) if ext else None
+    if with_ext and with_ext != base:
+        paths.append(with_ext)
+    paths.append(base)
+    return paths
+
+
+def _find_library_source_cache(input_key: str | None, ext: str = "") -> str | None:
+    """The existing local copy of *input_key*, or ``None`` when there is none.
+
+    Tries the known names first, then any cached sibling written with a
+    different extension for the same content-addressed media, so one stored
+    object is downloaded from the bucket at most once no matter which operation
+    asked for it first.
+    """
+    for path in _library_source_cache_paths(input_key, ext):
+        with contextlib.suppress(OSError):
+            if os.path.exists(path) and os.path.getsize(path) > 0:
+                return path
+    base = _library_source_cache_path(input_key)
+    if base:
+        with contextlib.suppress(Exception):
+            import glob
+
+            for match in sorted(glob.glob(base + ".*")):
+                # A leftover ``.part``/``.probe`` is not the media: serving one
+                # would hand ffmpeg a truncated or header-only slice.
+                if match.endswith((".part", ".probe")):
+                    continue
+                with contextlib.suppress(OSError):
+                    if os.path.getsize(match) > 0:
+                        return match
+    return None
 
 
 def _is_shared_source_cache(input_path: str | None, input_key: str | None) -> bool:
@@ -1152,11 +1177,18 @@ def _is_shared_source_cache(input_path: str | None, input_key: str | None) -> bo
 
     Used before deleting an input after a job: the per-job copy is disposable,
     but the library copy is the whole point of the cache and has to survive.
+    The comparison is extension-agnostic, because the cache file is named with
+    the caller's extension while the key itself usually is not - the mismatch
+    here is what used to let every job delete the shared copy it had just
+    written, forcing the next one to pull the same bytes out of the bucket.
     """
-    cached = _library_source_cache_path(input_key)
-    if not cached or not input_path:
+    if not input_path or not input_key:
         return False
-    return os.path.normpath(str(input_path)) == os.path.normpath(cached)
+    ext = os.path.splitext(str(input_path))[1]
+    for cached in _library_source_cache_paths(input_key, ext):
+        if os.path.normpath(str(input_path)) == os.path.normpath(cached):
+            return True
+    return False
 
 
 def _cleanup_local_thumb(job: dict) -> None:
@@ -1434,8 +1466,14 @@ async def handle_job(job: dict):
         # second style, the third button press and every repeat then read the
         # source off local disk. Only library keys are cached - a per-job object
         # belongs to that job alone and must never be served to another.
-        _shared_cache_path = _library_source_cache_path(input_key)
-        if _shared_cache_path and os.path.exists(_shared_cache_path) and os.path.getsize(_shared_cache_path) > 0:
+        # The key usually has no suffix, so derive the extension the cache file
+        # was written with exactly as the download path below does; the lookup
+        # also accepts a sibling written with any other extension for this media.
+        _src_ext = os.path.splitext(input_key)[1] or file_utils.safe_extension(
+            job.get("original_filename") or "", ""
+        )
+        _shared_cache_path = _find_library_source_cache(input_key, _src_ext)
+        if _shared_cache_path:
             logger.info(
                 "Job %s: reusing shared local source cache (%s); skipping storage download of %s",
                 job_id,
@@ -1796,6 +1834,22 @@ async def handle_job(job: dict):
     source_url = job.get("source_url")
     if source_url:
         try:
+            # SSRF defense in depth. Producers (the web API and the fetcher) do
+            # validate, but the worker trusts the queue, and the queue can be
+            # written by anything that can reach Redis/RabbitMQ/Kafka — including
+            # /bulk_url, which takes a URL straight from a Telegram message.
+            # Re-validating here means a forged job still cannot make the worker
+            # fetch cloud metadata or an internal service.
+            from utils.url_validation import _validate_url_safe
+
+            if not _validate_url_safe(source_url):
+                logger.warning(
+                    "Job %s: rejected source_url by SSRF validation (host=%s)",
+                    job_id,
+                    urlparse(source_url).hostname if isinstance(source_url, str) else "?",
+                )
+                await _set_job_state(job_id, "error", "source_url_rejected_ssrf", progress=0)
+                return
             temp_dir = os.path.join(getattr(config, "TEMP_PATH", "storage/temp"))
             os.makedirs(temp_dir, exist_ok=True)
             temp_input = os.path.join(temp_dir, f"{job_id}_src")
@@ -1974,7 +2028,13 @@ async def handle_job(job: dict):
             return int(getattr(p.memory_info(), "rss", 0))
         except Exception:
             try:
-                out = subprocess.check_output(["ps", "-o", "rss=", "-p", str(os.getpid())], text=True)
+                # Resolve ps explicitly: a bare name is a PATH lookup that fails
+                # opaquely on an image without procps.
+                ps_bin = shutil.which("ps")
+                if ps_bin is None:
+                    return 0
+                pid = str(os.getpid())
+                out = subprocess.check_output([ps_bin, "-o", "rss=", "-p", pid], text=True)  # nosec B603  # literal ps argv
                 return int(out.strip()) * 1024
             except Exception:
                 return 0
@@ -3680,7 +3740,7 @@ async def _start_healthcheck_server():
         app.router.add_get("/health", _handle_health)
         runner = web.AppRunner(app)
         await runner.setup()
-        host = os.environ.get("HEALTHCHECK_HOST", "0.0.0.0")  # nosec  # noqa: S104
+        host = os.environ.get("HEALTHCHECK_HOST", "0.0.0.0")  # nosec  # noqa: S104 - container listeners bind all interfaces; HEALTHCHECK_HOST overrides
         site = web.TCPSite(runner, host, port)
         await site.start()
         logger.info("Healthcheck server started on %s:%s/health", host, port)

@@ -115,7 +115,7 @@ git push origin main
 │   ├── app.py               # FastAPI forward fetcher
 │   └── service.py           # Forward fetch + enqueue logic
 │
-├── scripts/                 # 40+ diagnostic/admin scripts
+├── scripts/                 # 35 diagnostic/admin scripts
 │   ├── create_pyrogram_session.py  # Generate Pyrogram session string
 │   ├── create_telethon_session.py  # Generate Telethon session string
 │   ├── check_sessions.py           # Check session status

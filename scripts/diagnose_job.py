@@ -33,7 +33,7 @@ except Exception:
 
 def run_cmd(cmd, timeout=300) -> dict[str, Any]:
     try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)  # nosec B603  # argv list supplied by this diagnostic
         return {"returncode": proc.returncode, "stdout": proc.stdout, "stderr": proc.stderr}
     except Exception as e:
         return {"error": str(e)}
@@ -120,7 +120,7 @@ def job_info(job_id: str) -> dict[str, Any]:
 def ps_top(n: int = 20) -> dict[str, Any]:
     cmd = ["ps", "aux", "--sort=-rss"]
     try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=10)  # nosec B603  # literal ps argv
         out = proc.stdout.splitlines()[:n]
         return {"ps": out}
     except Exception as e:

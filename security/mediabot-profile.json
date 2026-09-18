@@ -1,0 +1,363 @@
+{
+  "instance": {
+    "name": "mediabot",
+    "display_name": "media_conversion_bot — Telegram media conversion bot",
+    "version": "1.0.0",
+    "description": "Customized Helpha-style security instance for media_conversion_bot: python-telegram-bot v21 + FastAPI/Starlette + Flask web UI + Telethon/Pyrogram userbot + Redis/RabbitMQ/Kafka job bus + MongoDB + S3/MinIO storage + ffmpeg worker.",
+    "authorized_scope": {
+      "kind": "local_repo",
+      "path": ".",
+      "note": "Static, offline-first review of the local checkout. No live target, no exploitation, no outbound traffic other than OSV.dev CVE metadata queries."
+    }
+  },
+
+  "stack": {
+    "language": "python",
+    "python_target": "3.12",
+    "frameworks": ["python-telegram-bot", "fastapi", "starlette", "flask", "uvicorn", "gunicorn"],
+    "messaging": ["telethon", "pyrogram", "redis", "aio-pika", "aiokafka"],
+    "storage": ["mongodb", "motor", "pymongo", "s3", "minio", "watchtower"],
+    "media": ["ffmpeg", "pillow"],
+    "layers": {
+      "bot": ["handlers.py", "main.py", "custom_thumbnail.py", "media_converter.py", "models.py", "config.py"],
+      "web": ["web/", "fetcher/"],
+      "worker": ["workers/", "tasks/"],
+      "utils": ["utils/"],
+      "infra": ["Dockerfile", "docker-compose*.yml", "Procfile", "start.sh", ".github/", "railway.json", ".dockerignore", ".gitignore", ".railwayignore"],
+      "deps": ["requirements.txt", "requirements-dev.txt", "web/requirements_web.txt"]
+    }
+  },
+
+  "scan": {
+    "roots": ["."],
+    "python_only_roots": ["handlers.py", "main.py", "config.py", "models.py", "media_converter.py", "custom_thumbnail.py", "setup_directory.py", "tasks", "utils", "web", "workers", "tools", "fetcher"],
+    "exclude_dirs": [
+      ".git", ".venv", "venv", "env", "__pycache__", "node_modules", ".eggs",
+      ".mypy_cache", ".pytest_cache", ".ruff_cache", "storage", "logs", "temp",
+      "dist", "build", "certs", "deploy", "scripts", "security", ".vulnclaw-local",
+      "VulnClaw", "pdf-Header_Image_Extractor"
+    ],
+    "exclude_globs": ["security/**", "**/*.min.js", "**/static/**", ".env", ".env.local", ".env.production"],
+    "test_globs": ["tests/**", "**/test_*.py", "**/*_test.py"],
+    "max_file_bytes": 2097152,
+    "binary_extensions": [
+      ".png", ".jpg", ".jpeg", ".gif", ".ico", ".pdf", ".zip", ".gz", ".tar", ".7z",
+      ".exe", ".dll", ".so", ".pyc", ".pyo", ".woff", ".woff2", ".ttf", ".otf",
+      ".session", ".db", ".sqlite", ".pem", ".key", ".crt", ".bin", ".mp3", ".mp4"
+    ]
+  },
+
+  "suppressions": [
+    {
+      "rule": "DEP-NO-HASHES",
+      "glob": "requirements.txt",
+      "reason": "requirements.txt is the direct-dependency spec that the platform builder installs with a plain `pip install -r`, so hash-checking mode cannot be turned on there without a full transitive lock (all dependencies pinned and hashed together). Every specifier now carries an upper bound, and pip-audit + OSV advisories are ingested on each scan, so a tampered or vulnerable release is still caught. A generated hash-pinned lock is a tracked follow-up, not a dismissed risk."
+    },
+    {
+      "rule": "S-GENERIC",
+      "glob": ".env*",
+      "reason": "dotenv files are the intended home for secrets and are git-ignored (checked separately by INFRA-GITIGNORE/INFRA-ENV-TRACKED)."
+    },
+    {
+      "rule": "S-KAFKA",
+      "glob": ".env*",
+      "reason": "the SASL password belongs in the dotenv file; the risk is whether that file is committed, which INFRA-ENV-TRACKED covers."
+    },
+    {
+      "rule": "CFG-HOST-0000",
+      "glob": "**/*.py",
+      "reason": "Only suppresses lines that already carry an explicit `# nosec`/`noqa: S104` justification."
+    }
+  ],
+
+  "severity_overrides": {
+    "CRYPTO-MD5": "LOW"
+  },
+
+  "cve": {
+    "enabled": true,
+    "osv_batch_url": "https://api.osv.dev/v1/querybatch",
+    "osv_detail_url": "https://api.osv.dev/v1/vulns/",
+    "ecosystem": "PyPI",
+    "requirements": ["requirements.txt", "requirements-dev.txt"],
+    "cache_path": "security/reports/cve-kb.json",
+    "cache_max_age_hours": 24,
+    "max_detail_fetches": 60,
+    "timeout_seconds": 25,
+    "vulnclaw_kb_dir": ".vulnclaw-local/kb"
+  },
+
+  "outputs": {
+    "json": "security/reports/mediabot-audit.json",
+    "markdown": "security/reports/MEDIABOT_SECURITY_AUDIT.md",
+    "cve_kb": "security/reports/cve-kb.json",
+    "sarif": "security/reports/mediabot-audit.sarif"
+  },
+
+  "verdict_policy": {
+    "fail_on": ["CRITICAL", "HIGH"],
+    "candidate_severities": ["CRITICAL", "HIGH", "MEDIUM"],
+    "note": "Mirrors the post-mortem discipline: a finding is only CONFIRMED when it carries file:line evidence from the current source. Everything else is a CANDIDATE and must be manually adjudicated before it is treated as real."
+  },
+
+  "skill_catalog": [
+    {
+      "id": "SA-A01",
+      "source": "SECURITY_AUDIT_SKILL.md",
+      "title": "Broken Access Control (owner/admin gating, webhook auth, ownership by immutable id)",
+      "owasp": "A01:2021",
+      "rules": ["AC-ADMIN-GUARD", "AC-WEBHOOK-FAILOPEN", "AC-DEBUG-ENDPOINT", "AC-USERID-FROM-PAYLOAD", "AUTH-QUERY-TOKEN"]
+    },
+    {
+      "id": "SA-A02",
+      "source": "SECURITY_AUDIT_SKILL.md",
+      "title": "Cryptographic Failures (env-only secrets, secrets module, constant-time compare)",
+      "owasp": "A02:2021",
+      "rules": ["CRYPTO-RANDOM", "CRYPTO-CMP", "S-TOKEN", "S-AWS-AK", "S-AWS-SK", "S-MONGO", "S-REDIS", "S-KAFKA", "S-GOOGLE-KEY", "S-OPENAI", "S-PRIVATE-KEY", "S-SESSION-STR", "S-GENERIC"]
+    },
+    {
+      "id": "SA-A03",
+      "source": "SECURITY_AUDIT_SKILL.md",
+      "title": "Injection (NoSQL, command, path traversal, ffmpeg argv)",
+      "owasp": "A03:2021",
+      "rules": ["INJ-SHELL", "INJ-OS-SYSTEM", "INJ-EVAL", "INJ-CMD-FSTRING", "INJ-PICKLE", "INJ-YAML", "INJ-NOSQL", "INJ-PATH-LOCAL", "INJ-SQL"]
+    },
+    {
+      "id": "SA-A04",
+      "source": "SECURITY_AUDIT_SKILL.md",
+      "title": "Insecure Design (rate limiting, flood-wait handling, outbound timeouts)",
+      "owasp": "A04:2021",
+      "rules": ["DES-RATE-LIMIT", "DES-NO-TIMEOUT", "BOT-FLOOD-WAIT", "DES-URL-LENGTH"]
+    },
+    {
+      "id": "SA-A05",
+      "source": "SECURITY_AUDIT_SKILL.md",
+      "title": "Security Misconfiguration (debug, detail leaks, binds, CORS, host header)",
+      "owasp": "A05:2021",
+      "rules": ["CFG-DEBUG-TRUE", "CFG-HOST-0000", "CFG-DETAIL-STR", "CFG-EXC-CLASS-LEAK", "AC-CORS-WILDCARD", "CFG-TRUSTED-HOST", "API-DOCS-EXPOSED", "INFRA-COMPOSE-PORT"]
+    },
+    {
+      "id": "SA-A06",
+      "source": "SECURITY_AUDIT_SKILL.md",
+      "title": "Vulnerable & Outdated Components (pip-audit + OSV real CVE ingestion)",
+      "owasp": "A06:2021",
+      "rules": ["DEP-CVE", "DEP-UNPINNED", "DEP-DIRECT-URL"]
+    },
+    {
+      "id": "SA-A07",
+      "source": "SECURITY_AUDIT_SKILL.md",
+      "title": "Authentication Failures (webhook secret layer, fail-open guards, timing-safe compares)",
+      "owasp": "A07:2021",
+      "rules": ["AC-WEBHOOK-FAILOPEN", "CRYPTO-CMP", "AUTH-SESSION-FILE", "AUTH-QUERY-TOKEN"]
+    },
+    {
+      "id": "SA-A08",
+      "source": "SECURITY_AUDIT_SKILL.md",
+      "title": "Software & Data Integrity (unsafe deserialization, unpinned CI actions)",
+      "owasp": "A08:2021",
+      "rules": ["INJ-PICKLE", "INJ-YAML", "INT-CI-UNPINNED", "DEP-DIRECT-URL"]
+    },
+    {
+      "id": "SA-A09",
+      "source": "SECURITY_AUDIT_SKILL.md",
+      "title": "Logging & Monitoring (no secret/PII in logs, no exception leaks to users)",
+      "owasp": "A09:2021",
+      "rules": ["LOG-SECRET", "LOG-PII", "CFG-EXC-CLASS-LEAK", "S-SENTRY-DSN"]
+    },
+    {
+      "id": "SA-A10",
+      "source": "SECURITY_AUDIT_SKILL.md",
+      "title": "SSRF (shared URL validation, no redirects, private-IP blocking)",
+      "owasp": "A10:2021",
+      "rules": ["SSRF-URL-USER", "SSRF-REDIRECT", "SSRF-VALIDATOR-WEAK"]
+    },
+    {
+      "id": "PACK-S01",
+      "source": "security training pack",
+      "title": "SIEM: centralized, masked security event logging",
+      "owasp": "A09:2021",
+      "rules": ["LOG-SECRET", "LOG-PII"]
+    },
+    {
+      "id": "PACK-S02",
+      "source": "security training pack",
+      "title": "Patch management: automated dependency CVE audit that blocks on CRITICAL/HIGH",
+      "owasp": "A06:2021",
+      "rules": ["DEP-CVE", "DEP-UNPINNED"]
+    },
+    {
+      "id": "PACK-S03",
+      "source": "security training pack",
+      "title": "Host header / domain integrity verification (webhook + reset link poisoning)",
+      "owasp": "A05:2021",
+      "rules": ["CFG-TRUSTED-HOST"]
+    },
+    {
+      "id": "PACK-S04",
+      "source": "security training pack",
+      "title": "Admin session gate: re-verify admin claims server-side on every sensitive request",
+      "owasp": "A01:2021",
+      "rules": ["AC-ADMIN-GUARD", "AC-DEBUG-ENDPOINT"]
+    },
+    {
+      "id": "PACK-S05",
+      "source": "security training pack",
+      "title": "Strict input sanitization / schema validation on every user field",
+      "owasp": "A03:2021",
+      "rules": ["INJ-NOSQL", "INJ-PATH-LOCAL", "DES-URL-LENGTH", "SANITIZE-FILENAME"]
+    },
+    {
+      "id": "PACK-S06",
+      "source": "security training pack",
+      "title": "Privilege escalation guard: no client-supplied role/permission fields",
+      "owasp": "A01:2021",
+      "rules": ["AC-ROLE-FROM-PAYLOAD"]
+    },
+    {
+      "id": "PACK-S07",
+      "source": "security training pack",
+      "title": "Tenant/user data isolation (no IDOR on job/session lookups)",
+      "owasp": "A01:2021",
+      "rules": ["AC-IDOR-JOB", "AC-USERID-FROM-PAYLOAD"]
+    },
+    {
+      "id": "PACK-S08",
+      "source": "security training pack",
+      "title": "API header & payload hardening (content-type, origin allowlist, body size cap)",
+      "owasp": "A05:2021",
+      "rules": ["AC-CORS-WILDCARD", "DES-BODY-LIMIT"]
+    },
+    {
+      "id": "PACK-S09",
+      "source": "security training pack",
+      "title": "Payment/webhook signature verification & server-side pricing (n/a: no payments — recorded as out of scope)",
+      "owasp": "A08:2021",
+      "rules": []
+    },
+    {
+      "id": "PACK-S10",
+      "source": "security training pack",
+      "title": "Strict origin whitelisting / sandboxed outbound notifications",
+      "owasp": "A05:2021",
+      "rules": ["AC-CORS-WILDCARD"]
+    },
+    {
+      "id": "PACK-S11",
+      "source": "security training pack",
+      "title": "Request origin tracking (proxy-aware client IP, anomaly logging)",
+      "owasp": "A09:2021",
+      "rules": ["LOG-PII", "IP-PROXY-HEADER"]
+    },
+    {
+      "id": "PACK-S12",
+      "source": "security training pack",
+      "title": "OWASP exploit-pattern filtering (URL/encoded payload normalization)",
+      "owasp": "A03:2021",
+      "rules": ["INJ-SQL", "INJ-NOSQL"]
+    },
+    {
+      "id": "PACK-S13",
+      "source": "security training pack",
+      "title": "In-memory / sandboxed file handling with MIME + size validation",
+      "owasp": "A04:2021",
+      "rules": ["DES-BODY-LIMIT", "SANITIZE-FILENAME", "UPLOAD-MIME-CHECK"]
+    },
+    {
+      "id": "PACK-S14",
+      "source": "security training pack",
+      "title": "Runtime hardening: no shell/eval, no env leakage to clients",
+      "owasp": "A05:2021",
+      "rules": ["INJ-SHELL", "INJ-EVAL", "INJ-OS-SYSTEM", "CFG-ENV-ECHO"]
+    },
+    {
+      "id": "PACK-S15",
+      "source": "security training pack",
+      "title": "Unified telemetry: structured logs, correlation IDs, no secrets in metrics",
+      "owasp": "A09:2021",
+      "rules": ["LOG-SECRET", "CFG-ENV-ECHO"]
+    },
+    {
+      "id": "TIF-SQLI-01",
+      "source": "post-mortem audit",
+      "title": "Raw SQL string interpolation",
+      "owasp": "A03:2021",
+      "rules": ["INJ-SQL"]
+    },
+    {
+      "id": "TIF-PARSE-01",
+      "source": "post-mortem audit",
+      "title": "Unvalidated parsing of route/query parameters (int/date/JSON)",
+      "owasp": "A03:2021",
+      "rules": ["PARSE-UNVALIDATED"]
+    },
+    {
+      "id": "TIF-SANITIZE-01",
+      "source": "post-mortem audit",
+      "title": "User-supplied name extrapolated into filesystem/command paths",
+      "owasp": "A03:2021",
+      "rules": ["SANITIZE-FILENAME", "INJ-PATH-LOCAL", "INJ-CMD-FSTRING"]
+    },
+    {
+      "id": "TIF-TIMING-01",
+      "source": "post-mortem audit",
+      "title": "No rate limiting on auth/entry endpoints",
+      "owasp": "A04:2021",
+      "rules": ["DES-RATE-LIMIT"]
+    },
+    {
+      "id": "TIF-INFO-01",
+      "source": "post-mortem audit",
+      "title": "Error messages leak internal state",
+      "owasp": "A09:2021",
+      "rules": ["CFG-DETAIL-STR", "CFG-EXC-CLASS-LEAK"]
+    },
+    {
+      "id": "TIF-INFO-02",
+      "source": "post-mortem audit",
+      "title": "Debug logging leaks auth tokens / session material",
+      "owasp": "A09:2021",
+      "rules": ["LOG-SECRET", "S-SESSION-STR"]
+    },
+    {
+      "id": "TIF-AUTH-01",
+      "source": "post-mortem audit",
+      "title": "Weak/absent auth gate on privileged surface",
+      "owasp": "A07:2021",
+      "rules": ["AC-WEBHOOK-FAILOPEN", "AC-ADMIN-GUARD", "AC-DEBUG-ENDPOINT"]
+    },
+    {
+      "id": "TIF-T-C09",
+      "source": "post-mortem audit",
+      "title": "Cross-tenant / cross-user data isolation leak",
+      "owasp": "A01:2021",
+      "rules": ["AC-IDOR-JOB", "AC-USERID-FROM-PAYLOAD"]
+    },
+    {
+      "id": "TIF-T-H01",
+      "source": "post-mortem audit",
+      "title": "Exposed .env / secret file shipped in the artifact",
+      "owasp": "A02:2021",
+      "rules": ["INFRA-ENV-TRACKED", "INFRA-DOCKERIGNORE", "INFRA-DOCKER-SECRET"]
+    },
+    {
+      "id": "TIF2-C01",
+      "source": "post-mortem audit v2",
+      "title": "Live secret shipped inside the deployable artifact",
+      "owasp": "A02:2021",
+      "rules": ["S-TOKEN", "S-AWS-AK", "S-AWS-SK", "S-PRIVATE-KEY", "S-SESSION-STR", "S-GENERIC"]
+    },
+    {
+      "id": "TIF2-GATE",
+      "source": "post-mortem audit v2",
+      "title": "Evidence gate: a finding is CONFIRMED only with reproducible, source-backed proof; everything else is a CANDIDATE",
+      "owasp": "A00:process",
+      "rules": ["DEP-CVE", "AC-DEBUG-ENDPOINT", "AC-WEBHOOK-FAILOPEN"]
+    }
+  ],
+
+  "in_scope_notes": [
+    "PACK-S09 (payment signature verification) is out of scope: this bot takes no payments.",
+    "PACK-S06 / AC-ROLE-FROM-PAYLOAD is in scope only for the web job-API surface; the Telegram side has no role field.",
+    "Client-side artifacts (Flutter/APK, SharedPreferences, WebView, biometrics) from the original audits are out of scope: there is no mobile client in this repo."
+  ]
+}

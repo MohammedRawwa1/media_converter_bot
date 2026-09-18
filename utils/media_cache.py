@@ -99,6 +99,42 @@ def media_library_key(file_unique_id) -> str | None:
     return f"{LIBRARY_KEY_PREFIX}{digest}/source"
 
 
+def library_source_cache_path(input_key, ext: str = "") -> str | None:
+    """Local cache path for a whole shared library object, or ``None``.
+
+    Shared library keys are content-addressed, so every operation on one media
+    (stream capture, audio extract, compress, any button) resolves to the same
+    object - and therefore to the same local cache file. The worker reads the
+    media from here instead of the bucket after the first fetch, and the
+    big-file pipeline populates it while it already has the bytes.
+
+    Returns ``None`` for every other key shape: a per-job object must never be
+    handed to a different job, and a crafted ``<hash>/<name>`` pair must not be
+    able to walk out of the cache directory. Lives here rather than in the
+    worker so the producer and the consumer cannot drift apart on the name.
+    """
+    import config  # local import: media_cache is imported very early
+
+    if not input_key or not isinstance(input_key, str):
+        return None
+    key = input_key.replace("\\", "/").lstrip("/")
+    if not key.startswith(LIBRARY_KEY_PREFIX):
+        return None
+    parts = [p for p in key[len(LIBRARY_KEY_PREFIX) :].split("/") if p not in ("", ".")]
+    if len(parts) != 2:
+        return None
+    _hash, _name = parts
+    if not _hash or len(_hash) > 64 or ".." in _hash or not all(c.isalnum() or c in "_-" for c in _hash):
+        return None
+    if ".." in _name or os.path.basename(_name) != _name:
+        return None
+    # The stored key may carry no extension (``source``); the caller's extension
+    # keeps the cached file usable by ffmpeg and friends.
+    if ext and not os.path.splitext(_name)[1]:
+        _name = f"{_name}{ext}"
+    return os.path.join(getattr(config, "TEMP_PATH", "storage/temp"), "library", _hash, _name)
+
+
 def sizes_agree(entry, expected_size) -> bool:
     """Pure size check: True only when the cached size equals the incoming one."""
     if not isinstance(entry, dict):

@@ -24,6 +24,7 @@ import asyncio
 import contextlib
 import logging
 import os
+import shutil
 import time
 import uuid
 from collections.abc import Callable
@@ -136,6 +137,38 @@ def _remove_partial(path: str | None) -> None:
             os.remove(path)
     except Exception:
         logger.debug("BigFilePipeline: could not remove partial download %s", path)
+
+
+def _install_local_cache(src: str | None, dest: str | None) -> None:
+    """Best-effort: place the already-fetched source at the shared cache *dest*.
+
+    The pipeline is holding the media on disk anyway, so the local copy the
+    worker would otherwise rebuild out of the bucket can be written now - which
+    is what lets even the *first* repeat read the source off disk. A hardlink is
+    used when the two paths share a filesystem (no second copy of the bytes),
+    and a failure just leaves the worker to download as before.
+    """
+    if not src or not dest:
+        return
+    tmp = f"{dest}.part"
+    try:
+        if not os.path.exists(src) or os.path.getsize(src) <= 0:
+            return
+        os.makedirs(os.path.dirname(dest), exist_ok=True)
+        with contextlib.suppress(OSError):
+            if os.path.exists(tmp):
+                os.remove(tmp)
+        try:
+            os.link(src, tmp)
+        except OSError:
+            shutil.copyfile(src, tmp)
+        os.replace(tmp, dest)
+        logger.info("BigFilePipeline: cached the source locally at %s for later jobs", dest)
+    except Exception:
+        with contextlib.suppress(OSError):
+            if os.path.exists(tmp):
+                os.remove(tmp)
+        logger.debug("BigFilePipeline: could not populate the local source cache at %s", dest)
 
 
 def _read_head_bytes(path: str, limit: int) -> bytes:
@@ -319,6 +352,18 @@ class BigFilePipeline:
         # evidence. A run without an identity keeps the per-job fallback key.
         _header_key = _header_object_key(_library_key) if _library_key and media_cache.cache_enabled() else None
 
+        # Where a fetched source is cached locally so the *next* job on this
+        # media is served from disk instead of a second bucket read - populated
+        # while the pipeline is holding the bytes anyway, so even the first
+        # repeat avoids the S3 read. Only a whole shared object is worth caching:
+        # a header is not a source, and a per-job key is never asked for again.
+        # Respects REUSE_LOCAL_INPUT, the switch that decides local reuse.
+        _cache_dest = (
+            media_cache.library_source_cache_path(input_s3_key, ext)
+            if (_shared_input and _keep_local_input and self._storage is not None)
+            else None
+        )
+
         actual_size = 0
         s3_key = input_s3_key
         _reused = False
@@ -423,6 +468,16 @@ class BigFilePipeline:
                         len(cached_data) // (1024 * 1024),
                     )
                     actual_size = len(cached_data)
+                    # Mirror the body into the shared local cache too, so a later
+                    # job on this media is served from disk rather than the bucket.
+                    if _cache_dest:
+                        try:
+                            os.makedirs(os.path.dirname(_cache_dest), exist_ok=True)
+                            with open(f"{_cache_dest}.part", "wb") as _cfh:
+                                _cfh.write(cached_data)
+                            os.replace(f"{_cache_dest}.part", _cache_dest)
+                        except Exception:
+                            logger.debug("BigFilePipeline: could not cache the byte-cache body locally")
                     if PIPELINE_SOURCE_UPLOAD == "full":
                         if self._storage is not None:
                             await self._storage.upload_bytes(cached_data, input_s3_key)
@@ -467,6 +522,7 @@ class BigFilePipeline:
                     cancel_check=cancel_check,
                     user_id=user_id,
                     temp_dir=temp_dir,
+                    local_cache_path=_cache_dest,
                 )
             except asyncio.CancelledError:
                 return IngestResult(ok=False, error="batch cancelled")
@@ -517,6 +573,11 @@ class BigFilePipeline:
 
                 actual_size = os.path.getsize(temp_path)
                 logger.info("BigFilePipeline: disk download complete, actual_size=%dMB", actual_size // (1024 * 1024))
+
+                # Keep a local copy at the shared cache location while the bytes
+                # are already here, so the next job on this media does not read
+                # the whole object back out of the bucket.
+                _install_local_cache(temp_path, _cache_dest)
 
                 # ── T4: ffprobe source analysis ──
                 _source_meta = {}
@@ -788,31 +849,41 @@ class BigFilePipeline:
         cancel_check: Callable[[], bool] | None,
         user_id: int | None,
         temp_dir: str,
+        local_cache_path: str | None = None,
     ) -> dict | None:
         """Stream the Telegram file into storage while it is still downloading.
 
         The bytes go through a multipart sink (:meth:`open_upload_sink`), so the
-        media is never staged on local disk: storage holds the source of truth
-        and a worker on any host can read it back. Only the container header is
-        tapped on the way past, and it is probed from a throwaway file so the job
-        still carries the ``source_*`` metadata the worker expects.
+        media is not staged on local disk just to upload it: storage holds the
+        source of truth and a worker on any host can read it back. Only the
+        container header is tapped on the way past, and it is probed from a
+        throwaway file so the job still carries the ``source_*`` metadata the
+        worker expects.
+
+        When ``local_cache_path`` is given, the same stream is *also* mirrored
+        into the shared local source cache, so the next job on this media is
+        served from disk instead of reading the object back out of the bucket.
+        That file is only finalized once the upload has completed.
 
         Returns ``{"s3_key", "size", "meta_fields"}`` on success. On any failure
         the multipart upload is aborted - there is no half-written object for a
         later job to mistake for a source - and ``None`` is returned so the
         caller can fall back to the disk download.
         """
-        from utils.storage import HeadCaptureSink
+        from utils.storage import HeadCaptureSink, LocalFileTeeSink
         from utils.userbot_downloader import download_media_to_sink
 
         sink = await self._storage.open_upload_sink(input_s3_key)
         head_sink = HeadCaptureSink(sink, PIPELINE_HEADER_BYTES)
+        # ``head_sink`` keeps the probe header; ``write_sink`` is what the
+        # download writes to - the head tap, plus an optional local mirror.
+        write_sink = LocalFileTeeSink(head_sink, local_cache_path) if local_cache_path else head_sink
         # A throwaway path for the header: the probe needs a real file, and this
         # one is removed again no matter how the probe ends.
         probe_path = os.path.join(temp_dir, f"stream_head_{uuid.uuid4().hex}.bin")
         try:
             os.makedirs(temp_dir, exist_ok=True)
-            await head_sink.open()
+            await write_sink.open()
             logger.info(
                 "BigFilePipeline: streaming %s/%s straight into %s",
                 chat_id,
@@ -832,25 +903,25 @@ class BigFilePipeline:
             ok = await download_media_to_sink(
                 chat_id,
                 message_id,
-                head_sink,
+                write_sink,
                 expected_size=expected_size or None,
                 progress_callback=_stream_progress,
                 user_id=user_id,
             )
             if not ok:
-                await head_sink.abort()
+                await write_sink.abort()
                 return None
             if cancel_check and cancel_check():
-                await head_sink.abort()
+                await write_sink.abort()
                 raise asyncio.CancelledError("batch cancelled during stream upload")
 
-            size = int(head_sink.tell() or 0)
+            size = int(write_sink.tell() or 0)
             if size <= 0:
                 # Nothing to complete: an empty object is worse than no object,
                 # because a job would later find it and treat it as a source.
-                await head_sink.abort()
+                await write_sink.abort()
                 return None
-            key = await head_sink.close()
+            key = await write_sink.close()
 
             head = head_sink.head
             meta: dict = {}
@@ -893,11 +964,11 @@ class BigFilePipeline:
             }
         except asyncio.CancelledError:
             with contextlib.suppress(Exception):
-                await head_sink.abort()
+                await write_sink.abort()
             raise
         except Exception:
             with contextlib.suppress(Exception):
-                await head_sink.abort()
+                await write_sink.abort()
             raise
         finally:
             _remove_partial(probe_path)

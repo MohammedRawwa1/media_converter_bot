@@ -336,7 +336,11 @@ def _md5_hex(file_path: str) -> str:
     Small files go up with ``SaveFilePart``, which wants the checksum; the big
     file path uses ``InputFileBig``, which has no such field.
     """
-    digest = hashlib.md5()  # noqa: S324 - a protocol field Telegram asks for, not security
+    # usedforsecurity=False states the intent in the call itself: this is the
+    # protocol checksum SaveFilePart requires, not a security primitive. Without
+    # it the call reads as a weak-hash mistake to both ruff (S324) and bandit
+    # (B324), the latter at HIGH severity.
+    digest = hashlib.md5(usedforsecurity=False)
     with open(file_path, "rb") as f:
         for block in iter(lambda: f.read(1024 * 1024), b""):
             digest.update(block)
@@ -396,12 +400,15 @@ async def _parallel_upload_file(
         )
         return None
 
-    import random
+    import secrets
 
     from telethon.tl.functions.upload import SaveBigFilePartRequest, SaveFilePartRequest
     from telethon.tl.types import InputFile, InputFileBig
 
-    file_id = random.randrange(1 << 63)  # noqa: S311
+    # Telegram's upload protocol wants a random int64 file_id. It has to be unique;
+    # it does not have to be secret. `secrets` is the same call with an OS-grade
+    # generator behind it, so there is no reason to reach for the Mersenne twister.
+    file_id = secrets.randbits(63)
     total_parts = _part_count(file_size, part_size)
     is_big = total_parts > 1024 or file_size > _PARALLEL_BIG_FILE_THRESHOLD
     sem = asyncio.Semaphore(workers)
@@ -501,14 +508,15 @@ async def _parallel_upload_file_pyrogram(
         )
         return None
 
-    import random as _random
+    import secrets as _secrets
 
     from pyrogram.raw.functions.upload import SaveBigFilePart as _SaveBig
     from pyrogram.raw.functions.upload import SaveFilePart as _SaveSmall
     from pyrogram.raw.types import InputFile as _InputFile
     from pyrogram.raw.types import InputFileBig as _InputBig
 
-    file_id = _random.randrange(1 << 63)  # noqa: S311
+    # Random int64 upload id, exactly as in the Telethon path above.
+    file_id = _secrets.randbits(63)
     total_parts = _part_count(file_size, part_size)
     is_big = total_parts > 1024 or file_size > _PARALLEL_BIG_FILE_THRESHOLD
     sem = asyncio.Semaphore(workers)

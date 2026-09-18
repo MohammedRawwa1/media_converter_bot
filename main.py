@@ -11,6 +11,7 @@ import inspect
 import json
 import logging
 import os
+import shutil
 import signal
 import subprocess
 import tempfile
@@ -21,7 +22,7 @@ from urllib.parse import urlparse
 import aiohttp
 import httpx
 from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup, Update
-from telegram.error import BadRequest, Conflict, TelegramError, TimedOut
+from telegram.error import BadRequest, Conflict, RetryAfter, TelegramError, TimedOut
 
 # Request location differs across PTB releases; try both locations and
 # fall back to None so the application can continue using default Request.
@@ -80,6 +81,7 @@ from utils.login_handler import cleanup_login_flow, register_login_handlers
 from utils.markdown_utils import escape_markdown as _escape_markdown
 from utils.queue_admin import cancel_all_jobs, clear_cache_keys
 from utils.rate_limiter import ConversionRateLimiter, ConversionRateLimiterRedis, TelegramAPIRateLimiter
+from utils.secure_compare import constant_time_eq
 from utils.session_healthcheck import (
     get_session_healthchecker,
     start_session_healthcheck,
@@ -211,7 +213,7 @@ async def check_ffmpeg_available() -> bool:
 
     def _probe():
         try:
-            proc = subprocess.run([FFMPEG_PATH, "-version"], capture_output=True, text=True, timeout=5)
+            proc = subprocess.run([FFMPEG_PATH, "-version"], capture_output=True, text=True, timeout=5)  # nosec B603  # literal argv, no shell
             return proc.returncode == 0
         except Exception:
             return False
@@ -401,6 +403,12 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
     logger.error("Exception while handling an update:", exc_info=context.error)
 
     # Handle Telegram-specific errors
+    if isinstance(context.error, RetryAfter):
+        # A flood wait is Telegram rejecting writes to that chat's budget, so
+        # apologising into the same chat is another doomed call. Log and stop.
+        retry_after = getattr(context.error, "retry_after", None)
+        logger.warning("Telegram flood wait while handling an update: retry after %ss", retry_after)
+        return
     if isinstance(context.error, TelegramError):
         logger.warning(f"Telegram API error: {context.error}")
 
@@ -723,6 +731,23 @@ def setup_handlers(application: Application) -> None:
         )
     except Exception:
         logger.debug("URL text handler not registered; Regex filter unavailable")
+
+    # Plain text is how every "Custom"/"Enter …" prompt is answered (bitrate,
+    # CRF, caption, rename, resolution, MP3 tags, …): the inline button arms an
+    # `awaiting_*` flag and the next text message must reach the handler that
+    # dispatches it. Registered after the URL handler so a bare URL still goes
+    # to the media/ingest path instead of the custom-input router.
+    try:
+        text_filter = filters.TEXT & ~filters.COMMAND
+        application.add_handler(
+            MessageHandler(
+                text_filter,
+                latency_wrapper(handler_manager.handle_text_message, "handle_text_message"),
+            )
+        )
+        logger.info("Custom-input text handler registered")
+    except Exception:
+        logger.debug("Custom-input text handler not registered")
 
     # Ensure a fallback handler is present for non-command, non-text messages.
     try:
@@ -2483,6 +2508,7 @@ if __name__ == "__main__":
 try:
     from fastapi import FastAPI, HTTPException, Request
     from fastapi.responses import FileResponse, Response
+    from starlette.middleware.trustedhost import TrustedHostMiddleware
     from telegram import Update as TgUpdate
 
     from web.ws_fastapi import sse_router as _sse_router
@@ -2492,7 +2518,76 @@ try:
     # WebSocket and SSE progress endpoints (same port as main app)
     from web.ws_fastapi import ws_router as _ws_router
 
-    app = FastAPI(title="Media Conversion Bot - PTB v20+")
+    # ── Host-header allowlist (CFG-TRUSTED-HOST) ──────────────────────────
+    # Behind a proxy the Host header is caller-controlled, so any absolute URL the
+    # app builds (webhook registration, links, redirects) can be pointed at an
+    # attacker's domain. Prefer an explicit ALLOWED_HOSTS list, then the host of
+    # the platform's own public URL, and fall back to a wildcard with a warning
+    # only when there is nothing to derive it from, so a local run still works.
+    def _bare_host(value: str) -> str:
+        """Hostname from a URL or bare domain: no scheme, userinfo or port."""
+        candidate = (value or "").strip()
+        if not candidate:
+            return ""
+        candidate = candidate.split("://", 1)[-1]
+        candidate = candidate.split("/", 1)[0]
+        candidate = candidate.rsplit("@", 1)[-1]
+        return candidate.split(":", 1)[0]
+
+    _allowed_hosts = [h.strip() for h in (os.environ.get("ALLOWED_HOSTS") or "").split(",") if h.strip()]
+    if not _allowed_hosts:
+        _allowed_hosts = [
+            h
+            for h in (
+                _bare_host(os.environ.get("RAILWAY_PUBLIC_DOMAIN", "")),
+                _bare_host(os.environ.get("WEB_UPLOAD_URL", "")),
+                _bare_host(os.environ.get("WEBAPP_URL", "")),
+            )
+            if h
+        ]
+    if _allowed_hosts and "*" not in _allowed_hosts:
+        # Loopback stays reachable so local runs and container health probes work.
+        _allowed_hosts = [*_allowed_hosts, "localhost", "127.0.0.1"]
+    elif not _allowed_hosts:
+        _allowed_hosts = ["*"]
+        logger.warning(
+            "ALLOWED_HOSTS is not set and no public domain is configured — the app "
+            "accepts any Host header. Set ALLOWED_HOSTS to this app's hostname(s)."
+        )
+    # ── API docs: a recon surface, off unless asked for (API-DOCS-EXPOSED) ──
+    # FastAPI otherwise publishes /docs, /redoc and /openapi.json, which enumerate
+    # every route and schema to anyone who asks.
+    if (os.environ.get("ENABLE_API_DOCS") or "").strip().lower() in ("1", "true", "yes", "on"):
+        _docs_kwargs: dict = {}
+    else:
+        _docs_kwargs = dict(docs_url=None, redoc_url=None, openapi_url=None)
+
+    app = FastAPI(title="Media Conversion Bot - PTB v20+", **_docs_kwargs)
+
+    # Registered after the app exists but before it serves anything, which is the
+    # only window Starlette allows.
+    app.add_middleware(TrustedHostMiddleware, allowed_hosts=_allowed_hosts)
+    logger.info("Trusted hosts: %s", _allowed_hosts)
+
+    async def _job_capability_ok(job_id: str, request: Request) -> bool:
+        """Authorize one job by its own capability token (utils/job_access.py).
+
+        A job id is not a credential: it is handed out with the upload and can
+        leak through a referrer or a shared link, so every job-scoped read checks
+        a per-job capability instead. A job with no recorded capability refuses
+        every caller.
+        """
+        try:
+            from utils.job_access import JOB_CAPABILITY_PARAM, job_token_ok
+        except Exception:
+            logger.exception("utils.job_access unavailable; refusing job-scoped access")
+            return False
+        incoming = request.headers.get("X-Job-Token") or request.query_params.get(JOB_CAPABILITY_PARAM)
+        try:
+            return await job_token_ok(job_id, incoming)
+        except Exception:
+            logger.exception("job capability check failed for %s", job_id)
+            return False
 
     app.include_router(_ws_router)
     app.include_router(_sse_router)
@@ -2532,7 +2627,11 @@ try:
             import traceback
 
             @app.get("/status/{job_id}")
-            async def root_status(job_id: str):
+            async def root_status(job_id: str, request: Request):
+                # Authorization: this job's own capability token, not its id.
+                if not await _job_capability_ok(job_id, request):
+                    raise HTTPException(status_code=401, detail="unauthorized")
+
                 try:
                     job_hash = None
 
@@ -2641,7 +2740,7 @@ try:
                 incoming = request.headers.get("X-DIAG-TOKEN") or token
                 if not DIAG_TOKEN:
                     raise HTTPException(status_code=403, detail="DIAG_TOKEN not configured on server")
-                if incoming != DIAG_TOKEN:
+                if not constant_time_eq(incoming, DIAG_TOKEN):
                     raise HTTPException(status_code=401, detail="unauthorized")
 
                 result = {"env": {}, "redis": {}, "logs": {}, "ps": None}
@@ -2746,9 +2845,14 @@ try:
                 except Exception:
                     result["logs"]["error"] = traceback.format_exc()
 
-                # Basic process list snapshot
+                # Basic process list snapshot. `ps` is resolved to an absolute path
+                # (and the snapshot skipped when it is absent) so this works on an
+                # image without procps instead of failing on the bare name.
                 try:
-                    ps_out = subprocess.check_output(["ps", "aux"], stderr=subprocess.STDOUT, text=True)
+                    ps_bin = shutil.which("ps")
+                    if ps_bin is None:
+                        raise FileNotFoundError("ps is not on PATH")
+                    ps_out = subprocess.check_output([ps_bin, "aux"], stderr=subprocess.STDOUT, text=True)  # nosec B603  # shutil.which path, literal args
                     result["ps"] = "\n".join(ps_out.splitlines()[:200])
                 except Exception:
                     result["ps"] = None
@@ -2766,7 +2870,7 @@ try:
                 incoming = request.headers.get("X-DIAG-TOKEN")
                 if not DIAG_TOKEN:
                     raise HTTPException(status_code=403, detail="DIAG_TOKEN not configured on server")
-                if incoming != DIAG_TOKEN:
+                if not constant_time_eq(incoming, DIAG_TOKEN):
                     raise HTTPException(status_code=401, detail="unauthorized")
 
                 try:
@@ -3054,14 +3158,16 @@ try:
                 """
                 DIAG_TOKEN = os.environ.get("DIAG_TOKEN")
                 UPLOAD_SECRET = os.environ.get("UPLOAD_SECRET")
-                incoming_diag = request.headers.get("X-DIAG-TOKEN") or request.query_params.get("token")
-                incoming_upload = request.headers.get("X-Upload-Token") or request.query_params.get("upload_token")
+                # Credentials come from a header only: a token in the query string
+                # leaks into access logs, browser history and Referer headers.
+                incoming_diag = request.headers.get("X-DIAG-TOKEN")
+                incoming_upload = request.headers.get("X-Upload-Token")
 
                 if DIAG_TOKEN:
-                    if incoming_diag != DIAG_TOKEN:
+                    if not constant_time_eq(incoming_diag, DIAG_TOKEN):
                         raise HTTPException(status_code=401, detail="unauthorized")
                 else:
-                    if not UPLOAD_SECRET or incoming_upload != UPLOAD_SECRET:
+                    if not constant_time_eq(incoming_upload, UPLOAD_SECRET):
                         raise HTTPException(status_code=401, detail="unauthorized (no DIAG_TOKEN configured)")
 
                 if not name:
@@ -3090,14 +3196,16 @@ try:
                 """
                 DIAG_TOKEN = os.environ.get("DIAG_TOKEN")
                 UPLOAD_SECRET = os.environ.get("UPLOAD_SECRET")
-                incoming_diag = request.headers.get("X-DIAG-TOKEN") or request.query_params.get("token")
-                incoming_upload = request.headers.get("X-Upload-Token") or request.query_params.get("upload_token")
+                # Credentials come from a header only: a token in the query string
+                # leaks into access logs, browser history and Referer headers.
+                incoming_diag = request.headers.get("X-DIAG-TOKEN")
+                incoming_upload = request.headers.get("X-Upload-Token")
 
                 if DIAG_TOKEN:
-                    if incoming_diag != DIAG_TOKEN:
+                    if not constant_time_eq(incoming_diag, DIAG_TOKEN):
                         raise HTTPException(status_code=401, detail="unauthorized")
                 else:
-                    if not UPLOAD_SECRET or incoming_upload != UPLOAD_SECRET:
+                    if not constant_time_eq(incoming_upload, UPLOAD_SECRET):
                         raise HTTPException(status_code=401, detail="unauthorized (no DIAG_TOKEN configured)")
 
                 if not name:
@@ -3245,8 +3353,12 @@ try:
             return {"status": "ok"}
 
     @app.get("/events/{job_id}")
-    async def events_sse(job_id: str):
+    async def events_sse(job_id: str, request: Request):
         """Server-Sent Events endpoint streaming real-time conversion progress from Redis."""
+        # Authorization: this job's own capability token (see _job_capability_ok).
+        if not await _job_capability_ok(job_id, request):
+            raise HTTPException(status_code=401, detail="unauthorized")
+
         import json as _rj
 
         from fastapi.responses import StreamingResponse
@@ -3301,12 +3413,18 @@ try:
         return StreamingResponse(_event_gen(), media_type="text/event-stream")
 
     @app.get("/download/{job_id}")
-    async def download_redirect(job_id: str):
+    async def download_redirect(job_id: str, request: Request):
         """Redirect to Flask's /flask/download endpoint for file downloads."""
         try:
             from fastapi.responses import RedirectResponse
 
-            return RedirectResponse(url=f"/flask/download/{job_id}")
+            # Carry the query string across the redirect: it holds the job's
+            # access capability, and dropping it turns a working download link
+            # into a 401.
+            target = f"/flask/download/{job_id}"
+            if request.url.query:
+                target = f"{target}?{request.url.query}"
+            return RedirectResponse(url=target)
         except Exception:
             from fastapi.responses import JSONResponse
 
@@ -3321,13 +3439,22 @@ try:
     @app.post("/telegram/webhook")
     async def telegram_webhook(request: Request):
         """PTB v20+ compatible webhook endpoint."""
-        # Verify secret token header if configured
+        # Verify the secret token header. This must FAIL CLOSED: previously the
+        # check was skipped entirely when WEBHOOK_SECRET was unset, which turned
+        # "forgot one platform variable" into "anyone can POST forged updates".
         try:
-            if WEBHOOK_SECRET:
-                incoming = request.headers.get("X-Telegram-Bot-Api-Secret-Token")
-                if not incoming or incoming != WEBHOOK_SECRET:
-                    logger.warning("Invalid webhook secret token: %s", incoming)
-                    raise HTTPException(status_code=403, detail="Invalid secret token")
+            if not WEBHOOK_SECRET:
+                logger.error(
+                    "Webhook called but WEBHOOK_SECRET is not configured — refusing the "
+                    "request. Set WEBHOOK_SECRET (or run with FORCE_POLLING)."
+                )
+                raise HTTPException(status_code=503, detail="Webhook secret not configured")
+            incoming = request.headers.get("X-Telegram-Bot-Api-Secret-Token")
+            if not constant_time_eq(incoming, WEBHOOK_SECRET):
+                # Never log the submitted value: it is attacker-controlled input
+                # and may itself be a real token pasted into the wrong place.
+                logger.warning("Invalid webhook secret token (header did not match)")
+                raise HTTPException(status_code=403, detail="Invalid secret token")
         except HTTPException:
             raise
         except Exception:
@@ -3339,7 +3466,9 @@ try:
 
         try:
             data = await request.json()
-            logger.debug(f"Received webhook data: {data}")
+            # Log the shape, not the payload: a Telegram update carries the
+            # sender's user id, chat id, message text and any forwarded content.
+            logger.debug("Received webhook update (keys=%s)", sorted(data) if isinstance(data, dict) else type(data).__name__)
         except Exception as e:
             logger.error(f"Invalid JSON in webhook: {e}")
             raise HTTPException(status_code=400, detail="Invalid JSON") from e
@@ -3438,8 +3567,18 @@ try:
             return {"ok": True, "update_id": getattr(update, "update_id", None), "accepted": True}
 
     @app.get("/metrics")
-    async def metrics():
+    async def metrics(request: Request):
         """Return Prometheus-style metrics as plain text."""
+        # Metrics expose user counts, queue depth and error rates, so the scraper
+        # is a privileged client. Fails closed when DIAG_TOKEN is unset.
+        try:
+            from utils.web_auth import diag_token_ok
+        except Exception:
+            logger.exception("utils.web_auth unavailable; refusing /metrics")
+            raise HTTPException(status_code=401, detail="unauthorized") from None
+        if not diag_token_ok(request.headers.get("X-DIAG-TOKEN")):
+            raise HTTPException(status_code=401, detail="unauthorized")
+
         uptime = time.time() - (BOT_STARTED_AT or START_TIME)
         allowed_total = len(ALLOWED_USER_IDS) if ALLOWED_USER_IDS else 0
         try:
@@ -3480,8 +3619,23 @@ try:
         return Response("\n".join(lines), media_type="text/plain; version=0.0.4")
 
     @app.get("/debug")
-    async def debug_info():
-        """Return debug information: startup error, dispatcher status, bot_data keys."""
+    async def debug_info(request: Request):
+        """Debug snapshot: startup error, dispatcher status, bot_data keys.
+
+        Gated like ``/internal/diag`` and **fail closed**: ``startup_error`` can
+        contain a connection string or a traceback, so this must never be open
+        by default. Supply ``DIAG_TOKEN`` (header ``X-DIAG-TOKEN``) or
+        ``DEBUG_SECRET`` (header ``X-Debug-Token``); with neither configured the
+        endpoint refuses every request.
+        """
+        _diag_token = os.environ.get("DIAG_TOKEN")
+        _debug_secret = os.environ.get("DEBUG_SECRET")
+        _incoming = request.headers.get("X-DIAG-TOKEN") or request.headers.get("X-Debug-Token")
+        if not _diag_token and not _debug_secret:
+            raise HTTPException(status_code=403, detail="Diagnostics are not configured on this server")
+        if not (constant_time_eq(_incoming, _diag_token) or constant_time_eq(_incoming, _debug_secret)):
+            raise HTTPException(status_code=401, detail="unauthorized")
+
         info = {
             "bot_initialized": BOT_APPLICATION is not None,
             "bot_ready": BOT_READY.is_set(),

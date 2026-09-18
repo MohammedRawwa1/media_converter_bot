@@ -40,7 +40,7 @@ try:
     if parsed_url.scheme not in ("http", "https"):
         print(f"Blocked urlopen with scheme={parsed_url.scheme}")
         raise ValueError(f"Unsupported URL scheme: {parsed_url.scheme}")
-    with request.urlopen(req, timeout=60) as resp:  # nosec  # noqa: S310
+    with request.urlopen(req, timeout=60) as resp:  # nosec  # noqa: S310 - scheme allowlisted to http/https above
         body = resp.read().decode("utf-8", errors="replace")
         print("HTTP", resp.status)
         print(body)

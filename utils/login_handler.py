@@ -46,6 +46,21 @@ logger = logging.getLogger(__name__)
 # ── Helpers ────────────────────────────────────────────────────────────
 
 
+def _mask_phone(phone: object) -> str:
+    """Log-safe form of a phone number: the first two and last two digits only.
+
+    A phone number is personal data (LOG-PII) and these lines go to a shared log
+    store, so the full value must not be written. Keeping both ends is enough to
+    tell two entries for the same user apart.
+    """
+    text = str(phone or "")
+    if not text:
+        return "(none)"
+    if len(text) <= 4:
+        return "*" * len(text)
+    return f"{text[:2]}{'*' * (len(text) - 4)}{text[-2:]}"
+
+
 def _normalize_code(text: str) -> str:
     """Normalize Unicode digits to ASCII and strip non-digit chars."""
     trans = str.maketrans(
@@ -171,11 +186,14 @@ def register_login_handlers(application):
     application.add_handler(CommandHandler("login", _login_command))
     application.add_handler(CommandHandler("loginpyro", _pyro_login_command))
     # This handler catches ALL text messages that might be login input.
-    # It runs *before* other text handlers and only consumes the message
-    # if there is a pending login Future for that user.
+    # It runs in a *higher-priority group* than the general text router so a
+    # pending login Future always gets first crack at the message. It is
+    # harmless when no login is pending (it returns immediately), and PTB runs
+    # one handler per group, so a separate group is what lets the custom-input
+    # router in group 0 still see the message afterwards.
     application.add_handler(
         MessageHandler(filters.TEXT & ~filters.COMMAND, _handle_login_text),
-        group=0,
+        group=-1,
     )
     # NOTE: /cancel is NOT registered here — the global cancel_command in main.py
     # handles both login-flow cancellation and normal cancel, because it
@@ -198,7 +216,7 @@ def _get_futures(context: ContextTypes.DEFAULT_TYPE, user_id: int, create: bool 
         fm[user_id] = {
             "phone": None,  # asyncio.Future or None
             "code": None,  # asyncio.Future or None
-            "password": None,  # nosec - asyncio.Future or placeholder
+            "password": None,  # nosec  # a login-flow field default (Future or None), not a credential
             "cancel": asyncio.Event(),
             "task": None,  # asyncio.Task or None
             "client": None,  # TelegramClient or None
@@ -656,7 +674,7 @@ async def _run_login_task(
                 pwd_info = await client(functions.account.GetPasswordRequest())
                 pwd_hint = str(getattr(pwd_info, "hint", "") or "")
             except Exception:
-                pwd_hint = ""  # nosec - fallback when hint is unavailable
+                pwd_hint = ""  # nosec  # the field was absent, so the hint is empty; not a credential
 
             msg_text = "🔐 Two-step verification is enabled. Please enter your account password:"
             if pwd_hint:
@@ -745,10 +763,10 @@ async def _run_login_task(
                 f"Saved to: {_escape_markdown(summary)}",
                 parse_mode="Markdown",
             )
-        logger.info("Login successful for %s (DC=%s)", phone, client.session.dc_id)
+        logger.info("Login successful for %s (DC=%s)", _mask_phone(phone), client.session.dc_id)
 
     except asyncio.CancelledError:
-        logger.info("login: task cancelled for %s", phone)
+        logger.info("login: task cancelled for %s", _mask_phone(phone))
     except Exception as exc:
         logger.exception("login: unexpected error: %s", exc)
         with contextlib.suppress(Exception):
@@ -1051,7 +1069,7 @@ async def _run_pyro_login_task(
             try:
                 pwd_hint = await client.get_password_hint()
             except Exception:
-                pwd_hint = ""  # nosec - fallback when hint is unavailable
+                pwd_hint = ""  # nosec  # the field was absent, so the hint is empty; not a credential
 
             msg_text = "🔐 Two-step verification is enabled. Please enter your account password:"
             if pwd_hint:
@@ -1139,10 +1157,10 @@ async def _run_pyro_login_task(
                 f"Saved to: {_escape_markdown(summary)}",
                 parse_mode="Markdown",
             )
-        logger.info("Pyrogram login successful for %s (DC=%s)", phone, client.session.dc_id)
+        logger.info("Pyrogram login successful for %s (DC=%s)", _mask_phone(phone), client.session.dc_id)
 
     except asyncio.CancelledError:
-        logger.info("login: Pyrogram task cancelled for %s", phone)
+        logger.info("login: Pyrogram task cancelled for %s", _mask_phone(phone))
     except Exception as exc:
         logger.exception("login: Pyrogram unexpected error: %s", exc)
         with contextlib.suppress(Exception):

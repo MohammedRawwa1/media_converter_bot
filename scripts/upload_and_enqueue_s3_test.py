@@ -59,7 +59,7 @@ def create_sample(path: str) -> bool:
         path,
     ]
     try:
-        subprocess.run(cmd, check=True)
+        subprocess.run(cmd, check=True)  # nosec B603  # literal ffmpeg argv list
         return True
     except Exception as e:
         print("ffmpeg failed to create sample:", e)

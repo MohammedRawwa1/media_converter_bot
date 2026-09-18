@@ -374,10 +374,23 @@ async def _delete_batch_message(bot, ref) -> bool:
     """
     if bot is None or not ref:
         return False
+
+    from telegram.error import RetryAfter
+
     try:
         chat_id, message_id = ref
         await bot.delete_message(chat_id=chat_id, message_id=message_id)
         return True
+    except RetryAfter as exc:
+        # Removing the bar is best-effort, and a flood wait means Telegram is
+        # refusing writes to this chat: count it as a miss rather than spending
+        # the cancel path's budget on retries.
+        logger.debug(
+            "cancelall: flood wait (%ss) deleting a batch progress message %s",
+            getattr(exc, "retry_after", "?"),
+            ref,
+        )
+        return False
     except Exception:
         logger.debug("cancelall: could not delete a batch progress message %s", ref)
         return False

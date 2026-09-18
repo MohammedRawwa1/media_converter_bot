@@ -5,7 +5,9 @@ services:
     image: redis:7
     restart: unless-stopped
     ports:
-      - "6379:6379"
+      # Loopback only: an unauthenticated Redis on 0.0.0.0 is a remote job
+      # injection surface for anything that can reach this host.
+      - "127.0.0.1:6379:6379"
     volumes:
       - redis-data:/data
 

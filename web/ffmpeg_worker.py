@@ -35,7 +35,7 @@ def get_duration(path: str) -> float:
             "default=noprint_wrappers=1:nokey=1",
             path,
         ]
-        out = subprocess.check_output(cmd, stderr=subprocess.STDOUT, text=True)
+        out = subprocess.check_output(cmd, stderr=subprocess.STDOUT, text=True)  # nosec B603  # cmd is an argv list built above
         return float(out.strip())
     except Exception:
         return None
@@ -64,7 +64,7 @@ def convert_video(input_path: str, output_path: str, job_id: str, duration: floa
         output_path,
     ]
 
-    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1)
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1)  # nosec B603  # cmd is an argv list built above
 
     current_out_time = 0.0
     try:

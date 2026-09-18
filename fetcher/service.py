@@ -15,6 +15,7 @@ except Exception:
     aioredis = None
 
 from utils import file_utils
+from utils.secure_compare import constant_time_eq
 
 try:
     from utils.forward_store import delete_forward_metadata, load_forward_metadata
@@ -218,12 +219,18 @@ async def _check_secret(request) -> bool:
     """
     secret = os.environ.get("UPLOAD_SECRET")
     if not secret:
-        return True
+        # Fail closed. This service can enqueue jobs and hand out presigned
+        # upload URLs, so an unset UPLOAD_SECRET must refuse traffic rather than
+        # silently expose the whole surface.
+        logging.getLogger("fetcher").error(
+            "UPLOAD_SECRET is not configured — refusing request. Set it in the environment."
+        )
+        return False
     auth = request.headers.get("Authorization") or request.query.get("secret")
     if not auth:
         return False
     token = auth.split(" ", 1)[1] if auth.startswith("Bearer ") else auth
-    return token == secret
+    return constant_time_eq(token, secret)
 
 
 async def handle_http_fetch(request):
@@ -261,7 +268,10 @@ def main():
     app.on_startup.append(on_startup)
     app.on_cleanup.append(on_cleanup)
 
-    host = os.environ.get("FETCHER_HOST", "0.0.0.0")  # nosec  # noqa: S104
+    # The suppression below is deliberately unqualified (no test id): naming one
+    # makes bandit log "no failed test" for the other nodes on the line, which
+    # buries the warnings that matter. See .bandit for the convention.
+    host = os.environ.get("FETCHER_HOST", "0.0.0.0")  # nosec  # noqa: S104 - container listeners bind all interfaces; FETCHER_HOST overrides
     port = int(os.environ.get("PORT", os.environ.get("FETCHER_PORT", "8765")))
     web.run_app(app, host=host, port=port)
 

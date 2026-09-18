@@ -186,7 +186,7 @@ async def _start_healthcheck_server():
     runner = _web.AppRunner(app)
     try:
         await runner.setup()
-        bind_host = os.environ.get("TELETHON_DEBUG_HOST", "0.0.0.0")  # nosec  # noqa: S104
+        bind_host = os.environ.get("TELETHON_DEBUG_HOST", "0.0.0.0")  # nosec  # noqa: S104 - container listeners bind all interfaces; TELETHON_DEBUG_HOST overrides
         site = _web.TCPSite(runner, bind_host, port)
         await site.start()
         logger.info("telethon_ingest: healthcheck HTTP server started on %s:%s", bind_host, port)

@@ -72,7 +72,7 @@ if __name__ == "__main__":
                     if parsed_url.scheme not in ("http", "https"):
                         print(f"Blocked urlopen with scheme={parsed_url.scheme}")
                         raise ValueError(f"Unsupported URL scheme: {parsed_url.scheme}")
-                    resp = _ur.urlopen(url, timeout=30)  # nosec  # noqa: S310
+                    resp = _ur.urlopen(url, timeout=30)  # nosec  # noqa: S310 - scheme allowlisted to http/https above
                     print("HTTP GET status:", resp.getcode())
                     print("Headers:", dict(resp.getheaders()))
                 except Exception as e:

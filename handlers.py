@@ -13,6 +13,7 @@ from telegram.error import BadRequest
 from telegram.ext import ContextTypes, ConversationHandler
 
 from utils.time_utils import utc_iso
+from utils.url_validation import _validate_url_safe
 
 # Try to import from local modules
 try:
@@ -1291,7 +1292,13 @@ class EnhancedMediaHandler:
                                     web_base = web_base[: -len(suf)]
                                     break
                             web_base = web_base.rstrip("/")
-                            status_url = f"{web_base}/status/{job_id}"
+                            # The status route is authorized by the job's own
+                            # capability (utils/job_access.py), so the link has to
+                            # carry it — the job id alone is not a credential.
+                            from utils.job_access import JOB_CAPABILITY_PARAM, issue_job_token
+
+                            _capability = await issue_job_token(job_id)
+                            status_url = f"{web_base}/status/{job_id}?{JOB_CAPABILITY_PARAM}={_capability}"
                     except Exception:
                         status_url = None
 
@@ -1440,8 +1447,9 @@ class EnhancedMediaHandler:
                                 import subprocess as _rsp
 
                                 _ffprobe_bin = getattr(config, "FFMPEG_PATH", "ffmpeg").replace("ffmpeg", "ffprobe")
-                                _rp = await asyncio.to_thread(
-                                    lambda: _rsp.run(  # noqa: S603
+
+                                def _probe_output():
+                                    return _rsp.run(  # noqa: S603  # nosec B603  # literal ffprobe argv list
                                         [
                                             _ffprobe_bin,
                                             "-v",
@@ -1455,7 +1463,8 @@ class EnhancedMediaHandler:
                                         capture_output=True,
                                         timeout=15,
                                     )
-                                )
+
+                                _rp = await asyncio.to_thread(_probe_output)
                                 if _rp.returncode == 0:
                                     _probe = _rj.loads(_rp.stdout.decode() or "{}")
                                     _streams = _probe.get("streams", [])
@@ -2911,6 +2920,16 @@ class EnhancedMediaHandler:
                     if _key_ok:
                         current_file["input_key"] = _stored_key
                         current_file["path"] = None
+                        # Carry the probe verdict captured at ingest across the
+                        # reuse. Without it a repeat rebuilds the caption and the
+                        # audio tags from nothing but the filename - the same loss
+                        # the pipeline's own reuse path had to fix.
+                        _cached_meta = (_entry or {}).get("source_meta")
+                        if isinstance(_cached_meta, dict) and _cached_meta:
+                            _merged_meta = dict(current_file.get("_source_metadata") or {})
+                            for _mk, _mv in _cached_meta.items():
+                                _merged_meta.setdefault(_mk, _mv)
+                            current_file["_source_metadata"] = _merged_meta
                         session["current_file"] = current_file
                         with contextlib.suppress(Exception):
                             self._persist_session(user_id)
@@ -4397,8 +4416,16 @@ class EnhancedMediaHandler:
             return
 
         enqueued = 0
+        rejected = 0
         for url in args:
             if not isinstance(url, str) or not url.startswith("http"):
+                continue
+            # The worker fetches this URL itself, so a URL pointing at loopback,
+            # link-local (cloud metadata) or a private range would make the worker
+            # an SSRF pivot. Reject it here so the user gets a clear answer instead
+            # of a failed job, and the queue is never polluted with it.
+            if not _validate_url_safe(url):
+                rejected += 1
                 continue
             job_id = str(uuid.uuid4())
             job = {
@@ -4421,7 +4448,10 @@ class EnhancedMediaHandler:
             except Exception:
                 logger.exception("Failed to enqueue bulk URL %s", url)
 
-        await update.message.reply_text(f"✅ Enqueued {enqueued} URL(s) for processing.")
+        message = f"✅ Enqueued {enqueued} URL(s) for processing."
+        if rejected:
+            message += f"\n⛔ Skipped {rejected} URL(s) that resolve to a private, loopback or link-local address."
+        await update.message.reply_text(message)
 
     async def convert_video_format(
         self,
@@ -4865,6 +4895,11 @@ class EnhancedMediaHandler:
                     with contextlib.suppress(OSError):
                         os.makedirs(output_dir, exist_ok=True)
                     output_path = os.path.join(output_dir, f"{job_id}.mp4")
+                    # Same SSRF gate as /bulk_url: the worker performs this fetch
+                    # on our behalf, so an internal address must never be queued.
+                    if not _validate_url_safe(url):
+                        logger.warning("SSRF blocked: refusing to enqueue internal URL from message")
+                        continue
                     job = {
                         "job_id": job_id,
                         "source_url": url,
@@ -5416,7 +5451,10 @@ class EnhancedMediaHandler:
             with contextlib.suppress(BadRequest):
                 await query.answer()
             await self.safe_edit(query, "⚠️ Invalid button payload.")
-            logger.warning(f"Invalid callback data type: {type(data)} data={data}")
+            # Log the shape of the payload, not the payload itself: callback data
+            # is tied to a user and would land in the shared log store unmasked.
+            # `_log_bad_callback` below already persists the value for diagnosis.
+            logger.warning("Invalid callback data type: %s", type(data).__name__)
             # Persist bad callback event
             await self._log_bad_callback(
                 "invalid_payload",
@@ -7329,6 +7367,91 @@ class EnhancedMediaHandler:
         with contextlib.suppress(RuntimeError):
             asyncio.create_task(self._watch_job_progress(query, job_id, bot=context.bot))
 
+    async def _enqueue_keyed_job(
+        self,
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+        current_file: dict,
+        output_path: str,
+        ffmpeg_args: list | None,
+        output_ext: str,
+        job_type: str,
+        caption: str | None = None,
+        query=None,
+        notify=None,
+    ) -> bool:
+        """Queue a worker job whose source is an object-storage key.
+
+        Handlers fall back to this when the session has no local copy of the
+        media but the media cache already knows where its whole object lives
+        (the repeat case: tier-1 cache reuse sets ``path = None`` and leaves
+        ``input_key``). The worker reads that object itself, so there is no
+        Telegram download and no Pyrogram. Returns True when the job was
+        queued, False when no key was available or enqueueing failed.
+        """
+        input_key = current_file.get("input_key")
+        if not input_key:
+            return False
+        job_id = str(uuid.uuid4())
+        job = {
+            "job_id": job_id,
+            "input_path": current_file.get("path") or current_file.get("_local_input_path"),
+            "input_key": input_key,
+            "output_path": output_path,
+            "original_filename": current_file.get("name") or os.path.basename(output_path),
+            "ffmpeg_args": ffmpeg_args,
+            "output_ext": output_ext,
+            "progress_channel": f"ffmpeg:progress:{job_id}",
+            # Delivery target and the user whose userbot session may carry the
+            # result: an output over the Bot API limit (large audio, video) is
+            # uploaded by that userbot, so this field is what makes the delivery
+            # - the one Telegram step a repeat genuinely cannot avoid - work.
+            "chat_id": update.effective_chat.id if update and update.effective_chat else None,
+            "user_id": update.effective_user.id if update and update.effective_user else None,
+            "thumbnail": current_file.get("thumbnail"),
+            "caption": caption or _metadata_caption(current_file),
+            "type": job_type,
+            # The media identity and original size: the worker uses them to
+            # estimate the download budget and to recover the stored copy from
+            # the media registry if the key were ever replaced.
+            "file_unique_id": current_file.get("file_unique_id"),
+            "file_size": current_file.get("size"),
+            "cleanup_input": True,
+            "cleanup_output": False,
+            # NOTE: `source_chat_id` / `source_message_id` are deliberately left
+            # off. The worker reads the source over Telegram first whenever they
+            # are present (it prefers MTProto over bucket egress); omitting them
+            # is what keeps a repeat served from the stored object instead of
+            # re-fetching the media over Telegram.
+        }
+        # Hand the ingest's probe verdict to the worker so it skips the redundant
+        # storage range-probe and reports real progress.
+        _src_meta = current_file.get("_source_metadata")
+        if isinstance(_src_meta, dict) and _src_meta:
+            with contextlib.suppress(Exception):
+                from utils.bigfile_pipeline import _flatten_source_meta
+
+                job.update(_flatten_source_meta(_src_meta))
+        try:
+            job["request_id"] = getattr(update, "request_id", None)
+        except Exception:
+            job["request_id"] = None
+        try:
+            await enqueue_job(job)
+        except Exception:
+            logger.exception("Failed to enqueue keyed %s job", job_type)
+            return False
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data=f"cancel_job:{job_id}")]])
+        text = f"⏳ Queued {job_type.replace('_', ' ')} — job {job_id[:8]}"
+        if notify is not None:
+            await notify(text, reply_markup=kb)
+        elif query is not None:
+            await self.safe_edit(query, text, reply_markup=kb)
+        if query is not None:
+            with contextlib.suppress(RuntimeError):
+                asyncio.create_task(self._watch_job_progress(query, job_id, bot=context.bot))
+        return True
+
     async def convert_to_mp3(
         self,
         update: Update,
@@ -7425,7 +7548,7 @@ class EnhancedMediaHandler:
 
             if AsyncFileLock:
                 # Defensive: ensure we have a concrete file path before attempting locks
-                path = current_file.get("path")
+                path = current_file.get("path") or current_file.get("_local_input_path")
                 if not path:
                     await notify("❌ Local file missing. Try re-downloading or use the web uploader.")
                     return
@@ -7444,7 +7567,10 @@ class EnhancedMediaHandler:
             else:
                 # Fallback without locking
                 success = await self.converter.extract_audio_from_video(
-                    current_file["path"], output_path, "mp3", audio_bitrate
+                    current_file.get("path") or current_file.get("_local_input_path"),
+                    output_path,
+                    "mp3",
+                    audio_bitrate,
                 )
 
                 if success and os.path.exists(output_path):
@@ -7488,6 +7614,29 @@ class EnhancedMediaHandler:
         # ── Cancel any stale pipeline job so user's specific settings take effect ──
         if current_file and current_file.get("_pipeline_job_id"):
             await self._cancel_stale_pipeline_job(session, "convert_to_mp3", user_id)
+
+        # ── No local copy: the source is already in object storage (a repeat
+        #    answered from the media cache). Queue the worker with the key so it
+        #    reads the stored object instead of a None path. ──
+        local_input = current_file.get("path") or current_file.get("_local_input_path")
+        if not (local_input and os.path.exists(local_input)):
+            queued = await self._enqueue_keyed_job(
+                update,
+                context,
+                current_file,
+                output_path=os.path.join(
+                    getattr(config, "OUTPUT_PATH", "storage/output"), f"{current_file['id']}_audio.mp3"
+                ),
+                ffmpeg_args=current_file.get("_pipeline_ffmpeg_args"),
+                output_ext=".mp3",
+                job_type="extract_audio",
+                caption=caption,
+                query=query,
+                notify=notify,
+            )
+            if not queued:
+                await notify("❌ Local file missing. Try re-downloading or use the web uploader.")
+            return
 
         await self._run_with_concurrency_limit(user_id, "mp3_conversion", do_conversion())
 
@@ -7549,15 +7698,14 @@ class EnhancedMediaHandler:
                 "1080_to_720": ("1280", "720"),
             }
 
+            _local = current_file.get("path") or current_file.get("_local_input_path")
             if crf in resolution_map:
                 width, height = resolution_map[crf]
-                success = await self.converter.change_resolution(
-                    current_file["path"], output_path, int(width), int(height)
-                )
+                success = await self.converter.change_resolution(_local, output_path, int(width), int(height))
             else:
                 # default optimize path: treat crf as an integer when possible
                 crf_value = int(crf) if isinstance(crf, str) and crf.isdigit() else 28
-                success = await self.converter.optimize_video(current_file["path"], output_path, "medium", crf_value)
+                success = await self.converter.optimize_video(_local, output_path, "medium", crf_value)
 
             if success and os.path.exists(output_path):
                 file_size = os.path.getsize(output_path)
@@ -7624,6 +7772,27 @@ class EnhancedMediaHandler:
         # ── Cancel any stale pipeline job so user's specific settings take effect ──
         if current_file and current_file.get("_pipeline_job_id"):
             await self._cancel_stale_pipeline_job(session, "compress_video", user_id)
+
+        # ── No local copy: the source is already in object storage (a repeat
+        #    answered from the media cache). Queue the worker with the key. ──
+        local_input = current_file.get("path") or current_file.get("_local_input_path")
+        if not (local_input and os.path.exists(local_input)):
+            queued = await self._enqueue_keyed_job(
+                update,
+                context,
+                current_file,
+                output_path=os.path.join(
+                    getattr(config, "OUTPUT_PATH", "storage/output"), f"{current_file['id']}_compressed.mp4"
+                ),
+                ffmpeg_args=current_file.get("_pipeline_ffmpeg_args"),
+                output_ext=".mp4",
+                job_type="compress_video",
+                caption=current_file.get("_pipeline_caption"),
+                query=query,
+            )
+            if not queued:
+                await self.safe_edit(query, "❌ Local file missing. Try re-downloading or use the web uploader.")
+            return
 
         await self._run_with_concurrency_limit(user_id, "compression", do_compression())
 
@@ -8482,11 +8651,36 @@ class EnhancedMediaHandler:
         if current_file and current_file.get("_pipeline_job_id"):
             await self._cancel_stale_pipeline_job(session, "convert_audio_format", update.effective_user.id)
 
+        local_input = current_file["path"] or current_file.get("_local_input_path")
         output_base = getattr(config, "OUTPUT_PATH", "storage/output") if config else "storage/output"
         with contextlib.suppress(OSError):
             os.makedirs(output_base, exist_ok=True)
         output_path = os.path.join(output_base, f"{current_file['id']}_converted.{format_type}")
-        success = await self.converter.convert_audio_format(current_file["path"], output_path, format_type)
+
+        if not (local_input and os.path.exists(local_input)):
+            # ── No local copy: the source is already in object storage. That is
+            #    the case on a repeat answered from the media cache (tier-1 key
+            #    reuse), where `path` is deliberately None, and on the S3 path
+            #    that hands the source over as a key. The in-process converter
+            #    needs a real file — calling it with None is what produced the
+            #    ``ffmpeg -i None`` failure — so the job goes to the worker,
+            #    which reads the stored object itself: no Telegram download and
+            #    no Pyrogram. ──
+            if not await self._enqueue_keyed_job(
+                update,
+                context,
+                current_file,
+                output_path=output_path,
+                ffmpeg_args=current_file.get("_pipeline_ffmpeg_args") or _format_ffmpeg_args.get(format_type),
+                output_ext=f".{format_type}",
+                job_type="format_audio",
+                caption=current_file.get("_pipeline_caption"),
+                query=query,
+            ):
+                await self.safe_edit(query, f"❌ Failed to convert to {format_type}: the source is not available.")
+            return
+
+        success = await self.converter.convert_audio_format(local_input, output_path, format_type)
 
         if success and os.path.exists(output_path):
             # NOTE: Bot API infers the MIME type from the filename, and
@@ -8567,7 +8761,23 @@ class EnhancedMediaHandler:
                 await self.safe_edit(query, f"❌ Failed to download file: {e}")
                 return
 
-        success, _ = await self.converter.execute_ffmpeg(cmd, current_file["path"], output_path)
+        local_input = current_file.get("path") or current_file.get("_local_input_path")
+        if not (local_input and os.path.exists(local_input)):
+            if not await self._enqueue_keyed_job(
+                update,
+                context,
+                current_file,
+                output_path=output_path,
+                ffmpeg_args=cmd,
+                output_ext=".mp3",
+                job_type="format_audio",
+                caption=_metadata_caption(current_file),
+                query=query,
+            ):
+                await self.safe_edit(query, "❌ Failed to adjust bitrate.")
+            return
+
+        success, _ = await self.converter.execute_ffmpeg(cmd, local_input, output_path)
 
         if success and os.path.exists(output_path):
             delivery_name = _audio_delivery_name(current_file.get("name"), current_file.get("id"))
@@ -8625,7 +8835,23 @@ class EnhancedMediaHandler:
                 await self.safe_edit(query, f"❌ Failed to download file: {e}")
                 return
 
-        success, _ = await self.converter.execute_ffmpeg(cmd, current_file["path"], output_path)
+        local_input = current_file.get("path") or current_file.get("_local_input_path")
+        if not (local_input and os.path.exists(local_input)):
+            if not await self._enqueue_keyed_job(
+                update,
+                context,
+                current_file,
+                output_path=output_path,
+                ffmpeg_args=cmd,
+                output_ext=".mp3",
+                job_type="format_audio",
+                caption=_metadata_caption(current_file),
+                query=query,
+            ):
+                await self.safe_edit(query, "❌ Failed to normalize audio.")
+            return
+
+        success, _ = await self.converter.execute_ffmpeg(cmd, local_input, output_path)
 
         if success and os.path.exists(output_path):
             delivery_name = _audio_delivery_name(current_file.get("name"), current_file.get("id"))
@@ -8915,6 +9141,34 @@ class EnhancedMediaHandler:
         except Exception as e:
             logger.error(f"Failed to log to MongoDB: {e}")
 
+    async def handle_text_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Route a plain text message to whichever flow is waiting for it.
+
+        Almost every inline "Custom"/"Enter …" button arms an ``awaiting_*`` flag
+        on ``context.user_data`` and expects the user's next text message to be
+        answered by the matching branch of :meth:`handle_custom_input`. The MP3
+        tag editor is the exception: it consumes a JSON object and is handled by
+        the media-message entry point, which owns that flow. Deciding here keeps
+        both reachable from a single text handler.
+        """
+        # A pending login step owns the message (phone / code / password); the
+        # login handler runs in a higher-priority group and answers it, so this
+        # router must not mistake it for a custom-input reply.
+        try:
+            _bot_data = getattr(getattr(context, "application", None), "bot_data", None) or {}
+            _login_futures = _bot_data.get("login_futures") or {}
+            _uid = getattr(update.effective_user, "id", None)
+            if _uid is not None and _login_futures.get(_uid) is not None:
+                return
+        except Exception:
+            logger.debug("handlers: login-pending check failed; continuing to custom input")
+
+        user_data = getattr(context, "user_data", None) or {}
+        if user_data.get("awaiting_mp3_tags"):
+            await self.handle_media_message(update, context)
+            return
+        await self.handle_custom_input(update, context)
+
     async def handle_custom_input(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle custom user input for various operations."""
         user_input = update.message.text.strip()
@@ -9157,7 +9411,7 @@ class EnhancedMediaHandler:
                 _write_bulk_setting(user_id, session, "bulk_crf", _crf)
                 await update.message.reply_text(f"✅ Bulk compress CRF set to {_crf}.")
 
-        elif context.user_data.get("awaiting_resolution"):
+        elif context.user_data.get("awaiting_resolution") or context.user_data.get("awaiting_custom_resolution"):
             if "x" in user_input:
                 try:
                     width, height = map(int, user_input.split("x"))
@@ -9330,15 +9584,13 @@ class EnhancedMediaHandler:
                         logger.exception("Failed to forward file to %s: %s", getattr(dest_chat, "id", lookup), e)
                         await update.message.reply_text(f"❌ Failed to forward: {e}")
 
-            # Clear awaiting flag regardless of outcome to avoid stuck state
+            # Clear awaiting flag regardless of outcome to avoid stuck state.
+            # (This used to be a `for … else` whose `else` always ran, so every
+            # successful forward was followed by a bogus
+            # "❌ Invalid format. Use WIDTHxHEIGHT." reply.)
             for key in list(context.user_data.keys()):
                 if key.startswith("awaiting_"):
                     del context.user_data[key]
-            else:
-                await update.message.reply_text("❌ Invalid format. Use WIDTHxHEIGHT.")
-                for key in list(context.user_data.keys()):
-                    if key.startswith("awaiting_"):
-                        del context.user_data[key]
 
         elif context.user_data.get("awaiting_trim"):
             # Handle trim time input (audio or video).
@@ -9436,6 +9688,12 @@ class EnhancedMediaHandler:
             if user_input.isdigit() and 2 <= int(user_input) <= 20:
                 count = int(user_input)
                 await update.message.reply_text(f"🖼️ Taking {count} screenshots...")
+
+                # ``output_base`` is branch-local: it was never defined here, so
+                # this prompt used to die with a NameError before making a grid.
+                output_base = getattr(config, "OUTPUT_PATH", "storage/output") if config else "storage/output"
+                with contextlib.suppress(OSError):
+                    os.makedirs(output_base, exist_ok=True)
 
                 screenshots = await self.converter.take_screenshot_grid(
                     current_file["path"],

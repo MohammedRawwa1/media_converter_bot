@@ -494,7 +494,7 @@ def test_the_recovery_runs_before_the_storage_download():
     src = read_object_source(ffmpeg_worker.handle_job)
     assert "_stored_source_for_job(job)" in src
     assert src.index("_stored_source_for_job(job)") < src.index(
-        "_shared_cache_path = _library_source_cache_path(input_key)"
+        "_shared_cache_path = _find_library_source_cache(input_key"
     )
     # The give-up message has to say a stored copy was looked for too.
     assert "and no stored copy to recover it from" in src

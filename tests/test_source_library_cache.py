@@ -77,11 +77,48 @@ def test_shared_cache_detection_matches_only_the_library_copy():
     assert ffmpeg_worker._is_shared_source_cache(cached, "inputs/6f2b/source.mp4") is False
 
 
+def test_cached_copy_is_found_whether_or_not_it_carries_the_key_extension(tmp_path, monkeypatch):
+    """The write names the cache file with an extension; the key has none.
+
+    If lookup and identity only consider the bare key name, a repeat never sees
+    the copy the previous job wrote, so it pays the full object out of the
+    bucket again. Both must accept the extension-bearing file.
+    """
+    monkeypatch.setattr(ffmpeg_worker.config, "TEMP_PATH", str(tmp_path))
+    cached = ffmpeg_worker._library_source_cache_path(LIBRARY_KEY, ".aac")
+    os.makedirs(os.path.dirname(cached), exist_ok=True)
+    with open(cached, "wb") as fh:
+        fh.write(b"x" * 16)
+
+    # Found with the same extension, with none, and by the cleanup guard.
+    assert ffmpeg_worker._find_library_source_cache(LIBRARY_KEY, ".aac") == cached
+    assert ffmpeg_worker._find_library_source_cache(LIBRARY_KEY) == cached
+    assert ffmpeg_worker._is_shared_source_cache(cached, LIBRARY_KEY) is True
+
+
+def test_empty_and_partial_files_are_never_served_as_a_cache_hit(tmp_path, monkeypatch):
+    monkeypatch.setattr(ffmpeg_worker.config, "TEMP_PATH", str(tmp_path))
+    cached = ffmpeg_worker._library_source_cache_path(LIBRARY_KEY, ".aac")
+    os.makedirs(os.path.dirname(cached), exist_ok=True)
+    open(cached, "wb").close()  # zero bytes is not a usable source
+    assert ffmpeg_worker._find_library_source_cache(LIBRARY_KEY, ".aac") is None
+
+    with open(cached, "wb") as fh:
+        fh.write(b"partial")
+    part = cached + ".part"
+    with open(part, "wb") as fh:
+        fh.write(b"y" * 16)
+    os.remove(cached)
+    # A leftover download fragment must not be handed to ffmpeg.
+    assert ffmpeg_worker._find_library_source_cache(LIBRARY_KEY, ".aac") is None
+
+
 def test_job_reuses_the_cache_and_keeps_it_after_the_job():
     """The source is downloaded into the cache, then deliberately not deleted."""
     src = read_object_source(ffmpeg_worker.handle_job)
-    # The reuse check runs before the download and short-circuits it.
-    assert "_shared_cache_path = _library_source_cache_path(input_key)" in src
+    # The reuse check runs before the download and short-circuits it, matching
+    # the copy by any extension rather than by the bare key name alone.
+    assert "_shared_cache_path = _find_library_source_cache(input_key" in src
     assert "reusing shared local source cache" in src
     # Bytes that do arrive are written to the shared location, not a job-only one.
     assert "_library_source_cache_path(input_key, ext)" in src

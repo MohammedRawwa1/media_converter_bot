@@ -47,6 +47,8 @@ class WebRateLimiter:
             "status": (5, 10),  # 5 req/s, burst 10
             "download": (2, 5),  # 2 req/s, burst 5
             "events": (5, 15),  # 5 req/s, burst 15 (SSE reconnect)
+            "sse": (5, 15),  # 5 req/s, burst 15 (SSE reconnect)
+            "ws": (5, 15),  # 5 handshakes/s, burst 15
             "search": (10, 20),  # 10 req/s, burst 20
             "health": (10, 30),  # 10 req/s, burst 30
             # Auth-protected endpoints: moderate limits
@@ -181,10 +183,18 @@ def get_client_ip(request) -> str:
         if hasattr(request, "remote_addr") and request.remote_addr:
             return request.remote_addr
 
-        # Flask and FastAPI compatibility
-        if hasattr(request, "client") and request.client:
-            host, port = request.client
-            return host
+        client = getattr(request, "client", None)
+        if client:
+            # Starlette hands back a Client(host=..., port=...) object rather than
+            # the (host, port) tuple WSGI uses, so unpacking it raised and every
+            # FastAPI/WebSocket caller shared the single "unknown" bucket — that
+            # is one global limit for the whole world instead of one per client.
+            host = getattr(client, "host", None)
+            if host:
+                return host
+            if isinstance(client, (tuple, list)):
+                return client[0]
+            return str(client)
 
         return "unknown"
     except Exception:

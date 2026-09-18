@@ -270,12 +270,24 @@ class EgressMonitor:
             logger.warning("EgressMonitor: no bot application available; alert not sent")
             return False
 
+        from telegram.error import RetryAfter
+
         try:
             await self.bot_app.bot.send_message(
                 chat_id=self.admin_user_id,
                 text=text,
                 parse_mode="HTML",
             )
+        except RetryAfter as exc:
+            # The alert itself hit a flood wait: Telegram is refusing writes to
+            # this chat for a while, so retrying now would only deepen it. Drop
+            # the alert — the same condition re-alerts on the next sample, once
+            # the window has closed.
+            logger.warning(
+                "EgressMonitor: flood wait (%ss) — alert not sent",
+                getattr(exc, "retry_after", "?"),
+            )
+            return False
         except Exception as exc:
             logger.warning("EgressMonitor: failed to send the alert: %s", exc)
             return False

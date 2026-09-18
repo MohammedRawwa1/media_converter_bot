@@ -1,11 +1,12 @@
 import asyncio
 import contextlib
 import logging
-import os
 import re
 import threading
 from collections import defaultdict
 from urllib.parse import parse_qs, urlparse
+
+from utils.job_access import JOB_CAPABILITY_PARAM, job_token_ok
 
 logger = logging.getLogger(__name__)
 
@@ -53,15 +54,17 @@ async def _ws_handler(websocket, path):
 
     job_id = m.group("job_id")
 
-    # Optional auth: reject before registering when UPLOAD_SECRET is set
-    upload_secret = os.environ.get("UPLOAD_SECRET")
-    if upload_secret:
-        token_list = query_params.get("upload_token", [])
-        upload_token = token_list[0] if token_list else None
-        if not upload_token or upload_token != upload_secret:
-            with contextlib.suppress(Exception):
-                await websocket.close()
-            return
+    # Authorization: the job's own access capability (utils/job_access.py). It
+    # travels in the query string because a browser cannot set headers on a
+    # WebSocket handshake; being per-job and unguessable it is the right
+    # credential for that slot, whereas the shared upload secret is not, and no
+    # longer appears in any URL. Fails closed when the job has no capability.
+    token_list = query_params.get(JOB_CAPABILITY_PARAM, [])
+    job_token = token_list[0] if token_list else None
+    if not await job_token_ok(job_id, job_token):
+        with contextlib.suppress(Exception):
+            await websocket.close()
+        return
 
     await _register(websocket, job_id)
     logger.info("WebSocket connected for job %s", job_id)

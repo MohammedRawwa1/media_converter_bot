@@ -29,6 +29,11 @@ uploadForm.addEventListener('submit', async (e) => {
   }
   const data = await res.json()
   const jobId = data.job_id
+  // The upload response hands back this job's access capability exactly once.
+  // Every job-scoped request (status/download/events/ws) must present it.
+  if (data.job_token) {
+    jobTokens[jobId] = data.job_token
+  }
   addJobCard(jobId, file.name, file.size)
 })
 
@@ -65,6 +70,7 @@ function addJobCard(jobId, filename, fileSizeBytes){
 
 const eventSources = {}
 const wsConnections = {}
+const jobTokens = {}
 
 function initWebSocket(jobId){
   // Returns true if a websocket connection attempt was started.
@@ -77,7 +83,7 @@ function initWebSocket(jobId){
   // In production (Railway, etc.) only one port is exposed, so we connect
   // via the main app's path-based WebSocket endpoint.
   const scheme = (location.protocol === 'https:') ? 'wss' : 'ws'
-  const wsUrl = appendToken(`${scheme}://${location.host}/ws/${jobId}`)
+  const wsUrl = appendToken(`${scheme}://${location.host}/ws/${jobId}`, jobId)
 
   const connect = () => {
     try{
@@ -114,7 +120,7 @@ function initWebSocket(jobId){
 
 function initEventSource(jobId){
   try{
-    const es = new EventSource(appendToken(`/events/${jobId}`))
+    const es = new EventSource(appendToken(`/events/${jobId}`, jobId))
     eventSources[jobId] = es
     es.onmessage = (e) => {
       try{
@@ -144,7 +150,7 @@ async function pollStatus(jobId){
     // if we have an active EventSource or WebSocket for this job, stop polling
     if (eventSources[jobId] || wsConnections[jobId]) break
     try{
-      const res = await fetch(appendToken(`/status/${jobId}`))
+      const res = await fetch(appendToken(`/status/${jobId}`, jobId))
       if (!res.ok) throw new Error('not found')
       const j = await res.json()
 
@@ -193,7 +199,7 @@ async function pollStatus(jobId){
 
       if (j.status === 'done' && j.output){
         meta.textContent = `${j.message} • ✅ Done`
-        const dlUrl = appendToken(`/download/${jobId}`)
+        const dlUrl = appendToken(`/download/${jobId}`, jobId)
         action.innerHTML = `<a href="${dlUrl}" class="btn">Download</a>`
         finished = true
         break
@@ -304,9 +310,17 @@ function getUploadToken(){
   return el ? el.value.trim() : ''
 }
 
-function appendToken(url){
+// Job-scoped URLs (/status, /download, /events, /ws) are authorized by the job's
+// own access capability, which is per job and unguessable - the job id on its
+// own is not a credential. The shared upload token still rides along for the
+// routes that require the service credential.
+function appendToken(url, jobId){
+  const params = []
   const token = getUploadToken()
-  if (!token) return url
+  if (token) params.push('upload_token=' + encodeURIComponent(token))
+  const jobToken = jobId ? jobTokens[jobId] : ''
+  if (jobToken) params.push('job_token=' + encodeURIComponent(jobToken))
+  if (!params.length) return url
   const sep = url.includes('?') ? '&' : '?'
-  return url + sep + 'upload_token=' + encodeURIComponent(token)
+  return url + sep + params.join('&')
 }

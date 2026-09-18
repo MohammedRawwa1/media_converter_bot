@@ -473,7 +473,11 @@ async def run_ffmpeg(
     current_out_time = 0.0
 
     try:
-        assert proc.stdout is not None
+        # Not an assert: `python -O` strips asserts, and a missing progress pipe
+        # would then surface as an opaque TypeError from the `async for` below
+        # rather than naming the actual problem.
+        if proc.stdout is None:
+            raise RuntimeError("ffmpeg progress pipe unavailable: proc.stdout is None")
         # Read line by line (ffmpeg -progress emits key=value lines)
         async for raw in proc.stdout:
             line = raw.decode(errors="ignore").strip()

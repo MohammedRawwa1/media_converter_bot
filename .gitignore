@@ -224,3 +224,33 @@ storage/temp_sessions/*
 storage/thumbnails/*
 !storage/thumbnails/README.md
 *.stderr
+
+# Telegram userbot session state.
+# A session string (or the JSON/SQLite file it is exported from) authenticates a
+# real account: it can read and send as that user with no further MFA. These
+# files are written next to the app at runtime, so they must never be committable.
+telethon_ingest.session*.json
+*.session
+*.session.json
+*.session-journal
+*.session.lock
+*.session.sqlite
+*.session.sqlite-journal
+
+# Private key material (certs/ covers the deployed pair; these catch strays)
+*.pem
+*.key
+*.p12
+*.pfx
+
+# Audit tooling output (may quote code excerpts and findings)
+security/reports/
+local-scan-report.json
+bandit-report.json
+pip-audit-output.txt
+
+# The VulnClaw audit instance: local agent state, not project source.
+# A runner resolves it from the checkout; scan_mediabot.py recreates kb/cve/ on
+# demand, so a missing tree costs nothing. Never committed and never shipped
+# (see .dockerignore / .railwayignore).
+.vulnclaw-local/

@@ -53,6 +53,9 @@ ignore = [
 
 [lint.per-file-ignores]
 # ── Scripts & helper tools: intentional lazy imports & subprocess calls ──
+# ── Security scanners: run git/pip-audit with fixed argv, and their rule
+#    tables intentionally contain secret-shaped literals/patterns ──
+"security/*.py" = ["S603", "S607", "S105", "S106", "S108"]
 "scripts/*.py" = ["E402", "S603", "S607"]
 "tools/*.py" = ["E402", "S603", "S607"]
 "workers/*.py" = ["E402", "S603", "S607"]

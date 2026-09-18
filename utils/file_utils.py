@@ -367,7 +367,7 @@ def safe_rmtree(path: str) -> None:
     if not path:
         return
     resolved = os.path.realpath(path)
-    protected = {"/", "/tmp", os.path.realpath(tempfile.gettempdir())}  # noqa: S108  # nosec  # deliberate safety guard, not insecure usage
+    protected = {"/", "/tmp", os.path.realpath(tempfile.gettempdir())}  # noqa: S108  # nosec  # a deny-list of paths never to delete, not temp-file usage
     if resolved in protected:
         raise RuntimeError(f"safe_rmtree: refusing to delete system directory {resolved!r}")
     shutil.rmtree(resolved, ignore_errors=True)
@@ -615,10 +615,18 @@ async def detect_filename(input_path: str, message=None) -> str:
                 import json
                 import subprocess
 
+                # Respect the configured binary instead of relying on a bare name
+                # on PATH: FFPROBE_PATH wins, else the ffprobe sibling of whatever
+                # FFMPEG_PATH names, matching how the rest of the pipeline resolves
+                # it (utils/ffmpeg_runner.py, handlers.py).
+                ffprobe_bin = os.environ.get("FFPROBE_PATH") or os.environ.get(
+                    "FFMPEG_PATH", "ffmpeg"
+                ).replace("ffmpeg", "ffprobe")
+
                 def _run_probe():
-                    return subprocess.run(
+                    return subprocess.run(  # nosec B603  # literal ffprobe argv list
                         [
-                            "ffprobe",
+                            ffprobe_bin,
                             "-v",
                             "quiet",
                             "-print_format",

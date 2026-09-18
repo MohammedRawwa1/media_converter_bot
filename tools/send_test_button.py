@@ -3,6 +3,7 @@ import os
 import sys
 
 from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.error import RetryAfter
 
 
 def main():
@@ -19,6 +20,11 @@ def main():
     try:
         msg = bot.send_message(chat_id=int(chat), text="Test progress — cancel button", reply_markup=kb)
         print("Sent test message id:", getattr(msg, "message_id", None))
+    except RetryAfter as e:
+        # A flood wait is Telegram closing that chat's write budget for a while.
+        # Retrying now is another refused call, so report it and let the caller
+        # decide when to try again.
+        print(f"Telegram flood wait: retry after {getattr(e, 'retry_after', '?')}s — not retrying.")
     except Exception as e:
         print("Failed to send test message:", e)
 

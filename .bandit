@@ -1,23 +1,92 @@
-# Bandit security scanner configuration
-# https://bandit.readthedocs.io/en/latest/config.html
+# Bandit configuration for media_conversion_bot.
+#
+# bandit auto-discovers this file in the working directory, and the Security Scan
+# workflow also passes `--ini .bandit` explicitly. (`-c/--configfile` is a
+# different flag — the YAML plugin profile — and this file is not that.) What
+# follows is the recorded decision for every finding class this project has
+# reviewed and accepted. Anything NOT skipped is still reported.
+#
+# The checks that matter for this codebase stay armed: B602/B604 (subprocess
+# with shell=True), B603 (subprocess without shell=True — see below), B607
+# (partial executable path), B101 (assert), B105/B106/B107 (hardcoded
+# credentials), B324 (weak hash used for security), B301/B302 (pickle), B506
+# (yaml.load), B608 (SQL assembled by formatting) and the rest of the B5xx
+# injection family. Fixes landed alongside this file removed the only findings in
+# those classes (B324 in utils/userbot_uploader.py, B607 in main.py,
+# workers/ffmpeg_worker.py and utils/file_utils.py, B101 in utils/ffmpeg_runner.py,
+# B105 in utils/job_access.py).
+#
+# B110/B112 mirror decisions already recorded in ruff.toml for the equivalent
+# ruff rules (S110/S112). B404 is an import-level "consider the implications"
+# note that fires on the import rather than on a call, so a per-line
+# suppression would carry no information. Nothing about subprocess execution is
+# skipped globally any more.
 
-skips:
-  - B101
-  - B110
-  - B112
-  - B311
-  - B404
-  - B603
-  - B607
+[bandit]
+# B110 (try/except/pass) and B112 (try/except/continue)
+#   This project's error handling is deliberately best-effort on cleanup and
+#   probing paths: closing a Redis client, reading a cancel flag, stat-ing a file
+#   that may have been removed, decoding a message that may be malformed. Letting
+#   a failed teardown raise would be strictly worse than continuing.
+#   ruff.toml records the same decision by ignoring S110 and S112. All 61 sites
+#   were reviewed: none swallows an error around a security decision, and the
+#   succeeding path already handles the absence it falls through to.
+#
+# B404 (import subprocess)
+#   A design-level "consider the implications" note that fires on the import, not
+#   on a call, so a per-line suppression would carry no information. The call
+#   sites are the thing to review, and B603 was exactly that review.
+#
+# B603 (subprocess without shell=True) — deliberately NOT skipped.
+#   It is an informational prompt to check for untrusted input, so it is
+#   suppressed per call site (`# nosec B603` plus a reason) instead of globally.
+#   That is the whole point: a new subprocess call anywhere in the tree is still
+#   reported, which is the only way this check keeps earning its place. All 15
+#   existing call sites were reviewed: every one passes a list argv and never a
+#   shell string, and the argv is either a literal (["ps", "aux"],
+#   [FFMPEG_PATH, "-version"]) or an ffmpeg/ffprobe argument list the worker
+#   builds from validated paths. Verified:
+#   `grep -rn "shell\s*=\s*True" --include=*.py .` returns nothing.
+#   Each suppression names B603 and nothing else, on purpose: a bare `# nosec`
+#   would also swallow a shell=True added to that same line later, so B602/B604
+#   stay live on all 15 lines. For the same reason every rule in
+#   security/scan_mediabot.py's injection family (INJ-*) refuses the generic
+#   neutralizer and honours only a comment naming its own class, so annotating a
+#   call for bandit cannot silently drop it out of injection coverage.
+#
+# In-code suppressions carry a reason after a second `#`. Two forms are in use:
+#
+#   * Bare `# nosec` — for a line that only ever trips ONE check, e.g.
+#     `... # nosec  # noqa: S104 - container listener`. Five sites: the reviewed
+#     bind-all-interfaces listeners (fetcher/service.py,
+#     workers/ffmpeg_worker.py, tools/telethon_ingest.py), the protected-path
+#     deny-list in utils/file_utils.py, the scheme-allowlisted urlopen calls in
+#     scripts/check_forward_s3.py and scripts/trigger_upload_get.py, and the
+#     login-flow field defaults in utils/login_handler.py.
+#   * Named `# nosec B603` — for the 15 subprocess call sites, where naming the
+#     id keeps B602/B604 (shell=True) armed on that same line.
+#
+# The reason must sit behind a second `#`. bandit captures everything up to the
+# next `#` as candidate test ids and warns for every word it cannot resolve
+# ("Test in comment: literal is not a test name or id"), so a bare
+# `# nosec B603 - literal argv` turns one annotation into six log lines. With the
+# reason behind the second `#` the whole repo produces 3 warnings, all benign:
+# bandit runs its tests per Call node and a suppression matches any line in that
+# node's line range, so an *outer* call whose range happens to contain the
+# annotation reports that IT has no B603 to suppress (handlers.py:1450, the
+# `asyncio.to_thread(` node, and twice on workers/ffmpeg_worker.py:2036 for the
+# `str(` / `os.getpid(` nodes). Those are log noise, not findings: CI reads the
+# JSON report, where the finding count is what gates the job.
+skips = B110,B112,B404
 
-exclude_dirs:
-  - .venv
-  - env
-  - __pycache__
-  - node_modules
-  - .git
-  - .eggs
-  - .mypy_cache
-  - .pytest_cache
-  - .github
-  - pdf-Header_Image_Extractor
+# Not part of the shipped or reviewed surface:
+#   security/        the audit scanner, whose rule tables deliberately contain
+#                    secret-shaped literals and fixed-argv git/pip-audit calls
+#   .vulnclaw-local/ vendored instance config and skill references
+#   tests/           dummy credentials, local servers and throwaway values
+#   .venv,/venv,env  installed dependencies
+#   __pycache__      compiled bytecode
+# Note: an `exclude` in this file REPLACES bandit's built-in default list rather
+# than extending it, so the entries bandit ships with .git/__pycache__/.tox/.eggs
+# are repeated here.
+exclude = ./.git,./.venv,./venv,./env,./security,./.vulnclaw-local,./tests,./__pycache__,./.tox,./.eggs,./node_modules

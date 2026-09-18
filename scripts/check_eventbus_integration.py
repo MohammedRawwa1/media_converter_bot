@@ -258,7 +258,7 @@ async def scenario_e_kafka(queue) -> None:
         source_url="https://cdn.example.com/x.mp4?token=leaked-token",
         # Not a credential: a canary value used below to assert the projection
         # keeps secrets out of the event log (bandit flags the argument name).
-        aws_secret_access_key="leaked-secret",  # noqa: S106
+        aws_secret_access_key="leaked-secret",  # noqa: S106  # nosec B106
     )
 
     for event_type in (messages.JOB_QUEUED, messages.JOB_STARTED, messages.JOB_COMPLETED):

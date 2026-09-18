@@ -9,7 +9,9 @@ import redis
 from flask import Flask, jsonify, request
 
 # SSRF protection: reuse the same validator as the main webapp
+from utils.secure_compare import constant_time_eq
 from utils.url_validation import _validate_url_safe  # noqa: PLC0415
+from utils.web_rate_limiter import get_client_ip, make_rate_limit_response, web_rate_limiter
 
 app = Flask(__name__)
 logger = logging.getLogger("fetcher")
@@ -26,9 +28,30 @@ JOB_LIST = "ffmpeg:jobs"
 FETCH_CHANNEL = "ffmpeg:fetch"
 
 
+@app.before_request
+def _rate_limit():
+    """Token-bucket limit per client IP, applied to every route.
+
+    This service enqueues jobs and mints presigned upload URLs, so it is a public
+    surface and cheap to flood. A single before-request hook means a route added
+    later cannot ship without a limit by omission. /health is limited too: a
+    probe does not need more than the limiter's headroom.
+    """
+    client_ip = get_client_ip(request)
+    endpoint = f"fetcher_{request.endpoint or 'unknown'}"
+    if not web_rate_limiter.check_limit(endpoint, client_ip):
+        body, status, headers = make_rate_limit_response(endpoint, client_ip)
+        return jsonify(body), status, headers
+    return None
+
+
 def _check_secret(req):
     if not UPLOAD_SECRET:
-        return True
+        # Fail closed. This service can enqueue jobs and hand out presigned
+        # upload URLs, so an unset UPLOAD_SECRET must refuse traffic rather than
+        # silently expose the whole surface.
+        logger.error("UPLOAD_SECRET is not configured — refusing request. Set it in the environment.")
+        return False
     auth = req.headers.get("Authorization") or req.args.get("secret")
     if not auth and req.is_json:
         _body = req.get_json(silent=True)
@@ -40,7 +63,7 @@ def _check_secret(req):
         token = auth.split(" ", 1)[1]
     else:
         token = auth
-    return token == UPLOAD_SECRET
+    return constant_time_eq(token, UPLOAD_SECRET)
 
 
 @app.route("/health", methods=["GET"])

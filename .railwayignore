@@ -71,13 +71,24 @@ htmlcov/
 # ── Temporary files ──
 *.tmp
 *.temp
-validation_results.txt
 
 # ── Deployment config (Docker config NOT excluded — Docker needs it during build) ──
 # NOTE: .dockerignore is intentionally NOT listed here. Docker reads it from the
 # build context; if Railway excludes it, all .dockerignore rules would be lost.
 docker-compose*.yml
 docker-compose*.yaml
+
+# ── Security tooling & audit output ──
+# security/ (tailored scanner + skill files + generated audit reports) and
+# .vulnclaw-local/ (audit instance, CVE/technique KB, run artifacts) are audit
+# material: they must not be uploaded as part of a deploy.
+security/
+.vulnclaw-local/
+local-scan-report.json
+bandit-report.json
+
+# ── Userbot session state (a session string is a full account login) ──
+telethon_ingest.session*.json
 
 # ── Documentation ──
 # Keep root README.md and DEPLOY.md — they're small and useful

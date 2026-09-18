@@ -907,11 +907,21 @@ class SessionHealthChecker:
         if not self.admin_user_id or not self.bot_app:
             logger.debug("SessionHealthChecker: no admin_user_id or bot_app; skipping admin notification")
             return
+        from telegram.error import RetryAfter
+
         try:
             await self.bot_app.bot.send_message(
                 chat_id=self.admin_user_id,
                 text=text,
                 parse_mode="Markdown",
+            )
+        except RetryAfter as exc:
+            # A flood wait means Telegram is refusing writes to this chat, so
+            # retrying the notification now is another refused call. The next
+            # scheduled health run reports the state again anyway.
+            logger.warning(
+                "SessionHealthChecker: flood wait (%ss) — admin message not sent",
+                getattr(exc, "retry_after", "?"),
             )
         except Exception as exc:
             logger.warning(
