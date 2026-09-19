@@ -4057,19 +4057,28 @@ def _batch_view_rows(batches) -> list[str]:
     return rows
 
 
-def _batch_progress_text(done: int, total: int, *, name: str = "", pct=None, batches=None) -> str:
+def _batch_progress_text(done: int, total: int, *, name: str = "", pct=None, batches=None, finished=False) -> str:
     """The batch's one message: how far this batch is, plus every other batch.
 
     ``batches`` is the aggregate view of every batch still running, so a user
     with several applies in flight reads them from one message instead of
     juggling one message per batch.
+
+    ``finished`` is what draws the checkmark, and only the caller that counted
+    this file may pass it. It used to be tied to ``pct is None``, which is also
+    the normal state of a file that has *not* started: the live ticker reads the
+    job hash's percentage, and a job the worker has just picked up - fetching its
+    source, probing it, waiting for the conversion slot - has not written one
+    yet. That drew ``✅ <name>`` beside a file that had not converted a second of
+    video, which is the line the user read as "already done" while it was still
+    queued.
     """
     text = f"📊 Processing one at a time — {done} of {total} finished"
     if name:
-        if pct is None:
+        if finished:
             text += f"\n✅ {name}"
         else:
-            text += f"\n🔄 {name} — {int(pct)}%"
+            text += f"\n🔄 {name} — {int(pct or 0)}%"
     rows = _batch_view_rows(batches)
     if len(rows) > 1:
         text += "\n\n🗂 Batches\n" + "\n".join(rows)
@@ -4221,6 +4230,10 @@ async def _batch_live_progress(job: dict) -> None:
                         raw = await r.hget(f"ffmpeg:job:{job_id}", "progress")
                         if raw is not None:
                             pct = float(raw)
+                    # Never ``finished=True`` here: this ticker runs for the file
+                    # that is *running*, and it stops before the end-of-job report
+                    # writes the final figure. A missing percentage therefore reads
+                    # as 0%, not as a finished file.
                     text = _batch_progress_text(
                         state["done"], state["total"], name=name, pct=pct, batches=state["batches"]
                     )
@@ -4301,13 +4314,15 @@ async def _report_batch_progress(job: dict) -> None:
                     await batch_pipeline.unregister_active_batch(r, batch_id=batch_id)
                 return
             name = str(job.get("original_filename") or "").strip()
+            # This is the report that runs as the file *ends*, so this is the one
+            # place the checkmark is earned.
             await _set_batch_message(
                 bot,
                 r,
                 batch_id,
                 chat_id,
                 state["stored"],
-                _batch_progress_text(done, total, name=name, batches=state["batches"]),
+                _batch_progress_text(done, total, name=name, batches=state["batches"], finished=True),
             )
     except Exception:
         logger.debug("ffmpeg worker: batch progress update failed for %s", batch_id)

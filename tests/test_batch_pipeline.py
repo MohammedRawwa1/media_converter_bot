@@ -502,9 +502,36 @@ class BatchProgressMessageTests(unittest.IsolatedAsyncioTestCase):
         running = _batch_progress_text(3, 12, name="clip.mp4", pct=47.6)
         self.assertIn("3 of 12 finished", running)
         self.assertIn("🔄 clip.mp4 — 47%", running)
-        # A finished file is shown without a percentage.
-        self.assertIn("✅ clip.mp4", _batch_progress_text(4, 12, name="clip.mp4"))
+        # A finished file is shown without a percentage - and only a caller that
+        # counted it may say so.
+        finished = _batch_progress_text(4, 12, name="clip.mp4", finished=True)
+        self.assertIn("✅ clip.mp4", finished)
         self.assertNotIn("clip.mp4", _batch_progress_text(4, 12))
+
+    def test_a_running_file_with_no_percentage_yet_is_not_shown_as_done(self):
+        """A queued file is not a finished one.
+
+        The live ticker runs for the file being *processed*, and the worker only
+        writes a percentage once ffmpeg starts - so a job that has just been
+        picked up (fetching its source, probing it, waiting for the slot) has none.
+        Reading that as "finished" drew "✅ <name>" beside work that had not begun,
+        which is how a file still queued came to be read as already done.
+        """
+        from workers.ffmpeg_worker import _batch_progress_text
+
+        not_started = _batch_progress_text(3, 12, name="Module 02.mp4")
+        self.assertIn("🔄 Module 02.mp4 — 0%", not_started)
+        self.assertNotIn("✅", not_started)
+        # And the ticker's own call never claims a finished file while it runs.
+        src = read_source("workers", "ffmpeg_worker.py")
+        ticker = src.index("async def _batch_live_progress(")
+        body = src[ticker : src.index("async def _report_batch_progress(")]
+        call_start = body.index("text = _batch_progress_text(")
+        call = body[call_start : body.index(")", call_start)]
+        self.assertNotIn("finished", call)
+        # The end-of-job report is where it is earned.
+        report = src[src.index("async def _report_batch_progress(") :]
+        self.assertIn("finished=True", report)
 
     async def test_a_batch_that_was_taken_down_is_never_reported_again(self):
         # Nothing left in Redis for this batch: a cancel-all swept it as stale
@@ -1452,12 +1479,69 @@ class BulkPipelineWatchTests(unittest.IsolatedAsyncioTestCase):
         await self._wait(info, "error")
         self.assertTrue(info["_pipeline_failed"])
 
-    async def test_a_wait_that_gave_up_still_counts_as_completed(self):
-        # The job still exists and will deliver; queueing a second one for the
-        # same file would be worse than waiting on the one already queued.
+    async def test_a_wait_that_gave_up_leaves_the_file_pending(self):
+        """Handed off is not finished.
+
+        The job still exists and will deliver, so queueing a second one for the
+        same file would be worse than waiting on the one already queued - but the
+        file is *not* complete: marking it so put a merely-queued file into the
+        "✅ finished" summary, remembered it as done in the resume record (so a
+        later Apply skipped a file nobody had converted) and let the batch report
+        itself finished while its work was still outstanding.
+        """
         info = {"_bulk_pipeline_job_pending": "job-1"}
         await self._wait(info, None)
-        self.assertTrue(info["_bulk_pipeline_completed"])
+
+        self.assertFalse(info.get("_bulk_pipeline_completed"))
+        self.assertEqual(info.get("_bulk_pipeline_pending"), "job-1")
+
+    async def test_a_batch_that_still_has_queued_files_does_not_report_itself_finished(self):
+        """The summary is the one place the user learns what actually happened."""
+        src = read_source("handlers.py")
+        assert_start = src.index('if f.get("_bulk_pipeline_pending"):')
+        # Through the summary the user reads, which is built at the end of the apply.
+        apply_body = src[assert_start : src.index("await self.safe_edit(query, _head, reply_markup=None)")]
+
+        # A file the wait gave up on is reported as still queued, and counted
+        # apart from the finished ones.
+        self.assertIn('still queued · {f.get("_bulk_pipeline_pending")}', apply_body)
+        self.assertIn("pending += 1", apply_body)
+        # The header only claims "finished" when nothing is outstanding.
+        self.assertIn("elif pending:", apply_body)
+        self.assertIn("queued and will arrive on their own", apply_body)
+        self.assertIn("Bulk apply handed off", apply_body)
+        # And the batch is not closed out from under that work: its message stays
+        # up while the job it describes is still running, and its resume record
+        # survives (those entries are not finished).
+        self.assertIn("if not pending:", apply_body)
+        self.assertIn("if not (stopped or stalled or pending):", apply_body)
+
+    def test_a_finished_member_is_not_left_reading_queued(self):
+        """The queueing line is a placeholder, not the file's last word.
+
+        The apply writes "📋 queued · <job>" before it waits, and only the pipeline
+        path ever replaced that line - so every file the apply queued itself kept
+        reading "queued" in the final summary, delivered or not: work the user had
+        already received looked like work still waiting, and a file the worker had
+        failed or a stop had cancelled looked the same.
+        """
+        src = self._src()
+        assert_start = src.index("_result_idx = len(results)")
+        # Through the summary the user reads, which is built at the end of the apply.
+        apply_body = src[assert_start : src.index("await self.safe_edit(query, _head, reply_markup=None)")]
+
+        # The outcome is written back onto that same line, per terminal status.
+        self.assertIn('f"✅ completed · {job_id}"', apply_body)
+        self.assertIn('f"❌ conversion failed · {job_id}"', apply_body)
+        self.assertIn('f"⏹️ cancelled · {job_id}"', apply_body)
+        self.assertIn("results[_result_idx] = (", apply_body)
+        # A failure counts as one, and a cancellation is neither failed nor queued.
+        self.assertIn("failed += 1", apply_body)
+        self.assertIn("cancelled_members += 1", apply_body)
+        # The header names cancellations too, and keeps its batch-id/one-at-a-time
+        # lines off a run that has one.
+        self.assertIn("file(s) were cancelled.", apply_body)
+        self.assertIn("bool(cancelled_members)", apply_body)
 
     async def test_a_file_with_no_pipeline_job_is_left_alone(self):
         calls = await self._wait({}, "done")

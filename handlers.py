@@ -292,6 +292,44 @@ _UPLOAD_MODES = (_UPLOAD_MODE_VIDEO, _UPLOAD_MODE_FILE)
 # batch until it expires.
 _BULK_APPLY_GUARD_SECONDS = 12 * 3600
 
+# The pipeline dedup key holds the job ingesting a media, or this placeholder
+# while the request that is ingesting it has no job id yet. The placeholder
+# carries its own start time so a claim whose ingest died (a cancelled batch, a
+# restarted process, an exception before the job existed) can be recognised as
+# dead instead of being read as "someone else is handling it" until its TTL runs
+# out - which is how a media came to be silently never downloaded at all.
+_DEDUP_PENDING_PREFIX = "pending"
+_DEDUP_PLACEHOLDER_TTL_SECONDS = 1800
+# How long a second request waits for the request that is ingesting the same
+# media to produce a job id before it concludes the claim is dead and takes over.
+_DEDUP_PENDING_WAIT_SECONDS = float(os.environ.get("DEDUP_PENDING_WAIT_SECONDS", "20"))
+_DEDUP_PENDING_POLL_SECONDS = 2.0
+
+
+def _dedup_placeholder(now: float | None = None) -> str:
+    """The claim a request writes before it has a job to put there."""
+    return f"{_DEDUP_PENDING_PREFIX}:{int(now if now is not None else time.time())}"
+
+
+def _dedup_placeholder_is_stale(value: str | None) -> bool:
+    """Whether a placeholder has outlived the ingest that wrote it.
+
+    A claim that never became a job id means the ingest behind it is gone: no
+    media was downloaded and no job will ever be queued for it, so the key has
+    to stop holding the media hostage. Unparseable values are *not* called stale:
+    an unknown shape is treated as a live claim, and only the bounded wait in
+    :meth:`_dedup_wait_for_owner` can conclude otherwise.
+    """
+    text = str(value or "")
+    if not text.startswith(f"{_DEDUP_PENDING_PREFIX}:"):
+        return False
+    try:
+        started = float(text.split(":", 1)[1])
+    except (TypeError, ValueError):
+        return False
+    return (time.time() - started) > _DEDUP_PLACEHOLDER_TTL_SECONDS
+
+
 # How long a bulk apply waits for one job to reach a terminal state before it
 # gives up and says so. Generous - a 900 MB conversion legitimately takes hours -
 # but not infinite: an unresponsive worker used to hang the whole apply silently,
@@ -423,6 +461,53 @@ def _sanitize_audio_bitrate(value, default: str = _DEFAULT_AUDIO_BITRATE) -> str
     if not _AUDIO_BITRATE_MIN_KBPS <= kbps <= _AUDIO_BITRATE_MAX_KBPS:
         return default
     return f"{kbps}k"
+
+
+def _short_reason(reason: str | None, limit: int = 180) -> str:
+    """The last useful line of an ffmpeg failure, for a message to the user.
+
+    ffmpeg puts its verdict on the last line of stderr (``Output file #0 does not
+    contain any stream``), after however many ``Input #0``/``Stream mapping``
+    lines came first - so the last non-empty line is the one worth showing, and
+    the rest would only be noise in a chat. Returns ``""`` when there is nothing
+    to say, which leaves the caller's own wording untouched.
+    """
+    lines = [line.strip() for line in str(reason or "").splitlines() if line.strip()]
+    if not lines:
+        return ""
+    text = lines[-1]
+    return f" ({text[:limit]})" if text else ""
+
+
+async def _source_has_audio(path: str | None, current_file: dict | None = None) -> bool:
+    """Whether the loaded media carries an audio stream for an audio-only encode.
+
+    Asked before such an encode so a file with no audio track (a video-only video,
+    or a download that is not the media it claims to be) is answered with what is
+    actually wrong, instead of ffmpeg's exit code being flattened into a generic
+    "failed". The ingest's own probe verdict answers it for free whenever the
+    session has one - which matters, because counting an mp3's streams means
+    scanning the whole file - and only a media that was never probed is read here.
+    "Unknown" is always answered as *yes*: the encode is the authority, and a probe
+    that cannot run must never be what blocks one.
+    """
+    stored = (current_file or {}).get("_source_metadata") or (current_file or {}).get("source_metadata")
+    meta = stored if isinstance(stored, dict) else {}
+    if not meta:
+        if not path or not os.path.exists(path):
+            return False
+        try:
+            from utils.ffmpeg_runner import probe_media
+
+            meta = await probe_media(path) or {}
+        except Exception:
+            return True
+    if not meta:
+        return True
+    try:
+        return int(meta.get("audio_streams") or 0) > 0
+    except (TypeError, ValueError):
+        return True
 
 
 def _video_delivery_name(current_file: dict | None, output_path: str | None) -> str:
@@ -2322,6 +2407,135 @@ class EnhancedMediaHandler:
         except Exception:
             pass
 
+    async def _dedup_job_is_active(self, redis, job_id: str) -> bool:
+        """Whether the job behind a dedup claim is still working on the media.
+
+        A claim is only worth honouring while its job is alive: once that job is
+        done, cancelled or errored the media has to be ingestible again at once -
+        and a *cancelled* one even while its hash still says ``queued``, which is
+        what lets a user reprocess a file they just stopped. An unreadable job
+        hash counts as dead, because the alternative is a media nobody can ever
+        fetch again until the key's TTL expires.
+        """
+        try:
+            old_hash = await redis.hgetall(f"ffmpeg:job:{job_id}")
+        except Exception:
+            return False
+        if not old_hash:
+            return False
+        cancel_val = old_hash.get(b"cancel") or old_hash.get("cancel")
+        if cancel_val:
+            value = cancel_val.decode() if isinstance(cancel_val, (bytes, bytearray)) else str(cancel_val)
+            if value == "1":
+                return False
+        status = old_hash.get(b"status") or old_hash.get("status")
+        if not status:
+            return False
+        text = status.decode() if isinstance(status, (bytes, bytearray)) else str(status)
+        return text in ("processing", "queued", "waiting", "started", "uploading", "sending")
+
+    async def _dedup_wait_for_owner(self, redis, key: str) -> str | None:
+        """Wait for the request that claimed *key* to produce its job id.
+
+        Returns that job id, or ``None`` when the claim turns out to be dead (its
+        placeholder is stale or it is never replaced within
+        :data:`_DEDUP_PENDING_WAIT_SECONDS`). ``None`` is the caller's signal to
+        take the media over: a claim that produced nothing must not be allowed to
+        keep standing in for work that is not happening.
+        """
+        deadline = time.monotonic() + _DEDUP_PENDING_WAIT_SECONDS
+        while True:
+            raw = None
+            with contextlib.suppress(Exception):
+                raw = await redis.get(key)
+            value = raw.decode() if isinstance(raw, (bytes, bytearray)) else raw
+            if not value:
+                # Released while we waited: nobody owns it.
+                return None
+            if not str(value).startswith(_DEDUP_PENDING_PREFIX):
+                return str(value)
+            if _dedup_placeholder_is_stale(str(value)):
+                return None
+            if time.monotonic() >= deadline:
+                logger.warning(
+                    "Pipeline dedup: the claim on %s never became a job id within %.0fs; treating it as dead",
+                    key,
+                    _DEDUP_PENDING_WAIT_SECONDS,
+                )
+                return None
+            await asyncio.sleep(_DEDUP_PENDING_POLL_SECONDS)
+
+    async def _claim_pipeline_dedup(self, redis, key: str, file_uid: str, user_id) -> str | None:
+        """Decide who fetches this media: another job's id, or nobody (us).
+
+        Returns the id of the job that already has this media in hand, or ``None``
+        when *this* request owns the ingest from here on (the claim has been taken,
+        so the caller downloads and enqueues it).
+
+        ``None`` is also the answer when a claim exists but nothing is behind it -
+        the placeholder of an ingest that died. That distinction is the whole
+        point: reading a bare ``pending`` as "another request is on it" made a new
+        media unfetchable for the claim's entire TTL, with no S3 stream, no
+        Pyrogram download and no job ever queued for it, which is exactly what a
+        batch reported as a file that "could not be fetched" while it sat in the
+        collected list.
+        """
+        raw = None
+        with contextlib.suppress(Exception):
+            raw = await redis.get(key)
+        value = raw.decode() if isinstance(raw, (bytes, bytearray)) else raw
+        if value:
+            text = str(value)
+            if text.startswith(_DEDUP_PENDING_PREFIX):
+                # Somebody is ingesting it this second. Give their claim a bounded
+                # chance to name the job they queued; if it never does, the claim
+                # is dead and this request takes it over.
+                owner = await self._dedup_wait_for_owner(redis, key)
+                if owner:
+                    return owner
+                logger.info(
+                    "Pipeline dedup: the claim on file %s is dead (no job behind it); re-ingesting for user %s",
+                    file_uid,
+                    user_id,
+                )
+                with contextlib.suppress(Exception):
+                    await redis.delete(key)
+            elif await self._dedup_job_is_active(redis, text):
+                return text
+            else:
+                # Done, cancelled, errored, or no such job: the media is free.
+                logger.info(
+                    "Pipeline dedup: job %s for file %s is no longer active (stale/done); "
+                    "clearing the claim and reprocessing",
+                    text,
+                    file_uid,
+                )
+                with contextlib.suppress(Exception):
+                    await redis.delete(key)
+
+        # ── Take the claim, atomically (SET NX) ──
+        # Losing the race means another request claimed the media between the read
+        # above and this write, so its job is what this request should follow. A
+        # claim that never becomes a job id is dead (as above), and a *duplicate
+        # download is still better than no download at all* - so the fallback when
+        # even the re-claim fails is to ingest the media anyway.
+        claimed = False
+        with contextlib.suppress(Exception):
+            claimed = await redis.set(key, _dedup_placeholder(), nx=True, ex=_DEDUP_PLACEHOLDER_TTL_SECONDS)
+        if claimed:
+            return None
+        owner = await self._dedup_wait_for_owner(redis, key)
+        if owner:
+            return owner
+        logger.warning(
+            "Pipeline dedup: could not claim file %s (a stale claim is in the way); ingesting it anyway",
+            file_uid,
+        )
+        with contextlib.suppress(Exception):
+            await redis.delete(key)
+            await redis.set(key, _dedup_placeholder(), nx=True, ex=_DEDUP_PLACEHOLDER_TTL_SECONDS)
+        return None
+
     async def _cancel_stale_pipeline_job(self, session: dict, handler_name: str, user_id: int | None = None) -> bool:
         """Cancel any stale pipeline job that may have been started, so the user's specific settings take effect.
 
@@ -3469,14 +3683,18 @@ class EnhancedMediaHandler:
             # cancelled file as done and keep the batch running.
             file_info["_batch_cancelled"] = True
         elif _pipeline_status is None:
-            # The job still exists and will deliver, so the file stays marked
-            # completed - enqueuing a second job for it would be worse than
-            # waiting on the one already queued.
+            # The wait gave up; the job did not. It is still queued and will
+            # deliver on its own, so it is marked *pending* rather than done - a
+            # second job for it would be worse than waiting, but calling it
+            # finished is what put a file that was merely queued into the
+            # "✅ finished" summary, remembered it as done in the resume record
+            # (so a later Apply skipped a file nobody ever converted) and let the
+            # batch report itself complete while its work was still outstanding.
             logger.warning(
-                "bulk apply: gave up waiting for pipeline job %s; its result arrives on its own",
+                "bulk apply: gave up waiting for pipeline job %s; it is still queued and its result arrives on its own",
                 job_id,
             )
-            file_info["_bulk_pipeline_completed"] = True
+            file_info["_bulk_pipeline_pending"] = job_id
         else:
             # Errored for real: say so, and never enqueue a second job for a file
             # the pipeline already tried and failed to convert.
@@ -3706,103 +3924,38 @@ class EnhancedMediaHandler:
                     _file_uid = current_file.get("file_unique_id")
                     if user_id and _file_uid:
                         _dedup_key = f"ffmpeg:pipeline_dedup:{user_id}:{_file_uid}"
-                        # ── Atomic dedup: use SET NX to claim the dedup key.
-                        #    If the key already exists AND the job is active, skip.
-                        #    If the key exists but the job is stale, overwrite it.
-                        #    If the key doesn't exist, claim it atomically. ──
+                        # ── One ingest per media at a time ──
+                        #    The key holds the job that is ingesting this media, or
+                        #    the ``pending`` placeholder the request that is doing it
+                        #    now wrote before it had one. Whoever owns it keeps it:
+                        #    downloading the same media twice is what this exists to
+                        #    prevent. What it must never do is answer "someone else is
+                        #    handling it" when nobody is - see _claim_pipeline_dedup.
                         try:
                             from utils.job_queue import get_redis
 
                             _r_dedup = await get_redis()
                             try:
-                                _already = await _r_dedup.get(_dedup_key)
-                                if _already:
-                                    _stored_job_id = _already.decode() if isinstance(_already, bytes) else _already
-                                    # ── Active-job guard: skip if the old job is still
-                                    #    actively processing or if another request is
-                                    #    currently claiming the key ("pending" placeholder). ──
-                                    _active = False
-                                    if _stored_job_id == "pending":
-                                        # Another concurrent request is mid-ingest — skip
-                                        _active = True
-                                    else:
-                                        try:
-                                            _old_hash = await _r_dedup.hgetall(f"ffmpeg:job:{_stored_job_id}")
-                                            if _old_hash:
-                                                # If the job has cancel=1 set (even if status still
-                                                # shows "queued"/"waiting"), treat it as inactive so
-                                                # the user can reprocess the same file immediately.
-                                                _cancel_val = _old_hash.get(b"cancel") or _old_hash.get("cancel")
-                                                _is_cancelled = False
-                                                if _cancel_val:
-                                                    _cv = (
-                                                        _cancel_val.decode()
-                                                        if isinstance(_cancel_val, bytes)
-                                                        else str(_cancel_val)
-                                                    )
-                                                    _is_cancelled = _cv == "1"
-                                                if not _is_cancelled:
-                                                    _status = _old_hash.get(b"status") or _old_hash.get("status")
-                                                    if _status:
-                                                        _s = (
-                                                            _status.decode()
-                                                            if isinstance(_status, bytes)
-                                                            else str(_status)
-                                                        )
-                                                        _active = _s in (
-                                                            "processing",
-                                                            "queued",
-                                                            "waiting",
-                                                            "started",
-                                                            "uploading",
-                                                            "sending",
-                                                        )
-                                                # else: _active stays False (cancelled)
-                                        except Exception:
-                                            _active = False
-
-                                    if _active:
-                                        logger.info(
-                                            "Pipeline dedup: file %s is still being processed "
-                                            "by job %s; skipping duplicate for user %s",
-                                            _file_uid,
-                                            _stored_job_id,
-                                            user_id,
-                                        )
-                                        if current_file is not None:
-                                            current_file["_pipeline_job_id"] = _stored_job_id
-                                            session["current_file"] = current_file
-                                        return
-                                    else:
-                                        # Job is done, cancelled, errored, or hash doesn't exist
-                                        # → clear dedup and allow re-processing
-                                        logger.info(
-                                            "Pipeline dedup: job %s for file %s is no longer "
-                                            "active (stale/done); clearing dedup and reprocessing",
-                                            _stored_job_id,
-                                            _file_uid,
-                                        )
-                                        await _r_dedup.delete(_dedup_key)
-                                        # Do NOT return — fall through to normal pipeline processing
-                                # ── Try to claim the dedup key atomically (SET NX). ──
-                                #    We'll set the value to a placeholder "pending" and
-                                #    overwrite it with the real job_id after ingest succeeds.
-                                #    If another concurrent call already claimed it, skip. ──
-                                _claimed = await _r_dedup.set(_dedup_key, "pending", nx=True, ex=86400)
-                                if not _claimed:
-                                    # Another concurrent call claimed it — skip
-                                    logger.info(
-                                        "Pipeline dedup: concurrent claim for file %s by "
-                                        "another request; skipping for user %s",
-                                        _file_uid,
-                                        user_id,
-                                    )
-                                    return
+                                _owner_job_id = await self._claim_pipeline_dedup(
+                                    _r_dedup, _dedup_key, _file_uid, user_id
+                                )
                             finally:
                                 with contextlib.suppress(Exception):
                                     await _r_dedup.close()
+                            if _owner_job_id:
+                                logger.info(
+                                    "Pipeline dedup: file %s is already being fetched by job %s; "
+                                    "not downloading it a second time for user %s",
+                                    _file_uid,
+                                    _owner_job_id,
+                                    user_id,
+                                )
+                                if current_file is not None:
+                                    current_file["_pipeline_job_id"] = _owner_job_id
+                                    session["current_file"] = current_file
+                                return
                         except Exception:
-                            pass
+                            logger.debug("handlers: pipeline dedup unavailable; ingesting the media")
                     # ── Relay-forward for pipeline: userbot may not have access to the
                     #    original chat (direct bot-user chat). If RELAY_CHAT_ID is configured,
                     #    forward the message there first so the userbot can download it.
@@ -7442,6 +7595,14 @@ class EnhancedMediaHandler:
 
                     stopped = False
                     stalled = False
+                    # Files whose job is queued and still running when the batch
+                    # gave up waiting: handed off, not finished.
+                    pending = 0
+                    # Files whose job was cancelled while the apply waited on it.
+                    # Neither finished nor queued: the job will never deliver, so
+                    # counting them as handled (or as still coming) would both be
+                    # wrong in the one place the user learns what happened.
+                    cancelled_members = 0
                     _bulk_files = list(files)
                     for _idx, f in enumerate(_bulk_files):
                         try:
@@ -7578,6 +7739,24 @@ class EnhancedMediaHandler:
                                 results.append((_bulk_display_name(f), "❌ conversion failed"))
                                 continue
 
+                            if f.get("_bulk_pipeline_pending"):
+                                # Queued, and the wait ran out before it finished.
+                                # It is a real hand-off - the worker owns it and
+                                # will deliver - so it counts as handled and must
+                                # not have a second job queued for it, but it is
+                                # not a finished file: not counted as completed,
+                                # not written to the resume record, and reported
+                                # for what it is.
+                                pending += 1
+                                enqueued += 1
+                                results.append(
+                                    (
+                                        _bulk_display_name(f),
+                                        f"⏳ still queued · {f.get('_bulk_pipeline_pending')}",
+                                    )
+                                )
+                                continue
+
                             # Check completion *before* looking for a local file: a
                             # conversion the pipeline already queued has neither a
                             # path nor a key of its own yet - its job is what fetches
@@ -7669,6 +7848,14 @@ class EnhancedMediaHandler:
                                         job["request_id"] = None
                                     await enqueue_job(job)
                                     enqueued += 1
+                                    # Remember where this file's line sits so the
+                                    # wait below can *replace* it with the outcome
+                                    # it actually had. Leaving the queueing line
+                                    # there reported every file the apply queued
+                                    # as "📋 queued" for good - a delivered file read
+                                    # as merely queued in the per-file summary, and
+                                    # a failed one read as if it were on its way.
+                                    _result_idx = len(results)
                                     results.append((_bulk_display_name(f), f"📋 queued · {job_id}"))
                                     # Keep bulk ingestion serial: do not download the next
                                     # source until this job has reached a terminal state,
@@ -7686,18 +7873,48 @@ class EnhancedMediaHandler:
                                     )
                                     if _job_status is None:
                                         stalled = True
-                                        results.append((_bulk_display_name(f), "⏱️ worker did not finish this job"))
+                                        results[_result_idx] = (
+                                            _bulk_display_name(f),
+                                            f"⏱️ worker did not finish {job_id}",
+                                        )
                                         break
-                                    if _job_status == "done" and _batch_id:
-                                        # This file is genuinely finished, so a later
-                                        # resume must not convert it again.
-                                        with contextlib.suppress(Exception):
-                                            from utils.batch_pipeline import mark_batch_entry_finished
-                                            from utils.job_queue import get_redis as _get_redis_mark
+                                    if _job_status == "done":
+                                        # The job ran and delivered: say so, and keep
+                                        # the job id the queueing line carried.
+                                        results[_result_idx] = (
+                                            _bulk_display_name(f),
+                                            f"✅ completed · {job_id}",
+                                        )
+                                        if _batch_id:
+                                            # This file is genuinely finished, so a later
+                                            # resume must not convert it again.
+                                            with contextlib.suppress(Exception):
+                                                from utils.batch_pipeline import mark_batch_entry_finished
+                                                from utils.job_queue import get_redis as _get_redis_mark
 
-                                            await mark_batch_entry_finished(
-                                                await _get_redis_mark(), _batch_id, _bulk_entry_key(f)
-                                            )
+                                                await mark_batch_entry_finished(
+                                                    await _get_redis_mark(), _batch_id, _bulk_entry_key(f)
+                                                )
+                                    elif _job_status == "cancelled":
+                                        # Stopped, not queued and not finished. The
+                                        # batch's own cancel marker decides what the
+                                        # rest of the run does; this file is counted
+                                        # apart so the summary cannot claim it was
+                                        # handled.
+                                        cancelled_members += 1
+                                        results[_result_idx] = (
+                                            _bulk_display_name(f),
+                                            f"⏹️ cancelled · {job_id}",
+                                        )
+                                    else:
+                                        # "error": the worker tried and could not
+                                        # convert it. Counting it as queued left a
+                                        # failure out of the summary's own totals.
+                                        failed += 1
+                                        results[_result_idx] = (
+                                            _bulk_display_name(f),
+                                            f"❌ conversion failed · {job_id}",
+                                        )
                                 except Exception:
                                     logger.exception("Failed to enqueue bulk job for %s", f.get("id"))
                                     failed += 1
@@ -7727,19 +7944,28 @@ class EnhancedMediaHandler:
                         # whenever its counter matched the total; this covers the
                         # case where files were skipped at enqueue and the total
                         # the worker saw was the higher estimate.
-                        with contextlib.suppress(Exception):
-                            await self._close_batch_message(context, _batch_id)
-                        with contextlib.suppress(Exception):
-                            from utils.batch_pipeline import unregister_active_batch
+                        #
+                        # Unless something is still queued: then the batch is not
+                        # over. Its progress message is where the user watches the
+                        # job that is still running, so it is left alone, and the
+                        # batch stays registered until that work arrives.
+                        if not pending:
+                            with contextlib.suppress(Exception):
+                                await self._close_batch_message(context, _batch_id)
+                            with contextlib.suppress(Exception):
+                                from utils.batch_pipeline import unregister_active_batch
 
-                            await unregister_active_batch(batch_id=_batch_id)
+                                await unregister_active_batch(batch_id=_batch_id)
                         # A run that finished keeps no resume record: its collection
                         # is cleared, so there is nothing left to skip. A stopped or
                         # stalled run keeps its record deliberately - the finished
                         # files are still in the collection, and pressing Apply again
                         # should continue from where it stopped rather than convert
                         # them a second time.
-                        if not (stopped or stalled):
+                        # A batch with work still queued is not over: its resume
+                        # record must survive (those files were never finished)
+                        # and the rest of it is released when that work arrives.
+                        if not (stopped or stalled or pending):
                             with contextlib.suppress(Exception):
                                 from utils.batch_pipeline import close_batch_resume
 
@@ -7772,9 +7998,19 @@ class EnhancedMediaHandler:
                             f"⏹️ Bulk apply stopped — {enqueued} file(s) were already handled "
                             f"before the stop.\n• Applied: {_applied}"
                         )
+                    elif pending:
+                        # Saying "finished" here was the lie the summary is not
+                        # allowed to tell: some of these files are still queued,
+                        # and their results arrive after this message.
+                        _head = (
+                            f"⏳ Bulk apply handed off {enqueued} file(s) — {pending} of them are still "
+                            f"queued and will arrive on their own.\n• Applied: {_applied}"
+                        )
                     else:
                         _head = f"✅ Bulk apply finished — queued {enqueued} file(s).\n• Applied: {_applied}"
-                    _halted = stopped or stalled
+                    _halted = stopped or stalled or bool(pending) or bool(cancelled_members)
+                    if pending:
+                        _head += f"\n⏳ {pending} file(s) are still queued — no need to press Apply again for them."
                     if _batch_id and not _halted:
                         _head += (
                             f"\n• Batch ID: `{_batch_id}`\nUse `/cancelbatch {_batch_id}` to stop the remaining jobs."
@@ -7800,6 +8036,12 @@ class EnhancedMediaHandler:
                         # Covers both outcomes: a file that could not be queued and
                         # one the pipeline already tried and failed to convert.
                         _head += f"\n❗ {failed} file(s) failed."
+                    if cancelled_members:
+                        # Separate from "failed": nothing went wrong, the batch was
+                        # stopped while these files were running. Their results will
+                        # never arrive, so they are named as cancelled rather than
+                        # left in the list reading "queued".
+                        _head += f"\n⏹️ {cancelled_members} file(s) were cancelled."
                     if _reclaimed:
                         _head += f"\n↩️ Skipped {_reclaimed} file(s) an earlier run had already finished."
                     if photo_skipped:
@@ -8641,6 +8883,89 @@ class EnhancedMediaHandler:
             await enqueue_job(job)
         except Exception:
             logger.exception("Failed to enqueue keyed %s job", job_type)
+            return False
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data=f"cancel_job:{job_id}")]])
+        text = f"⏳ Queued {job_type.replace('_', ' ')} — job {job_id[:8]}"
+        if notify is not None:
+            await notify(text, reply_markup=kb)
+        elif query is not None:
+            await self.safe_edit(query, text, reply_markup=kb)
+        if query is not None:
+            with contextlib.suppress(RuntimeError):
+                asyncio.create_task(self._watch_job_progress(query, job_id, bot=context.bot))
+        return True
+
+    async def _enqueue_worker_job(
+        self,
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+        current_file: dict,
+        *,
+        output_path: str,
+        ffmpeg_args: list | None,
+        output_ext: str,
+        job_type: str,
+        caption: str | None = None,
+        delivery_name: str | None = None,
+        query=None,
+        notify=None,
+    ) -> bool:
+        """Queue this file's conversion for a worker, from disk or from storage.
+
+        The sibling of :meth:`_enqueue_keyed_job`, for the case that one cannot
+        serve: the media is on *this* disk but there is no stored object to name
+        (a source the Bot API size limit forced through the userbot). Both ends
+        are handed over - the local path, which a worker sharing this filesystem
+        reads directly, and the Telegram chat/message the media came from, which
+        lets a worker on any other host fetch it over MTProto. A job with none of
+        those is exactly the one that dies as "the source is missing from
+        storage", so nothing is queued when neither exists.
+
+        ``cleanup_input`` stays off deliberately: these bytes are the session's
+        own copy of the media, still pointed at by ``current_file`` for every
+        other action, and a worker must not delete them out from under it.
+        """
+        path = current_file.get("path") or current_file.get("_local_input_path")
+        input_key = current_file.get("input_key")
+        if not (path and os.path.exists(path)) and not input_key:
+            return False
+        forward = current_file.get("forward") or {}
+        source_chat = current_file.get("chat_id") or forward.get("chat_id")
+        source_msg = current_file.get("msg_id") or current_file.get("message_id") or forward.get("message_id")
+        job_id = str(uuid.uuid4())
+        job = {
+            "job_id": job_id,
+            "input_path": path,
+            "input_key": input_key,
+            "output_path": output_path,
+            # The delivered name comes from the media, never from the transient
+            # output path this store wrote it under.
+            "original_filename": delivery_name or current_file.get("name") or os.path.basename(output_path),
+            "ffmpeg_args": ffmpeg_args,
+            "output_ext": output_ext,
+            "progress_channel": f"ffmpeg:progress:{job_id}",
+            "chat_id": update.effective_chat.id if update and update.effective_chat else None,
+            "user_id": update.effective_user.id if update and update.effective_user else None,
+            "message_id": source_msg,
+            # Where the media can be read from if this disk cannot be seen.
+            "source_chat_id": source_chat,
+            "source_message_id": source_msg,
+            "file_unique_id": current_file.get("file_unique_id"),
+            "file_size": current_file.get("size"),
+            "thumbnail": None if output_ext == ".mp3" else current_file.get("thumbnail"),
+            "caption": caption or _metadata_caption(current_file),
+            "type": job_type,
+            "cleanup_input": False,
+            "cleanup_output": False,
+        }
+        try:
+            job["request_id"] = getattr(update, "request_id", None)
+        except Exception:
+            job["request_id"] = None
+        try:
+            await enqueue_job(job)
+        except Exception:
+            logger.exception("Failed to enqueue %s job for %s", job_type, path or input_key)
             return False
         kb = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data=f"cancel_job:{job_id}")]])
         text = f"⏳ Queued {job_type.replace('_', ' ')} — job {job_id[:8]}"
@@ -10008,8 +10333,9 @@ class EnhancedMediaHandler:
                 return
 
         local_input = current_file.get("path") or current_file.get("_local_input_path")
+        delivery_name = _audio_delivery_name(current_file.get("name"), current_file.get("id"))
         if not (local_input and os.path.exists(local_input)):
-            if not await self._enqueue_keyed_job(
+            if not await self._enqueue_worker_job(
                 update,
                 context,
                 current_file,
@@ -10018,16 +10344,26 @@ class EnhancedMediaHandler:
                 output_ext=".mp3",
                 job_type="format_audio",
                 caption=_metadata_caption(current_file),
+                delivery_name=delivery_name,
                 query=query,
                 notify=notify,
             ):
                 await notify("❌ Failed to adjust bitrate.")
             return
 
-        success, _ = await self.converter.execute_ffmpeg(cmd, local_input, output_path)
+        # ── Nothing an audio encode can produce ──
+        # A source with no audio stream (a video-only video, or a download that
+        # is not the media it claims to be) makes ffmpeg fail in a fraction of a
+        # second, and the exit code alone reaches the user as a flat "Failed to
+        # adjust bitrate" - which is true but says nothing about the cause, and
+        # leaves them retrying the same button.
+        if not await _source_has_audio(local_input, current_file):
+            await notify("❌ This file has no audio track to re-encode.")
+            return
+
+        success, reason = await self.converter.execute_ffmpeg(cmd, local_input, output_path)
 
         if success and os.path.exists(output_path):
-            delivery_name = _audio_delivery_name(current_file.get("name"), current_file.get("id"))
             with open(output_path, "rb") as audio_file:
                 await context.bot.send_audio(
                     chat_id=update.effective_chat.id,
@@ -10039,8 +10375,37 @@ class EnhancedMediaHandler:
             with contextlib.suppress(OSError):
                 os.remove(output_path)
             await notify(f"✅ Bitrate set to {audio_bitrate}. Here is your file.")
-        else:
-            await notify("❌ Failed to adjust bitrate.")
+            return
+
+        # ── The inline encode failed: hand the work to a worker ──
+        # Re-encoding in the web process is what the buttons do for a small file,
+        # and it is bounded by whatever else that process is holding and by the
+        # request that triggered it. The queue is the path every other conversion
+        # in this bot takes - the same ffmpeg, its own process, with retries and
+        # a progress bar - so a failure here is a reason to move the work, not a
+        # verdict on the file. The cause is logged and, when the queue cannot
+        # take it either, shown to the user instead of the bare "failed".
+        logger.warning(
+            "adjust_bitrate: the inline encode to %s failed for %s%s; queueing it for a worker",
+            audio_bitrate,
+            local_input,
+            _short_reason(reason),
+        )
+        queued = await self._enqueue_worker_job(
+            update,
+            context,
+            current_file,
+            output_path=output_path,
+            ffmpeg_args=cmd,
+            output_ext=".mp3",
+            job_type="format_audio",
+            caption=_metadata_caption(current_file),
+            delivery_name=delivery_name,
+            query=query,
+            notify=notify,
+        )
+        if not queued:
+            await notify(f"❌ Failed to adjust bitrate.{_short_reason(reason)}")
 
     async def normalize_audio(self, update: Update, context: ContextTypes.DEFAULT_TYPE, session: dict):
         """Normalize audio volume."""

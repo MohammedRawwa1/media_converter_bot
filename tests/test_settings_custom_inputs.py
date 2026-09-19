@@ -138,11 +138,11 @@ class _BitrateConverter:
 def _stub(converter, sent, *, trim: bool = False, fade: bool = False, replies=None):
     handler = _StubHandler(converter, sent, replies)
     if trim:
-        names = ("_trim_current_media", "_enqueue_keyed_job")
+        names = ("_trim_current_media", "_enqueue_keyed_job", "_enqueue_worker_job")
     elif fade:
-        names = ("_apply_fade", "_enqueue_keyed_job")
+        names = ("_apply_fade", "_enqueue_keyed_job", "_enqueue_worker_job")
     else:
-        names = ("adjust_bitrate", "compress_video", "_enqueue_keyed_job")
+        names = ("adjust_bitrate", "compress_video", "_enqueue_keyed_job", "_enqueue_worker_job")
     for name in names:
         # Bind the real implementation to the stub: a plain function assigned to
         # an instance does not become a bound method.
@@ -414,6 +414,127 @@ class RepeatBitrateJobTests(unittest.TestCase):
         self.assertEqual(job["output_ext"], ".mp3")
         self.assertIn("64k", job["ffmpeg_args"])
         self.assertEqual(job["chat_id"], 99)
+        # The delivered name is the media's, not the transient output path's.
+        self.assertEqual(job["original_filename"], "song.mp3")
+
+
+class BitrateFailureTests(unittest.TestCase):
+    """A failed inline encode is moved to a worker, and says why if it cannot be.
+
+    Re-encoding in the web process is bounded by whatever else that process holds
+    and by the request that triggered it; the queue is the path every other
+    conversion in this bot takes. Failing there used to end the action with a bare
+    "Failed to adjust bitrate" and ffmpeg's own verdict discarded.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.output_patch = patch.object(handlers_module, "config", SimpleNamespace(OUTPUT_PATH=self.tmp.name))
+        self.output_patch.start()
+        self.jobs = []
+
+        async def _record(job):
+            self.jobs.append(job)
+
+        self.enqueue_patch = patch.object(handlers_module, "enqueue_job", _record)
+        self.enqueue_patch.start()
+
+    def tearDown(self):
+        self.enqueue_patch.stop()
+        self.output_patch.stop()
+        self.tmp.cleanup()
+
+    def _source(self):
+        path = os.path.join(self.tmp.name, "track.mp3")
+        with open(path, "wb") as fh:
+            fh.write(b"source")
+        return {
+            "id": "abc123",
+            "name": "track.mp3",
+            "path": path,
+            "chat_id": 99,
+            "msg_id": 4321,
+            "type": "audio",
+            "_source_metadata": {},
+        }
+
+    def test_a_failed_inline_encode_is_queued_for_a_worker(self):
+        class FailingConverter(_BitrateConverter):
+            async def execute_ffmpeg(self, cmd, input_path, output_path):
+                return False, "Conversion failed\nOutput file #0 does not contain any stream"
+
+        replies, sent = [], {}
+        handler = _stub(FailingConverter(), sent)
+        session = {"current_file": self._source()}
+
+        asyncio.run(handler.adjust_bitrate(_FakeUpdate(replies), _FakeContext(sent), session, "64k"))
+
+        self.assertEqual(len(self.jobs), 1, "the failed encode was not handed to a worker")
+        job = self.jobs[0]
+        self.assertEqual(job["type"], "format_audio")
+        self.assertIn("64k", job["ffmpeg_args"])
+        self.assertEqual(job["input_path"], session["current_file"]["path"])
+        # A worker on another host can still reach the media: the Telegram
+        # chat/message it came from travels with the job.
+        self.assertEqual(job["source_chat_id"], 99)
+        self.assertEqual(job["source_message_id"], 4321)
+        # The session's own copy is not a worker's to delete.
+        self.assertFalse(job["cleanup_input"])
+        self.assertTrue(any("Queued" in text for text, _ in replies), replies)
+
+    def test_a_source_with_no_audio_stream_is_answered_before_ffmpeg_runs(self):
+        converter = _BitrateConverter()
+        replies, sent = [], {}
+        handler = _stub(converter, sent)
+        session = {"current_file": self._source()}
+
+        async def _no_audio(_path, _current_file=None):
+            return False
+
+        with patch.object(handlers_module, "_source_has_audio", _no_audio):
+            asyncio.run(handler.adjust_bitrate(_FakeUpdate(replies), _FakeContext(sent), session, "64k"))
+
+        self.assertIsNone(converter.ffmpeg_call, "ffmpeg ran on a source with no audio")
+        self.assertTrue(any("no audio track" in text for text, _ in replies), replies)
+
+    def test_the_ingest_verdict_answers_whether_there_is_audio(self):
+        """The stored probe is used as-is: counting streams means reading the file."""
+
+        async def _run():
+            return await handlers_module._source_has_audio(
+                "a-path-that-does-not-exist.mp3", {"_source_metadata": {"audio_streams": 1}}
+            )
+
+        self.assertTrue(asyncio.run(_run()))
+
+        async def _none():
+            return await handlers_module._source_has_audio(
+                "a-path-that-does-not-exist.mp3", {"_source_metadata": {"audio_streams": 0}}
+            )
+
+        self.assertFalse(asyncio.run(_none()))
+
+    def test_a_failure_that_cannot_be_queued_reports_what_ffmpeg_said(self):
+        class FailingConverter(_BitrateConverter):
+            async def execute_ffmpeg(self, cmd, input_path, output_path):
+                return False, "Conversion failed\nOutput file #0 does not contain any stream"
+
+        replies, sent = [], {}
+        handler = _stub(FailingConverter(), sent)
+        session = {"current_file": self._source()}
+
+        # No Redis queue in this process: the enqueue raises and the reply is the
+        # only thing the user has left.
+        async def _boom(_job):
+            raise RuntimeError("no broker")
+
+        with patch.object(handlers_module, "enqueue_job", _boom):
+            asyncio.run(handler.adjust_bitrate(_FakeUpdate(replies), _FakeContext(sent), session, "64k"))
+
+        self.assertTrue(
+            any("does not contain any stream" in text for text, _ in replies),
+            f"the cause never reached the user: {replies}",
+        )
 
 
 class RepeatFadeJobTests(unittest.TestCase):

@@ -63,9 +63,20 @@ class ExtendedMediaConverter:
 
             if process.returncode == 0:
                 return True, "Success"
-            else:
-                error_msg = stderr.decode("utf-8", errors="ignore")[:500]
-                return False, error_msg
+            error_msg = stderr.decode("utf-8", errors="ignore")[:500]
+            # ffmpeg's own words are what identify a failure (a source with no
+            # stream to encode, an unwritable output, a process the platform
+            # killed). They used to be returned to a caller that dropped them, so
+            # a real failure left nothing but "❌ Failed to …" in the chat and
+            # nothing at all in the log. The exit code tells the two kinds apart:
+            # a normal error is 1, a signal (killed) is negative.
+            logger.error(
+                "FFmpeg failed (exit=%s): %s\n%s",
+                process.returncode,
+                " ".join(str(part) for part in full_cmd),
+                error_msg.strip() or "(ffmpeg wrote nothing to stderr)",
+            )
+            return False, error_msg
 
         except Exception as e:
             logger.error(f"FFmpeg execution error: {e}")

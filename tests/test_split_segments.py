@@ -125,6 +125,7 @@ def _patch_spawn(monkeypatch, *, returncode=0, stderr=b"", parts=3, size=16):
 
     async def _spawn(*cmd, **kwargs):
         seen["cmd"] = list(cmd)
+        seen.setdefault("calls", []).append(list(cmd))
         pattern = cmd[-1]
         if returncode == 0:
             for index in range(1, parts + 1):
@@ -170,11 +171,71 @@ def test_the_split_is_one_stream_copy_with_the_users_timing(tmp_path, monkeypatc
         "1",
         "-fflags",
         "+genpts",
-        "-write_index",
-        "1",
+        "-segment_format_options",
+        "movflags=+faststart",
         os.path.join(str(out_dir), "Concert.%03d.mp4"),
     ]
     assert [os.path.basename(p) for p in parts] == ["Concert.001.mp4", "Concert.002.mp4", "Concert.003.mp4"]
+
+
+def test_every_part_carries_its_duration_in_its_own_header(tmp_path, monkeypatch):
+    """A part's length must be readable before the part is fetched.
+
+    The mov/mp4 family writes its index (``moov``) at the *end* of the file unless
+    it is told otherwise, and a player that streams a part - Telegram's above all -
+    reads the header first: every part then showed ``00:00 / 00:00`` until it had
+    been downloaded whole, and only the one that happened to arrive completely
+    showed a length. ``movflags=+faststart`` moves that index to the front, and it
+    has to be handed over as ``-segment_format_options`` - the same flag applied to
+    the ``segment`` muxer (``-movflags``) never reaches the muxer writing the part.
+    """
+    src = _source_file(tmp_path)
+    seen = _patch_spawn(monkeypatch)
+
+    _run(conversion_tasks.split_media_segments(src, str(tmp_path / "out"), 60, ext=".mp4", stem="Concert"))
+
+    cmd = seen["cmd"]
+    assert cmd[cmd.index("-segment_format_options") + 1] == "movflags=+faststart"
+    # The flag belongs to the per-part muxer, not to the segment muxer itself.
+    assert "-movflags" not in cmd
+    # ``-write_index 1`` writes the index at the end of each part - the default,
+    # and exactly what hid the durations.
+    assert "-write_index" not in cmd
+
+
+@pytest.mark.parametrize("ext", [".mkv", ".avi", ".webm"])
+def test_containers_that_reject_the_flag_do_not_get_it(tmp_path, monkeypatch, ext):
+    """``movflags`` is a mov/mp4 option: a container that refuses it fails the run."""
+    src = _source_file(tmp_path, f"Concert{ext}")
+    seen = _patch_spawn(monkeypatch)
+
+    ok, parts, _error = _run(
+        conversion_tasks.split_media_segments(src, str(tmp_path / "out"), 60, ext=ext, stem="Concert")
+    )
+
+    assert ok and parts
+    assert "-segment_format_options" not in seen["cmd"]
+
+
+def test_an_audio_part_keeps_the_header_that_states_its_length(tmp_path, monkeypatch):
+    """A CBR mp3 part carries a Xing/Info header: no rewrite is needed (or wanted).
+
+    The splitter used to rewrite every audio part afterwards with ``-metadata
+    duration=…`` into a ``<part>.tmp`` file - which ffmpeg cannot even open (no
+    output format for ``.tmp``), so the pass only burned a process per part and
+    never fixed anything. The header ffmpeg writes for the part is what states the
+    length, so the split has to leave the file alone.
+    """
+    src = _source_file(tmp_path, "Album.mp3")
+    seen = _patch_spawn(monkeypatch)
+
+    _run(conversion_tasks.split_media_segments(src, str(tmp_path / "out"), 600, ext=".mp3", stem="Album"))
+
+    cmd = seen["cmd"]
+    assert cmd[cmd.index("-id3v2_version") + 1] == "3"
+    assert cmd[cmd.index("-avoid_negative_ts") + 1] == "make_zero"
+    # One ffmpeg run: the parts are never post-processed behind the splitter's back.
+    assert len(seen["calls"]) == 1
 
 
 def test_the_parts_are_numbered_from_one_not_from_ffmpegs_zero(tmp_path, monkeypatch):

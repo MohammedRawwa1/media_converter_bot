@@ -12,17 +12,19 @@ FFMPEG_PATH = getattr(config, "FFMPEG_PATH", "ffmpeg") or "ffmpeg"
 
 logger = logging.getLogger(__name__)
 
+#: Containers of the mov/mp4 family - the ones whose index (``moov``) decides
+#: whether a part's duration is readable before the whole file is fetched. These
+#: are exactly the containers that accept ``movflags=+faststart``; every other
+#: one rejects the option, which would fail the whole split.
+_FASTSTART_EXTS = frozenset({".mp4", ".m4a", ".m4v", ".mov", ".3gp", ".3g2"})
+
 # Import timeout utilities
-with contextlib.suppress(ImportError):
+try:
     from utils.async_timeout_wrapper import (
         DEFAULT_FFMPEG_TIMEOUT,
         run_subprocess_with_timeout,
     )
-
-# Probe helper for getting media duration/metadata
-with contextlib.suppress(ImportError):
-    from utils.ffmpeg_runner import probe_media
-
+except ImportError:
     # Fallback if module not available
     async def run_subprocess_with_timeout(cmd, timeout_seconds=18000, operation_name="Operation"):
         if create_checked_subprocess_exec is not None:
@@ -610,11 +612,18 @@ async def split_media_segments(
     segment muxer's own default of 000 - the numbering a user expects next to the
     "part 1/N" caption that goes out with each file.
 
-    Each part gets proper duration metadata (-fflags +genpts generates presentation
-    timestamps for each segment, -write_index 1 writes the container index/moov atom
-    at the end of each part, not just the last one). Without these flags, only the
-    final part would show correct duration when played - the intermediate parts would
-    have incomplete metadata.
+    Every part carries its own duration *up front*, because a player that streams a
+    part (Telegram's, above all) reads the header before the bytes: the mov/mp4
+    family writes its index (the ``moov`` atom) at the **end** of the file by
+    default, so the player shows ``00:00 / 00:00`` until the whole part has been
+    fetched, and only the part it happened to download fully shows a length. Passing
+    ``movflags=+faststart`` per segment is what moves that index to the front, so the
+    duration is visible in the preview immediately. It has to travel as
+    ``-segment_format_options``: the flag applied to the ``segment`` muxer itself
+    (``-movflags +faststart``) never reaches the per-part muxer and changes nothing.
+    Any other container refuses the flag outright (``-segment_format_options
+    movflags=+faststart`` on an MKV fails the whole run), so it is only added for the
+    containers it belongs to - the ones whose header is the ``moov`` atom.
 
     Cuts can only land on the source's keyframes, so a part can come out longer
     than *segment_seconds* (and a source whose keyframes are farther apart than
@@ -676,45 +685,27 @@ async def split_media_segments(
         "1",
         "-reset_timestamps",
         "1",
-        # Ensure proper timestamp generation for each segment. Without this,
-        # intermediate parts may have incomplete/missing duration metadata,
-        # with only the final part showing correct duration when played.
+        # Presentation timestamps for every part, so a cut that lands on a
+        # keyframe still yields a file with a coherent timeline.
         "-fflags",
         "+genpts",
     ]
 
-    # Container-specific flags: MP4 needs -write_index for proper metadata per segment,
-    # but MP3/M4A audio files use different mechanisms.
+    # How each part's header has to be written, by container. The mov/mp4 family
+    # (and only it) takes ``movflags=+faststart``; ``-segment_format_options``
+    # forwards the option to the muxer of each individual part, which is the only
+    # form that works - ``-movflags`` on the segment muxer is silently ignored.
     ext_lower = ext.lower()
-    if ext_lower in (".mp4", ".mkv", ".avi", ".mov", ".webm"):
-        # Video containers: write the index (moov atom for MP4) at the end of each
-        # segment, not just the final file. This ensures each part has valid duration
-        # metadata when played.
-        cmd.extend(
-            [
-                "-write_index",
-                "1",
-            ]
-        )
-    elif ext_lower in (".mp3", ".m4a", ".aac", ".flac", ".ogg", ".opus", ".wav", ".wma"):
-        # Audio containers: ensure ID3 tags and proper framing for each segment.
-        # MP3 files need ID3v2 tags written for each segment so players can read
-        # the duration correctly. M4A/AAC needs similar treatment.
-        if ext_lower == ".mp3":
-            cmd.extend(
-                [
-                    "-id3v2_version",
-                    "3",
-                ]
-            )
-        # For all audio formats, write a fresh header for each segment so the
-        # player doesn't rely on the source file's metadata.
-        cmd.extend(
-            [
-                "-avoid_negative_ts",
-                "make_zero",
-            ]
-        )
+    if ext_lower in _FASTSTART_EXTS:
+        cmd.extend(["-segment_format_options", "movflags=+faststart"])
+    elif ext_lower == ".mp3":
+        # The Xing/Info header ffmpeg writes for a CBR mp3 already carries the
+        # part's frame count - which is the duration a streaming player reads -
+        # so only the tag version is pinned here, for older players.
+        cmd.extend(["-id3v2_version", "3"])
+    if ext_lower not in _FASTSTART_EXTS:
+        # Every part starts at zero regardless of what the cut's timestamps were.
+        cmd.extend(["-avoid_negative_ts", "make_zero"])
 
     # Add the output pattern as the last argument
     cmd.append(_pattern)
@@ -739,48 +730,6 @@ async def split_media_segments(
     )
     if not parts:
         return False, [], "ffmpeg produced no parts"
-
-    # Post-process audio files to fix duration metadata.
-    # MP3/MP4 audio segments created with stream copy often have incorrect or
-    # missing duration metadata in their headers. This causes players (including
-    # Telegram's audio player) to show wrong or no duration for intermediate parts.
-    # We probe each part and rewrite its metadata with the correct duration.
-    if ext_lower in (".mp3", ".m4a", ".aac", ".ogg", ".opus", ".flac"):
-        for part_path in parts:
-            try:
-                # Probe the actual duration of this part
-                _part_meta = await probe_media(part_path)
-                _part_duration = _part_meta.get("duration") if _part_meta else None
-                if _part_duration and float(_part_duration) > 0:
-                    # Rewrite the file with correct duration metadata.
-                    # For MP3: use ffmpeg to copy streams and write proper ID3 tags
-                    # with the correct duration. This is fast (no re-encode) and fixes
-                    # the metadata that Telegram's player reads.
-                    _temp_path = f"{part_path}.tmp"
-                    _fix_cmd = [
-                        FFMPEG_PATH,
-                        "-y",
-                        "-i",
-                        part_path,
-                        "-c",
-                        "copy",
-                        "-metadata",
-                        f"duration={_part_duration}",
-                        "-id3v2_version",
-                        "3",
-                        _temp_path,
-                    ]
-                    _fix_proc = await _spawn_process(
-                        *_fix_cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
-                    )
-                    await _fix_proc.communicate()
-                    if _fix_proc.returncode == 0 and os.path.exists(_temp_path):
-                        os.replace(_temp_path, part_path)
-            except Exception:
-                logger.debug(
-                    "split_media_segments: could not fix metadata for %s",
-                    part_path,
-                )
 
     logger.info(f"Split media into {len(parts)} part(s) of ~{segment_arg}s")
     return True, parts, ""
