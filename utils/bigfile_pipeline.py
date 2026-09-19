@@ -32,6 +32,15 @@ from dataclasses import dataclass
 
 import config
 from utils import file_utils, media_cache
+from utils.source_store import (
+    SourceRef,
+    header_bytes,
+    header_object_key,
+    read_head_bytes,
+    record_source,
+    source_upload_mode,
+    store_source,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -49,20 +58,13 @@ DEFAULT_BOT_API_MAX_BYTES = config.BOT_API_MAX_BYTES
 PIPELINE_DOWNLOAD_TIMEOUT_SECONDS = float(os.getenv("PIPELINE_DOWNLOAD_TIMEOUT_SECONDS", "1800"))
 
 
-def _env_positive_int(name: str, default: int) -> int:
-    """Read a positive int env var, tolerating an unset, empty or garbage value.
-
-    ``int(os.getenv(...))`` raises on the empty string a ``.env`` file leaves
-    behind, which would take the whole bot down at import time.
-    """
-    try:
-        value = int(str(os.getenv(name) or "").strip())
-    except (TypeError, ValueError):
-        return default
-    return value if value > 0 else default
-
-
 # How much of a fetched source is kept in the bucket.
+#
+# The mode and the header size are owned by utils/source_store.py - the one place
+# every producer of a source reads them from - so this pipeline, the bot's own
+# download, the fetcher and the web uploader can never disagree about what a
+# source costs to keep. The names stay bound here because the rest of this module
+# (and its tests) read them from it.
 #
 # The bucket is a *copy*, never the transport for a job. The media itself is
 # already on Telegram (that is how the userbot fetched it, and the relay copy it
@@ -81,10 +83,8 @@ def _env_positive_int(name: str, default: int) -> int:
 #            worker on any host. Costs one read-back; see PIPELINE_HEADER_BYTES
 #            for the zero-egress default.
 #   local  - nothing at all is uploaded; the job carries the local path only.
-PIPELINE_SOURCE_UPLOAD = (os.getenv("PIPELINE_SOURCE_UPLOAD") or "header").strip().lower()
-if PIPELINE_SOURCE_UPLOAD not in ("header", "full", "local", "stream"):
-    PIPELINE_SOURCE_UPLOAD = "header"
-PIPELINE_HEADER_BYTES = _env_positive_int("PIPELINE_HEADER_BYTES", 2 * 1024 * 1024)
+PIPELINE_SOURCE_UPLOAD = source_upload_mode()
+PIPELINE_HEADER_BYTES = header_bytes()
 
 # Promote on repeat: a media whose first ingest stored only a probe header gets
 # its whole object written the *second* time it is requested. The first request
@@ -175,10 +175,12 @@ def _read_head_bytes(path: str, limit: int) -> bytes:
     """Read at most *limit* bytes from the front of a file.
 
     A container header is all the bucket needs to hold, so the whole file is
-    never read into memory to make one.
+    never read into memory to make one. The implementation - like the header key
+    below - lives in utils/source_store.py, which is the one place every producer
+    of a source stores from; the name stays here because this module and its tests
+    read it from here.
     """
-    with open(path, "rb") as fh:
-        return fh.read(limit)
+    return read_head_bytes(path, limit)
 
 
 def _flatten_source_meta(meta: dict) -> dict:
@@ -212,9 +214,7 @@ def _header_object_key(input_s3_key: str) -> str:
     A distinct name on purpose: a probe object must never be mistaken for - or
     overwrite - the full ``.../source`` object a previous run may have stored.
     """
-    if input_s3_key.endswith("/source"):
-        return f"{input_s3_key[: -len('source')]}header"
-    return f"{input_s3_key}/header"
+    return header_object_key(input_s3_key)
 
 
 @dataclass
@@ -366,6 +366,10 @@ class BigFilePipeline:
 
         actual_size = 0
         s3_key = input_s3_key
+        # What this run stored, in the shape every job reads it in. Defaults to
+        # "nothing stored": a reuse hands over an object another run stored, and
+        # the worker is told about it through ``input_key``, not through this.
+        _ref = SourceRef(mode=PIPELINE_SOURCE_UPLOAD)
         _reused = False
         _reuse_reason = None
         _local_reuse_path = None
@@ -478,18 +482,32 @@ class BigFilePipeline:
                             os.replace(f"{_cache_dest}.part", _cache_dest)
                         except Exception:
                             logger.debug("BigFilePipeline: could not cache the byte-cache body locally")
-                    if PIPELINE_SOURCE_UPLOAD == "full":
-                        if self._storage is not None:
-                            await self._storage.upload_bytes(cached_data, input_s3_key)
-                        s3_key = input_s3_key
-                    else:
-                        # Nothing but a probe reference goes to the bucket in
-                        # these modes, and a header is not a source - so the
-                        # cached body is written out for the local handoff.
-                        os.makedirs(temp_dir, exist_ok=True)
-                        with open(temp_path, "wb") as _fh:
-                            _fh.write(cached_data)
-                        s3_key = None
+                    # The body is written out first and stored from that file,
+                    # through the same helper the disk path uses: a cache hit has
+                    # no business making its own decision about what the bucket
+                    # gets, or about which key it goes under.
+                    os.makedirs(temp_dir, exist_ok=True)
+                    with open(temp_path, "wb") as _fh:
+                        _fh.write(cached_data)
+                    _ref = await store_source(
+                        self._storage,
+                        temp_path,
+                        key=input_s3_key,
+                        mode=PIPELINE_SOURCE_UPLOAD,
+                        header_key=_header_key,
+                        telegram_fallback=True,
+                        head_limit=PIPELINE_HEADER_BYTES,
+                        log_prefix="BigFilePipeline",
+                    )
+                    s3_key = _ref.job_key
+                    if _ref.stored:
+                        await record_source(
+                            file_unique_id,
+                            ref=_ref,
+                            size=actual_size,
+                            name=original_filename,
+                            data=cached_data if not _ref.header_only else None,
+                        )
                     _bytes_hit = True
             except Exception as e:
                 logger.debug("BigFilePipeline: byte cache check failed: %s", e)
@@ -532,6 +550,9 @@ class BigFilePipeline:
             if _stream:
                 _streamed = True
                 s3_key = _stream["s3_key"]
+                # The stream wrote the media itself, so the job is a normal
+                # whole-object job (never a probe reference).
+                _ref = SourceRef(mode=PIPELINE_SOURCE_UPLOAD, key=s3_key, job_key=s3_key)
                 actual_size = _stream["size"]
                 _source_meta_fields = _stream["meta_fields"]
                 _source_meta_raw = dict(_stream.get("meta") or {})
@@ -621,76 +642,59 @@ class BigFilePipeline:
             # object and the descriptor, which is what put it in the disk-block
             # above - so there is nothing left to store for it.
             _upload_enabled = self._storage is not None and PIPELINE_SOURCE_UPLOAD != "local"
+            # The bytes go to the bucket through the one shared helper, so this
+            # pipeline stores a source exactly the way the bot's own download, the
+            # fetcher and the web uploader store theirs - same mode, same key rule,
+            # same header mechanics (utils/source_store.py):
+            #   a promoted repeat -> the shared whole-object key
+            #   a header-only run -> the content-addressed probe header
+            #   anything else     -> this run's own key (a whole object)
+            # ``telegram_fallback=True`` is what makes a header-only object safe:
+            # the relay copy this fetch came from travels on the job below, so the
+            # worker reads the media itself over MTProto instead of this reference.
             try:
                 if _upload_enabled:
-                    # What this run stores:
-                    #   a promoted repeat -> the shared whole-object key
-                    #   a header-only run -> the content-addressed probe header
-                    #   anything else     -> this run's own key (a whole object)
-                    if _promote and _library_key:
-                        _stored_key = _library_key
-                    elif _header_only:
-                        _stored_key = _header_key or _header_object_key(input_s3_key)
-                    else:
-                        _stored_key = input_s3_key
-                    if _header_only and not _promote:
-                        _head = _read_head_bytes(temp_path, PIPELINE_HEADER_BYTES)
-                        await self._storage.upload_bytes(_head, _stored_key)
-                        # Deliberately *not* reported as this job's storage key:
-                        # callers persist the key and reuse it as a source, and a
-                        # header is not a source. Nothing downloads it either -
-                        # the worker's own probe can, but only as a last resort.
-                        s3_key = None
-                        logger.info(
-                            "BigFilePipeline: stored the %dKB header of the source at %s "
-                            "(the media itself stays on Telegram)",
-                            len(_head) // 1024,
-                            _stored_key,
-                        )
-                    else:
-                        logger.info("BigFilePipeline: uploading to S3 key=%s", _stored_key)
-                        await self._storage.upload_file(temp_path, _stored_key)
-                        s3_key = _stored_key
-                        logger.info("BigFilePipeline: S3 upload complete")
-
+                    # A promoted repeat stores the media itself whatever the mode
+                    # says: promotion *is* the decision to pay for the whole object.
+                    _store_mode = "full" if _promote else PIPELINE_SOURCE_UPLOAD
+                    _ref = await store_source(
+                        self._storage,
+                        temp_path,
+                        key=_library_key if (_promote and _library_key) else input_s3_key,
+                        mode=_store_mode,
+                        header_key=_header_key,
+                        telegram_fallback=True,
+                        head_limit=PIPELINE_HEADER_BYTES,
+                        log_prefix="BigFilePipeline",
+                    )
+                    # A header is deliberately *not* reported as this job's storage
+                    # key: callers persist the key and reuse it as a source, and a
+                    # header is not a source. Only a whole object travels as
+                    # ``input_key``; the helper files a header under ``header_key``
+                    # so it proves the media was already ingested without ever
+                    # being mistaken for something to encode from.
+                    s3_key = _ref.job_key
+                    _payload = None
+                    if (
+                        not _ref.header_only
+                        and media_cache.cache_enabled()
+                        and file_unique_id
+                        and actual_size
+                        and actual_size <= media_cache.bytes_cache_limit()
+                    ):
+                        with contextlib.suppress(Exception), open(temp_path, "rb") as _fh:
+                            _payload = _fh.read()
                     # The descriptor is written in every mode, and it is what the
-                    # next submission's validation gate reads. Only a whole object
-                    # is handed over as ``input_key``: a header goes in
-                    # ``header_key``, so it proves the media was already ingested
-                    # without ever being mistaken for something to encode from.
-                    # A promotion writes the whole object, so its descriptor is
-                    # the whole-object one - the header is superseded.
-                    if _header_only and not _promote:
-                        await media_cache.remember(
-                            file_unique_id,
-                            size=actual_size,
-                            header_key=_stored_key,
-                            header_only=True,
-                            name=original_filename,
-                            storage="s3",
-                            duration=_source_meta.get("duration"),
-                            source_meta=_source_meta or None,
-                        )
-                    else:
-                        _payload = None
-                        if (
-                            media_cache.cache_enabled()
-                            and file_unique_id
-                            and actual_size
-                            and actual_size <= media_cache.bytes_cache_limit()
-                        ):
-                            with contextlib.suppress(Exception), open(temp_path, "rb") as _fh:
-                                _payload = _fh.read()
-                        await media_cache.remember(
-                            file_unique_id,
-                            size=actual_size,
-                            input_key=_stored_key,
-                            name=original_filename,
-                            storage="s3",
-                            data=_payload,
-                            duration=_source_meta.get("duration"),
-                            source_meta=_source_meta or None,
-                        )
+                    # next submission's validation gate reads.
+                    await record_source(
+                        file_unique_id,
+                        ref=_ref,
+                        size=actual_size,
+                        name=original_filename,
+                        data=_payload,
+                        duration=_source_meta.get("duration"),
+                        source_meta=_source_meta or None,
+                    )
                 elif self._storage is None:
                     # No S3 — keep the file locally
                     s3_key = temp_path
@@ -759,7 +763,7 @@ class BigFilePipeline:
                 "source_message_id": message_id,
                 # A stored object that is only a header is a probe reference:
                 # no worker may ever encode from it.
-                "input_header_only": 1 if (_header_only and not _promote) else 0,
+                "input_header_only": 1 if _ref.header_only else 0,
                 # chat_id for delivery = user_id (the person who should receive
                 # the processed result). The original chat_id was used for download
                 # (may be a relay group) but the result must go to the user's DM.
@@ -939,12 +943,11 @@ class BigFilePipeline:
             # be reused later - that is exactly what makes this the source of
             # truth. A small file whose entire body fit in the capture is also
             # worth keeping in Redis so a repeat needs storage at all.
-            await media_cache.remember(
+            await record_source(
                 file_unique_id,
+                ref=SourceRef(mode=PIPELINE_SOURCE_UPLOAD, key=key, job_key=key),
                 size=size,
-                input_key=key,
                 name=original_filename,
-                storage="s3",
                 data=head if head and size <= len(head) else None,
                 duration=meta.get("duration"),
                 source_meta=meta or None,

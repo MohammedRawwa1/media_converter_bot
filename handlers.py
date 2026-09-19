@@ -5,6 +5,7 @@ import html
 import json
 import logging
 import os
+import shutil
 import time
 from datetime import UTC, datetime
 
@@ -12,6 +13,7 @@ from telegram import InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto
 from telegram.error import BadRequest
 from telegram.ext import ContextTypes, ConversationHandler
 
+from utils.media_time import format_clock, segment_seconds_for_parts
 from utils.time_utils import utc_iso
 from utils.url_validation import _validate_url_safe
 
@@ -38,8 +40,10 @@ except ImportError:
         uuid = None
 
 try:
+    from utils import file_utils
     from utils.file_utils import AsyncFileLock, detect_filename, filename_from_url, sanitize_filename
 except ImportError:
+    file_utils = None
     AsyncFileLock = None
     sanitize_filename = None
 
@@ -201,22 +205,58 @@ def _extract_large_file_source(current_file: dict | None) -> tuple[int | None, i
 
 
 def _parse_time_to_seconds(tstr: str) -> float:
-    """Parse time strings like HH:MM:SS(.ms), MM:SS(.ms) or plain seconds -> seconds (float)."""
-    try:
-        parts = tstr.strip().split(":")
-        if len(parts) == 3:
-            h = int(parts[0])
-            m = int(parts[1])
-            s = float(parts[2])
-            return h * 3600 + m * 60 + s
-        elif len(parts) == 2:
-            m = int(parts[0])
-            s = float(parts[1])
-            return m * 60 + s
-        else:
-            return float(parts[0])
-    except Exception as e:
-        raise ValueError(f"Invalid time format: {tstr}") from e
+    """Parse time strings like HH:MM:SS(.ms), MM:SS(.ms) or plain seconds -> seconds (float).
+
+    Delegates to the shared parser (utils/media_time.py), which is what the
+    splitter reads too, so one time typed in two places cannot mean two things.
+    """
+    from utils.media_time import parse_time_to_seconds
+
+    return parse_time_to_seconds(tstr)
+
+
+#: Extensions that are audio even when Telegram labels the upload a video.
+_AUDIO_SPLIT_EXTS = (".mp3", ".m4a", ".aac", ".flac", ".ogg", ".opus", ".wav", ".wma")
+
+
+def _parse_split_request(text: str) -> tuple[str, float, float | None]:
+    """Read the splitter's answer: a part length, a part count, or one range.
+
+    Returns ``("length", seconds, None)``, ``("parts", count, None)`` or
+    ``("range", start, end)``. Raises ``ValueError`` for anything else, so the
+    caller can ask again instead of handing ffmpeg a number it made up.
+    """
+    raw = str(text or "").strip()
+    if not raw:
+        raise ValueError("The split request was empty")
+
+    # A range cut - "00:10-00:20" - is what the button always accepted, and it is
+    # the single-part form of the same question.
+    if raw.count("-") == 1:
+        left, right = (part.strip() for part in raw.split("-", 1))
+        if left and right:
+            try:
+                start = _parse_time_to_seconds(left)
+                end = _parse_time_to_seconds(right)
+            except ValueError:
+                start = end = None
+            if start is not None and end is not None:
+                if end <= start:
+                    raise ValueError("The end of the range has to come after its start")
+                return "range", start, end
+
+    # A bare integer is a *part count*: the prompt asks for it in those words, and
+    # a length of a few seconds is written "4s".
+    if raw.isdigit() and ":" not in raw:
+        count = int(raw)
+        if count < 2:
+            raise ValueError("A split needs at least 2 parts")
+        return "parts", float(count), None
+
+    seconds = _parse_time_to_seconds(raw)
+    if seconds <= 0:
+        raise ValueError("The part length has to be more than zero")
+    return "length", seconds, None
 
 
 # Fallback bitrate for every video -> MP3 extraction when the user has not
@@ -227,6 +267,12 @@ _DEFAULT_AUDIO_BITRATE = "128k"
 # the default so a user-supplied string can never reach the ffmpeg command line.
 _AUDIO_BITRATE_MIN_KBPS = 32
 _AUDIO_BITRATE_MAX_KBPS = 320
+
+# Video delivery format, mirroring utils.callbacks.UPLOAD_MODE_*. "video" sends
+# playable media (Telegram shows a preview), "file" sends a document.
+_UPLOAD_MODE_VIDEO = "video"
+_UPLOAD_MODE_FILE = "file"
+_UPLOAD_MODES = (_UPLOAD_MODE_VIDEO, _UPLOAD_MODE_FILE)
 
 # A bulk apply holds the collected list until it finishes, so pressing Apply
 # again while the first run is still going would process every file twice. The
@@ -361,24 +407,30 @@ def _sanitize_audio_bitrate(value, default: str = _DEFAULT_AUDIO_BITRATE) -> str
     return f"{kbps}k"
 
 
-def _audio_delivery_name(name: str | None, fallback_id=None, extension: str = ".mp3") -> str:
-    """Build the filename used when delivering an extracted audio file.
+def _video_delivery_name(current_file: dict | None, output_path: str | None) -> str:
+    """The name a converted video is delivered under.
 
-    The original media name is preserved (only the extension is swapped) so the
-    user receives ``My Video.mp3`` instead of an opaque storage key.
+    The Bot API names an uploaded video after the part it is handed, which here
+    is a storage/output path such as ``<file id>_video_only.mp4`` - a name the
+    user never chose. The media's own name is the one they recognise, keeping
+    whatever extension the conversion actually produced.
     """
-    stem = os.path.basename((name or "").strip())
-    stem = os.path.splitext(stem)[0]
+    info = current_file or {}
+    stem = os.path.splitext(os.path.basename(str(info.get("name") or "")))[0]
+    ext = os.path.splitext(str(output_path or ""))[1]
     if not stem:
-        stem = f"audio_{fallback_id}" if fallback_id else "audio"
-    return f"{stem}{extension}"
+        return os.path.basename(str(output_path or "")) or "video.mp4"
+    return f"{stem}{ext or '.mp4'}"
 
 
-def _metadata_caption(current_file: dict | None, fallback: str | None = None) -> str:
-    """Build a metadata-derived caption from the captured source metadata.
+def _source_media_tags(current_file: dict | None) -> tuple[str, str]:
+    """The title and performer the media itself carries: ``(title, performer)``.
 
-    Prefer title/performer tags when present, otherwise fall back to the
-    original media filename stem, then the supplied fallback string.
+    Both come from the ingest's own ffprobe verdict (``_source_metadata``), which
+    is the metadata every caption in this bot is already built from. Reading them
+    in one place is what makes an audio delivered by *any* button arrive in
+    Telegram's player with the title and performer the file actually has, instead
+    of a filename stem and an empty artist.
     """
     metadata = {}
     if current_file:
@@ -394,8 +446,94 @@ def _metadata_caption(current_file: dict | None, fallback: str | None = None) ->
                 return value
         return ""
 
-    title = _first("title", "source_title")
-    performer = _first("performer", "artist", "artists", "album_artist", "author")
+    return (
+        _first("title", "source_title"),
+        _first("performer", "artist", "artists", "album_artist", "author"),
+    )
+
+
+def _audio_tag_kwargs(current_file: dict | None, delivery_name: str | None) -> dict:
+    """The ``title``/``performer`` an audio delivery carries.
+
+    The media's own tags come first - that is the metadata preserved across the
+    buttons - and the delivered name only fills in a title when the file carries
+    none, which keeps untagged files behaving exactly as before.
+    """
+    title, performer = _source_media_tags(current_file)
+    if not title:
+        title = os.path.splitext(os.path.basename(str(delivery_name or "")))[0]
+    kwargs: dict[str, str] = {}
+    if title:
+        kwargs["title"] = title
+    if performer:
+        kwargs["performer"] = performer
+    return kwargs
+
+
+def _safe_media_stem(name: str | None, fallback: str = "media", limit: int = 80) -> str:
+    """The media's own name reduced to something safe to put in a path.
+
+    Used where output files are named after the media (a split's parts): it drops
+    directories, separators and the characters a filesystem or ffmpeg's own
+    ``%03d`` pattern would read as syntax, so the delivered name is the user's
+    name and never a path.
+    """
+    raw = str(name or "").replace("\\", "/")
+    stem = os.path.splitext(os.path.basename(raw))[0]
+    cleaned = "".join(ch for ch in stem if ch.isprintable() and ch not in '%:/\\*?"<>|')
+    cleaned = " ".join(cleaned.split()).strip(". ")
+    return cleaned[:limit] or fallback
+
+
+def _split_part_name(current_file: dict | None, part_path: str, index: int, total: int) -> str:
+    """The name one split part is delivered under.
+
+    The parts are named by the splitter itself (``Concert.001.mp4``, ...), so this
+    keeps that name - and only falls back to a numbered name built from the media
+    when the part somehow has none.
+    """
+    name = os.path.basename(str(part_path or ""))
+    if name:
+        return name
+    stem = _safe_media_stem((current_file or {}).get("name"))
+    ext = os.path.splitext(str(part_path or ""))[1] or ".mp4"
+    return f"{stem}.{index:03d}{ext}"
+
+
+def _audio_delivery_name(name: str | None, fallback_id=None, extension: str = ".mp3") -> str:
+    """Build the filename used when delivering an extracted audio file.
+
+    The original media name is preserved (only the extension is swapped) so the
+    user receives ``My Video.mp3`` instead of an opaque storage key.
+    """
+    stem = os.path.basename((name or "").strip())
+    stem = os.path.splitext(stem)[0]
+    if not stem:
+        stem = f"audio_{fallback_id}" if fallback_id else "audio"
+    return f"{stem}{extension}"
+
+
+def _document_delivery_name(current_file: dict | None, path: str | None, default_ext: str = ".mp4") -> str:
+    """The name a document delivery uses: the media's own name, same extension.
+
+    The Bot API names an uploaded document after the file it is handed, which here
+    is an output path such as ``<file id>_optimized.mp4`` or a temp name - neither
+    of which the user ever chose.
+    """
+    ext = os.path.splitext(str(path or ""))[1] or default_ext
+    stem = _safe_media_stem((current_file or {}).get("name"), fallback="")
+    if stem:
+        return f"{stem}{ext}"
+    return os.path.basename(str(path or "")) or f"media{ext}"
+
+
+def _metadata_caption(current_file: dict | None, fallback: str | None = None) -> str:
+    """Build a metadata-derived caption from the captured source metadata.
+
+    Prefer title/performer tags when present, otherwise fall back to the
+    original media filename stem, then the supplied fallback string.
+    """
+    title, performer = _source_media_tags(current_file)
 
     if title and performer:
         return f"{title} — {performer}"
@@ -407,10 +545,9 @@ def _metadata_caption(current_file: dict | None, fallback: str | None = None) ->
     if fallback:
         return fallback
 
-    name = (
-        current_file.get("name") or current_file.get("original_filename") or current_file.get("output_filename") or ""
-    )
-    stem = os.path.splitext(os.path.basename(name))[0].strip()
+    info = current_file or {}
+    name = info.get("name") or info.get("original_filename") or info.get("output_filename") or ""
+    stem = os.path.splitext(os.path.basename(str(name)))[0].strip()
     if stem:
         return stem
 
@@ -833,6 +970,33 @@ def _register_bulk_file(session: dict | None, file_info: dict | None) -> bool:
     except Exception:
         logger.exception("Failed to register file for bulk processing")
         return False
+
+
+def _user_audio_bitrate(user_id) -> str:
+    """The audio bitrate the user set in /usersettings, or the 128k default.
+
+    Read from the settings store rather than the current file: the preference
+    tells a conversion what quality to use when nothing was picked for the file
+    itself, which is the whole point of the setting.
+    """
+    try:
+        if user_settings:
+            return _sanitize_audio_bitrate(user_settings.get_user_setting(user_id, "audio_bitrate"))
+    except Exception:
+        logger.debug("handlers: could not read the audio bitrate preference for %s", user_id)
+    return _DEFAULT_AUDIO_BITRATE
+
+
+def _user_upload_mode(user_id) -> str:
+    """How the user wants videos delivered: playable media or a document."""
+    try:
+        if user_settings:
+            mode = str(user_settings.get_user_setting(user_id, "upload_mode") or "").strip().lower()
+            if mode in _UPLOAD_MODES:
+                return mode
+    except Exception:
+        logger.debug("handlers: could not read the upload mode preference for %s", user_id)
+    return _UPLOAD_MODE_VIDEO
 
 
 def _write_bulk_setting(user_id, session: dict | None, key: str, value) -> None:
@@ -2212,6 +2376,249 @@ class EnhancedMediaHandler:
             logger.debug("handlers: could not invalidate a refused %s file_id", media_type)
 
     # ── Video delivery helper: send_video with rich metadata ──────────────
+    async def _split_local_source(self, current_file: dict) -> str | None:
+        """A readable local copy of the loaded media, fetching the stored object if needed.
+
+        The split needs real bytes on disk. The file the user sent is usually still
+        there (``REUSE_LOCAL_INPUT`` keeps it), a cache repeat hands over its own
+        copy, and the one case left is a media that only lives in the bucket - which
+        is downloaded here rather than answering "send the file again".
+        """
+        for key in ("path", "_local_input_path"):
+            candidate = current_file.get(key)
+            try:
+                if candidate and os.path.exists(candidate) and os.path.getsize(candidate) > 0:
+                    return candidate
+            except OSError:
+                continue
+
+        input_key = current_file.get("input_key")
+        if not input_key:
+            return None
+        try:
+            from utils.storage import get_storage_backend
+
+            backend = await get_storage_backend() if get_storage_backend is not None else None
+            if backend is None:
+                return None
+            temp_dir = os.path.join(getattr(config, "TEMP_PATH", "storage/temp"))
+            os.makedirs(temp_dir, exist_ok=True)
+            ext = os.path.splitext(str(current_file.get("name") or ""))[1] or ".bin"
+            dest = os.path.join(temp_dir, f"split_src_{current_file.get('id') or uuid.uuid4().hex}{ext}")
+            if await backend.download_file(input_key, dest) and os.path.getsize(dest) > 0:
+                logger.info("handlers: split source fetched from storage (%s)", input_key)
+                return dest
+        except Exception:
+            logger.exception("handlers: could not fetch the split source from storage")
+        return None
+
+    async def _deliver_split_parts(
+        self,
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+        current_file: dict,
+        parts: list[str],
+        *,
+        status_message=None,
+        as_audio: bool = False,
+    ) -> int:
+        """Send the parts one after another, naming the one that is on its way.
+
+        A part is ordinary media, so it goes out the way every other result of
+        these buttons does: the user's upload preference decides whether a video is
+        a playable video or a document, the original names are kept, and a part too
+        big for the Bot API travels the same large-file path as anything else.
+
+        The parts are sent in order and one at a time on purpose - each one is a
+        complete file the user can start watching while the next is still being
+        uploaded, so nothing waits for "the whole split" to finish first.
+        """
+        total = len(parts)
+        chat_id = update.effective_chat.id
+        user_id = update.effective_user.id if update.effective_user else None
+        upload_mode = _user_upload_mode(user_id)
+        base_caption = _metadata_caption(current_file)
+        sent = 0
+        for index, part in enumerate(parts, 1):
+            label = f"part {index}/{total}"
+            if status_message is not None:
+                with contextlib.suppress(Exception):
+                    await status_message.edit_text(f"📤 Sending {label}…")
+            caption = f"{base_caption}\n\n({label})" if base_caption else label
+            # The part's own file name is the media's name plus its number
+            # (``Concert.001.mp4``) - the splitter wrote it that way, so nothing
+            # here can fall back to naming a part after an output path.
+            part_name = _split_part_name(current_file, part, index, total)
+            try:
+                if as_audio:
+                    # The media's own title/performer travel to every part, so the
+                    # metadata the source carried is preserved - with the part
+                    # number added, because otherwise Telegram's player shows the
+                    # same title for all of them.
+                    _title, _performer = _source_media_tags(current_file)
+                    if _title:
+                        _title = f"{_title} ({label})"
+                    await self._send_audio_result(
+                        context.bot,
+                        chat_id,
+                        part,
+                        caption=caption,
+                        title=_title or os.path.splitext(part_name)[0],
+                        performer=_performer or None,
+                        filename=part_name,
+                    )
+                else:
+                    await self._send_video_result(
+                        context.bot,
+                        chat_id,
+                        part,
+                        caption=caption,
+                        delivery_name=part_name,
+                        upload_mode=upload_mode,
+                    )
+                sent += 1
+            except Exception:
+                logger.exception("handlers: could not send %s (%s)", label, part)
+                await update.message.reply_text(f"⚠️ Could not send {label}.")
+        return sent
+
+    async def _handle_split_request(
+        self,
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+        session: dict,
+        user_input: str,
+    ) -> None:
+        """Turn the timing the user typed into parts, then deliver them in order.
+
+        The split itself is one stream copy of the source into a set of files, so
+        it works the same for a video and for an audio file (the part extension is
+        what differs) and costs seconds rather than the length of the media.
+        """
+        current_file = (session or {}).get("current_file") or {}
+        kind = str(current_file.get("type") or "").lower()
+        if kind not in ("video", "audio"):
+            await update.message.reply_text("❌ Load a video or an audio file, then press the split button.")
+            return
+
+        try:
+            mode, value, end = _parse_split_request(user_input)
+        except ValueError as exc:
+            await update.message.reply_text(
+                f"❌ {exc}.\nSend the length of each part (`10:00`, `01:00:00`, `30m`), "
+                "a number of equal parts (`4`), or a single range (`00:10-00:20`)."
+            )
+            return
+
+        ext = (
+            file_utils.safe_extension(current_file.get("name"), ".mp3" if kind == "audio" else ".mp4")
+            if file_utils is not None
+            else (".mp3" if kind == "audio" else ".mp4")
+        )
+        # Telegram labels plenty of audio uploads as video; the extension is the
+        # better answer for which delivery to use.
+        as_audio = kind == "audio" or ext in _AUDIO_SPLIT_EXTS
+
+        source_path = await self._split_local_source(current_file)
+        if not source_path:
+            await update.message.reply_text(
+                "❌ The source file is no longer on disk. Send the media again and press the split button."
+            )
+            return
+
+        if mode == "parts":
+            duration = await self._split_source_duration(current_file, source_path)
+            try:
+                seconds = segment_seconds_for_parts(duration, int(value))
+            except ValueError:
+                await update.message.reply_text(
+                    "❌ I could not read this file's duration, so equal parts are not possible. "
+                    "Send the part length instead (e.g. `10:00`)."
+                )
+                return
+        else:
+            seconds = float(value)
+
+        # The parts are named after the media itself: ``Concert.mp4`` becomes
+        # ``Concert.001.mp4``, ``Concert.002.mp4``, ... - the original name
+        # preserved, which is also what the delivery uses.
+        stem = _safe_media_stem(current_file.get("name"))
+        out_dir = os.path.join(getattr(config, "OUTPUT_PATH", "storage/output"), f"split_{uuid.uuid4().hex}")
+        status_message = None
+        with contextlib.suppress(Exception):
+            status_message = await update.message.reply_text("✂️ Splitting…")
+
+        try:
+            if mode == "range":
+                # One part out of the middle: the same stream copy, cut once.
+                from tasks.conversion_tasks import trim_media
+
+                os.makedirs(out_dir, exist_ok=True)
+                target = os.path.join(out_dir, f"{stem}.001{ext}")
+                ok, message = await trim_media(source_path, target, format_clock(value), format_clock(float(end or 0)))
+                parts = [target] if ok and os.path.exists(target) else []
+            else:
+                from tasks.conversion_tasks import split_media_segments
+
+                ok, parts, message = await split_media_segments(source_path, out_dir, seconds, ext=ext, stem=stem)
+            if not parts:
+                detail = (message or "").strip()[:200]
+                text = "❌ The split produced no parts." + (f"\n`{detail}`" if detail else "")
+                if status_message is not None:
+                    with contextlib.suppress(Exception):
+                        await status_message.edit_text(text)
+                else:
+                    await update.message.reply_text(text)
+                return
+
+            sent = await self._deliver_split_parts(
+                update, context, current_file, parts, status_message=status_message, as_audio=as_audio
+            )
+            if mode == "range":
+                summary = f"✅ Cut {format_clock(value)}–{format_clock(float(end or 0))} out and sent it."
+            elif len(parts) == 1:
+                # The media is shorter than the part length: nothing to cut.
+                summary = "✅ The file is shorter than one part, so it was sent as it is."
+            else:
+                summary = f"✅ Split into {len(parts)} parts of {format_clock(seconds)}, sent {sent} in order."
+            if status_message is not None:
+                with contextlib.suppress(Exception):
+                    await status_message.edit_text(summary)
+            else:
+                await update.message.reply_text(summary)
+        except Exception:
+            logger.exception("handlers: split failed")
+            if status_message is not None:
+                with contextlib.suppress(Exception):
+                    await status_message.edit_text("❌ The split failed.")
+        finally:
+            # The parts have been sent; the copies on disk have served their
+            # purpose. A failure leaves nothing behind either.
+            with contextlib.suppress(Exception):
+                shutil.rmtree(out_dir, ignore_errors=True)
+
+    async def _split_source_duration(self, current_file: dict, source_path: str) -> float:
+        """How long the media is, for turning a part count into a part length.
+
+        The ingest already probed the whole file and left the verdict on the
+        session, so that comes first (no second read of the media); only a file
+        that was never probed - a plain small upload - is probed here.
+        """
+        meta = current_file.get("_source_metadata")
+        if isinstance(meta, dict):
+            with contextlib.suppress(TypeError, ValueError):
+                duration = float(meta.get("duration") or 0.0)
+                if duration > 0:
+                    return duration
+        with contextlib.suppress(Exception):
+            from utils.ffmpeg_runner import probe_media
+
+            probed = await probe_media(source_path)
+            duration = float((probed or {}).get("duration") or 0.0)
+            if duration > 0:
+                return duration
+        return 0.0
+
     async def _send_video_result(
         self,
         bot,
@@ -2220,6 +2627,8 @@ class EnhancedMediaHandler:
         caption: str = "",
         thumb_path: str | None = None,
         file_unique_id: str | None = None,
+        delivery_name: str | None = None,
+        upload_mode: str | None = None,
     ) -> str | None:
         """Send a video file with probed metadata (duration, width, height, thumbnail).
 
@@ -2259,6 +2668,23 @@ class EnhancedMediaHandler:
                     os.remove(_auto_thumb)
         except Exception:
             logger.debug("handlers: probe_video_for_delivery failed")
+
+        if str(upload_mode or "").lower() == _UPLOAD_MODE_FILE:
+            # The user asked for videos as Telegram documents in /usersettings:
+            # the same bytes, sent in the file view instead of as a preview.
+            _doc_name = os.path.basename(delivery_name or file_path)
+            try:
+                with open(file_path, "rb") as _doc_fh:
+                    await bot.send_document(
+                        chat_id=chat_id,
+                        document=_doc_fh,
+                        caption=caption,
+                        filename=_doc_name,
+                    )
+                return None
+            except Exception:
+                logger.exception("handlers: failed to send the video as a document")
+                return None
 
         # ── Try to use cached file_id first ──
         _sent_file_id = None
@@ -2319,6 +2745,9 @@ class EnhancedMediaHandler:
                     "caption": caption,
                     "supports_streaming": True,
                 }
+                # Without this the video is named after the local output path.
+                if delivery_name:
+                    _send_kwargs["filename"] = os.path.basename(delivery_name)
                 if _vid_duration is not None:
                     _send_kwargs["duration"] = _vid_duration
                 if _vid_width is not None:
@@ -3774,11 +4203,27 @@ class EnhancedMediaHandler:
             except Exception:
                 logger.debug("handlers: source ffprobe failed for %s", file_id)
 
-            # Upload to storage. With the media cache on the key is derived from
-            # the media identity, so the object is reused by the next request for
-            # this file instead of being downloaded and uploaded again.
-            _input_key = _library_key or f"inputs/{_job_id}/source{ext}"
-            await _backend.upload_file(_temp_path, _input_key)
+            # Upload to storage through the one shared source-store helper, so
+            # this path stores exactly what every other producer stores for the
+            # same media under the same mode (utils/source_store.py). The key is
+            # derived from the media identity when there is one, so a repeat of
+            # this file is a cache hit instead of another download and upload.
+            #
+            # ``telegram_fallback=False``: the worker cannot read a Bot API file
+            # id, so this path has no second way to reach the media. In ``header``
+            # mode the whole object is therefore stored rather than a probe header
+            # that nothing could turn back into a source.
+            from utils.source_store import record_source as _record_source
+            from utils.source_store import store_source as _store_source
+
+            _ref = await _store_source(
+                _backend,
+                _temp_path,
+                key=_library_key or f"inputs/{_job_id}/source{ext}",
+                telegram_fallback=False,
+                log_prefix="handlers",
+            )
+            _input_key = _ref.job_key
 
             # Record where this media now lives (and its bytes when small enough
             # for Redis) so the reuse paths can find it. Read the body before the
@@ -3794,12 +4239,14 @@ class EnhancedMediaHandler:
                     if _cached_size and _cached_size <= _media_cache.bytes_cache_limit():
                         with contextlib.suppress(Exception), open(_temp_path, "rb") as _fh:
                             _payload = _fh.read()
-                    await _media_cache.remember(
+                    # One descriptor shape for every producer: a probe header
+                    # lands in ``header_key`` and never in ``input_key``.
+                    await _record_source(
                         _cache_uid,
+                        ref=_ref,
                         size=_cached_size,
-                        input_key=_input_key,
                         name=current_file.get("name"),
-                        storage="s3",
+                        local_path=_temp_path,
                         data=_payload,
                         # The location token the upload came from: it is what lets
                         # a later step forward the media inside Telegram instead
@@ -4216,7 +4663,15 @@ class EnhancedMediaHandler:
             raise
 
     async def show_settings(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Show user settings with Redis cache for preferences."""
+        """Show the user's preferences.
+
+        Everything in this panel is a *setting*: it stores a value or toggles a
+        preference, and shows which one is active. Nothing here encodes,
+        downloads or queues media, so opening /usersettings can never start a
+        conversion of whatever file happens to be loaded. The media actions live
+        in the main menu's tool sub-menus (Audio Tools / Video Tools / Advanced
+        Tools), which is also why this panel no longer needs a loaded file.
+        """
         user_id = update.effective_user.id
         # Try loading preferences from Redis cache first
         _cached_prefs = None
@@ -4230,45 +4685,44 @@ class EnhancedMediaHandler:
             for k, v in _cached_prefs.items():
                 if k not in context.user_data or context.user_data.get(k) is None:
                     context.user_data[k] = v
-        user_id = update.effective_user.id
         if user_settings is None:
             await update.message.reply_text("⚠️ Settings not available (missing module).")
             return
 
-        # Build a two-page settings keyboard with toggle switches
-        s = user_settings.get_user_settings(user_id)
-
-        # If called via callback with page param, the caller will handle; default to page 1
-        # Build text and keyboard to match the requested control panel style
-        text = "⚙️ <b>Config Bot Settings</b>\n\n"
-        text += f"• Thumbnail : {'Yes' if s.get('use_custom_thumbnail') else 'No'}\n"
-        text += f"• Rename File : {'Yes' if s.get('prefix') or s.get('suffix') else 'No'}\n"
-
-        kb_page1 = [
-            [
-                InlineKeyboardButton(
-                    f"Thumbnail : {'Yes' if s.get('use_custom_thumbnail') else 'No'}", callback_data="settings_page:2"
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    f"Rename File : {'Yes' if s.get('prefix') or s.get('suffix') else 'No'}",
-                    callback_data="video_renamer",
-                )
-            ],
-            [InlineKeyboardButton("Upload as Audio", callback_data="menu_audio")],
-            [InlineKeyboardButton("Upload as Video", callback_data="menu_video")],
-            [InlineKeyboardButton("Stream Mapper", callback_data="menu_advanced")],
-            [InlineKeyboardButton("Video Metadata", callback_data="full_info")],
-            [InlineKeyboardButton("Mp3 Tag Setting", callback_data="mp3_tag_editor")],
-            [InlineKeyboardButton("Audio Settings", callback_data="menu_audio")],
-            [InlineKeyboardButton("Reset Settings", callback_data="reset_settings")],
-            [InlineKeyboardButton("Close Settings", callback_data="menu_main")],
-        ]
-
-        await update.message.reply_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb_page1))
+        text, markup = self._settings_view(user_id, 1)
+        await update.message.reply_text(text, parse_mode="HTML", reply_markup=markup)
         context.user_data.clear()
         context.user_data["settings_page"] = 1
+
+    def _settings_view(self, user_id, page: int = 1) -> tuple[str, InlineKeyboardMarkup]:
+        """``(text, markup)`` for one page of the /usersettings panel."""
+        s = user_settings.get_user_settings(user_id) if user_settings else {}
+        page = 2 if int(page or 1) == 2 else 1
+        if page == 2:
+            bitrate = _sanitize_audio_bitrate(s.get("audio_bitrate"))
+            text = (
+                "🎧 <b>Your Settings — Audio</b>\n\n"
+                f"• Bitrate : <b>{bitrate}</b>\n\n"
+                "<i>Used whenever audio is converted without a quality of its own "
+                "(Video To Audio, Normalize, Bitrate). Picking a value here only "
+                "stores it — nothing is converted.</i>"
+            )
+        else:
+            mode = str(s.get("upload_mode") or _UPLOAD_MODE_VIDEO).lower()
+            if mode not in _UPLOAD_MODES:
+                mode = _UPLOAD_MODE_VIDEO
+            words = s.get("words_remove") or []
+            text = (
+                "⚙️ <b>Your Settings — General</b>\n\n"
+                f"• Upload as Video : {'preview' if mode == _UPLOAD_MODE_VIDEO else 'document'}\n"
+                f"• Custom Thumbnail : {'On' if s.get('use_custom_thumbnail') else 'Off'}\n"
+                f"• Rename prefix : {html.escape(str(s.get('prefix') or '(none)'))}\n"
+                f"• Rename suffix : {html.escape(str(s.get('suffix') or '(none)'))}\n"
+                f"• Words to remove : {html.escape(', '.join(words)) if words else '(none)'}\n\n"
+                "<i>Each option is stored and applied to your next conversion — "
+                "none of them start one.</i>"
+            )
+        return text, MediaMenuBuilder.get_settings_page(page, s)
 
     async def show_bulk_menu(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Show the bulk-mode action menu (either as reply or edit)."""
@@ -5205,7 +5659,12 @@ class EnhancedMediaHandler:
                 await update.message.reply_text("✅ Subtitles applied. Sending file...")
                 try:
                     with open(out_path, "rb") as doc_file:
-                        await context.bot.send_document(chat_id=update.effective_chat.id, document=doc_file)
+                        # Named after the media, not after the output path.
+                        await context.bot.send_document(
+                            chat_id=update.effective_chat.id,
+                            document=doc_file,
+                            filename=_document_delivery_name(current, out_path),
+                        )
                 except Exception:
                     await update.message.reply_text("⚠️ Failed to send file; try downloading from the server.")
             else:
@@ -5469,9 +5928,10 @@ class EnhancedMediaHandler:
                         chat_id=update.effective_chat.id,
                         audio=audio_file,
                         caption=_metadata_caption(current_file),
-                        title=os.path.splitext(delivery_name)[0],
+                        # The media's own title/performer are preserved, so the
+                        # delivered audio is the same track it was.
+                        **_audio_tag_kwargs(current_file, delivery_name),
                         filename=delivery_name,
-                        performer="",
                     )
             else:
                 await self._send_video_result(
@@ -5479,6 +5939,8 @@ class EnhancedMediaHandler:
                     update.effective_chat.id,
                     output_path,
                     caption=_metadata_caption(current_file),
+                    delivery_name=_video_delivery_name(current_file, output_path),
+                    upload_mode=_user_upload_mode(update.effective_user.id),
                 )
             await notify(f"✅ Trim complete ({start_norm} → {end_norm}).")
         finally:
@@ -5589,13 +6051,16 @@ class EnhancedMediaHandler:
                             chat_id=update.effective_chat.id,
                             audio=audio_file,
                             caption=_metadata_caption(current_file),
-                            title=os.path.splitext(delivery_name)[0],
+                            **_audio_tag_kwargs(session.get("current_file"), delivery_name),
                             filename=delivery_name,
-                            performer="",
                         )
                 else:
                     with open(output_path, "rb") as f:
-                        await context.bot.send_document(chat_id=update.effective_chat.id, document=f)
+                        await context.bot.send_document(
+                            chat_id=update.effective_chat.id,
+                            document=f,
+                            filename=_document_delivery_name(current_file, output_path),
+                        )
             except Exception:
                 await self.safe_edit(
                     query,
@@ -5922,7 +6387,11 @@ class EnhancedMediaHandler:
                         )
                         try:
                             with open(output_path, "rb") as f:
-                                await context.bot.send_document(chat_id=update.effective_chat.id, document=f)
+                                await context.bot.send_document(
+                                    chat_id=update.effective_chat.id,
+                                    document=f,
+                                    filename=_document_delivery_name(current_file, output_path),
+                                )
                         except Exception:
                             await self.safe_edit(
                                 query,
@@ -6200,12 +6669,18 @@ class EnhancedMediaHandler:
 
             elif data == "video_splitter":
                 current_file = session.get("current_file")
-                if not current_file or current_file.get("type") != "video":
-                    await self.safe_edit(query, "❌ No video file found to split.")
+                # The splitter works on audio as well as video: splitting a long
+                # recording into hour-long parts is the same stream copy, and the
+                # parts are ``.mp3`` instead of ``.mp4``.
+                _split_kind = str((current_file or {}).get("type") or "").lower()
+                if not current_file or _split_kind not in ("video", "audio"):
+                    await self.safe_edit(query, "❌ No video or audio file found to split.")
                     return
                 await self.safe_edit(
                     query,
-                    "📌 Send split as either 'start-end' in seconds (e.g. 10-30) or 'n' for number of equal parts:",
+                    "📌 Send the length of each part:\n• `10:00` / `01:00:00` / `30m` / `2h` — part length\n"
+                    "• `4` — split into 4 equal parts\n"
+                    "• `00:10-00:20` — cut that single range out",
                 )
                 for key in list(context.user_data.keys()):
                     if key.startswith("awaiting_"):
@@ -7142,42 +7617,158 @@ class EnhancedMediaHandler:
             elif data == "batch_process":
                 await self.show_bulk_menu(update, context)
 
-            # Settings pagination and toggle handlers
+            # Settings pagination and preference handlers
             elif isinstance(data, str) and data.startswith("settings_page:"):
                 # Show a specific settings page
                 try:
                     page = int(data.split(":", 1)[1])
                 except Exception:
                     page = 1
-
-                s = user_settings.get_user_settings(user_id) if user_settings else {}
-                if page == 1:
-                    text = "⚙️ <b>Your Settings — Page 1</b>\n\n"
-                    text += f"• Upload mode: {s.get('upload_mode')}\n"
-                    text += f"• Prefix: {s.get('prefix')!s}\n"
-                    text += f"• Suffix: {s.get('suffix')!s}\n"
-                    kb = [
-                        [
-                            InlineKeyboardButton(
-                                f"Toggle Save Thumb: {'On' if s.get('save_thumbnail') else 'Off'}",
-                                callback_data="toggle_save_thumbnail",
-                            )
-                        ],
-                        [InlineKeyboardButton("Next ➡️", callback_data="settings_page:2")],
-                        [InlineKeyboardButton("Close", callback_data="menu_main")],
-                    ]
-                    await self.safe_edit(query, text, reply_markup=InlineKeyboardMarkup(kb), parse_mode="HTML")
+                if user_settings is None:
+                    await self.safe_edit(query, "⚠️ Settings not available.")
                 else:
-                    text = "⚙️ <b>Your Settings — Page 2</b>\n\n"
-                    _words = html.escape(", ".join(s.get("words_remove") or []))
-                    text += f"• Words to remove: {_words}\n"
-                    _thumb = html.escape(str(s.get("default_thumbnail") or ""))
-                    text += f"• Default thumbnail: {_thumb}\n"
-                    kb = [
-                        [InlineKeyboardButton("⬅️ Prev", callback_data="settings_page:1")],
-                        [InlineKeyboardButton("Close", callback_data="menu_main")],
-                    ]
-                    await self.safe_edit(query, text, reply_markup=InlineKeyboardMarkup(kb), parse_mode="HTML")
+                    text, markup = self._settings_view(user_id, page)
+                    await self.safe_edit(query, text, reply_markup=markup, parse_mode="HTML")
+
+            elif data == "settings_bitrate_menu":
+                # Audio bitrate preference. Only ever stores a value - see
+                # _settings_view for why the panel never converts anything.
+                current = _user_audio_bitrate(user_id)
+                await self.safe_edit(
+                    query,
+                    "🎚️ <b>Audio Bitrate</b>\n\n"
+                    f"Current: <b>{current}</b>\n"
+                    "<i>Applied whenever audio is converted without a quality of its "
+                    "own. Choosing a value only stores it.</i>",
+                    reply_markup=MediaMenuBuilder.get_settings_bitrate_menu(current),
+                    parse_mode="HTML",
+                )
+
+            elif data.startswith("settings_set_bitrate:"):
+                # Store the chosen default bitrate (or arm the custom prompt).
+                value = data.split(":", 1)[1]
+                if user_settings is None:
+                    await self.safe_edit(query, "⚠️ Settings not available.")
+                elif value == "custom":
+                    for key in list(context.user_data.keys()):
+                        if key.startswith("awaiting_"):
+                            del context.user_data[key]
+                    context.user_data["awaiting_settings_bitrate"] = True
+                    await self.safe_edit(
+                        query,
+                        f"✏️ Send the audio bitrate ({_AUDIO_BITRATE_MIN_KBPS}k-{_AUDIO_BITRATE_MAX_KBPS}k, e.g. 128k):",
+                    )
+                else:
+                    bitrate = _sanitize_audio_bitrate(value, default="")
+                    if not bitrate:
+                        await self.safe_edit(query, "⚠️ Invalid bitrate option.")
+                    else:
+                        user_settings.set_user_setting(user_id, "audio_bitrate", bitrate)
+                        await self.safe_edit(
+                            query,
+                            f"✅ Audio bitrate set to <b>{bitrate}</b>.",
+                            reply_markup=MediaMenuBuilder.get_settings_bitrate_menu(bitrate),
+                            parse_mode="HTML",
+                        )
+
+            elif data.startswith("settings_upload_mode:"):
+                # Video delivery format: playable media (preview) or document.
+                mode = data.split(":", 1)[1].strip().lower()
+                if user_settings is None:
+                    await self.safe_edit(query, "⚠️ Settings not available.")
+                elif mode not in _UPLOAD_MODES:
+                    await self.safe_edit(query, "⚠️ Invalid upload mode.")
+                else:
+                    user_settings.set_user_setting(user_id, "upload_mode", mode)
+                    text, markup = self._settings_view(user_id, 1)
+                    await self.safe_edit(query, text, reply_markup=markup, parse_mode="HTML")
+
+            elif isinstance(data, str) and data.startswith("settings_toggle:"):
+                key = data.split(":", 1)[1]
+                if user_settings is None:
+                    await self.safe_edit(query, "⚠️ Settings not available.")
+                else:
+                    try:
+                        user_settings.toggle_user_setting(user_id, key)
+                        text, markup = self._settings_view(user_id, 1)
+                        await self.safe_edit(query, text, reply_markup=markup, parse_mode="HTML")
+                    except Exception:
+                        logger.exception("Failed to toggle setting %s for user %s", key, user_id)
+                        await self.safe_edit(query, "⚠️ Failed to change setting.")
+
+            elif data == "settings_rename_menu":
+                if user_settings is None:
+                    await self.safe_edit(query, "⚠️ Settings not available.")
+                else:
+                    s = user_settings.get_user_settings(user_id)
+                    await self.safe_edit(
+                        query,
+                        "✏️ <b>Rename Delivered Files</b>\n\n"
+                        f"• Prefix : {html.escape(str(s.get('prefix') or '(none)'))}\n"
+                        f"• Suffix : {html.escape(str(s.get('suffix') or '(none)'))}\n\n"
+                        "<i>Applied to the name of every file the bot delivers.</i>",
+                        reply_markup=MediaMenuBuilder.get_settings_rename_menu(s),
+                        parse_mode="HTML",
+                    )
+
+            elif data == "settings_set_prefix" or data == "settings_set_suffix":
+                which = "prefix" if data.endswith("prefix") else "suffix"
+                for key in list(context.user_data.keys()):
+                    if key.startswith("awaiting_"):
+                        del context.user_data[key]
+                context.user_data[f"awaiting_settings_{which}"] = True
+                await self.safe_edit(query, f"✏️ Send the filename {which} (send '-' to clear it):")
+
+            elif data == "settings_clear_rename":
+                if user_settings is None:
+                    await self.safe_edit(query, "⚠️ Settings not available.")
+                else:
+                    user_settings.set_user_setting(user_id, "prefix", "")
+                    user_settings.set_user_setting(user_id, "suffix", "")
+                    text, markup = self._settings_view(user_id, 1)
+                    await self.safe_edit(
+                        query,
+                        "✅ Filename prefix and suffix cleared.\n\n" + text,
+                        reply_markup=markup,
+                        parse_mode="HTML",
+                    )
+
+            elif data == "settings_words_menu":
+                if user_settings is None:
+                    await self.safe_edit(query, "⚠️ Settings not available.")
+                else:
+                    s = user_settings.get_user_settings(user_id)
+                    words = s.get("words_remove") or []
+                    _list = html.escape(", ".join(words)) if words else "(none)"
+                    await self.safe_edit(
+                        query,
+                        "🧹 <b>Words To Remove</b>\n\n"
+                        f"• Current : {_list}\n\n"
+                        "<i>Stripped out of every delivered filename.</i>",
+                        reply_markup=MediaMenuBuilder.get_settings_words_menu(s),
+                        parse_mode="HTML",
+                    )
+
+            elif data == "settings_add_word" or data == "settings_remove_word":
+                action = "add" if data.endswith("add_word") else "remove"
+                for key in list(context.user_data.keys()):
+                    if key.startswith("awaiting_"):
+                        del context.user_data[key]
+                context.user_data[f"awaiting_settings_word_{action}"] = True
+                await self.safe_edit(query, f"✏️ Send the word to {action}:")
+
+            elif data == "settings_clear_words":
+                if user_settings is None:
+                    await self.safe_edit(query, "⚠️ Settings not available.")
+                else:
+                    user_settings.set_user_setting(user_id, "words_remove", [])
+                    text, markup = self._settings_view(user_id, 1)
+                    await self.safe_edit(
+                        query,
+                        "✅ Words list cleared.\n\n" + text,
+                        reply_markup=markup,
+                        parse_mode="HTML",
+                    )
 
             elif isinstance(data, str) and data.startswith("toggle_"):
                 # toggle_<key>
@@ -7437,7 +8028,11 @@ class EnhancedMediaHandler:
             await self.safe_edit(query, "❌ No video file found.")
             return
 
-        current = _sanitize_audio_bitrate(current_file.get("audio_bitrate"))
+        # The file's own pick wins; otherwise the bitrate from /usersettings, so
+        # the preference the user set is what the picker opens on.
+        current = _sanitize_audio_bitrate(
+            current_file.get("audio_bitrate") or _user_audio_bitrate(update.effective_user.id)
+        )
         await self.safe_edit(
             query,
             "🎵 **Extract Audio (MP3)**\n"
@@ -7697,7 +8292,9 @@ class EnhancedMediaHandler:
             await notify("❌ No video file found.")
             return
 
-        audio_bitrate = _sanitize_audio_bitrate(bitrate or current_file.get("audio_bitrate") or _DEFAULT_AUDIO_BITRATE)
+        audio_bitrate = _sanitize_audio_bitrate(
+            bitrate or current_file.get("audio_bitrate") or _user_audio_bitrate(user_id)
+        )
         current_file["audio_bitrate"] = audio_bitrate
         session["current_file"] = current_file
         delivery_name = _audio_delivery_name(current_file.get("name"), current_file.get("id"))
@@ -7752,9 +8349,10 @@ class EnhancedMediaHandler:
                         chat_id=update.effective_chat.id,
                         audio=audio_file,
                         caption=caption,
-                        title=os.path.splitext(delivery_name)[0],
+                        # The media's own title/performer are preserved, so the
+                        # delivered audio is the same track it was.
+                        **_audio_tag_kwargs(current_file, delivery_name),
                         filename=delivery_name,
-                        performer="",
                     )
 
             if AsyncFileLock:
@@ -7946,6 +8544,8 @@ class EnhancedMediaHandler:
                         update.effective_chat.id,
                         output_path,
                         caption=_metadata_caption(current_file),
+                        delivery_name=_video_delivery_name(current_file, output_path),
+                        upload_mode=_user_upload_mode(update.effective_user.id),
                     )
                     with contextlib.suppress(OSError):
                         os.remove(output_path)
@@ -8048,11 +8648,14 @@ class EnhancedMediaHandler:
         output_path = os.path.join(output_dir, f"merged_{int(datetime.now(UTC).timestamp())}.mp4")
         success = await self.converter.merge_videos(session["merge_list"], output_path)
         if success and os.path.exists(output_path):
+            _session_file = session.get("current_file")
             await self._send_video_result(
                 context.bot,
                 update.effective_chat.id,
                 output_path,
-                caption=_metadata_caption(session.get("current_file")),
+                caption=_metadata_caption(_session_file),
+                delivery_name=_video_delivery_name(_session_file, output_path),
+                upload_mode=_user_upload_mode(getattr(update.effective_user, "id", None)),
             )
 
             # Cleanup
@@ -8100,9 +8703,8 @@ class EnhancedMediaHandler:
                     chat_id=update.effective_chat.id,
                     audio=audio_file,
                     caption=_metadata_caption(session.get("current_file")),
-                    title=os.path.splitext(delivery_name)[0],
+                    **_audio_tag_kwargs(session.get("current_file"), delivery_name),
                     filename=delivery_name,
-                    performer="",
                 )
 
             # Cleanup
@@ -8151,6 +8753,8 @@ class EnhancedMediaHandler:
                 update.effective_chat.id,
                 output_path,
                 caption=_metadata_caption(current_file),
+                delivery_name=_video_delivery_name(current_file, output_path),
+                upload_mode=_user_upload_mode(update.effective_user.id),
             )
             os.remove(output_path)
         else:
@@ -8225,6 +8829,8 @@ class EnhancedMediaHandler:
                 update.effective_chat.id,
                 output_path,
                 caption=_metadata_caption(current_file),
+                delivery_name=_video_delivery_name(current_file, output_path),
+                upload_mode=_user_upload_mode(update.effective_user.id),
             )
             os.remove(output_path)
         else:
@@ -8395,6 +9001,8 @@ class EnhancedMediaHandler:
                 update.effective_chat.id,
                 output_path,
                 caption=_metadata_caption(current_file),
+                delivery_name=_video_delivery_name(current_file, output_path),
+                upload_mode=_user_upload_mode(update.effective_user.id),
             )
             os.remove(output_path)
         else:
@@ -8922,9 +9530,8 @@ class EnhancedMediaHandler:
                     chat_id=update.effective_chat.id,
                     audio=audio_file,
                     caption=_metadata_caption(current_file),
-                    title=os.path.splitext(delivery_name)[0],
+                    **_audio_tag_kwargs(current_file, delivery_name),
                     filename=delivery_name,
-                    performer="",
                 )
             os.remove(output_path)
         else:
@@ -9031,9 +9638,8 @@ class EnhancedMediaHandler:
                     chat_id=update.effective_chat.id,
                     audio=audio_file,
                     caption=_metadata_caption(current_file),
-                    title=os.path.splitext(delivery_name)[0],
+                    **_audio_tag_kwargs(current_file, delivery_name),
                     filename=delivery_name,
-                    performer="",
                 )
             with contextlib.suppress(OSError):
                 os.remove(output_path)
@@ -9061,7 +9667,9 @@ class EnhancedMediaHandler:
         with contextlib.suppress(OSError):
             os.makedirs(output_base, exist_ok=True)
         output_path = os.path.join(output_base, f"{current_file['id']}_normalized.mp3")
-        audio_bitrate = _sanitize_audio_bitrate(current_file.get("audio_bitrate"))
+        audio_bitrate = _sanitize_audio_bitrate(
+            current_file.get("audio_bitrate") or _user_audio_bitrate(update.effective_user.id)
+        )
 
         # Use loudnorm filter for normalization
         cmd = [
@@ -9107,9 +9715,8 @@ class EnhancedMediaHandler:
                     chat_id=update.effective_chat.id,
                     audio=audio_file,
                     caption=_metadata_caption(current_file),
-                    title=os.path.splitext(delivery_name)[0],
+                    **_audio_tag_kwargs(current_file, delivery_name),
                     filename=delivery_name,
-                    performer="",
                 )
             os.remove(output_path)
         else:
@@ -9150,12 +9757,16 @@ class EnhancedMediaHandler:
         success = await self.converter.extract_subtitles(current_file["path"], output_path)
 
         if success and os.path.exists(output_path):
+            # The media's own name with the subtitle extension: the old
+            # ``<name>.mp4_subtitles.srt`` doubled the extension and crashed
+            # outright when the session had no name at all.
+            subtitle_name = f"{_safe_media_stem(current_file.get('name'), fallback='subtitles')}.srt"
             with open(output_path, "rb") as sub_file:
                 await context.bot.send_document(
                     chat_id=update.effective_chat.id,
                     document=sub_file,
                     caption=_metadata_caption(current_file),
-                    filename=f"{current_file['name']}_subtitles.srt",
+                    filename=subtitle_name,
                 )
             os.remove(output_path)
         else:
@@ -9502,6 +10113,73 @@ class EnhancedMediaHandler:
                 await update.message.reply_text(f"❌ {e}")
                 return
 
+        # /usersettings prompts. Every one of these only stores a preference and
+        # re-renders the panel — they must never fall through to a conversion, so
+        # they return before the action prompts below are considered.
+        _settings_prompt = next(
+            (
+                flag
+                for flag in (
+                    "awaiting_settings_bitrate",
+                    "awaiting_settings_prefix",
+                    "awaiting_settings_suffix",
+                    "awaiting_settings_word_add",
+                    "awaiting_settings_word_remove",
+                )
+                if context.user_data.get(flag)
+            ),
+            None,
+        )
+        if _settings_prompt is not None:
+            text_value = user_input.strip()
+            if user_settings is None:
+                await update.message.reply_text("⚠️ Settings backend not available.")
+            elif _settings_prompt == "awaiting_settings_bitrate":
+                parsed = _sanitize_audio_bitrate(text_value, default="")
+                if parsed:
+                    user_settings.set_user_setting(user_id, "audio_bitrate", parsed)
+                    await update.message.reply_text(
+                        f"✅ Audio bitrate set to {parsed}.",
+                        reply_markup=MediaMenuBuilder.get_settings_bitrate_menu(parsed),
+                    )
+                else:
+                    await update.message.reply_text(
+                        f"❌ Invalid bitrate. Use a value between {_AUDIO_BITRATE_MIN_KBPS}k and"
+                        f" {_AUDIO_BITRATE_MAX_KBPS}k (e.g. 128k)."
+                    )
+            elif _settings_prompt in ("awaiting_settings_prefix", "awaiting_settings_suffix"):
+                which = "prefix" if _settings_prompt.endswith("prefix") else "suffix"
+                # "-" is the documented way to clear one without retyping the other.
+                value = "" if text_value in ("-", "") else text_value
+                user_settings.set_user_setting(user_id, which, value)
+                _state = user_settings.get_user_settings(user_id)
+                await update.message.reply_text(
+                    f"✅ Filename {which} set to {value or '(none)'}.",
+                    reply_markup=MediaMenuBuilder.get_settings_rename_menu(_state),
+                )
+            else:
+                adding = _settings_prompt == "awaiting_settings_word_add"
+                state = user_settings.get_user_settings(user_id)
+                words = list(state.get("words_remove") or [])
+                if adding:
+                    if text_value and text_value not in words:
+                        words.append(text_value)
+                        user_settings.set_user_setting(user_id, "words_remove", words)
+                        await update.message.reply_text(f"✅ Added word to remove: {text_value}")
+                    else:
+                        await update.message.reply_text("⚠️ Word empty or already present.")
+                elif text_value in words:
+                    words.remove(text_value)
+                    user_settings.set_user_setting(user_id, "words_remove", words)
+                    await update.message.reply_text(f"✅ Removed word: {text_value}")
+                else:
+                    await update.message.reply_text("⚠️ Word not found in the list.")
+
+            for key in list(context.user_data.keys()):
+                if key.startswith("awaiting_"):
+                    del context.user_data[key]
+            return ConversationHandler.END
+
         # Check what we're waiting for
         if context.user_data.get("awaiting_settings"):
             if user_settings is None:
@@ -9632,6 +10310,8 @@ class EnhancedMediaHandler:
                             update.effective_chat.id,
                             output_path,
                             caption=_metadata_caption(current_file),
+                            delivery_name=_video_delivery_name(current_file, output_path),
+                            upload_mode=_user_upload_mode(update.effective_user.id),
                         )
                         os.remove(output_path)
                     else:
@@ -9669,49 +10349,9 @@ class EnhancedMediaHandler:
                     del context.user_data[key]
 
         elif context.user_data.get("awaiting_split"):
-            if not current_file or current_file.get("type") != "video":
-                await update.message.reply_text("❌ No video available to split.")
-            else:
-                # Basic placeholder: accept 'start-end' or integer parts
-                try:
-                    if "-" in user_input:
-                        start_s, end_s = user_input.split("-", 1)
-                        start = float(start_s.strip())
-                        end = float(end_s.strip())
-                        await update.message.reply_text(
-                            f"✅ Split request queued for {start}s to {end}s. Processing..."
-                        )
-                        # Try to call converter.split if available
-                        try:
-                            output_base = (
-                                getattr(config, "OUTPUT_PATH", "storage/output") if config else "storage/output"
-                            )
-                            with contextlib.suppress(OSError):
-                                os.makedirs(output_base, exist_ok=True)
-                            out = os.path.join(output_base, f"{current_file['id']}_split_{int(start)}_{int(end)}.mp4")
-                            if hasattr(self.converter, "split_video"):
-                                success = await self.converter.split_video(current_file["path"], start, end, out)
-                                if success and os.path.exists(out):
-                                    await self._send_video_result(
-                                        context.bot,
-                                        update.effective_chat.id,
-                                        out,
-                                        caption=_metadata_caption(current_file),
-                                    )
-                                    os.remove(out)
-                                else:
-                                    await update.message.reply_text("⚠️ Split finished but no file produced.")
-                        except Exception:
-                            logger.exception("split_video failed")
-                    else:
-                        await update.message.reply_text(
-                            "⚠️ Split-into-equal-parts is not yet implemented. "
-                            "Use a range like `00:10-00:20` (start-end in HH:MM:SS) instead."
-                        )
-                except Exception:
-                    await update.message.reply_text(
-                        "❌ Invalid split format. Use 'start-end' or an integer number of parts."
-                    )
+            # The whole split - splitting and the one-at-a-time delivery of the
+            # parts - lives in one place, for video and audio alike.
+            await self._handle_split_request(update, context, session, user_input)
             for key in list(context.user_data.keys()):
                 if key.startswith("awaiting_"):
                     del context.user_data[key]
@@ -9753,7 +10393,16 @@ class EnhancedMediaHandler:
                     # Try sending with validation and robust error handling
                     try:
                         # Choose send method; document is a safer fallback for large files
-                        caption = current_file.get("caption", "")
+                        caption = current_file.get("caption", "") or _metadata_caption(current_file)
+                        # A forwarded file has to arrive under the name the user
+                        # sent it with: without these the forwarded copy is named
+                        # after the local temp path this session happens to use.
+                        _forward_name = _document_delivery_name(current_file, path)
+                        _forward_audio = _audio_delivery_name(
+                            current_file.get("name"),
+                            current_file.get("id"),
+                            extension=os.path.splitext(str(path or ""))[1] or ".mp3",
+                        )
 
                         if current_file.get("type") == "video":
                             # Prefer send_video; fallback to send_document on failure
@@ -9763,24 +10412,37 @@ class EnhancedMediaHandler:
                                     dest_chat.id,
                                     path,
                                     caption=caption,
+                                    delivery_name=_forward_name,
                                 )
                             except Exception:
                                 logger.exception("send_video failed, trying send_document as fallback")
                                 with open(path, "rb") as f:
-                                    await context.bot.send_document(chat_id=dest_chat.id, document=f, caption=caption)
+                                    await context.bot.send_document(
+                                        chat_id=dest_chat.id, document=f, caption=caption, filename=_forward_name
+                                    )
 
                         elif current_file.get("type") == "audio":
                             try:
                                 with open(path, "rb") as f:
-                                    await context.bot.send_audio(chat_id=dest_chat.id, audio=f, caption=caption)
+                                    await context.bot.send_audio(
+                                        chat_id=dest_chat.id,
+                                        audio=f,
+                                        caption=caption,
+                                        filename=_forward_audio,
+                                        **_audio_tag_kwargs(current_file, _forward_audio),
+                                    )
                             except Exception:
                                 logger.exception("send_audio failed, trying send_document as fallback")
                                 with open(path, "rb") as f:
-                                    await context.bot.send_document(chat_id=dest_chat.id, document=f, caption=caption)
+                                    await context.bot.send_document(
+                                        chat_id=dest_chat.id, document=f, caption=caption, filename=_forward_audio
+                                    )
 
                         else:
                             with open(path, "rb") as f:
-                                await context.bot.send_document(chat_id=dest_chat.id, document=f, caption=caption)
+                                await context.bot.send_document(
+                                    chat_id=dest_chat.id, document=f, caption=caption, filename=_forward_name
+                                )
 
                         await update.message.reply_text("✅ Forwarded file successfully.")
                     except Exception as e:
@@ -9912,6 +10574,8 @@ class EnhancedMediaHandler:
                         update.effective_chat.id,
                         output_path,
                         caption=_metadata_caption(current_file),
+                        delivery_name=_video_delivery_name(current_file, output_path),
+                        upload_mode=_user_upload_mode(update.effective_user.id),
                     )
                     os.remove(output_path)
                 else:
@@ -9977,6 +10641,8 @@ class EnhancedMediaHandler:
                         update.effective_chat.id,
                         output_path,
                         caption=_metadata_caption(current_file),
+                        delivery_name=_video_delivery_name(current_file, output_path),
+                        upload_mode=_user_upload_mode(update.effective_user.id),
                     )
                     os.remove(output_path)
                 else:
@@ -10005,6 +10671,8 @@ class EnhancedMediaHandler:
                         update.effective_chat.id,
                         output_path,
                         caption=_metadata_caption(current_file),
+                        delivery_name=_video_delivery_name(current_file, output_path),
+                        upload_mode=_user_upload_mode(update.effective_user.id),
                     )
                     os.remove(output_path)
                 else:

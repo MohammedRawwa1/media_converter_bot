@@ -29,6 +29,7 @@ from .conversion_tasks import (
     normalize_audio,
     optimize_video,
     repair_video,
+    split_media_segments,
     take_screenshot,
     trim_media,
 )
@@ -74,6 +75,7 @@ __all__ = [
     "merge_audios",
     "take_screenshot",
     "change_resolution",
+    "split_media_segments",
     "trim_media",
     "repair_video",
     "optimize_video",

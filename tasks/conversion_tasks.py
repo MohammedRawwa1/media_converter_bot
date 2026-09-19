@@ -581,6 +581,106 @@ async def trim_media(input_path: str, output_path: str, start_time: str, end_tim
         return False, str(e)
 
 
+async def split_media_segments(
+    input_path: str,
+    output_dir: str,
+    segment_seconds: float,
+    *,
+    ext: str = ".mp4",
+    stem: str = "part",
+) -> tuple[bool, list[str], str]:
+    """Cut one media file into parts of *segment_seconds*, one file per part.
+
+    This is the stream-copy split, and it is the same command for a video and an
+    audio file - only the extension of the parts differs::
+
+        ffmpeg -i in.mp4 -c copy -map 0 -segment_time 3600 -f segment \\
+               -reset_timestamps 1 out/Concert.%03d.mp4
+
+    ``-c copy`` means no re-encode: the parts are the original bytes, cut at
+    segment boundaries, so splitting an hour-long file costs seconds, not hours.
+    ``-map 0`` keeps every stream of the source (video, audio, subtitle tracks),
+    and ``-reset_timestamps 1`` restarts each part at 00:00 so a player shows the
+    part's own duration instead of an hour-long timeline.
+
+    Returns ``(ok, parts, error)``: the sorted list of files that were written, so
+    a caller can deliver them in order, and the ffmpeg stderr tail when it failed.
+
+    *stem* is the media's own name, so a split of ``Concert.mp4`` yields
+    ``Concert.001.mp4``, ``Concert.002.mp4``, ... - the numbering Telegram users
+    expect from a self-extracting archive, and the original name the user
+    recognises instead of a storage path. The caller owns *output_dir* and is
+    expected to give a fresh one per run, which is what keeps parts apart.
+    """
+    ok, message = _validate_input_file(input_path)
+    if not ok:
+        return False, [], message
+
+    try:
+        segment = float(segment_seconds)
+    except (TypeError, ValueError):
+        return False, [], "invalid segment length"
+    if segment <= 0:
+        return False, [], "invalid segment length"
+
+    ext = ext if str(ext).startswith(".") else f".{ext}"
+    # Traversal hardening: the stem ends up in a path, so only its file name part
+    # is kept.
+    safe_stem = os.path.basename(str(stem or "part")) or "part"
+    try:
+        os.makedirs(output_dir, exist_ok=True)
+    except Exception as e:
+        return False, [], f"cannot create the output directory: {e}"
+
+    # A float-typed second is what ``-segment_time`` takes; ``3600`` and
+    # ``01:00:00`` are the same to ffmpeg, and the number cannot be misread.
+    segment_arg = f"{segment:.3f}".rstrip("0").rstrip(".")
+    # ``Stem.%03d.ext``: ffmpeg numbers the parts itself, so the files on disk are
+    # already named the way they are delivered - nothing has to be renamed later,
+    # and no delivery can fall back to naming a part after its storage path.
+    pattern = os.path.join(output_dir, f"{safe_stem}.%03d{ext}")
+    cmd = [
+        FFMPEG_PATH,
+        "-y",
+        "-i",
+        input_path,
+        "-c",
+        "copy",
+        "-map",
+        "0",
+        "-segment_time",
+        segment_arg,
+        "-f",
+        "segment",
+        "-reset_timestamps",
+        "1",
+        pattern,
+    ]
+
+    try:
+        process = await _spawn_process(*cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+        _stdout, stderr = await process.communicate()
+    except Exception as e:
+        logger.error(f"Exception in split_media_segments: {e}")
+        return False, [], str(e)
+
+    if process.returncode != 0:
+        error = stderr.decode("utf-8", errors="ignore")[-300:]
+        logger.error(f"split_media_segments failed: {error}")
+        return False, [], error
+
+    prefix = f"{safe_stem}."
+    parts = sorted(
+        os.path.join(output_dir, name)
+        for name in os.listdir(output_dir)
+        if name.startswith(prefix) and name.endswith(ext) and os.path.getsize(os.path.join(output_dir, name)) > 0
+    )
+    if not parts:
+        return False, [], "ffmpeg produced no parts"
+    logger.info(f"Split media into {len(parts)} part(s) of ~{segment_arg}s")
+    return True, parts, ""
+
+
 async def repair_video(input_path: str, output_path: str) -> tuple[bool, str]:
     """Repair corrupted video asynchronously."""
     try:

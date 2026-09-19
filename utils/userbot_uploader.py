@@ -602,6 +602,7 @@ async def _send_with_telethon(
     media_kind: str | None = None,
     delivery_name: str | None = None,
     audio_meta: dict | None = None,
+    as_document: bool = False,
 ) -> int | None:
     """Send a file using Telethon.
 
@@ -627,6 +628,8 @@ async def _send_with_telethon(
                     the file extension.
         delivery_name: Filename shown in Telegram (defaults to the file's name).
         audio_meta: Pre-probed audio metadata (``duration``/``title``/``performer``).
+        as_document: Send non-audio outputs as a Telegram document instead of
+                    playable media (the ``upload_mode`` preference).
 
     Returns:
         The sent message ID on success, or None on failure.
@@ -661,6 +664,10 @@ async def _send_with_telethon(
 
     _is_audio = is_audio_delivery_output(file_path, media_kind)
     _delivery_name = delivery_name or os.path.basename(file_path)
+    # Audio is never forced into the document view: a music file rendered as a
+    # plain download has lost the thing that made it useful. Everything else
+    # can be, when the user asked for documents in /usersettings.
+    _as_document = bool(as_document) and not _is_audio
 
     # Pre-fetch video metadata and thumbnail before connecting.
     # Gracefully fall back to a generic send if ffprobe isn't available.
@@ -676,12 +683,17 @@ async def _send_with_telethon(
             except Exception:
                 audio_meta = {}
         video_meta = video_meta or {}
+    elif _as_document:
+        # A document needs no duration, dimensions or preview frame, so the
+        # probe and the thumbnail generation are skipped entirely - worth doing
+        # for a large file that only had to be re-uploaded as its own bytes.
+        video_meta = {}
     elif video_meta is None:
         try:
             video_meta = await _probe_video_metadata(file_path) or {}
         except Exception:
             video_meta = {}
-    if not _is_audio and thumb_path is None:
+    if not _is_audio and not _as_document and thumb_path is None:
         try:
             thumb_path = await _generate_video_thumbnail(file_path)
             if thumb_path:
@@ -719,7 +731,28 @@ async def _send_with_telethon(
         # If parallel upload returned None (memory guard triggered), use
         # the raw file_path instead and let Telethon upload sequentially.
         _file_arg = uploaded_file if uploaded_file is not None else file_path
-        if _is_audio:
+        if _as_document:
+            from telethon.tl.types import DocumentAttributeFilename
+
+            # Only the filename attribute: without a video/audio attribute
+            # Telegram files this as a document, and the explicit filename
+            # keeps the on-disk name (with its collision suffix) out of the chat.
+            kwargs = {
+                "caption": caption or "",
+                "attributes": [DocumentAttributeFilename(file_name=_delivery_name)],
+            }
+            # Only pass progress_callback for sequential upload (parallel handles its own)
+            if uploaded_file is None and progress_callback is not None:
+                kwargs["progress_callback"] = progress_callback
+            msg = await client.send_file(target, _file_arg, **kwargs)
+            logger.info(
+                "userbot: Telethon sent document %s to %s as %s (msg_id=%s)",
+                file_path,
+                target,
+                _delivery_name,
+                getattr(msg, "id", None),
+            )
+        elif _is_audio:
             from telethon.tl.types import DocumentAttributeAudio, DocumentAttributeFilename
 
             audio_meta = audio_meta or {}
@@ -932,6 +965,36 @@ async def _send_video_raw(
     return await _send_media_raw(client, target, media, caption=caption, file_path=file_path)
 
 
+async def _send_document_raw(
+    client,  # pyrogram.Client — noqa: F821
+    target: int | str,
+    file_path: str,
+    uploaded_file,  # raw.types.InputFile or InputFileBig
+    caption: str = "",
+    delivery_name: str | None = None,
+) -> int | None:
+    """Send a pre-uploaded file as a plain document via the raw Telegram API.
+
+    Same reason as ``_send_video_raw``: Pyrogram's ``send_document`` cannot take
+    an already-uploaded ``InputFile`` and would upload the file a second time.
+
+    Only ``DocumentAttributeFilename`` is attached, and deliberately no video
+    attribute: that is what makes Telegram show the file in the document view
+    (downloadable, named) instead of as playable media with a preview. It is
+    also what carries the user-facing name, which the raw message would
+    otherwise take from the on-disk path.
+    """
+    from pyrogram import raw
+
+    name = delivery_name or os.path.basename(file_path)
+    media = raw.types.InputMediaUploadedDocument(
+        mime_type=client.guess_mime_type(file_path) or "application/octet-stream",
+        file=uploaded_file,
+        attributes=[raw.types.DocumentAttributeFilename(file_name=name)],
+    )
+    return await _send_media_raw(client, target, media, caption=caption, file_path=file_path)
+
+
 async def _send_audio_raw(
     client,  # pyrogram.Client — noqa: F821
     target: int | str,
@@ -1026,6 +1089,7 @@ async def _send_with_pyrogram(
     media_kind: str | None = None,
     delivery_name: str | None = None,
     audio_meta: dict | None = None,
+    as_document: bool = False,
 ) -> int | None:
     """Send a file using Pyrogram (session string fallback).
 
@@ -1050,6 +1114,8 @@ async def _send_with_pyrogram(
                     the file extension.
         delivery_name: Filename shown in Telegram (defaults to the file's name).
         audio_meta: Pre-probed audio metadata (``duration``/``title``/``performer``).
+        as_document: Send non-audio outputs as a Telegram document instead of
+                    playable media (the ``upload_mode`` preference).
 
     Returns:
         The sent message ID on success, or None on failure.
@@ -1080,6 +1146,10 @@ async def _send_with_pyrogram(
 
     _is_audio = is_audio_delivery_output(file_path, media_kind)
     _delivery_name = delivery_name or os.path.basename(file_path)
+    # Audio is never forced into the document view: a music file rendered as a
+    # plain download has lost the thing that made it useful. Everything else
+    # can be, when the user asked for documents in /usersettings.
+    _as_document = bool(as_document) and not _is_audio
 
     # Pre-fetch video metadata and thumbnail before connecting to Telegram.
     # If video_meta/thumb_path were provided externally, skip internal probe.
@@ -1091,12 +1161,17 @@ async def _send_with_pyrogram(
             except Exception:
                 audio_meta = {}
         video_meta = video_meta or {}
+    elif _as_document:
+        # A document needs no duration, dimensions or preview frame, so the
+        # probe and the thumbnail generation are skipped entirely - worth doing
+        # for a large file that only had to be re-uploaded as its own bytes.
+        video_meta = {}
     elif video_meta is None:
         try:
             video_meta = await _probe_video_metadata(file_path) or {}
         except Exception:
             video_meta = {}
-    if not _is_audio and thumb_path is None:
+    if not _is_audio and not _as_document and thumb_path is None:
         try:
             thumb_path = await _generate_video_thumbnail(file_path)
             if thumb_path:
@@ -1132,6 +1207,15 @@ async def _send_with_pyrogram(
                     uploaded_file,
                     caption=caption or "",
                     audio_meta=audio_meta,
+                    delivery_name=_delivery_name,
+                )
+            elif _as_document:
+                msg_id = await _send_document_raw(
+                    client,
+                    target,
+                    file_path,
+                    uploaded_file,
+                    caption=caption or "",
                     delivery_name=_delivery_name,
                 )
             else:
@@ -1174,6 +1258,23 @@ async def _send_with_pyrogram(
             msg = await client.send_audio(target, file_path, **kwargs)
             logger.info(
                 "userbot: Pyrogram sent audio %s to %s as %s (msg_id=%s)",
+                file_path,
+                target,
+                _delivery_name,
+                getattr(msg, "id", None),
+            )
+            return getattr(msg, "id", None)
+
+        if _as_document:
+            # Fallback: let Pyrogram handle upload + send via send_document,
+            # which forces the document view and names the file explicitly.
+            logger.info("userbot: Pyrogram falling back to send_document for %s", file_path)
+            kwargs = {"caption": caption or "", "file_name": _delivery_name}
+            if progress_callback is not None:
+                kwargs["progress"] = progress_callback
+            msg = await client.send_document(target, file_path, **kwargs)
+            logger.info(
+                "userbot: Pyrogram sent document %s to %s as %s (msg_id=%s)",
                 file_path,
                 target,
                 _delivery_name,
@@ -1230,6 +1331,7 @@ async def _send_with_pyrogram_bot(
     media_kind: str | None = None,
     delivery_name: str | None = None,
     audio_meta: dict | None = None,
+    as_document: bool = False,
 ) -> int | None:
     """Send a video/audio using Pyrogram authenticated as the bot (bot token).
 
@@ -1262,6 +1364,10 @@ async def _send_with_pyrogram_bot(
 
     _is_audio = is_audio_delivery_output(file_path, media_kind)
     _delivery_name = delivery_name or os.path.basename(file_path)
+    # Audio is never forced into the document view: a music file rendered as a
+    # plain download has lost the thing that made it useful. Everything else
+    # can be, when the user asked for documents in /usersettings.
+    _as_document = bool(as_document) and not _is_audio
 
     # Pre-fetch video metadata and thumbnail before connecting.
     _thumb_dir = None
@@ -1272,12 +1378,17 @@ async def _send_with_pyrogram_bot(
             except Exception:
                 audio_meta = {}
         video_meta = video_meta or {}
+    elif _as_document:
+        # A document needs no duration, dimensions or preview frame, so the
+        # probe and the thumbnail generation are skipped entirely - worth doing
+        # for a large file that only had to be re-uploaded as its own bytes.
+        video_meta = {}
     elif video_meta is None:
         try:
             video_meta = await _probe_video_metadata(file_path) or {}
         except Exception:
             video_meta = {}
-    if not _is_audio and thumb_path is None:
+    if not _is_audio and not _as_document and thumb_path is None:
         try:
             thumb_path = await _generate_video_thumbnail(file_path)
             if thumb_path:
@@ -1314,6 +1425,15 @@ async def _send_with_pyrogram_bot(
                     uploaded_file,
                     caption=caption or "",
                     audio_meta=audio_meta,
+                    delivery_name=_delivery_name,
+                )
+            elif _as_document:
+                msg_id = await _send_document_raw(
+                    bot,
+                    target,
+                    file_path,
+                    uploaded_file,
+                    caption=caption or "",
                     delivery_name=_delivery_name,
                 )
             else:
@@ -1356,6 +1476,23 @@ async def _send_with_pyrogram_bot(
             msg = await bot.send_audio(target, file_path, **kwargs)
             logger.info(
                 "userbot: Pyrogram (bot) sent audio %s to %s as %s (msg_id=%s)",
+                file_path,
+                target,
+                _delivery_name,
+                getattr(msg, "id", None),
+            )
+            return getattr(msg, "id", None)
+
+        if _as_document:
+            # Fallback: let Pyrogram handle upload + send via send_document,
+            # which forces the document view and names the file explicitly.
+            logger.info("userbot: Pyrogram (bot) falling back to send_document for %s", file_path)
+            kwargs = {"caption": caption or "", "file_name": _delivery_name}
+            if progress_callback is not None:
+                kwargs["progress"] = progress_callback
+            msg = await bot.send_document(target, file_path, **kwargs)
+            logger.info(
+                "userbot: Pyrogram (bot) sent document %s to %s as %s (msg_id=%s)",
                 file_path,
                 target,
                 _delivery_name,
@@ -1414,6 +1551,7 @@ async def send_file_via_userbot(
     media_kind: str | None = None,
     delivery_name: str | None = None,
     audio_meta: dict | None = None,
+    as_document: bool = False,
 ) -> int | None:
     """Send a file using a user account or bot.
 
@@ -1446,6 +1584,9 @@ async def send_file_via_userbot(
                     the file extension decide.
         delivery_name: Filename shown in Telegram (defaults to the file's name).
         audio_meta: Pre-probed audio metadata (``duration``/``title``/``performer``).
+        as_document: Send non-audio outputs as a Telegram document instead of
+                    playable media, matching the ``upload_mode`` preference from
+                    /usersettings. Set on the job by ``enqueue_job``.
 
     Returns:
         The sent message ID on success, or None on failure.
@@ -1475,6 +1616,7 @@ async def send_file_via_userbot(
                 media_kind=media_kind,
                 delivery_name=delivery_name,
                 audio_meta=audio_meta,
+                as_document=as_document,
             )
             if msg_id is not None:
                 return msg_id
@@ -1498,6 +1640,7 @@ async def send_file_via_userbot(
                 media_kind=media_kind,
                 delivery_name=delivery_name,
                 audio_meta=audio_meta,
+                as_document=as_document,
             )
             if msg_id is not None:
                 return msg_id
@@ -1520,6 +1663,7 @@ async def send_file_via_userbot(
             media_kind=media_kind,
             delivery_name=delivery_name,
             audio_meta=audio_meta,
+            as_document=as_document,
         )
         if msg_id is not None:
             return msg_id

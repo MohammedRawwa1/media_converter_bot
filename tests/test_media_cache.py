@@ -544,14 +544,24 @@ def test_photo_path_uses_the_cache_too():
 
 
 def test_remote_s3_streaming_path_uses_the_shared_library_key():
-    """The S3/R2 streaming branch must reuse and remember under the library key."""
+    """The S3/R2 streaming branch must reuse and remember under the library key.
+
+    The store itself goes through the shared helper now, so what is asserted is
+    the key it is given and that the job's key comes back from what was stored -
+    plus the descriptor, which the same helper writes in one shape for every
+    producer.
+    """
     src = _handlers_source()
 
     assert "media_library_key(_cache_uid)" in src
     assert 'f"inputs/{_job_id}/source{ext}"' in src
-    assert '_input_key = _library_key or f"inputs/{_job_id}/source{ext}"' in src
+    assert 'key=_library_key or f"inputs/{_job_id}/source{ext}"' in src
+    assert "store_source(" in src and "_input_key = _ref.job_key" in src
+    assert "record_source(" in src
     assert "_media_cache.remember(" in src
-    assert 'storage="s3",' in src
+    # The descriptor shape itself (``storage="s3"``, header vs whole) is written
+    # once, by the shared helper, rather than restated at every producer.
+    assert '"storage": "s3"' in read_source("utils", "source_store.py")
 
 
 def test_both_download_pipes_share_one_key_scheme():

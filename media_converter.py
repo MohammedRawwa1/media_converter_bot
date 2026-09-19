@@ -187,17 +187,20 @@ class ExtendedMediaConverter:
         success, _ = await _merge_auds(audio_paths, output_path)
         return success
 
-    async def split_video(self, input_path: str, output_pattern: str, segment_time: str = "01:00:00") -> list[str]:
-        """Split video into segments."""
-        cmd = ["-c", "copy", "-map", "0", "-segment_time", segment_time, "-f", "segment", "-reset_timestamps", "1"]
-        success = (await self.execute_ffmpeg(cmd, input_path, output_pattern))[0]
+    async def split_video(
+        self, input_path: str, output_dir: str, segment_seconds: float = 3600, *, ext: str = ".mp4", stem: str = "part"
+    ) -> list[str]:
+        """Split a video or an audio file into numbered parts.
 
-        if success:
-            # Find generated files
-            base_dir = os.path.dirname(output_pattern)
-            prefix = os.path.basename(output_pattern).split("%03d")[0]
-            return sorted([f for f in os.listdir(base_dir) if f.startswith(prefix)])
-        return []
+        Delegates to the canonical splitter (``tasks.conversion_tasks.split_media_segments``),
+        which is the one implementation of the ``-f segment`` copy: a second copy
+        here is how this method came to take arguments its callers never passed.
+        Parts are named ``<stem>.001<ext>``, ``<stem>.002<ext>``, ...
+        """
+        from tasks.conversion_tasks import split_media_segments
+
+        ok, parts, _message = await split_media_segments(input_path, output_dir, segment_seconds, ext=ext, stem=stem)
+        return parts if ok else []
 
     async def split_video_range(self, input_path: str, start: float, end: float, output_path: str) -> bool:
         """Split a single range from video between start and end (seconds).

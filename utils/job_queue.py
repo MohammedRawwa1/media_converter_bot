@@ -50,6 +50,36 @@ def _as_hash_str(value):
     return str(value) or None
 
 
+# How a queued video output should reach the user: playable media (Telegram
+# shows a preview) or a document. Mirrors utils.callbacks.UPLOAD_MODE_*.
+_UPLOAD_MODES = ("video", "file")
+
+
+def _stamp_upload_mode(job: dict) -> None:
+    """Copy the owner's video delivery preference onto the job payload.
+
+    Done at the one place every job passes through, so a conversion queued by
+    the bot, the web UI or a script is delivered the way /usersettings asks
+    without each call site having to remember to pass it. An explicit
+    ``upload_mode`` already on the payload always wins.
+    """
+    if job.get("upload_mode"):
+        return
+    owner = job.get("user_id") or job.get("chat_id")
+    if not owner:
+        return
+    try:
+        # Imported lazily: this module is used by the worker too, where the
+        # settings store may not exist and the default is the right answer.
+        from utils.user_settings import get_user_setting
+
+        mode = str(get_user_setting(owner, "upload_mode") or "").strip().lower()
+        if mode in _UPLOAD_MODES:
+            job["upload_mode"] = mode
+    except Exception:
+        logger.debug("job_queue: could not read upload_mode for %s", owner)
+
+
 def _normalized_hash(stored: dict | None) -> dict:
     """Normalize a hash read without ``decode_responses`` (bytes keys) to str keys.
 
@@ -256,6 +286,8 @@ async def enqueue_job(job: dict) -> None:
     except Exception:
         logger.debug("job_queue: failed to set request_id for job")
 
+    _stamp_upload_mode(job)
+
     # Initialize a Redis job hash so status endpoints see the job immediately.
     # Write the job hash before pushing to the list to avoid a race where a
     # worker pops the job before the metadata has been created.
@@ -293,6 +325,10 @@ async def enqueue_job(job: dict) -> None:
             # name already stored for this job id.
             for _field, _value in stored_job_naming(job).items():
                 mapping[_field] = _value
+            # Kept in the hash as well as the payload so a status view can show
+            # how the result will be delivered.
+            if job.get("upload_mode"):
+                mapping["upload_mode"] = str(job["upload_mode"])
             # Attempt to set the hash first
             try:
                 await r.hset(f"ffmpeg:job:{job_id}", mapping=mapping)

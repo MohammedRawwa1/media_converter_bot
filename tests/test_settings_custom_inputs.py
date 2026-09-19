@@ -94,8 +94,11 @@ class _StubHandler:
     async def _ensure_current_file_downloaded(self, update, context, session):
         return None
 
-    async def _send_video_result(self, bot, chat_id, file_path, caption=""):
+    async def _send_video_result(self, bot, chat_id, file_path, caption="", **delivery_options):
+        # Mirrors the real helper's signature, which also takes the delivered
+        # name and the user's media/document preference.
         self.sent["video"] = file_path
+        self.sent["video_options"] = delivery_options
         return "file-id"
 
     async def safe_edit(self, query, text, **kwargs):

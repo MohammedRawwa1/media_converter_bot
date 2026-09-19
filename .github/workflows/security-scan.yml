@@ -260,8 +260,16 @@ jobs:
         run: |
           # Same resolution target as the image (Dockerfile base: linux/amd64,
           # Python 3.12). If this command ever changes, update the lock header too.
+          #
+          # --upgrade is what makes this a *fresh* resolution. Without it uv
+          # prefers the versions already in an existing output file, so the
+          # committed lock silently went stale: re-running the documented
+          # command in place kept multidict 6.8.0 while this check (writing to a
+          # path that does not exist yet) resolved 6.9.0 and failed. Passing it
+          # here and in the header keeps the two commands identical.
           uv pip compile requirements.txt \
             --generate-hashes \
+            --upgrade \
             --python-version 3.12 \
             --python-platform x86_64-unknown-linux-gnu \
             --output-file /tmp/regenerated.lock

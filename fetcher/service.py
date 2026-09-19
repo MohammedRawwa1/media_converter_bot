@@ -31,6 +31,24 @@ try:
 except Exception:
     get_storage_backend = None
 
+try:
+    from utils.source_store import SourceRef, record_source, source_upload_mode, store_source
+except Exception:  # pragma: no cover - the module is part of the project
+    store_source = None
+    record_source = None
+    source_upload_mode = None
+
+    class SourceRef:  # type: ignore[no-redef]
+        """Fallback stand-in, so a broken import cannot fail the whole fetch."""
+
+        def __init__(self, mode=None, key=None, job_key=None, header_only=False, bytes=0):
+            self.mode = mode
+            self.key = key
+            self.job_key = job_key
+            self.header_only = header_only
+            self.bytes = bytes
+
+
 logger = logging.getLogger(__name__)
 
 
@@ -104,8 +122,17 @@ async def process_forward_hash(forward_hash: str):
         logger.exception("fetcher: exception during download for %s", forward_hash)
         return False
 
-    # Optionally upload the fetched input to remote storage (S3/R2/MinIO)
+    # Store the fetched input through the one shared helper, so this service
+    # keeps exactly what the bot's own pipeline keeps for the same media under
+    # the same `PIPELINE_SOURCE_UPLOAD` mode (utils/source_store.py).
+    #
+    # The forward carries where the media came from, which makes this a producer
+    # that *can* hand the worker a second way to reach it - and that is what lets
+    # `header` mode store a probe header instead of the whole file. When it does,
+    # the job below carries those coordinates: a header is only a source if the
+    # media itself can still be read over MTProto.
     input_key = None
+    source_ref = SourceRef(mode=source_upload_mode())
     try:
         backend_name = config.get_storage_backend_name()
         if backend_name in ("s3", "r2") and get_storage_backend is not None:
@@ -116,12 +143,28 @@ async def process_forward_hash(forward_hash: str):
                 key = _shared_library_key(meta.get("file_unique_id")) or (
                     f"uploads/{job_uuid}_{os.path.basename(input_path)}"
                 )
-                await backend.upload_file(input_path, key)
+                source_ref = await store_source(
+                    backend,
+                    input_path,
+                    key=key,
+                    telegram_fallback=source_upload_mode() == "header",
+                    log_prefix="fetcher",
+                )
+                try:
+                    await record_source(
+                        meta.get("file_unique_id"),
+                        ref=source_ref,
+                        size=meta.get("size") or os.path.getsize(input_path),
+                        name=meta.get("name"),
+                        file_id=meta.get("file_id"),
+                    )
+                except Exception:
+                    logger.debug("fetcher: could not remember the source descriptor")
                 # remove local copy unless KEEP_LOCAL_UPLOADS set
                 if os.environ.get("KEEP_LOCAL_UPLOADS", "").lower() not in ("1", "true", "yes"):
                     with contextlib.suppress(Exception):
                         os.remove(input_path)
-                input_key = key
+                input_key = source_ref.job_key
             except Exception:
                 logger.exception("fetcher: failed to upload fetched input to storage for %s", forward_hash)
     except Exception:
@@ -151,9 +194,17 @@ async def process_forward_hash(forward_hash: str):
             "ffmpeg_args": ["-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-c:a", "aac", "-b:a", "128k"],
             "progress_channel": f"ffmpeg:progress:{job_id}",
             "chat_id": meta.get("chat_id"),
+            "file_unique_id": meta.get("file_unique_id"),
             "cleanup_input": True,
             "cleanup_output": False,
         }
+        # A stored object that is only a header is a probe reference: the job has
+        # to carry the Telegram copy this fetch came from, or the worker would
+        # have nothing to encode from.
+        if source_ref.header_only:
+            job["input_header_only"] = 1
+            job["source_chat_id"] = meta.get("chat_id")
+            job["source_message_id"] = meta.get("message_id") or meta.get("msg_id")
 
         if enqueue_job:
             await enqueue_job(job)

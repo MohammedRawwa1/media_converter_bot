@@ -239,3 +239,34 @@ BULK_SLIDESHOW_MAX = 30.0
 
 def bulk_slideshow_key(val) -> str:
     return f"{BULK_SLIDESHOW_PREFIX}{val}"
+
+
+# /usersettings. Every trigger below only ever *stores* a preference - it never
+# starts a conversion, so the panel stays a settings panel and opening it can
+# never encode whatever file happens to be loaded. Actions live in the menus.
+SETTINGS_RENAME_MENU = "settings_rename_menu"
+SETTINGS_WORDS_MENU = "settings_words_menu"
+SETTINGS_BITRATE_MENU = "settings_bitrate_menu"
+SETTINGS_BITRATE_PREFIX = "settings_set_bitrate:"
+SETTINGS_TOGGLE_PREFIX = "settings_toggle:"
+SETTINGS_TOOL_PREFIX = "settings_tool:"
+
+# The video delivery format: playable media (Telegram preview) or a document.
+# Shares the ``upload_mode`` user setting, so switching it here and switching it
+# in the settings panel are the same choice.
+SETTINGS_UPLOAD_MODE_PREFIX = "settings_upload_mode:"
+UPLOAD_MODE_VIDEO = "video"
+UPLOAD_MODE_FILE = "file"
+UPLOAD_MODES = (UPLOAD_MODE_VIDEO, UPLOAD_MODE_FILE)
+UPLOAD_MODE_LABELS = {
+    UPLOAD_MODE_VIDEO: "📺 Video (preview)",
+    UPLOAD_MODE_FILE: "📄 File (document)",
+}
+
+
+def settings_bitrate_key(val) -> str:
+    return f"{SETTINGS_BITRATE_PREFIX}{val}"
+
+
+def settings_upload_mode_key(mode: str) -> str:
+    return f"{SETTINGS_UPLOAD_MODE_PREFIX}{mode}"

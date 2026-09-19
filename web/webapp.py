@@ -15,6 +15,7 @@ from flask_cors import CORS
 
 import config
 from utils.job_access import JOB_CAPABILITY_PARAM, issue_job_token, job_token_ok
+from utils.source_store import source_library_key, store_source
 from utils.url_validation import _validate_url_safe
 from utils.web_auth import debug_token_ok, diag_token_ok, upload_token_ok
 
@@ -398,14 +399,28 @@ def upload():
                             _publish_upload_progress(j_id, 50, "Uploading to S3...")
                             try:
                                 b = get_storage_backend_sync()
-                                _asyncio.run(b.upload_file(inp_path, key_loc))
+                                # The shared source-store helper: one media is one
+                                # object under the identity key when the forward
+                                # carries one, and the configured mode decides
+                                # whether that object is the media or a probe header.
+                                _ref_loc = _asyncio.run(
+                                    store_source(
+                                        b,
+                                        inp_path,
+                                        key=source_library_key(m.get("file_unique_id")) or key_loc,
+                                        telegram_fallback=True,
+                                        log_prefix="webapp",
+                                    )
+                                )
                                 _publish_upload_progress(j_id, 80, "S3 upload complete")
-                                if os.environ.get("KEEP_LOCAL_UPLOADS", "").lower() not in ("1", "true", "yes"):
+                                if _ref_loc.stored and (
+                                    os.environ.get("KEEP_LOCAL_UPLOADS", "").lower() not in ("1", "true", "yes")
+                                ):
                                     with contextlib.suppress(Exception):
                                         os.remove(inp_path)
                                 job_loc = {
                                     "job_id": j_id,
-                                    "input_key": key_loc,
+                                    "input_key": _ref_loc.job_key,
                                     "output_path": os.path.join(OUTPUT_DIR, f"{j_id}.mp4"),
                                     "original_filename": m.get("name") or os.path.basename(inp_path),
                                     "output_filename": f"{j_id}.mp4",
@@ -424,6 +439,13 @@ def upload():
                                     "progress_channel": f"ffmpeg:progress:{j_id}",
                                     "cleanup_input": True,
                                 }
+                                # A probe header is a reference, not a source: the
+                                # job also carries the relay copy the media can be
+                                # read from, or there would be nothing to encode.
+                                if _ref_loc.header_only:
+                                    job_loc["input_header_only"] = 1
+                                    job_loc["source_chat_id"] = m.get("chat_id")
+                                    job_loc["source_message_id"] = m.get("message_id") or m.get("msg_id")
                             except Exception:
                                 logger.exception("Background upload failed for fetched forward %s", inp_path)
                                 _publish_upload_progress(j_id, 0, "S3 upload failed")
@@ -537,14 +559,25 @@ def upload():
                     _publish_upload_progress(j_id, 50, "Uploading to S3...")
                     try:
                         b = get_storage_backend_sync()
-                        _asyncio.run(b.upload_file(inp_path, key_loc))
+                        # Same helper as every other producer (utils/source_store.py).
+                        _ref_loc = _asyncio.run(
+                            store_source(
+                                b,
+                                inp_path,
+                                key=source_library_key(meta_obj.get("file_unique_id")) or key_loc,
+                                telegram_fallback=True,
+                                log_prefix="webapp",
+                            )
+                        )
                         _publish_upload_progress(j_id, 80, "S3 upload complete")
-                        if os.environ.get("KEEP_LOCAL_UPLOADS", "").lower() not in ("1", "true", "yes"):
+                        if _ref_loc.stored and (
+                            os.environ.get("KEEP_LOCAL_UPLOADS", "").lower() not in ("1", "true", "yes")
+                        ):
                             with contextlib.suppress(Exception):
                                 os.remove(inp_path)
                         job_loc = {
                             "job_id": j_id,
-                            "input_key": key_loc,
+                            "input_key": _ref_loc.job_key,
                             "output_path": os.path.join(OUTPUT_DIR, f"{j_id}.mp4"),
                             "original_filename": meta_obj.get("name") or os.path.basename(inp_path),
                             "output_filename": f"{j_id}.mp4",
@@ -563,6 +596,12 @@ def upload():
                             "progress_channel": f"ffmpeg:progress:{j_id}",
                             "cleanup_input": True,
                         }
+                        # A probe header is a reference, not a source: the job
+                        # carries the relay copy that can still be read.
+                        if _ref_loc.header_only:
+                            job_loc["input_header_only"] = 1
+                            job_loc["source_chat_id"] = meta_obj.get("chat_id")
+                            job_loc["source_message_id"] = meta_obj.get("message_id") or meta_obj.get("msg_id")
                     except Exception:
                         logger.exception("Background upload failed for fetched forward %s", inp_path)
                         _publish_upload_progress(j_id, 40, "S3 upload failed, using local fallback")
@@ -679,10 +718,17 @@ def upload():
                         import asyncio as _asyncio
 
                         _publish_upload_progress(jid, 20, "Uploading to S3 (0-50%)...", in_bytes=inp_bytes)
-                        _asyncio.run(b.upload_file(input_path, key))
+                        # The same helper as every other producer, on purpose: one
+                        # key-choice rule and one mode decision for the whole
+                        # system. This branch has no Telegram fallback - the bytes
+                        # arrived over HTTP - so the object always has to be the
+                        # media itself rather than a probe header.
+                        _ref = _asyncio.run(
+                            store_source(b, input_path, key=key, telegram_fallback=False, log_prefix="webapp")
+                        )
                         _publish_upload_progress(jid, 80, "S3 upload complete, cleaning up...", in_bytes=inp_bytes)
 
-                        if os.environ.get("KEEP_LOCAL_UPLOADS", "").lower() not in ("1", "true", "yes"):
+                        if _ref.stored and os.environ.get("KEEP_LOCAL_UPLOADS", "").lower() not in ("1", "true", "yes"):
                             with contextlib.suppress(Exception):
                                 os.remove(input_path)
                     except Exception:
@@ -690,7 +736,8 @@ def upload():
                         _publish_upload_progress(jid, 0, "S3 upload failed", in_bytes=inp_bytes)
                         # fallthrough; enqueue with local path as a fallback
                     else:
-                        j["input_key"] = key
+                        if _ref.job_key:
+                            j["input_key"] = _ref.job_key
 
                 # attach request id for tracing
                 try:

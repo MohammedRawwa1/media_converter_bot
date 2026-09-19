@@ -291,6 +291,56 @@ async def _stored_source_for_job(job: dict) -> str | None:
     return key
 
 
+async def _fetch_source_url_to_path(url: str, dest_path: str, *, timeout: int = 60) -> bool:
+    """Fetch a job's ``source_url`` onto disk - the one way this worker does it.
+
+    A URL source is needed in two places: when the job is picked up, and again
+    when a failed job is re-downloaded mid-run. Both used to carry their own copy
+    of this, which is how the SSRF check, the no-redirect rule and the write could
+    drift apart. They share this instead.
+
+    The SSRF re-validation is deliberate defence in depth: producers (the web API)
+    do validate, but the worker trusts the queue, and the queue can be written by
+    anything that can reach Redis/RabbitMQ/Kafka - including ``/bulk_url``, which
+    takes a URL straight from a Telegram message. Redirects are never followed for
+    the same reason: a redirect to an internal address would bypass the check.
+
+    The bytes land in a sibling ``.part`` file and are only swapped in once the
+    whole body is there, so an interrupted fetch cannot leave a truncated file
+    that ffmpeg would happily encode as if it were the source.
+    """
+    from utils.url_validation import _validate_url_safe
+
+    if not isinstance(url, str) or not _validate_url_safe(url):
+        logger.warning(
+            "refusing a source_url that fails SSRF validation (host=%s)",
+            urlparse(url).hostname if isinstance(url, str) else "?",
+        )
+        return False
+
+    part_path = f"{dest_path}.part"
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=timeout), allow_redirects=False) as resp:
+                if resp.status != 200:
+                    logger.warning("source_url fetch returned %s for %s", resp.status, url)
+                    return False
+                with open(part_path, "wb") as fh:
+                    async for chunk in resp.content.iter_chunked(1024 * 64):
+                        fh.write(chunk)
+        if os.path.exists(part_path) and os.path.getsize(part_path) > 0:
+            os.replace(part_path, dest_path)
+            return True
+        return False
+    except Exception:
+        logger.exception("source_url fetch failed for %s", url)
+        return False
+    finally:
+        with contextlib.suppress(OSError):
+            if os.path.exists(part_path):
+                os.remove(part_path)
+
+
 async def _check_upload_cancelled(job_id: str) -> bool:
     """Quick Redis check: return True if this job has been cancelled."""
     if not job_id:
@@ -475,6 +525,7 @@ async def _send_video_result(
     vid_width: int | None = None,
     vid_height: int | None = None,
     file_unique_id: str | None = None,
+    delivery_name: str | None = None,
 ) -> str | None:
     """Open a video file, wrap with upload progress, and send_video with metadata.
 
@@ -542,6 +593,11 @@ async def _send_video_result(
                 "caption": caption,
                 "supports_streaming": True,
             }
+            # Without an explicit name the Bot API names the video after the
+            # uploaded part, i.e. the local output path - which is where the
+            # collision suffix would otherwise surface in the chat.
+            if delivery_name:
+                _send_kwargs["filename"] = os.path.basename(delivery_name)
             if vid_duration is not None:
                 _send_kwargs["duration"] = vid_duration
             if vid_width is not None:
@@ -682,6 +738,20 @@ _DEFERRED_RETRY_BACKOFF_SECONDS = float(os.getenv("DEFERRED_DELIVERY_RETRY_BACKO
 _DEFERRED_SWEEP_LIMIT = int(os.getenv("DEFERRED_DELIVERY_SWEEP_LIMIT", "5"))
 
 
+def _deliver_as_document(job) -> bool:
+    """Whether this job's output belongs in Telegram's document view.
+
+    The ``upload_mode`` preference from /usersettings, stamped onto the job by
+    ``enqueue_job``. Audio is deliberately not affected - the upload helpers
+    ignore this for audio outputs, because a music file sent as a plain download
+    has lost the player that makes it useful.
+    """
+    try:
+        return str((job or {}).get("upload_mode") or "").strip().lower() == "file"
+    except Exception:
+        return False
+
+
 def _deferred_media_kind(record: dict) -> str:
     """How a deferred output has to be sent: audio, video, or a plain file."""
     name = record.get("delivery_name") or record.get("output") or ""
@@ -692,6 +762,10 @@ def _deferred_media_kind(record: dict) -> str:
             return "audio"
     except Exception:
         logger.debug("deferred delivery: audio detection unavailable for %s", name)
+    # The user's choice outranks the extension: a retried delivery has to arrive
+    # the same way the first attempt would have sent it.
+    if _deliver_as_document(record):
+        return "document"
     if os.path.splitext(name)[1].lower() in (".mp4", ".mkv", ".mov", ".webm", ".avi"):
         return "video"
     return "document"
@@ -728,6 +802,9 @@ async def _defer_delivery(
         "output_key": output_key,
         "delivery_name": delivery_name,
         "media_kind": media_kind,
+        # Carried so the retry after the flood window sends it the same way the
+        # first attempt would have (see _deferred_media_kind).
+        "upload_mode": (job or {}).get("upload_mode"),
         "caption": caption,
         "link_url": get_url,
         "cleanup_output": bool(job.get("cleanup_output", False)),
@@ -1833,38 +1910,18 @@ async def handle_job(job: dict):
     temp_input = None
     source_url = job.get("source_url")
     if source_url:
-        try:
-            # SSRF defense in depth. Producers (the web API and the fetcher) do
-            # validate, but the worker trusts the queue, and the queue can be
-            # written by anything that can reach Redis/RabbitMQ/Kafka — including
-            # /bulk_url, which takes a URL straight from a Telegram message.
-            # Re-validating here means a forged job still cannot make the worker
-            # fetch cloud metadata or an internal service.
-            from utils.url_validation import _validate_url_safe
-
-            if not _validate_url_safe(source_url):
-                logger.warning(
-                    "Job %s: rejected source_url by SSRF validation (host=%s)",
-                    job_id,
-                    urlparse(source_url).hostname if isinstance(source_url, str) else "?",
-                )
-                await _set_job_state(job_id, "error", "source_url_rejected_ssrf", progress=0)
-                return
-            temp_dir = os.path.join(getattr(config, "TEMP_PATH", "storage/temp"))
+        temp_dir = os.path.join(getattr(config, "TEMP_PATH", "storage/temp"))
+        with contextlib.suppress(OSError):
             os.makedirs(temp_dir, exist_ok=True)
-            temp_input = os.path.join(temp_dir, f"{job_id}_src")
-            async with aiohttp.ClientSession() as session:
-                async with session.get(source_url, timeout=60, allow_redirects=False) as resp:
-                    if resp.status != 200:
-                        raise RuntimeError(f"Failed to download source URL: {resp.status}")
-                    with open(temp_input, "wb") as fh:
-                        async for chunk in resp.content.iter_chunked(1024 * 64):
-                            fh.write(chunk)
+        temp_input = os.path.join(temp_dir, f"{job_id}_src")
+        # One URL fetch, shared with the mid-run re-download below. It re-validates
+        # the URL itself, so a forged job in the queue cannot reach an internal
+        # address through here either.
+        if await _fetch_source_url_to_path(source_url, temp_input):
             if not job.get("input_path"):
                 job["input_path"] = temp_input
             input_path = job.get("input_path")
-        except Exception as e:
-            logger.exception("Failed to download source URL for job %s: %s", job_id, e)
+        else:
             with contextlib.suppress(Exception):
                 await publish_update(
                     progress_channel,
@@ -2013,6 +2070,14 @@ async def handle_job(job: dict):
                 counter += 1
             output_path = candidate
             job["output_path"] = output_path
+            # The on-disk name has to be unique, but the collision suffix is an
+            # implementation detail of the shared output directory: delivering
+            # ``clip_1.mp3`` for a file the user called ``clip.mp3`` leaks the
+            # storage path into their chat. Record the clean name so everything
+            # that names the result (audio/document filename, the video part)
+            # uses it, while the encode still writes to the unique path.
+            if not job.get("output_filename"):
+                job["output_filename"] = f"{base}{out_ext}"
     except Exception:
         logger.exception("Failed to compute output_path from original_filename")
 
@@ -2813,6 +2878,10 @@ async def handle_job(job: dict):
                                             user_id=job.get("user_id"),
                                             media_kind=_media_kind,
                                             delivery_name=_delivery_name,
+                                            # /usersettings can ask for videos as a
+                                            # Telegram document; MTProto delivery has
+                                            # to honour that too, not just the Bot API.
+                                            as_document=_deliver_as_document(job),
                                         )
                                     finally:
                                         if _pre_tp:
@@ -2861,6 +2930,12 @@ async def handle_job(job: dict):
                                     elif out and str(out).lower().endswith((".mp4", ".mov", ".mkv")):
                                         kind = "video"
                                     else:
+                                        kind = "doc"
+                                    # /usersettings can ask for videos as a Telegram
+                                    # document instead of playable media, so the
+                                    # bytes come back untouched in the file view
+                                    # rather than as a preview.
+                                    if kind == "video" and str(job.get("upload_mode") or "").lower() == "file":
                                         kind = "doc"
                                     logger.info(
                                         "Worker: Bot API probe for %s: kind=%s duration=%s width=%s height=%s",
@@ -2978,15 +3053,22 @@ async def handle_job(job: dict):
                                                                         chat_id=chat_id,
                                                                         document=fh,
                                                                         caption=caption,
+                                                                        filename=_delivery_name,
                                                                         thumbnail=tf,
                                                                     )
                                                             except Exception:
                                                                 await bot.send_document(
-                                                                    chat_id=chat_id, document=fh, caption=caption
+                                                                    chat_id=chat_id,
+                                                                    document=fh,
+                                                                    caption=caption,
+                                                                    filename=_delivery_name,
                                                                 )
                                                         else:
                                                             await bot.send_document(
-                                                                chat_id=chat_id, document=fh, caption=caption
+                                                                chat_id=chat_id,
+                                                                document=fh,
+                                                                caption=caption,
+                                                                filename=_delivery_name,
                                                             )
                                                 finally:
                                                     try:
@@ -3119,6 +3201,7 @@ async def handle_job(job: dict):
                                                     vid_duration=_vid_duration,
                                                     vid_width=_vid_width,
                                                     vid_height=_vid_height,
+                                                    delivery_name=_delivery_name,
                                                 )
                                             else:
                                                 # non-video non-zip fallback
@@ -3171,15 +3254,22 @@ async def handle_job(job: dict):
                                                                         chat_id=chat_id,
                                                                         document=fh,
                                                                         caption=caption,
+                                                                        filename=_delivery_name,
                                                                         thumbnail=tf,
                                                                     )
                                                             except Exception:
                                                                 await bot.send_document(
-                                                                    chat_id=chat_id, document=fh, caption=caption
+                                                                    chat_id=chat_id,
+                                                                    document=fh,
+                                                                    caption=caption,
+                                                                    filename=_delivery_name,
                                                                 )
                                                         else:
                                                             await bot.send_document(
-                                                                chat_id=chat_id, document=fh, caption=caption
+                                                                chat_id=chat_id,
+                                                                document=fh,
+                                                                caption=caption,
+                                                                filename=_delivery_name,
                                                             )
                                                 finally:
                                                     try:
@@ -3234,6 +3324,10 @@ async def handle_job(job: dict):
                                             user_id=job.get("user_id"),
                                             media_kind=_media_kind,
                                             delivery_name=_delivery_name,
+                                            # /usersettings can ask for videos as a
+                                            # Telegram document; MTProto delivery has
+                                            # to honour that too, not just the Bot API.
+                                            as_document=_deliver_as_document(job),
                                         )
                                     finally:
                                         if _pre_tp:
@@ -3587,26 +3681,14 @@ async def handle_job(job: dict):
                                     except Exception:
                                         ok = False
 
-                                # Try HTTP source_url if available
+                                # Try HTTP source_url if available. The same fetch
+                                # the initial acquisition uses, SSRF check included,
+                                # so the two can never disagree about what a URL
+                                # source is allowed to be.
                                 if not tried and job.get("source_url"):
                                     try:
                                         tried = True
-                                        async with aiohttp.ClientSession() as session:
-                                            async with session.get(
-                                                # SSRF hardening: never follow redirects. The URL was
-                                                # pre-validated by webapp.py; a redirect to an internal
-                                                # address would bypass that validation.
-                                                job.get("source_url"),
-                                                timeout=aiohttp.ClientTimeout(total=60),
-                                                allow_redirects=False,
-                                            ) as resp:
-                                                if resp.status == 200:
-                                                    with open(input_path, "wb") as fh:
-                                                        async for chunk in resp.content.iter_chunked(1024 * 64):
-                                                            fh.write(chunk)
-                                                    ok = os.path.exists(input_path) and os.path.getsize(input_path) > 0
-                                                else:
-                                                    ok = False
+                                        ok = await _fetch_source_url_to_path(job.get("source_url"), input_path)
                                     except Exception:
                                         ok = False
 

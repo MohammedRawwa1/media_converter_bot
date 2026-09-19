@@ -185,7 +185,33 @@ Send any video, audio, or document file to access the full menu:
 - **Audio:** MP3, WAV, AAC, FLAC, OGG, etc.
 - **Document:** PDF, ZIP, etc.
 
-Supported operations: Format conversion, compression, resolution change, framerate adjust, trimming, merging, audio extraction, stream extraction, screenshot, thumbnail generation, sample generation, repair, optimization, metadata editing, archive creation.
+Supported operations: Format conversion, compression, resolution change, framerate adjust, trimming, splitting, merging, audio extraction, stream extraction, screenshot, thumbnail generation, sample generation, repair, optimization, metadata editing, archive creation.
+
+#### 🔪 Splitter (video **and** audio)
+
+The split button cuts the loaded media into parts at the timing you give it, in a
+single stream copy (`-c copy -map 0 -segment_time <t> -f segment -reset_timestamps 1`),
+so cutting an hour-long file costs seconds rather than a re-encode. It works the
+same on a video and on an audio file: only the part extension differs.
+
+```
+📌 Send the length of each part:
+• 10:00 / 01:00:00 / 30m / 2h — part length
+• 4                            — split into 4 equal parts
+• 00:10-00:20                  — cut that single range out
+```
+
+Parts keep the media's own name with the numbering users expect —
+`Concert.mp4` becomes `Concert.001.mp4`, `Concert.002.mp4`, … — and they are
+delivered **one after another**, each with its part number in the caption, so the
+first part can be watched while the next one uploads. That is a split, not batch
+mode: there is no batch lock and no queue, just the parts in order.
+
+The metadata travels with them: an audio part keeps the source's `title` and
+`performer` (with the part number appended so the player can tell them apart), and
+a video part keeps the probed duration/dimensions and the metadata caption. A
+media whose source is no longer on disk is fetched back from the bucket before it
+is split, rather than failing.
 
 ### Bulk Batches
 
@@ -271,7 +297,7 @@ For Railway's 1 GB box the shipped `.env.example` is tuned to: `MAX_CONCURRENT_F
 | `MEDIA_REGISTRY_TTL_SECONDS` | `2592000` | How long a descriptor stays in the MongoDB media registry (30 days) |
 | `PRESENCE_TTL_SECONDS` | `300` | How long a user counts as "online" after their last interaction |
 | `REUSE_LOCAL_INPUT` | `1` | Keep the source on disk after uploading it, so a worker in the same container reads it instead of downloading it back out of S3 (one full copy of the media of egress saved per job) |
-| `PIPELINE_SOURCE_UPLOAD` | `header` | What the big-file pipeline stores for a source: `header` keeps only its first `PIPELINE_HEADER_BYTES` as a probe reference, `full` stores the whole file after the download finishes, `stream` writes the whole file **while** it downloads (storage is the source of truth, no local copy), `local` stores nothing. In `header`/`local` the media is read over Telegram, so a large video costs no bucket egress at all. Code default is `header`; `stream` is what makes a **repeat** of a media cost no Telegram traffic at all (one shared object per media, served from the bucket once validated) |
+| `PIPELINE_SOURCE_UPLOAD` | `header` | What **every** producer of a source stores for it — the big-file pipeline, the Bot API download behind the bot's buttons, the fetcher and the web uploader all go through one helper (`utils/source_store.py`): `header` keeps only its first `PIPELINE_HEADER_BYTES` as a probe reference, `full` stores the whole file after the download finishes, `stream` writes the whole file **while** it downloads (storage is the source of truth, no local copy), `local` stores nothing. In `header`/`local` the media is read over Telegram, so a large video costs no bucket egress at all. Code default is `header`; `stream` is what makes a **repeat** of a media cost no Telegram traffic at all (one shared object per media, served from the bucket once validated). A producer that has no Telegram copy to fall back on (a Bot API file id, a web upload) always stores the media itself, because a probe header and no reachable copy is not a smaller source — it is a lost one |
 | `PIPELINE_PROMOTE_ON_REPEAT` | `1` | On the second request for a media in `header` mode, store its whole object at the shared library key instead of only refreshing the probe header. First-time media keep costing 2 MB; media that come back stop being read over Telegram for every job. `0` restores pure header behaviour |
 | `PIPELINE_HEADER_BYTES` | `2097152` | How much of a source the `header` object carries (2 MB covers MP4 `moov`, MKV `SegmentInfo` and AVI `RIFF` headers). In `stream` mode it is also how much of the stream is tapped for the ffprobe that fills the job's `source_*` metadata |
 | `S3_UPLOAD_PARTS_IN_FLIGHT` | `4` | Multipart parts a streaming upload keeps in flight at once |
@@ -403,8 +429,11 @@ pip install -r requirements-dev.txt   # linting + security tools
 #
 # After editing requirements.txt, regenerate the lock with the command recorded
 # in its header:
-#   uv pip compile requirements.txt --generate-hashes --python-version 3.12 \
+#   uv pip compile requirements.txt --generate-hashes --upgrade --python-version 3.12 \
 #     --python-platform x86_64-unknown-linux-gnu --output-file requirements.lock
+# --upgrade is required, not cosmetic: without it uv prefers the versions
+# already in the file, so the command reports no change while CI - which
+# resolves fresh - sees the lock as stale.
 # CI fails if the two drift apart, or if any pinned entry loses its hash.
 pip install --require-hashes -r requirements.lock   # optional: verify it locally on Linux
 
@@ -589,6 +618,30 @@ break it:
 
 Set `MEDIA_CACHE_ENABLED=0` to disable reuse entirely and go back to per-job
 inputs.
+
+### One store decision, for every producer
+
+A source is stored by whoever holds it: the big-file pipeline, the Bot API
+download behind the bot's buttons, the fetcher service, the web uploader. Each of
+them used to carry its own copy of the decision — which key, whole file or probe
+header, what to tell the job — which is how `PIPELINE_SOURCE_UPLOAD` came to be
+honoured by exactly one of them. All of it now lives in `utils/source_store.py`:
+
+- `source_upload_mode()` / `header_bytes()` read the settings, in one place, so a
+  typo'd value cannot mean two different things;
+- `store_source()` performs the store and reports what it did as a `SourceRef`
+  (`key`, `header_only`, and the `job_key` that is allowed to travel as
+  `input_key` — which is `None` for a probe header, since a header is not a
+  source);
+- `record_source()` writes the media descriptor in the one shape every reader
+  expects, with a header filed under `header_key` and never under `input_key`.
+
+A producer passes `telegram_fallback=True` only when the job it is about to queue
+carries the media's Telegram location (`source_chat_id`/`source_message_id`); that
+is what makes a header-only object safe, and a producer without it stores the
+whole object and says so in the log. `tests/test_source_store_consistency.py` is
+the gate: no producer may upload a source itself, parse the mode, or derive a
+header key.
 
 ### Streaming a source into storage (`PIPELINE_SOURCE_UPLOAD=stream`)
 

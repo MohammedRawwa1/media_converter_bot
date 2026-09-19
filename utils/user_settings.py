@@ -5,17 +5,25 @@ import os
 from typing import Any
 
 import config
+from utils.callbacks import MP3_DEFAULT_BITRATE
 
 logger = logging.getLogger(__name__)
 
 DEFAULTS = {
-    "upload_mode": "video",  # options: video, file, zip
+    # "video" delivers a video as playable media (preview), "file" as a Telegram
+    # document. A document is the only way to get the untouched bytes back, so
+    # the two are a real choice rather than two labels for the same thing.
+    "upload_mode": "video",  # options: video, file
     "prefix": "",
     "suffix": "",
     "words_remove": [],
     "save_thumbnail": False,
     "default_thumbnail": None,  # path or URL
     "use_custom_thumbnail": False,  # when True, use per-user custom thumbnail if set
+    # The bitrate every audio conversion falls back to when the file carries no
+    # quality of its own. Set from /usersettings - it is a preference, never a
+    # conversion trigger.
+    "audio_bitrate": MP3_DEFAULT_BITRATE,
 }
 
 

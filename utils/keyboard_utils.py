@@ -35,7 +35,10 @@ from .callbacks import (
     INFO,
     MANUAL_SHOTS,
     MEDIA_FORWARDER,
+    MENU_ADVANCED,
+    MENU_AUDIO,
     MENU_MAIN,
+    MENU_VIDEO,
     MERGE_ADD,
     MERGE_CLEAR,
     MERGE_MENU,
@@ -43,10 +46,15 @@ from .callbacks import (
     MERGE_VIEW,
     MP3_DEFAULT_BITRATE,
     MP3_QUALITY_CHOICES,
+    MP3_TAG_EDITOR,
     OPTIMIZE_MENU,
     REMOVE_AUDIO,
     RESOLUTION_MENU,
     SCREENSHOTS_MENU,
+    SETTINGS_BITRATE_MENU,
+    SETTINGS_RENAME_MENU,
+    SETTINGS_UPLOAD_MODE_PREFIX,
+    SETTINGS_WORDS_MENU,
     STREAM_EXTRACTOR,
     STREAM_REMOVER,
     SUBTITLE_MERGER,
@@ -56,6 +64,9 @@ from .callbacks import (
     TRIM_VIDEO,
     TRIMMER_1,
     TRIMMER_2,
+    UPLOAD_MODE_FILE,
+    UPLOAD_MODE_LABELS,
+    UPLOAD_MODE_VIDEO,
     VIDEO_RENAMER,
     VIDEO_TO_AUDIO,
     VIDEOS_SPLITTER,
@@ -64,6 +75,7 @@ from .callbacks import (
     bulk_preset_key,
     bulk_slideshow_key,
     mp3_quality_key,
+    settings_bitrate_key,
 )
 
 
@@ -111,6 +123,11 @@ class MediaMenuBuilder:
             row("🎵 Video To Audio", VIDEO_TO_AUDIO, "📉 Compress", COMPRESS_MENU),
             row("⚡ Video Optimizer", OPTIMIZE_MENU, "🔗 Subtitle Merger", SUBTITLE_MERGER),
             row("✏️ Video Renamer", VIDEO_RENAMER, "🛈 Media Information", INFO),
+            # The tool sub-menus. They live here rather than behind the settings
+            # button: they all act on the loaded media, and /usersettings must
+            # stay a preferences panel that never starts a conversion.
+            row("🎧 Audio Tools", MENU_AUDIO, "🎬 Video Tools", MENU_VIDEO),
+            [InlineKeyboardButton("🔧 Advanced Tools", callback_data=MENU_ADVANCED)],
             # Single-button rows for create/archive and final cancel button
             [InlineKeyboardButton("📦 Create Archive", callback_data=CREATE_ARCHIVE)],
             # Add quick access to bulk actions
@@ -524,6 +541,10 @@ class MediaMenuBuilder:
                 InlineKeyboardButton("🔀 Merge", callback_data="merge_audio"),
                 InlineKeyboardButton("📈 Fade In/Out", callback_data="fade_menu"),
             ],
+            # The Mp3 tag editor used to be reachable only from /usersettings,
+            # where it read the loaded file's tags and rewrote them. It is an
+            # action, so it belongs with the other audio actions.
+            [InlineKeyboardButton("🏷️ Mp3 Tag Editor", callback_data=MP3_TAG_EDITOR)],
             [InlineKeyboardButton("↩️ Back", callback_data=MENU_MAIN)],
         ]
         return InlineKeyboardMarkup(buttons)
@@ -575,4 +596,103 @@ class MediaMenuBuilder:
     def get_back_button() -> InlineKeyboardMarkup:
         """Get simple back button."""
         buttons = [[InlineKeyboardButton("🔙 Back", callback_data=MENU_MAIN)]]
+        return InlineKeyboardMarkup(buttons)
+
+    # ── /usersettings ────────────────────────────────────────────────────────
+    # Every button below stores a preference (and shows which one is active).
+    # None of them encode, download or queue anything: the media actions live in
+    # the main menu's tool sub-menus, so opening the settings panel can never
+    # touch whatever file happens to be loaded.
+
+    @staticmethod
+    def get_settings_page(page: int = 1, settings: dict = None) -> InlineKeyboardMarkup:
+        """The preferences panel: page 1 general, page 2 audio."""
+        s = settings or {}
+        buttons: list[list[InlineKeyboardButton]] = []
+
+        if int(page or 1) == 2:
+            bitrate = s.get("audio_bitrate") or MP3_DEFAULT_BITRATE
+            buttons.append([InlineKeyboardButton(f"🎚️ Audio Bitrate: {bitrate}", callback_data=SETTINGS_BITRATE_MENU)])
+            buttons.append([InlineKeyboardButton("⬅️ Prev", callback_data="settings_page:1")])
+        else:
+            mode = str(s.get("upload_mode") or UPLOAD_MODE_VIDEO).lower()
+            if mode not in (UPLOAD_MODE_VIDEO, UPLOAD_MODE_FILE):
+                mode = UPLOAD_MODE_VIDEO
+            other = UPLOAD_MODE_FILE if mode == UPLOAD_MODE_VIDEO else UPLOAD_MODE_VIDEO
+            buttons.append(
+                [
+                    InlineKeyboardButton(
+                        f"📤 Upload as Video: {UPLOAD_MODE_LABELS[mode]}",
+                        callback_data=f"{SETTINGS_UPLOAD_MODE_PREFIX}{other}",
+                    )
+                ]
+            )
+            thumb = "On" if s.get("use_custom_thumbnail") else "Off"
+            buttons.append(
+                [
+                    InlineKeyboardButton(
+                        f"🖼️ Custom Thumbnail: {thumb}", callback_data="settings_toggle:use_custom_thumbnail"
+                    )
+                ]
+            )
+            words = s.get("words_remove") or []
+            buttons.append(
+                [
+                    InlineKeyboardButton("✏️ Rename Files", callback_data=SETTINGS_RENAME_MENU),
+                    InlineKeyboardButton(f"🧹 Words: {len(words)}", callback_data=SETTINGS_WORDS_MENU),
+                ]
+            )
+            buttons.append([InlineKeyboardButton("Next ➡️", callback_data="settings_page:2")])
+
+        buttons.append(
+            [
+                InlineKeyboardButton("♻️ Reset Settings", callback_data="reset_settings"),
+                InlineKeyboardButton("✖️ Close", callback_data=MENU_MAIN),
+            ]
+        )
+        return InlineKeyboardMarkup(buttons)
+
+    @staticmethod
+    def get_settings_bitrate_menu(current: str = None) -> InlineKeyboardMarkup:
+        """Audio-bitrate picker for /usersettings, marking the active value.
+
+        Same choices as the bulk and video -> MP3 pickers, but with settings
+        triggers so choosing one only stores it.
+        """
+        active = current if current in MP3_QUALITY_CHOICES else MP3_DEFAULT_BITRATE
+
+        def _label(value: str) -> str:
+            return f"{'✅ ' if value == active else ''}{value}"
+
+        rows = [MP3_QUALITY_CHOICES[i : i + 2] for i in range(0, len(MP3_QUALITY_CHOICES), 2)]
+        buttons = [
+            [InlineKeyboardButton(_label(v), callback_data=settings_bitrate_key(v)) for v in row] for row in rows
+        ]
+        buttons.append([InlineKeyboardButton("✏️ Custom bitrate", callback_data=settings_bitrate_key("custom"))])
+        buttons.append([InlineKeyboardButton("↩️ Back", callback_data="settings_page:2")])
+        return InlineKeyboardMarkup(buttons)
+
+    @staticmethod
+    def get_settings_rename_menu(settings: dict = None) -> InlineKeyboardMarkup:
+        """Prefix/suffix the bot applies to delivered filenames."""
+        s = settings or {}
+        prefix = s.get("prefix") or ""
+        suffix = s.get("suffix") or ""
+        buttons = [
+            [InlineKeyboardButton(f"Prefix: {prefix or '(none)'}", callback_data="settings_set_prefix")],
+            [InlineKeyboardButton(f"Suffix: {suffix or '(none)'}", callback_data="settings_set_suffix")],
+            [InlineKeyboardButton("🗑️ Clear Both", callback_data="settings_clear_rename")],
+            [InlineKeyboardButton("↩️ Back", callback_data="settings_page:1")],
+        ]
+        return InlineKeyboardMarkup(buttons)
+
+    @staticmethod
+    def get_settings_words_menu(settings: dict = None) -> InlineKeyboardMarkup:
+        """Words stripped out of every delivered filename."""
+        buttons = [
+            [InlineKeyboardButton("➕ Add Word", callback_data="settings_add_word")],
+            [InlineKeyboardButton("➖ Remove Word", callback_data="settings_remove_word")],
+            [InlineKeyboardButton("🗑️ Clear List", callback_data="settings_clear_words")],
+            [InlineKeyboardButton("↩️ Back", callback_data="settings_page:1")],
+        ]
         return InlineKeyboardMarkup(buttons)

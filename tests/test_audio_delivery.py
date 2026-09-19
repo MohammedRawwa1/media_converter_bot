@@ -1137,6 +1137,44 @@ class MergeAudiosDeliveryTests(unittest.TestCase):
         self.assertEqual(session["merge_list"], [])
 
 
+class DocumentDeliveryPreferenceTests(unittest.TestCase):
+    """ "Upload as Video: File (document)" must reach every delivery path.
+
+    A video large enough for MTProto/userbot delivery never touches the Bot API,
+    so honouring the preference only there would silently keep sending playable
+    media for exactly the files the user switched it for.
+    """
+
+    def test_flag_reads_the_preference_and_is_quiet_about_missing_data(self):
+        from workers.ffmpeg_worker import _deliver_as_document
+
+        self.assertTrue(_deliver_as_document({"upload_mode": "file"}))
+        self.assertTrue(_deliver_as_document({"upload_mode": "FILE"}))
+        self.assertFalse(_deliver_as_document({"upload_mode": "video"}))
+        self.assertFalse(_deliver_as_document({}))
+        self.assertFalse(_deliver_as_document(None))
+
+    def test_a_deferred_retry_keeps_the_requested_format(self):
+        from workers.ffmpeg_worker import _deferred_media_kind
+
+        self.assertEqual(_deferred_media_kind({"delivery_name": "clip.mp4", "upload_mode": "file"}), "document")
+        self.assertEqual(_deferred_media_kind({"delivery_name": "clip.mp4"}), "video")
+        # Audio stays playable whatever the preference says.
+        self.assertEqual(_deferred_media_kind({"delivery_name": "track.mp3", "upload_mode": "file"}), "audio")
+
+    def test_both_userbot_call_sites_pass_the_preference(self):
+        src = read_source("workers", "ffmpeg_worker.py")
+        self.assertEqual(src.count("as_document=_deliver_as_document(job)"), 2)
+
+    def test_the_uploader_builds_a_document_and_never_for_audio(self):
+        src = read_source("utils", "userbot_uploader.py")
+        self.assertIn("_as_document = bool(as_document) and not _is_audio", src)
+        self.assertIn("_send_document_raw", src)
+        # A document carries only the filename attribute: a video attribute would
+        # put it back in the media view it was meant to leave.
+        self.assertIn("attributes=[raw.types.DocumentAttributeFilename(file_name=name)]", src)
+
+
 class MenuTriggerCoverageTests(unittest.TestCase):
     """Every inline-button trigger from MediaMenuBuilder must be dispatched."""
 
@@ -1169,6 +1207,11 @@ class MenuTriggerCoverageTests(unittest.TestCase):
         ("get_fade_menu()", lambda b: b.get_fade_menu()),
         ("get_confirm_menu()", lambda b: b.get_confirm_menu()),
         ("get_back_button()", lambda b: b.get_back_button()),
+        ("get_settings_page(1, {})", lambda b: b.get_settings_page(1, {})),
+        ("get_settings_page(2, {})", lambda b: b.get_settings_page(2, {})),
+        ('get_settings_bitrate_menu("192k")', lambda b: b.get_settings_bitrate_menu("192k")),
+        ("get_settings_rename_menu({})", lambda b: b.get_settings_rename_menu({})),
+        ("get_settings_words_menu({})", lambda b: b.get_settings_words_menu({})),
     )
 
     @classmethod
