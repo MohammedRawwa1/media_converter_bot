@@ -20,6 +20,27 @@ except Exception:
 CREATE_NEW_PROCESS_GROUP = 0x00000200 if os.name == "nt" else 0
 
 
+#: The metadata arguments every MP3 encode and every MP3 remux in this project
+#: carries, in one place so the two writers of MP3 commands cannot drift apart.
+#:
+#: ``-map_metadata 0`` states the copy instead of leaving it to ffmpeg's default.
+#: The default is what every one of these commands relies on today, and it is
+#: invisible: the day a command next to it grows a ``-map`` of its own, or a
+#: ``-map_metadata -1`` is borrowed from a caller that wanted a clean file, the
+#: media's title/artist/album/album_artist/track tags disappear from the output
+#: with nothing in the command line to show for it. The user finds out when the
+#: delivered file shows a filename where their player used to show the album.
+#:
+#: ``-id3v2_version 3`` is the tag version the readers users actually check
+#: understand. ffmpeg writes ID3v2.4 by default, which Windows Explorer - the
+#: "file explorer meta stuff" - and older players do not read: the file keeps
+#: its tags and the Properties panel shows an empty set of fields anyway. The
+#: splitter pinned this version for exactly this reason; the audio encodes did
+#: not, which is why a file could keep its metadata through one action and lose
+#: it to the next.
+MP3_METADATA_ARGS: tuple[str, ...] = ("-map_metadata", "0", "-id3v2_version", "3")
+
+
 async def probe_duration(path: str) -> float | None:
     """Probe media duration using ffprobe (sync subprocess wrapped)."""
     # Defensive checks: ensure caller provided a valid path

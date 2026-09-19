@@ -18,6 +18,14 @@ logger = logging.getLogger(__name__)
 #: one rejects the option, which would fail the whole split.
 _FASTSTART_EXTS = frozenset({".mp4", ".m4a", ".m4v", ".mov", ".3gp", ".3g2"})
 
+# The metadata arguments every MP3 command in this project carries. Shared with
+# the audio encodes in handlers.py, so a split part and a re-encoded file cannot
+# disagree about what a delivered media keeps (see utils/ffmpeg_runner.py).
+try:
+    from utils.ffmpeg_runner import MP3_METADATA_ARGS
+except ImportError:  # pragma: no cover - the module is always present in-tree
+    MP3_METADATA_ARGS: tuple[str, ...] = ("-map_metadata", "0", "-id3v2_version", "3")
+
 # Import timeout utilities
 try:
     from utils.async_timeout_wrapper import (
@@ -701,8 +709,13 @@ async def split_media_segments(
     elif ext_lower == ".mp3":
         # The Xing/Info header ffmpeg writes for a CBR mp3 already carries the
         # part's frame count - which is the duration a streaming player reads -
-        # so only the tag version is pinned here, for older players.
-        cmd.extend(["-id3v2_version", "3"])
+        # so only the tags themselves are pinned here: the media's metadata is
+        # copied onto the command line instead of left to ffmpeg's default, and
+        # it is written as ID3v2.3, the version Windows Explorer and older
+        # players read. Both come from MP3_METADATA_ARGS, which the audio
+        # encodes use too - a split part and a re-encoded file must carry the
+        # same tags, and neither may lose them.
+        cmd.extend(MP3_METADATA_ARGS)
     if ext_lower not in _FASTSTART_EXTS:
         # Every part starts at zero regardless of what the cut's timestamps were.
         cmd.extend(["-avoid_negative_ts", "make_zero"])

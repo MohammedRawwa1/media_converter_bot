@@ -233,5 +233,144 @@ class UserbotDownloaderTests(unittest.IsolatedAsyncioTestCase):
                 await mod._wait_download_or_stall(asyncio.create_task(silent_download()), watch)
 
 
+class HeadReadTests(unittest.IsolatedAsyncioTestCase):
+    """Reading a media's first bytes instead of the whole of it.
+
+    This is what lets a question about a media - what bitrate does it carry? - be
+    answered before the 47MB download the question exists to avoid. It is asked
+    as a shortcut, so every way it can fail has to come back as a plain ``False``
+    that leaves the caller on the path it would have taken anyway.
+    """
+
+    class _FakeClient:
+        def __init__(self, chunks):
+            self.chunks = chunks
+            self.requests = []
+            self.started = False
+            self.disconnected = False
+
+        async def start(self):
+            self.started = True
+
+        async def disconnect(self):
+            self.disconnected = True
+
+        async def iter_download(self, msg, offset=0, limit=None):
+            self.requests.append((offset, limit))
+            for chunk in self.chunks:
+                yield chunk
+
+    @contextlib.asynccontextmanager
+    async def _client(self, chunks):
+        """A fake userbot whose client records what it was asked for."""
+        client = self._FakeClient(chunks)
+        with (
+            patch.object(mod, "TelegramClient", object()),
+            patch.object(mod, "_normalize_target", AsyncMock(return_value="target")),
+            patch.object(mod, "_resolve_message_via_telethon", AsyncMock(return_value=[object()])),
+            patch("utils.telethon_session.get_userbot_credentials", return_value=(1, "hash")),
+            patch(
+                "utils.telethon_session.get_telethon_session_string_for_user",
+                new=AsyncMock(return_value="session"),
+            ),
+            patch("utils.telethon_session.get_db_model", return_value=None),
+            patch("utils.telethon_session.build_telethon_client", return_value=client),
+        ):
+            yield client
+
+    async def test_only_the_head_is_read_and_kept(self):
+        chunks = [b"a" * 100, b"b" * 100, b"c" * 100]
+        dest = os.path.join(tempfile.gettempdir(), f"head_{os.getpid()}_{id(self)}.bin")
+        try:
+            async with self._client(chunks) as client:
+                ok = await mod.download_head_via_userbot(123, 456, dest, max_bytes=250, user_id=7)
+
+            self.assertTrue(ok)
+            with open(dest, "rb") as fh:
+                body = fh.read()
+            # Two whole chunks and a slice of the third: the transfer stops at the
+            # limit rather than walking the rest of a file nobody asked for.
+            self.assertEqual(body, (b"a" * 100) + (b"b" * 100) + (b"c" * 50))
+            self.assertEqual(client.requests, [(0, 250)])
+            self.assertTrue(client.disconnected, "the client must not be left running")
+        finally:
+            with contextlib.suppress(OSError):
+                os.remove(dest)
+
+    async def test_a_short_file_is_read_whole_and_still_answers_yes(self):
+        dest = os.path.join(tempfile.gettempdir(), f"head_{os.getpid()}_{id(self)}_short.bin")
+        try:
+            async with self._client([b"x" * 10]):
+                ok = await mod.download_head_via_userbot(123, 456, dest, max_bytes=4096)
+
+            self.assertTrue(ok)
+            self.assertEqual(os.path.getsize(dest), 10)
+        finally:
+            with contextlib.suppress(OSError):
+                os.remove(dest)
+
+    async def test_no_userbot_configured_is_a_no_not_an_error(self):
+        with patch.object(mod, "TelegramClient", None):
+            self.assertFalse(await mod.download_head_via_userbot(123, 456, "nowhere.bin"))
+
+    async def test_a_missing_credential_is_a_no(self):
+        with patch("utils.telethon_session.get_userbot_credentials", side_effect=RuntimeError("unset")):
+            self.assertFalse(await mod.download_head_via_userbot(123, 456, "nowhere.bin"))
+
+    async def test_a_message_that_cannot_be_resolved_is_a_no(self):
+        dest = os.path.join(tempfile.gettempdir(), f"head_{os.getpid()}_{id(self)}_unresolved.bin")
+        with (
+            patch.object(mod, "TelegramClient", object()),
+            patch.object(mod, "_normalize_target", AsyncMock(return_value="target")),
+            patch.object(mod, "_resolve_message_via_telethon", AsyncMock(return_value=[])),
+            patch("utils.telethon_session.get_userbot_credentials", return_value=(1, "hash")),
+            patch("utils.telethon_session.get_telethon_session_string_for_user", new=AsyncMock(return_value=None)),
+            patch("utils.telethon_session.get_db_model", return_value=None),
+            patch("utils.telethon_session.build_telethon_client", return_value=self._FakeClient([b"x"])),
+        ):
+            ok = await mod.download_head_via_userbot(123, 456, dest)
+
+        self.assertFalse(ok)
+        self.assertFalse(os.path.exists(dest), "nothing may be left behind for a read that found no media")
+
+    async def test_a_transport_failure_is_a_no(self):
+        async def _boom(*args, **kwargs):
+            raise RuntimeError("connection reset")
+
+        with (
+            patch.object(mod, "TelegramClient", object()),
+            patch.object(mod, "_normalize_target", _boom),
+            patch("utils.telethon_session.get_userbot_credentials", return_value=(1, "hash")),
+            patch("utils.telethon_session.get_telethon_session_string_for_user", new=AsyncMock(return_value=None)),
+            patch("utils.telethon_session.get_db_model", return_value=None),
+            patch("utils.telethon_session.build_telethon_client", return_value=self._FakeClient([b"x"])),
+        ):
+            self.assertFalse(await mod.download_head_via_userbot(123, 456, "nowhere.bin"))
+
+    async def test_a_read_that_hangs_is_abandoned(self):
+        client = AsyncMock()
+        client.start = AsyncMock()
+        client.disconnect = AsyncMock()
+
+        async def _hanging(*args, **kwargs):
+            await asyncio.sleep(30)
+            yield b"never"
+
+        client.iter_download = _hanging
+
+        with (
+            patch.object(mod, "TelegramClient", object()),
+            patch.object(mod, "_normalize_target", AsyncMock(return_value="target")),
+            patch.object(mod, "_resolve_message_via_telethon", AsyncMock(return_value=[object()])),
+            patch("utils.telethon_session.get_userbot_credentials", return_value=(1, "hash")),
+            patch("utils.telethon_session.get_telethon_session_string_for_user", new=AsyncMock(return_value=None)),
+            patch("utils.telethon_session.get_db_model", return_value=None),
+            patch("utils.telethon_session.build_telethon_client", return_value=client),
+        ):
+            ok = await mod.download_head_via_userbot(123, 456, "nowhere.bin", timeout=0.05)
+
+        self.assertFalse(ok)
+
+
 if __name__ == "__main__":
     unittest.main()

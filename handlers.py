@@ -25,6 +25,15 @@ from utils.callbacks import (
     compress_quality_label,
     settings_page_number,
 )
+
+# The tag arguments every MP3 command carries, from the one module that owns
+# them (utils/ffmpeg_runner.py), so a bitrate change here and a split in
+# ``tasks.conversion_tasks`` cannot drift apart on what a delivered file keeps.
+try:
+    from utils.ffmpeg_runner import MP3_METADATA_ARGS
+except Exception:  # pragma: no cover - the module is always present in-tree
+    MP3_METADATA_ARGS = ("-map_metadata", "0", "-id3v2_version", "3")
+
 from utils.media_time import format_clock, segment_seconds_for_parts
 from utils.time_utils import utc_iso
 from utils.url_validation import _validate_url_safe
@@ -510,6 +519,95 @@ async def _source_has_audio(path: str | None, current_file: dict | None = None) 
         return True
 
 
+async def _already_at_bitrate(
+    current_file: dict | None,
+    target: str,
+    *,
+    user_id=None,
+    target_codec: str = "mp3",
+) -> int | None:
+    """Compare → validate → already exists: the bitrate the file already has.
+
+    Returns the source's own bitrate when the request asks for the one it
+    already carries, and ``None`` for every other outcome. The work - and the
+    reasoning behind calling a *fetch* the expensive part of a bitrate change -
+    lives in ``utils.audio_bitrate_gate``; this is the import guard that keeps a
+    missing or broken gate from ever failing a conversion the user asked for.
+    """
+    try:
+        from utils.audio_bitrate_gate import already_at_bitrate
+
+        return await already_at_bitrate(
+            current_file,
+            target,
+            user_id=user_id,
+            target_codec=target_codec,
+        )
+    except Exception:
+        logger.debug("handlers: the already-at-bitrate check could not run")
+        return None
+
+
+def _already_at_bitrate_text(target: str) -> str:
+    """The one line a file that already carries the request gets.
+
+    Named after the bitrate rather than the button, because what the user needs
+    to know is *why* nothing happened: the file is already what they asked for.
+    """
+    return f"ℹ️ Already {target} — nothing to re-encode."
+
+
+async def _probe_downloaded_source(current_file: dict | None, path: str | None) -> dict:
+    """Record a freshly downloaded media's own ffprobe verdict on the file.
+
+    Every caption and every set of player tags this bot delivers is built from
+    ``_source_metadata`` - and only the object-storage ingest path used to write
+    it. The paths that land a media on *local disk* (a Bot API download, a
+    userbot fallback, a reused local copy) left the field unset, so a media
+    fetched that way arrived with a title taken from its filename and no
+    performer at all: Telegram's player showed ``Module 02`` where the file
+    carried a real title, artist and album artist, and a split's parts lost them
+    the same way. Probing here costs one ffprobe per downloaded media and makes
+    every delivery site read the same thing, because they all read this field.
+
+    Never raises and never overwrites a verdict that is already there: a probe
+    that cannot run leaves the caller with exactly what it had before.
+    """
+    if current_file is None or not path or not os.path.exists(path):
+        return {}
+    if current_file.get("_source_metadata"):
+        return dict(current_file.get("_source_metadata") or {})
+    try:
+        from utils.ffmpeg_runner import probe_media
+
+        meta = await probe_media(path) or {}
+    except Exception:
+        logger.debug("handlers: could not probe the downloaded source %s", path)
+        return {}
+    if meta:
+        current_file["_source_metadata"] = dict(meta)
+    return meta
+
+
+def _merge_cached_source_meta(current_file: dict | None, entry: dict | None) -> None:
+    """Carry a media-cache descriptor's probe verdict onto the file it answers.
+
+    A media answered from the cache is the same media, and the caption and the
+    player tags are built from exactly this verdict - which is why the descriptor
+    keeps a copy of it. Without the merge a *repeat* describes itself worse than
+    its first request did: the title and performer vanish and the filename takes
+    their place. Fields already on the file win, so a verdict gathered from the
+    bytes in hand is never overwritten by a stored one.
+    """
+    cached = (entry or {}).get("source_meta")
+    if current_file is None or not isinstance(cached, dict) or not cached:
+        return
+    merged = dict(current_file.get("_source_metadata") or {})
+    for key, value in cached.items():
+        merged.setdefault(key, value)
+    current_file["_source_metadata"] = merged
+
+
 def _video_delivery_name(current_file: dict | None, output_path: str | None) -> str:
     """The name a converted video is delivered under.
 
@@ -813,7 +911,9 @@ def _resolve_bulk_plan(settings: dict | None) -> dict:
 
     ignored: list[str] = []
     if extract_audio:
-        ffmpeg_args = ["-vn", "-acodec", "libmp3lame", "-ab", extract_bitrate]
+        # ``MP3_METADATA_ARGS``: a batch extraction has to keep the media's own
+        # tags for the same reason a single-file one does.
+        ffmpeg_args = [*MP3_METADATA_ARGS, "-vn", "-acodec", "libmp3lame", "-ab", extract_bitrate]
         output_ext, convert_type = ".mp3", "extract_audio"
         applied = ["bulk_extract_audio"]
         # Video work and audio removal are meaningless once the audio is the
@@ -3860,12 +3960,7 @@ class EnhancedMediaHandler:
                         # reuse. Without it a repeat rebuilds the caption and the
                         # audio tags from nothing but the filename - the same loss
                         # the pipeline's own reuse path had to fix.
-                        _cached_meta = (_entry or {}).get("source_meta")
-                        if isinstance(_cached_meta, dict) and _cached_meta:
-                            _merged_meta = dict(current_file.get("_source_metadata") or {})
-                            for _mk, _mv in _cached_meta.items():
-                                _merged_meta.setdefault(_mk, _mv)
-                            current_file["_source_metadata"] = _merged_meta
+                        _merge_cached_source_meta(current_file, _entry)
                         session["current_file"] = current_file
                         with contextlib.suppress(Exception):
                             self._persist_session(user_id)
@@ -3880,6 +3975,10 @@ class EnhancedMediaHandler:
                 _stored_path = (_entry or {}).get("path")
                 if _stored_path and os.path.exists(_stored_path):
                     current_file["path"] = _stored_path
+                    # A local copy this media was already fetched to carries the
+                    # same descriptor verdict as a stored one; a repeat must not
+                    # describe it worse than the first request did.
+                    _merge_cached_source_meta(current_file, _entry)
                     session["current_file"] = current_file
                     with contextlib.suppress(Exception):
                         self._persist_session(user_id)
@@ -3896,6 +3995,7 @@ class EnhancedMediaHandler:
                     with open(file_path, "wb") as _fh:
                         _fh.write(_cached)
                     current_file["path"] = file_path
+                    _merge_cached_source_meta(current_file, _entry)
                     session["current_file"] = current_file
                     with contextlib.suppress(Exception):
                         self._persist_session(user_id)
@@ -4453,6 +4553,12 @@ class EnhancedMediaHandler:
                             pass
                     if ok and os.path.exists(file_path):
                         current_file["path"] = file_path
+                        # Read the media's own metadata now that its bytes are
+                        # here: without this the fallback's download is the one
+                        # path into the pipe with no probe verdict, and every
+                        # caption and player tag built after it falls back to the
+                        # filename (see _probe_downloaded_source).
+                        await _probe_downloaded_source(current_file, file_path)
                         session["current_file"] = current_file
                         try:
                             self._persist_session(user_id)
@@ -4773,6 +4879,10 @@ class EnhancedMediaHandler:
             except Exception:
                 logger.debug("detect_filename failed after download")
             current_file["path"] = file_path
+            # Same reason as the userbot fallback above: a media that reached
+            # this disk still has to carry the verdict the rest of the bot reads
+            # its captions and player tags from.
+            await _probe_downloaded_source(current_file, file_path)
 
             # Remember the body so a repeat of this media skips the download.
             # Only small media are stored in Redis; larger ones are covered by
@@ -7454,6 +7564,12 @@ class EnhancedMediaHandler:
                     enqueued = 0
                     skipped = 0
                     photo_skipped = 0
+                    # Files whose own audio already carries the bitrate the batch
+                    # asked for, so the conversion would have produced a copy of
+                    # what the user sent (see the compare/validate step below).
+                    # Neither enqueued nor skipped: nothing was queued, and
+                    # nothing failed.
+                    already = 0
                     failed = 0
                     # (label, status) pairs — one per queued file/group — shown below.
                     results: list[tuple[str, str]] = []
@@ -7681,6 +7797,29 @@ class EnhancedMediaHandler:
                             # stares at while a batch is being fed is a message
                             # that has not changed since they pressed Apply.
                             await self._bulk_show_fetch_progress(query, _batch_id, _idx + 1, len(_bulk_files), f)
+
+                            # ── Compare → validate → already exists ──
+                            # The batch's Extract Audio makes the same promise as the
+                            # single-file one, and holds the same trap: these are the
+                            # user's own files, so a queued audio that already
+                            # carries the requested bitrate would be downloaded in
+                            # full only to be re-encoded into itself. Answering it
+                            # here keeps the fetch - the part that costs minutes on
+                            # a large file - out of the batch entirely. Only an
+                            # audio source is answered this way: an extraction from
+                            # a *video* produces a file the user does not have yet,
+                            # matching bitrate or not.
+                            if _plan["convert_type"] == "extract_audio" and f.get("type") == "audio":
+                                _existing = await _already_at_bitrate(f, _plan["extract_bitrate"], user_id=user_id)
+                                if _existing:
+                                    already += 1
+                                    results.append(
+                                        (
+                                            _bulk_display_name(f),
+                                            f"ℹ️ already {_plan['extract_bitrate']}",
+                                        )
+                                    )
+                                    continue
 
                             # Each entry may need its own download — the session's
                             # current_file is not necessarily this file.
@@ -8087,6 +8226,15 @@ class EnhancedMediaHandler:
                         _head += f"\n⏹️ {cancelled_members} file(s) were cancelled."
                     if _reclaimed:
                         _head += f"\n↩️ Skipped {_reclaimed} file(s) an earlier run had already finished."
+                    if already:
+                        # Not a failure and not a skip: these files already are
+                        # what the batch asked for, so there is nothing to fetch
+                        # and nothing to encode. Saying so is the whole point of
+                        # the check - otherwise the user only sees a file quietly
+                        # missing from the "queued" count.
+                        _head += (
+                            f"\nℹ️ {already} file(s) were already {_plan['extract_bitrate']} — nothing to re-encode."
+                        )
                     if photo_skipped:
                         _head += f"\n⚠️ Skipped {photo_skipped} photo(s) — “{_applied}” needs an audio/video stream."
                     if _plan["ignored"]:
@@ -10373,6 +10521,21 @@ class EnhancedMediaHandler:
         # visible only on the file it was made for.
         _remember_audio_bitrate(update, audio_bitrate)
 
+        # ── Compare → validate → already exists ──
+        # A bitrate change on an audio file is the one request whose answer can
+        # already be in the user's hands: they sent the media, so a file that
+        # already carries this bitrate *is* the result. Ask the source what it
+        # carries before fetching it, because the fetch is the expensive half -
+        # a 47MB audio is past what the Bot API will hand a bot, so acting on
+        # "64k" for a file that is already 64k used to mean a full userbot
+        # download of the media to re-encode it into an identical file. An
+        # unknown verdict falls through to the normal path, exactly as before.
+        _existing = await _already_at_bitrate(current_file, audio_bitrate, user_id=update.effective_user.id)
+        if _existing:
+            session["current_file"] = current_file
+            await notify(_already_at_bitrate_text(audio_bitrate))
+            return
+
         await notify(f"🎚️ Setting bitrate to {audio_bitrate}...")
 
         output_base = getattr(config, "OUTPUT_PATH", "storage/output") if config else "storage/output"
@@ -10380,8 +10543,16 @@ class EnhancedMediaHandler:
             os.makedirs(output_base, exist_ok=True)
         output_path = os.path.join(output_base, f"{current_file['id']}_{audio_bitrate}.mp3")
 
-        # Convert with specific bitrate
-        cmd = ["-c:a", "libmp3lame", "-b:a", audio_bitrate]
+        # Convert with specific bitrate.
+        #
+        # The media's own tags are copied explicitly (``-map_metadata 0``) and
+        # written as ID3v2.3 (``-id3v2_version 3``): the title/artist/album/
+        # album_artist/track the file carries are what the user sees in Telegram
+        # *and* in their file explorer, and ffmpeg writes ID3v2.4 by default,
+        # which Explorer does not read - it shows an empty Properties panel for a
+        # file that still has every tag in it. One recipe, shared with the
+        # splitter, so a bitrate change and a split keep the same metadata.
+        cmd = [*MP3_METADATA_ARGS, "-c:a", "libmp3lame", "-b:a", audio_bitrate]
 
         # Ensure file downloaded (lazy-download)
         if not current_file.get("path") or not os.path.exists(current_file.get("path") or ""):

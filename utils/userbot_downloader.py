@@ -1293,6 +1293,97 @@ async def download_media_to_sink(
             await client.disconnect()
 
 
+async def download_head_via_userbot(
+    chat_id: int | str,
+    message_id: int,
+    dest_path: str,
+    *,
+    max_bytes: int = 262144,
+    user_id: int | None = None,
+    timeout: float = 60.0,
+) -> bool:
+    """Read only the **first** ``max_bytes`` of a Telegram media into *dest_path*.
+
+    Some questions about a media can be answered from its opening bytes - what
+    bitrate does this audio carry? - and the download that answers them is the
+    one worth avoiding: a 47MB audio cannot be read over the Bot API at all, so
+    the only way to learn its bitrate used to be fetching the whole file through
+    the userbot pipeline. Telethon's ``iter_download`` takes a byte offset and a
+    limit, so this is a genuine partial read: a quarter of a megabyte instead of
+    the media.
+
+    Deliberately best-effort. Returns ``False`` - never raises - for a missing
+    credential, an unresolvable message, a timeout or a transport error, because
+    every caller uses the answer only to decide whether it can skip work it would
+    otherwise do.
+    """
+    if TelegramClient is None or not dest_path or max_bytes <= 0:
+        return False
+
+    from utils.telethon_session import (
+        build_telethon_client,
+        get_db_model,
+        get_telethon_session_string_for_user,
+        get_userbot_credentials,
+    )
+
+    try:
+        api_id, api_hash = get_userbot_credentials()
+    except Exception as e:
+        # No userbot configured at all: a normal state for a Bot-API-only
+        # deploy, and a "no" from this path rather than an error.
+        logger.debug("userbot: no userbot credentials (%s); cannot read a header", e)
+        return False
+
+    try:
+        session_str = await get_telethon_session_string_for_user(user_id=user_id, db_model=get_db_model())
+    except Exception:
+        session_str = None
+
+    client = build_telethon_client(api_id, api_hash, session_str=session_str)
+    if client is None:
+        logger.debug("userbot: no Telethon session for a header read")
+        return False
+
+    async def _fetch() -> bool:
+        try:
+            await client.start()
+            target = await _normalize_target(chat_id, client)
+            msgs = await _resolve_message_via_telethon(client, chat_id, message_id, target=target)
+            if not msgs:
+                logger.debug("userbot: could not resolve %s/%s for a header read", chat_id, message_id)
+                return False
+            written = 0
+            with open(dest_path, "wb") as fh:
+                async for chunk in client.iter_download(msgs[0], offset=0, limit=max_bytes):
+                    if not chunk:
+                        continue
+                    # Only the bytes still missing are written, so the file holds
+                    # the header and not a whole chunk past it: ``limit`` is
+                    # honoured by every version of Telethon this project
+                    # supports, but a version that read it as a *chunk* count
+                    # would otherwise turn a header read back into a full
+                    # download of the very media this exists to avoid.
+                    slice_ = chunk[: max_bytes - written]
+                    fh.write(slice_)
+                    written += len(slice_)
+                    if written >= max_bytes:
+                        break
+            return written > 0
+        finally:
+            with contextlib.suppress(Exception):
+                await client.disconnect()
+
+    try:
+        return bool(await asyncio.wait_for(_fetch(), timeout=timeout))
+    except TimeoutError:
+        logger.debug("userbot: header read for %s/%s timed out after %.0fs", chat_id, message_id, timeout)
+        return False
+    except Exception as exc:
+        logger.debug("userbot: header read for %s/%s failed: %s", chat_id, message_id, exc)
+        return False
+
+
 async def _download_with_telethon(
     chat_id: int | str,
     message_id: int,
