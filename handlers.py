@@ -2619,6 +2619,7 @@ class EnhancedMediaHandler:
         if not as_audio and os.path.exists(file_path):
             try:
                 from utils.ffmpeg_runner import probe_video_for_delivery
+
                 _meta, _auto_thumb = await probe_video_for_delivery(file_path)
                 if _auto_thumb and os.path.exists(_auto_thumb):
                     _thumb_path = _auto_thumb
@@ -2793,7 +2794,7 @@ class EnhancedMediaHandler:
             # not real content. A 0.5s tail (~8KB at 128kbps) is real and must be kept.
             #
             # We detect junk by checking if the part is both tiny AND the last part:
-            # - Real short tails are meaningful content the user asked for (e.g. 10.5s 
+            # - Real short tails are meaningful content the user asked for (e.g. 10.5s
             #   video split into 10s parts gives a 0.5s final part).
             # - Junk tails are frame quantization artifacts: too small to be useful.
             #
