@@ -3111,9 +3111,7 @@ async def handle_job(job: dict):
                                                         duration=int(_audio_meta["duration"])
                                                         if _audio_meta.get("duration")
                                                         else (
-                                                            int(_vid_duration)
-                                                            if _vid_duration is not None
-                                                            else None
+                                                            int(_vid_duration) if _vid_duration is not None else None
                                                         ),
                                                     )
                                             elif kind == "video":
