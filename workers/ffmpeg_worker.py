@@ -3083,6 +3083,15 @@ async def handle_job(job: dict):
                                                 # mime_type argument is passed (send_audio
                                                 # does not accept one).
                                                 _bot_up_cb = _make_upload_progress_callback(job_id, progress_channel)
+                                                # The tags come from the file the worker just
+                                                # produced, the same way the deferred-delivery
+                                                # path reads them (see _deliver_audio above).
+                                                # They used to be hard-coded to the delivery
+                                                # name and an empty performer, so the *same*
+                                                # job showed the album's title and artist when
+                                                # it was delivered later and nothing but the
+                                                # filename when it was delivered inline.
+                                                _audio_meta = await _probe_audio_delivery(out, _delivery_name) or {}
                                                 with open(out, "rb") as fh:
                                                     fh = (
                                                         _ProgressFileWrapper(fh, file_size, _bot_up_cb)
@@ -3093,12 +3102,19 @@ async def handle_job(job: dict):
                                                         chat_id=chat_id,
                                                         audio=fh,
                                                         caption=caption,
-                                                        title=os.path.splitext(_delivery_name)[0],
+                                                        title=(
+                                                            _audio_meta.get("title")
+                                                            or os.path.splitext(_delivery_name)[0]
+                                                        ),
                                                         filename=_delivery_name,
-                                                        performer="",
-                                                        duration=int(_vid_duration)
-                                                        if _vid_duration is not None
-                                                        else None,
+                                                        performer=(_audio_meta.get("performer") or ""),
+                                                        duration=int(_audio_meta["duration"])
+                                                        if _audio_meta.get("duration")
+                                                        else (
+                                                            int(_vid_duration)
+                                                            if _vid_duration is not None
+                                                            else None
+                                                        ),
                                                     )
                                             elif kind == "video":
                                                 # Try to attach thumbnail (thumb) when available

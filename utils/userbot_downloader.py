@@ -1345,6 +1345,13 @@ async def download_head_via_userbot(
         logger.debug("userbot: no Telethon session for a header read")
         return False
 
+    # Written to a sibling and swapped in only once the bytes are there. An
+    # aborted read must never leave a file at the destination: every caller asks
+    # nothing more than "is there something at this path", and a leftover empty
+    # one answers yes - the same reason every download in this project stages
+    # through a ``.part`` file.
+    part_path = f"{dest_path}.part"
+
     async def _fetch() -> bool:
         try:
             await client.start()
@@ -1354,7 +1361,7 @@ async def download_head_via_userbot(
                 logger.debug("userbot: could not resolve %s/%s for a header read", chat_id, message_id)
                 return False
             written = 0
-            with open(dest_path, "wb") as fh:
+            with open(part_path, "wb") as fh:
                 async for chunk in client.iter_download(msgs[0], offset=0, limit=max_bytes):
                     if not chunk:
                         continue
@@ -1369,8 +1376,14 @@ async def download_head_via_userbot(
                     written += len(slice_)
                     if written >= max_bytes:
                         break
-            return written > 0
+            if written <= 0:
+                return False
+            os.replace(part_path, dest_path)
+            return True
         finally:
+            with contextlib.suppress(OSError):
+                if os.path.exists(part_path):
+                    os.remove(part_path)
             with contextlib.suppress(Exception):
                 await client.disconnect()
 

@@ -316,7 +316,15 @@ async def probe_media(path: str) -> dict:
     if not result.get("creation_time"):
         result["creation_time"] = fmt_tags.get("creation_time", "")
 
-    # Preserve media title/performer tags for metadata-driven captions.
+    # Preserve media title/performer tags for metadata-driven captions, and read
+    # the rest of the album tags alongside them.
+    #
+    # The format is where an audio file's tags live: an MP3's ID3 tags are
+    # ``format.tags`` and the audio stream carries none, which is why title and
+    # performer are read here rather than only from the stream. Album, album
+    # artist, track, genre and year are read from the same place - a delivered
+    # file has to be able to state all of them, and the probe verdict is the one
+    # place the rest of the bot learns what the media carries.
     for tag_key, tag_value in fmt_tags.items():
         lowered = str(tag_key).lower()
         if lowered in ("title", "filename") and tag_value and not result.get("title"):
@@ -327,9 +335,23 @@ async def probe_media(path: str) -> dict:
             and not result.get("performer")
         ):
             result["performer"] = str(tag_value)[:128]
+        elif lowered == "album" and tag_value and not result.get("album"):
+            result["album"] = str(tag_value)[:128]
+        elif lowered in ("album_artist", "albumartist", "band") and tag_value and not result.get("album_artist"):
+            result["album_artist"] = str(tag_value)[:128]
+        elif lowered == "track" and tag_value and not result.get("track"):
+            result["track"] = str(tag_value)[:32]
+        elif lowered == "genre" and tag_value and not result.get("genre"):
+            result["genre"] = str(tag_value)[:64]
+        elif lowered in ("date", "year") and tag_value and not result.get("date"):
+            result["date"] = str(tag_value)[:32]
 
+    # The tags are printed because "is the metadata even there?" is the question
+    # every metadata bug starts from, and the answer has to be visible in the log
+    # of the run that lost it - not something to be reproduced afterwards.
     logger.info(
-        "probe_media: %s — dur=%s codec=%s %sx%s fps=%s rot=%s audio=%s ch=%s lang=%s chapters=%s",
+        "probe_media: %s — dur=%s codec=%s %sx%s fps=%s rot=%s audio=%s ch=%s lang=%s "
+        "chapters=%s title=%r performer=%r album=%r album_artist=%r",
         path,
         result.get("duration", "?"),
         result.get("video_codec", "?"),
@@ -341,6 +363,10 @@ async def probe_media(path: str) -> dict:
         result.get("audio_channels", "?"),
         result.get("language", "?"),
         result.get("chapters", "?"),
+        result.get("title", ""),
+        result.get("performer", ""),
+        result.get("album", ""),
+        result.get("album_artist", ""),
     )
     return result
 

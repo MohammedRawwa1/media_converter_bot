@@ -1,6 +1,7 @@
 import asyncio
 import contextlib
 import os
+import shutil
 import tempfile
 import unittest
 from types import SimpleNamespace
@@ -278,47 +279,59 @@ class HeadReadTests(unittest.IsolatedAsyncioTestCase):
         ):
             yield client
 
+    def setUp(self):
+        """Every read writes inside this test's own directory, never the repo.
+
+        The destination is a path the code under test creates, so a case that
+        fails to clean up would otherwise leave a file in whatever directory the
+        suite was started from - a stray, untracked file in the project root is a
+        test bug, not a result.
+        """
+        self._dir = tempfile.mkdtemp(prefix="headread_")
+
+    def tearDown(self):
+        with contextlib.suppress(Exception):
+            shutil.rmtree(self._dir, ignore_errors=True)
+
+    def _dest(self, name="head.bin"):
+        return os.path.join(self._dir, name)
+
     async def test_only_the_head_is_read_and_kept(self):
         chunks = [b"a" * 100, b"b" * 100, b"c" * 100]
-        dest = os.path.join(tempfile.gettempdir(), f"head_{os.getpid()}_{id(self)}.bin")
-        try:
-            async with self._client(chunks) as client:
-                ok = await mod.download_head_via_userbot(123, 456, dest, max_bytes=250, user_id=7)
+        dest = self._dest()
 
-            self.assertTrue(ok)
-            with open(dest, "rb") as fh:
-                body = fh.read()
-            # Two whole chunks and a slice of the third: the transfer stops at the
-            # limit rather than walking the rest of a file nobody asked for.
-            self.assertEqual(body, (b"a" * 100) + (b"b" * 100) + (b"c" * 50))
-            self.assertEqual(client.requests, [(0, 250)])
-            self.assertTrue(client.disconnected, "the client must not be left running")
-        finally:
-            with contextlib.suppress(OSError):
-                os.remove(dest)
+        async with self._client(chunks) as client:
+            ok = await mod.download_head_via_userbot(123, 456, dest, max_bytes=250, user_id=7)
+
+        self.assertTrue(ok)
+        with open(dest, "rb") as fh:
+            body = fh.read()
+        # Two whole chunks and a slice of the third: the transfer stops at the
+        # limit rather than walking the rest of a file nobody asked for.
+        self.assertEqual(body, (b"a" * 100) + (b"b" * 100) + (b"c" * 50))
+        self.assertEqual(client.requests, [(0, 250)])
+        self.assertTrue(client.disconnected, "the client must not be left running")
+        self.assertFalse(os.path.exists(f"{dest}.part"), "the staging file must be gone")
 
     async def test_a_short_file_is_read_whole_and_still_answers_yes(self):
-        dest = os.path.join(tempfile.gettempdir(), f"head_{os.getpid()}_{id(self)}_short.bin")
-        try:
-            async with self._client([b"x" * 10]):
-                ok = await mod.download_head_via_userbot(123, 456, dest, max_bytes=4096)
+        dest = self._dest()
 
-            self.assertTrue(ok)
-            self.assertEqual(os.path.getsize(dest), 10)
-        finally:
-            with contextlib.suppress(OSError):
-                os.remove(dest)
+        async with self._client([b"x" * 10]):
+            ok = await mod.download_head_via_userbot(123, 456, dest, max_bytes=4096)
+
+        self.assertTrue(ok)
+        self.assertEqual(os.path.getsize(dest), 10)
 
     async def test_no_userbot_configured_is_a_no_not_an_error(self):
         with patch.object(mod, "TelegramClient", None):
-            self.assertFalse(await mod.download_head_via_userbot(123, 456, "nowhere.bin"))
+            self.assertFalse(await mod.download_head_via_userbot(123, 456, self._dest()))
 
     async def test_a_missing_credential_is_a_no(self):
         with patch("utils.telethon_session.get_userbot_credentials", side_effect=RuntimeError("unset")):
-            self.assertFalse(await mod.download_head_via_userbot(123, 456, "nowhere.bin"))
+            self.assertFalse(await mod.download_head_via_userbot(123, 456, self._dest()))
 
     async def test_a_message_that_cannot_be_resolved_is_a_no(self):
-        dest = os.path.join(tempfile.gettempdir(), f"head_{os.getpid()}_{id(self)}_unresolved.bin")
+        dest = self._dest()
         with (
             patch.object(mod, "TelegramClient", object()),
             patch.object(mod, "_normalize_target", AsyncMock(return_value="target")),
@@ -345,9 +358,10 @@ class HeadReadTests(unittest.IsolatedAsyncioTestCase):
             patch("utils.telethon_session.get_db_model", return_value=None),
             patch("utils.telethon_session.build_telethon_client", return_value=self._FakeClient([b"x"])),
         ):
-            self.assertFalse(await mod.download_head_via_userbot(123, 456, "nowhere.bin"))
+            self.assertFalse(await mod.download_head_via_userbot(123, 456, self._dest()))
 
-    async def test_a_read_that_hangs_is_abandoned(self):
+    async def test_a_read_that_hangs_is_abandoned_and_leaves_nothing(self):
+        """The abandoned read must not leave the file its caller checks for."""
         client = AsyncMock()
         client.start = AsyncMock()
         client.disconnect = AsyncMock()
@@ -357,6 +371,7 @@ class HeadReadTests(unittest.IsolatedAsyncioTestCase):
             yield b"never"
 
         client.iter_download = _hanging
+        dest = self._dest()
 
         with (
             patch.object(mod, "TelegramClient", object()),
@@ -367,9 +382,11 @@ class HeadReadTests(unittest.IsolatedAsyncioTestCase):
             patch("utils.telethon_session.get_db_model", return_value=None),
             patch("utils.telethon_session.build_telethon_client", return_value=client),
         ):
-            ok = await mod.download_head_via_userbot(123, 456, "nowhere.bin", timeout=0.05)
+            ok = await mod.download_head_via_userbot(123, 456, dest, timeout=0.05)
 
         self.assertFalse(ok)
+        self.assertFalse(os.path.exists(dest))
+        self.assertFalse(os.path.exists(f"{dest}.part"))
 
 
 if __name__ == "__main__":

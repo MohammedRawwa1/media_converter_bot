@@ -270,7 +270,10 @@ def test_audio_probe_returns_none_rather_than_a_partial_dict(tmp_path, monkeypat
 def test_delivery_sites_pass_the_audio_tags_through():
     src = read_object_source(ffmpeg_worker.handle_job)
     assert src.count("audio_meta=_pre_am") == 2
-    assert src.count("_probe_audio_delivery(out, _delivery_name)") == 2
+    # Every place that sends the produced audio reads the tags off it: the two
+    # MTProto uploads and the inline Bot-API send, which used to hard-code a
+    # filename title and an empty performer instead.
+    assert src.count("_probe_audio_delivery(out, _delivery_name)") == 3
 
 
 def test_uploader_exposes_a_public_probe_entry_point():

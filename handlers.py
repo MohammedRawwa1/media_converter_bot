@@ -4013,10 +4013,32 @@ class EnhancedMediaHandler:
         # file size or access rules, prefer a user-account (userbot) fallback when
         # configured via env (`ENABLE_USERBOT` + API_ID/API_HASH).
         try:
-            # -- Big files pipeline: route files > BOT_API_MAX_MB through Pyrogram->S3->Worker
-            bot_api_max_mb = config.BOT_API_MAX_MB
+            # ── Which pipe can carry this file ──
+            # Two different limits, because Telegram has two of them: a bot may
+            # *upload* 50MB (BOT_API_MAX_MB, which every delivery check reads) but
+            # it may only *download* 20MB (BOT_API_DOWNLOAD_MAX_MB). Deciding how
+            # to fetch from the upload number is how a 47MB audio was read as
+            # "small": get_file was called for a file Telegram was never going to
+            # hand over, and the userbot fallback that would have run anyway ran
+            # twenty seconds later instead. A media past the download ceiling goes
+            # to the pipeline / userbot route directly.
+            #
+            # The pipeline is only used when the caller has *declared what to
+            # produce* (``_pipeline_ffmpeg_args``): a pipeline job is handed its
+            # ffmpeg arguments at ingest time, so a caller that declares none would
+            # get a default-args conversion of a file it never asked to convert
+            # that way. Those callers are not stranded - without a declaration the
+            # media is fetched by the userbot fallback below, which is the local
+            # file they actually need.
+            bot_api_download_max_mb = getattr(config, "BOT_API_DOWNLOAD_MAX_MB", 20)
             file_size = current_file.get("size") or 0
-            if file_size and file_size > bot_api_max_mb * 1024 * 1024 and _bigfile_pipeline is not None:
+            _declared_conversion = bool(current_file.get("_pipeline_ffmpeg_args"))
+            if (
+                file_size
+                and file_size > bot_api_download_max_mb * 1024 * 1024
+                and _bigfile_pipeline is not None
+                and _declared_conversion
+            ):
                 _bot_chat, _bot_msg = _extract_large_file_source(current_file)
                 if _bot_chat and _bot_msg:
                     # A batch that is already stopped must not reach the relay
@@ -4418,7 +4440,7 @@ class EnhancedMediaHandler:
                                 await _pipeline_cancel_task
 
             # ── Clean early error: file > Bot API download limit but no fallback available ──
-            if file_size and file_size > bot_api_max_mb * 1024 * 1024 and _bigfile_pipeline is None:
+            if file_size and file_size > bot_api_download_max_mb * 1024 * 1024 and _bigfile_pipeline is None:
                 _userbot_enabled = config.ENABLE_USERBOT
                 if not _userbot_enabled:
                     _upload_url_early = (
@@ -4426,7 +4448,7 @@ class EnhancedMediaHandler:
                     )
                     raise Exception(
                         f"File is {file_size // (1024 * 1024)} MB, which exceeds the "
-                        f"{bot_api_max_mb} MB download limit.\n\n"
+                        f"{bot_api_download_max_mb} MB download limit.\n\n"
                         "To process files larger than this size, configure one of these:\n"
                         "• Set ENABLE_USERBOT=true and configure PYROGRAM_SESSION "
                         "(or API_ID/API_HASH + API_SESSION) so the bot can use a user account.\n"
@@ -10554,11 +10576,40 @@ class EnhancedMediaHandler:
         # splitter, so a bitrate change and a split keep the same metadata.
         cmd = [*MP3_METADATA_ARGS, "-c:a", "libmp3lame", "-b:a", audio_bitrate]
 
+        # ── Declare what a pipeline fetch should produce ──
+        # An audio past the Bot API's download ceiling cannot be fetched by this
+        # process at all, so it is handed to the pipeline - and a pipeline job
+        # carries its ffmpeg arguments from the moment it is queued. Declaring
+        # the very command the inline path below runs is what makes this button's
+        # large files take that route instead of falling back to the same
+        # download-by-hand the pipeline exists to replace.
+        current_file["_pipeline_ffmpeg_args"] = list(cmd)
+        current_file["_pipeline_output_ext"] = ".mp3"
+        current_file["_pipeline_conversion_type"] = "format_audio"
+        session["current_file"] = current_file
+
         # Ensure file downloaded (lazy-download)
         if not current_file.get("path") or not os.path.exists(current_file.get("path") or ""):
             try:
                 await self._ensure_current_file_downloaded(update, context, session)
                 current_file = session.get("current_file")
+                # The pipeline queued the conversion itself: it owns the fetch,
+                # the encode and the delivery, so queueing a second job for the
+                # same file here would convert and send it twice.
+                if current_file and current_file.get("_pipeline_job_id"):
+                    _pipeline_job_id = current_file["_pipeline_job_id"]
+                    kb = InlineKeyboardMarkup(
+                        [[InlineKeyboardButton("❌ Cancel", callback_data=f"cancel_job:{_pipeline_job_id}")]]
+                    )
+                    await notify(
+                        f"✅ Large file queued (Job: {_pipeline_job_id[:8]}...). I'll send the MP3 when ready.",
+                        reply_markup=kb,
+                    )
+                    # Progress can only be watched when we own the callback message.
+                    if query is not None:
+                        with contextlib.suppress(RuntimeError):
+                            asyncio.create_task(self._watch_job_progress(query, _pipeline_job_id, bot=context.bot))
+                    return
             except Exception as e:
                 await notify(f"❌ Failed to download file: {e}")
                 return

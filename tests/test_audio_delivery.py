@@ -16,6 +16,7 @@ from source_helpers import (
     compared_literals,
     defined_functions,
     find_function,
+    flatten,
     literal_dict,
     parse_source,
     read_source,
@@ -1072,9 +1073,37 @@ class EnqueueNamingPersistenceTests(unittest.TestCase):
         self.assertIn("stored_job_naming", src)
 
     def test_worker_bot_api_audio_send_includes_duration(self):
-        """Checked on the call itself, so wrapping the argument cannot hide it."""
+        """Checked on the call itself, so wrapping the argument cannot hide it.
+
+        The duration the produced file itself reports comes first: it is the one
+        a streaming player seeks by, and the delivery name's own guess was the
+        only thing the inline send used to carry.
+        """
         durations = call_keywords(parse_source("workers", "ffmpeg_worker.py"), "send_audio", "duration")
-        self.assertIn("int(_vid_duration) if _vid_duration is not None else None", durations)
+        self.assertIn(
+            "int(_audio_meta['duration']) if _audio_meta.get('duration') "
+            "else int(_vid_duration) if _vid_duration is not None else None",
+            durations,
+        )
+
+    def test_worker_inline_audio_send_keeps_the_produced_tags(self):
+        """The inline bot-API send must read the output's tags, not invent them.
+
+        It hard-coded ``title`` to the delivery name and ``performer`` to the
+        empty string, so one job showed the track's real title and artist when it
+        was delivered by the deferred path - which probes the file - and nothing
+        but a filename when it was delivered inline.
+        """
+        tree = parse_source("workers", "ffmpeg_worker.py")
+        assert call_keywords(tree, "_probe_audio_delivery", "out") == []
+        # Flattened, so the quote style ``ast.unparse`` happens to emit is not
+        # what the assertion is about - only which expression is passed.
+        titles = [flatten(value) for value in call_keywords(tree, "send_audio", "title")]
+        performers = [flatten(value) for value in call_keywords(tree, "send_audio", "performer")]
+        assert any('_audio_meta.get("title")' in value for value in titles)
+        assert any('_audio_meta.get("performer")' in value for value in performers)
+        # Nothing may still be sending a bare empty performer.
+        assert '""' not in performers
 
 
 class StoredJobOwnerTests(unittest.TestCase):

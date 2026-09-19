@@ -78,8 +78,25 @@ MAX_CONCURRENT_TASKS = int(os.getenv("MAX_CONCURRENT_TASKS", "5"))
 
 # Maximum file size (in MB) that the Telegram Bot API can handle.
 # Files larger than this go through the BigFilePipeline (Pyrogram -> S3 -> Worker).
+#
+# This is the *upload* limit - what the bot may send. It is not the download one.
 BOT_API_MAX_MB = int(os.getenv("BOT_API_MAX_MB", "50"))
 BOT_API_MAX_BYTES = BOT_API_MAX_MB * 1024 * 1024
+
+# Maximum file size (in MB) a bot may *download* through the Bot API.
+#
+# Telegram has two ceilings, and they are not the same number: a bot may upload
+# 50MB, but ``getFile`` only serves files up to 20MB (20,971,520 bytes - one byte
+# more is a flat 400 "File is too big"). Deciding how to fetch a media from the
+# *upload* limit is how a 47MB audio came to be classified as small: get_file was
+# called for a file Telegram was never going to hand over, and the userbot
+# fallback that would have run anyway ran twenty seconds later instead.
+#
+# Raise it only if this deployment really serves more - a self-hosted local Bot
+# API server lifts the ceiling, the cloud one does not. Filing a 20-30MB file as
+# "small" reintroduces exactly the failed call this number exists to avoid.
+BOT_API_DOWNLOAD_MAX_MB = int(os.getenv("BOT_API_DOWNLOAD_MAX_MB", "20"))
+BOT_API_DOWNLOAD_MAX_BYTES = BOT_API_DOWNLOAD_MAX_MB * 1024 * 1024
 
 # Enable userbot (Pyrogram/Telethon) for large file downloads and uploads
 ENABLE_USERBOT = os.getenv("ENABLE_USERBOT", "").lower() in ("1", "true", "yes")
