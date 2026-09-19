@@ -386,6 +386,33 @@ class BulkQualityMenuTests(unittest.TestCase):
         for choice in MP3_QUALITY_CHOICES:
             self.assertIn(bulk_bitrate_key(choice), rendered)
 
+    def test_the_audio_bitrate_picker_marks_the_active_value(self):
+        """The tool picker says which bitrate is in force, custom included.
+
+        It used to mark nothing at all and offer no place for a value that is not
+        one of its presets, so a file set to 64k (not one of them) reopened on a
+        menu that looked untouched.
+        """
+        from utils.keyboard_utils import MediaMenuBuilder
+
+        rendered = self._buttons(MediaMenuBuilder.get_bitrate_menu("audio", "128k"))
+        self.assertTrue(rendered["bitrate_128"].startswith("✅"), rendered["bitrate_128"])
+        self.assertFalse(rendered["bitrate_96"].startswith("✅"))
+
+        custom = self._buttons(MediaMenuBuilder.get_bitrate_menu("audio", "64k"))
+        self.assertEqual(custom["bitrate_custom"], "✅ Custom: 64k")
+        # No preset is marked when the value is not one of them.
+        for value in ("96", "128", "192", "256", "320"):
+            self.assertFalse(custom[f"bitrate_{value}"].startswith("✅"), value)
+
+    def test_the_mp3_quality_picker_shows_a_custom_value(self):
+        from utils.callbacks import mp3_quality_key
+        from utils.keyboard_utils import MediaMenuBuilder
+
+        rendered = self._buttons(MediaMenuBuilder.get_mp3_quality_menu("100k"))
+        self.assertEqual(rendered[mp3_quality_key("custom")], "✅ Custom: 100k")
+        self.assertFalse(rendered[mp3_quality_key("128k")].startswith("✅"))
+
     def test_bitrate_menu_uses_bulk_triggers_not_the_single_file_ones(self):
         """Choosing a bulk bitrate must never start a single-file conversion."""
         from utils.callbacks import MP3_QUALITY_PREFIX

@@ -363,6 +363,74 @@ async def _normalize_target(chat_id: int | str, client=None):
         return chat_id
 
 
+# How far a downloaded file's size may differ from the one Telegram announced for
+# the requested media before it is treated as a *different* file. Telegram rounds
+# sizes in some message shapes, so equality alone would refuse the right file; 1%
+# or 4 KB is far tighter than the gap between two unrelated media (a 1600x800
+# photo against a 49 MB module, in the case this exists for).
+_MEDIA_SIZE_TOLERANCE = 0.01
+
+
+def _message_media_size(message) -> int | None:
+    """Bytes Telegram says a message's media is, or ``None`` when it has no file.
+
+    ``None`` is the answer for a photo, a poll, a location - anything that is not
+    a downloadable file - and for a message with no media at all.
+    """
+    for field in ("document", "audio", "video", "voice", "video_note", "animation", "sticker"):
+        media = getattr(message, field, None)
+        size = getattr(media, "size", None) if media is not None else None
+        if size:
+            with contextlib.suppress(TypeError, ValueError):
+                return int(size)
+    return None
+
+
+def _message_has_audio(message) -> bool:
+    """Whether a message's media actually carries an audio stream."""
+    if getattr(message, "audio", None) is not None or getattr(message, "voice", None) is not None:
+        return True
+    document = getattr(message, "document", None)
+    for attribute in getattr(document, "attributes", None) or ():
+        if attribute.__class__.__name__ == "DocumentAttributeAudio" or hasattr(attribute, "voice"):
+            return True
+    return False
+
+
+def _size_matches(size, expected_size) -> bool:
+    """Whether a candidate's size can be the requested media's size."""
+    if size is None or not expected_size:
+        return True
+    with contextlib.suppress(TypeError, ValueError):
+        expected = int(expected_size)
+        return abs(int(size) - expected) <= max(4096, int(expected * _MEDIA_SIZE_TOLERANCE))
+    return True
+
+
+def _scan_candidate_matches(message, *, expected_size=None, want_audio: bool = False) -> bool:
+    """Whether a message found by a *scan* can be the media that was asked for.
+
+    The date and recent-history scans do not look at the requested message: they
+    walk the chat and take the first thing with media near the given instant. Near
+    a forwarded audio that can perfectly well be a photo the user sent in the same
+    minute - and a photo downloaded into the audio's own path satisfied every check
+    the old code had (a file exists; ffprobe can read it), so the fallback returned
+    success, the chat got "✅ Download complete!", and the encode that followed
+    failed on a source with no audio track at all.
+
+    A scan is therefore only allowed to take a candidate that is a *file* (never a
+    photo), whose announced size is the one the caller expected, and - when an
+    audio was requested - that actually carries audio. Everything else is skipped
+    so the scan can carry on to the message that really holds the media.
+    """
+    size = _message_media_size(message)
+    if size is None:
+        return False
+    if not _size_matches(size, expected_size):
+        return False
+    return not want_audio or _message_has_audio(message)
+
+
 async def _ffprobe_ok(path: str) -> bool:
     """Run ffprobe (in a thread) to verify the media file appears valid."""
     cmd = [os.getenv("FFPROBE_PATH", "ffprobe"), "-v", "error", "-show_entries", "format=size", "-of", "json", path]
@@ -1233,12 +1301,20 @@ async def _download_with_telethon(
     file_unique_id: str | None = None,
     progress_callback=None,
     user_id: int | None = None,
+    *,
+    expected_size: int | None = None,
+    want_audio: bool = False,
 ) -> bool:
     """Download using Telethon client.
 
     Args:
         progress_callback: Optional ``(current, total)`` callback for download progress.
         user_id: Optional Telegram user ID for per-user session resolution.
+        expected_size: Size Telegram announced for the requested media. The scans
+            use it to refuse a nearby message's media - see
+            :func:`_scan_candidate_matches`.
+        want_audio: The requested media is an audio, so a scan candidate without
+            an audio stream is not it.
     """
     if TelegramClient is None:
         logger.debug("Telethon not installed; skipping Telethon download")
@@ -1370,6 +1446,20 @@ async def _download_with_telethon(
                         msg_date,
                     )
                     async for m in client.iter_messages(target, limit=100, offset_date=dt):
+                        if not _scan_candidate_matches(m, expected_size=expected_size, want_audio=want_audio):
+                            # Not the media that was asked for: a photo, another
+                            # file, or something with no audio when audio was
+                            # requested. Skip it instead of downloading it into the
+                            # requested file's path - that is how a 1600x800 JPEG
+                            # came to be reported as the module it was asked for.
+                            if getattr(m, "media", None):
+                                logger.info(
+                                    "userbot: date scan skipping message %s (media is %s bytes%s) - not the source that was requested",
+                                    getattr(m, "id", "?"),
+                                    _message_media_size(m),
+                                    ", no audio" if want_audio and not _message_has_audio(m) else "",
+                                )
+                            continue
                         if getattr(m, "media", None):
                             for _ in range(3):
                                 try:
@@ -1389,6 +1479,22 @@ async def _download_with_telethon(
                                         )
                                     _reconcile_download_path(dl_result, dest_path)
                                     if os.path.exists(dest_path) and os.path.getsize(dest_path) > 0:
+                                        written = os.path.getsize(dest_path)
+                                        # The candidate looked right before the
+                                        # transfer; check what actually landed. A
+                                        # file of the wrong size is not the source,
+                                        # and keeping it is what let the fallback
+                                        # report success for media it never fetched.
+                                        if not _size_matches(written, expected_size or _message_media_size(m)):
+                                            logger.warning(
+                                                "userbot: date scan message %s downloaded %d bytes but %s were expected; discarding it",
+                                                getattr(m, "id", "?"),
+                                                written,
+                                                expected_size or _message_media_size(m),
+                                            )
+                                            with contextlib.suppress(OSError):
+                                                os.remove(dest_path)
+                                            break
                                         ok = await _ffprobe_ok(dest_path)
                                         if ok:
                                             logger.info("userbot: downloaded via date search to %s", dest_path)
@@ -1411,6 +1517,16 @@ async def _download_with_telethon(
                     target,
                 )
                 async for m in client.iter_messages(target, limit=200):
+                    if not _scan_candidate_matches(m, expected_size=expected_size, want_audio=want_audio):
+                        # Same gate as the date scan, same reason: a recent message
+                        # with *some* media is not the requested one.
+                        if getattr(m, "media", None):
+                            logger.info(
+                                "userbot: recent scan skipping message %s (media is %s bytes) - not the source that was requested",
+                                getattr(m, "id", "?"),
+                                _message_media_size(m),
+                            )
+                        continue
                     if getattr(m, "media", None):
                         for _ in range(3):
                             try:
@@ -1430,6 +1546,17 @@ async def _download_with_telethon(
                                     )
                                 _reconcile_download_path(dl_result, dest_path)
                                 if os.path.exists(dest_path) and os.path.getsize(dest_path) > 0:
+                                    written = os.path.getsize(dest_path)
+                                    if not _size_matches(written, expected_size or _message_media_size(m)):
+                                        logger.warning(
+                                            "userbot: recent scan message %s downloaded %d bytes but %s were expected; discarding it",
+                                            getattr(m, "id", "?"),
+                                            written,
+                                            expected_size or _message_media_size(m),
+                                        )
+                                        with contextlib.suppress(OSError):
+                                            os.remove(dest_path)
+                                        break
                                     ok = await _ffprobe_ok(dest_path)
                                     if ok:
                                         return True
@@ -2291,6 +2418,9 @@ async def download_forward_via_userbot(
     file_unique_id: str | None = None,
     progress_callback=None,
     user_id: int | None = None,
+    *,
+    expected_size: int | None = None,
+    want_audio: bool = False,
 ) -> bool:
     """Download a message media using a user account.
 
@@ -2305,6 +2435,10 @@ async def download_forward_via_userbot(
       file_unique_id: Telegram Bot API file_unique_id (optional)
       progress_callback: Optional ``(current, total)`` callback for download progress.
       user_id: Optional Telegram user ID for per-user session resolution.
+      expected_size: The size Telegram announced for the requested media. Passed to
+        the scans so they cannot hand back a *different* message's media.
+      want_audio: The requested media is an audio, so a scan candidate without an
+        audio stream is not it.
 
     Returns True on success, False on failure. Raises RuntimeError for missing config.
     """
@@ -2348,6 +2482,8 @@ async def download_forward_via_userbot(
                 file_unique_id,
                 progress_callback=progress_callback,
                 user_id=user_id,
+                expected_size=expected_size,
+                want_audio=want_audio,
             )
             if result:
                 return True

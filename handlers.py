@@ -1100,6 +1100,30 @@ def _user_audio_bitrate(user_id) -> str:
     return _DEFAULT_AUDIO_BITRATE
 
 
+def _remember_audio_bitrate(update, bitrate: str) -> bool:
+    """Store a chosen bitrate as the user's audio-bitrate setting.
+
+    A bitrate picked anywhere - the audio bitrate picker, its Custom prompt, the
+    video -> MP3 quality picker - is a *setting* the converters fall back to, not a
+    one-shot argument: it is kept so the next conversion without a quality of its
+    own uses it, and so every picker can show it back (a custom value has no preset
+    button to mark, so it is read back on the Custom row as ``✅ Custom: 64k``).
+
+    Returns True when it was stored. Never raises: a settings store that is down
+    must not fail the conversion the user actually asked for.
+    """
+    user_id = getattr(getattr(update, "effective_user", None), "id", None)
+    value = _sanitize_audio_bitrate(bitrate, default="")
+    if not user_id or not value or not user_settings:
+        return False
+    try:
+        user_settings.set_user_setting(user_id, "audio_bitrate", value)
+        return True
+    except Exception:
+        logger.debug("handlers: could not store the audio bitrate preference for %s", user_id)
+        return False
+
+
 def _user_compress_crf(user_id) -> int:
     """The compress quality the user set in /usersettings, or the default CRF.
 
@@ -4401,6 +4425,14 @@ class EnhancedMediaHandler:
                         file_unique_id=current_file.get("file_unique_id"),
                         progress_callback=_dl_progress_cb,
                         user_id=update.effective_user.id,
+                        # The scans inside the fallback walk the chat and take the
+                        # first message with media near this instant. Without these
+                        # it can (and did) take a nearby photo instead of the audio,
+                        # download it into this file's own path, and report "ok" - so
+                        # the chat saw "✅ Download complete!" and the conversion that
+                        # followed failed on a source with no audio track at all.
+                        expected_size=current_file.get("size"),
+                        want_audio=str(current_file.get("type") or "") == "audio",
                     )
                     logger.info(
                         "Userbot download fallback (%s) result for %s/%s: ok=%s exists=%s",
@@ -4925,6 +4957,8 @@ class EnhancedMediaHandler:
                                 file_unique_id=metadata.get("file_unique_id"),
                                 progress_callback=_dl_progress_cb,
                                 user_id=update.effective_user.id,
+                                expected_size=metadata.get("size"),
+                                want_audio=str(metadata.get("type") or "") == "audio",
                             )
                             logger.info(
                                 "userbot download result for fh=%s: ok=%s exists=%s",
@@ -6926,10 +6960,19 @@ class EnhancedMediaHandler:
                     await self.convert_audio_format(update, context, session, format_type)
 
             elif data == "bitrate_menu":
+                # The picker marks what will be used: the bitrate last set for this
+                # file, or the user's own setting when nothing was picked for it
+                # yet. A custom value is shown on the Custom row (see
+                # _custom_bitrate_button), so the menu never marks a preset that
+                # is not the one in force.
+                _current_bitrate = _sanitize_audio_bitrate(
+                    (current_file or {}).get("audio_bitrate") or _user_audio_bitrate(user_id),
+                    default="",
+                )
                 await self.safe_edit(
                     query,
                     "🎚️ **Adjust Bitrate**\nSelect bitrate:",
-                    reply_markup=MediaMenuBuilder.get_bitrate_menu(),
+                    reply_markup=MediaMenuBuilder.get_bitrate_menu("audio", _current_bitrate),
                 )
 
             # Merge list interactions
@@ -8701,7 +8744,13 @@ class EnhancedMediaHandler:
             await self.safe_edit(
                 query,
                 "🎚️ Choose the target bitrate for this audio:",
-                reply_markup=MediaMenuBuilder.get_bitrate_menu("audio"),
+                reply_markup=MediaMenuBuilder.get_bitrate_menu(
+                    "audio",
+                    _sanitize_audio_bitrate(
+                        current_file.get("audio_bitrate") or _user_audio_bitrate(update.effective_user.id),
+                        default="",
+                    ),
+                ),
             )
             return
 
@@ -9016,6 +9065,10 @@ class EnhancedMediaHandler:
             bitrate or current_file.get("audio_bitrate") or _user_audio_bitrate(user_id)
         )
         current_file["audio_bitrate"] = audio_bitrate
+        # The bitrate is a setting as much as an argument: keep it, so the next
+        # conversion without a quality of its own uses it and the quality picker
+        # reads it back.
+        _remember_audio_bitrate(update, audio_bitrate)
         session["current_file"] = current_file
         delivery_name = _audio_delivery_name(current_file.get("name"), current_file.get("id"))
         caption = _metadata_caption(current_file)
@@ -10312,6 +10365,13 @@ class EnhancedMediaHandler:
         audio_bitrate = _sanitize_audio_bitrate(bitrate)
         current_file["audio_bitrate"] = audio_bitrate
         session["current_file"] = current_file
+
+        # The value is also the user's *setting*, not only this file's argument: a
+        # bitrate chosen here is the one the audio converter uses the next time it
+        # runs without a quality of its own (``_user_audio_bitrate``), and the
+        # picker reads it back as "✅ Custom: 64k" instead of leaving the choice
+        # visible only on the file it was made for.
+        _remember_audio_bitrate(update, audio_bitrate)
 
         await notify(f"🎚️ Setting bitrate to {audio_bitrate}...")
 

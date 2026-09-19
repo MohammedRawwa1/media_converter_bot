@@ -22,6 +22,131 @@ def _stall_window(*, stall, poll):
         mod.DOWNLOAD_STALL_SECONDS, mod._STALL_POLL_SECONDS = saved
 
 
+class ScanCandidateTests(unittest.TestCase):
+    """A scan must not hand back a *different* message's media.
+
+    The date and recent-history scans walk the chat and take the first thing with
+    media near the requested instant - and near a forwarded audio that can be a
+    photo the user sent in the same minute. A photo written into the audio's own
+    path satisfied every check the fallback had (a file exists; ffprobe can read
+    it), so the download was reported as a success, the chat got "✅ Download
+    complete!", and the conversion that followed failed on a source with no audio
+    track. These pin the gate that replaced that.
+    """
+
+    def _audio_attr(self):
+        return type("DocumentAttributeAudio", (), {"voice": False})()
+
+    def test_a_photo_is_never_the_requested_file(self):
+        photo = SimpleNamespace(id=1, media=object(), photo=SimpleNamespace(id="p"))
+        self.assertFalse(mod._scan_candidate_matches(photo, expected_size=49_000_000, want_audio=True))
+
+    def test_a_file_of_another_size_is_refused(self):
+        small = SimpleNamespace(id=2, media=object(), document=SimpleNamespace(size=100_000))
+        self.assertFalse(mod._scan_candidate_matches(small, expected_size=49_000_000, want_audio=True))
+
+    def test_the_requested_audio_is_accepted(self):
+        audio = SimpleNamespace(
+            id=3,
+            media=object(),
+            audio=SimpleNamespace(size=49_289_926),
+            document=SimpleNamespace(size=49_289_926, attributes=[self._audio_attr()]),
+        )
+        self.assertTrue(mod._scan_candidate_matches(audio, expected_size=49_289_926, want_audio=True))
+
+    def test_a_video_is_not_the_audio_that_was_asked_for(self):
+        video = SimpleNamespace(
+            id=4, media=object(), video=SimpleNamespace(size=49_289_926), document=SimpleNamespace(size=49_289_926)
+        )
+        self.assertFalse(mod._scan_candidate_matches(video, expected_size=49_289_926, want_audio=True))
+        # The same message is a perfectly good answer when audio was not requested.
+        self.assertTrue(mod._scan_candidate_matches(video, expected_size=49_289_926, want_audio=False))
+
+    def test_a_document_carrying_audio_counts_as_an_audio(self):
+        sent_as_file = SimpleNamespace(
+            id=5,
+            media=object(),
+            document=SimpleNamespace(size=49_289_926, attributes=[self._audio_attr()]),
+        )
+        self.assertTrue(mod._scan_candidate_matches(sent_as_file, expected_size=49_289_926, want_audio=True))
+
+    def test_no_expectation_means_no_size_constraint(self):
+        anything = SimpleNamespace(id=6, media=object(), document=SimpleNamespace(size=12))
+        self.assertTrue(mod._scan_candidate_matches(anything))
+        self.assertFalse(mod._scan_candidate_matches(SimpleNamespace(id=7, media=object()), expected_size=99))
+
+    def test_both_scans_go_through_the_gate(self):
+        src = read_source("utils", "userbot_downloader.py")
+        self.assertEqual(src.count("_scan_candidate_matches(m"), 3)
+
+
+class ScanSkipsTheWrongMediaTests(unittest.IsolatedAsyncioTestCase):
+    """End to end through the date scan: the photo is passed over, the audio taken."""
+
+    async def test_the_scan_skips_a_nearby_photo_and_downloads_the_audio(self):
+        photo = SimpleNamespace(id=1, media=object(), photo=SimpleNamespace(id="p"))
+        audio = SimpleNamespace(
+            id=2,
+            media=object(),
+            audio=SimpleNamespace(size=1_048_576),
+            document=SimpleNamespace(size=1_048_576, attributes=[type("DocumentAttributeAudio", (), {})()]),
+        )
+        downloaded: list = []
+
+        class _Client:
+            async def start(self):
+                return self
+
+            async def disconnect(self):
+                return None
+
+            def iter_messages(self, target, **kwargs):
+                async def _gen():
+                    for message in (photo, audio):
+                        yield message
+
+                return _gen()
+
+            async def download_media(self, message, file=None, **kwargs):
+                downloaded.append(message.id)
+                with open(file, "wb") as fh:
+                    fh.write(b"x" * 1_048_576)
+                return file
+
+        with tempfile.TemporaryDirectory() as tmp:
+            dest = os.path.join(tmp, "Module_02.mp3")
+            with (
+                patch.object(mod, "TelegramClient", object()),
+                # Imported inside the function, so the session module is what has
+                # to be patched (the module attribute is not on the downloader).
+                patch("utils.telethon_session.build_telethon_client", lambda *a, **k: _Client()),
+                patch(
+                    "utils.telethon_session.get_telethon_session_string_for_user",
+                    new=AsyncMock(return_value=None),
+                ),
+                patch.object(mod, "_normalize_target", AsyncMock(return_value=1405333465)),
+                patch.object(mod, "_resolve_message_via_telethon", AsyncMock(return_value=None)),
+                patch.object(mod, "_ffprobe_ok", AsyncMock(return_value=True)),
+                patch("utils.telethon_session.get_db_model", return_value=None),
+                patch(
+                    "utils.telethon_session.get_userbot_credentials",
+                    return_value=(1, "hash"),
+                ),
+            ):
+                ok = await mod._download_with_telethon(
+                    1405333465,
+                    4460,
+                    dest,
+                    msg_date="2026-09-19T20:41:42+00:00",
+                    expected_size=1_048_576,
+                    want_audio=True,
+                )
+
+            self.assertTrue(ok)
+            self.assertEqual(downloaded, [2], "the photo should never have been downloaded")
+            self.assertTrue(os.path.exists(dest))
+
+
 class UserbotDownloaderTests(unittest.IsolatedAsyncioTestCase):
     async def test_prefers_pyrogram_when_session_string_is_configured(self):
         pyrogram_mock = AsyncMock(return_value=True)

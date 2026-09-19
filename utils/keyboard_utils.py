@@ -99,6 +99,59 @@ from .callbacks import (
 )
 
 
+def _bitrate_preset(current, choices=MP3_QUALITY_CHOICES) -> str | None:
+    """The preset bitrate ``current`` is, or ``None`` when it is not a preset.
+
+    Bitrates are compared as text because that is what all of these menus carry:
+    the callback value, the stored setting and the ffmpeg argument are the same
+    string (``"64k"``), and nothing here re-derives one from another.
+
+    ``choices`` is the picker's *own* offer. The audio-bitrate picker is the one
+    that differs: it has no 64k button, so 64k is a custom value there even though
+    the other pickers list it as a preset.
+    """
+    value = str(current or "").strip()
+    return value if value in choices else None
+
+
+def _custom_bitrate(current, choices=MP3_QUALITY_CHOICES) -> str | None:
+    """The bitrate ``current`` holds that is *not* one of the presets, if any."""
+    value = str(current or "").strip()
+    return value if value and _bitrate_preset(value, choices) is None else None
+
+
+def _active_bitrate(current, default: str | None = None, choices=MP3_QUALITY_CHOICES) -> str | None:
+    """Which preset a picker should mark as active.
+
+    A custom value has no preset to mark - marking the default instead is what used
+    to put a check beside 128k while the user's own 64k appeared nowhere - so it
+    marks none, and the Custom row carries the value instead.
+    """
+    preset = _bitrate_preset(current, choices)
+    if preset is not None:
+        return preset
+    if _custom_bitrate(current, choices) is not None:
+        return None
+    return default if default is not None else MP3_DEFAULT_BITRATE
+
+
+def _custom_bitrate_button(
+    current, callback_data: str, *, mark: str = "✏️ Custom bitrate", choices=MP3_QUALITY_CHOICES
+) -> InlineKeyboardButton:
+    """The Custom row of a bitrate picker, carrying the value when it is custom.
+
+    A bitrate that is not one of the presets has nowhere else to be read back, so
+    the row states it: ``✅ Custom: 64k``. Without that, choosing Custom and typing
+    a value left the picker looking untouched - the only feedback was the "✅…set"
+    reply, and reopening the menu showed a check beside a preset instead of the
+    value the user had just entered.
+    """
+    custom = _custom_bitrate(current, choices)
+    if custom:
+        return InlineKeyboardButton(f"✅ Custom: {custom}", callback_data=callback_data)
+    return InlineKeyboardButton(mark, callback_data=callback_data)
+
+
 class MediaMenuBuilder:
     """Builds interactive keyboards for media conversion options."""
 
@@ -250,21 +303,41 @@ class MediaMenuBuilder:
         return InlineKeyboardMarkup(buttons)
 
     @staticmethod
-    def get_bitrate_menu(media_type: str = "audio") -> InlineKeyboardMarkup:
-        """Get bitrate adjustment menu (re-encodes an existing audio file)."""
+    def get_bitrate_menu(media_type: str = "audio", current: str | None = None) -> InlineKeyboardMarkup:
+        """Get bitrate adjustment menu (re-encodes an existing audio file).
+
+        ``current`` is the bitrate this file is currently set to re-encode to - the
+        one the menu last set, or the user's own default bitrate - and it is marked
+        in the labels, so the menu says which value is in force instead of leaving
+        the user to remember it. A value that is not one of the presets is shown on
+        the Custom row as itself (``✅ Custom: 64k``); see
+        :func:`_custom_bitrate_button`.
+        """
+        presets = {
+            "320": "320k (Best)",
+            "256": "256k (Very High)",
+            "192": "192k (High)",
+            "128": "128k (Standard)",
+            "96": "96k (Small)",
+        }
+        # This picker's own offer - it has no 64k button, so 64k is a custom value
+        # here even though the other pickers list it among their presets.
+        offered = tuple(f"{value}k" for value in presets)
+
+        def _preset(value: str) -> InlineKeyboardButton:
+            label = presets[value]
+            return InlineKeyboardButton(
+                f"{'✅ ' if _bitrate_preset(current, offered) == f'{value}k' else ''}{label}",
+                callback_data=f"bitrate_{value}",
+            )
+
         if media_type == "audio":
             buttons = [
+                [_preset("320"), _preset("256")],
+                [_preset("192"), _preset("128")],
                 [
-                    InlineKeyboardButton("320k (Best)", callback_data="bitrate_320"),
-                    InlineKeyboardButton("256k (Very High)", callback_data="bitrate_256"),
-                ],
-                [
-                    InlineKeyboardButton("192k (High)", callback_data="bitrate_192"),
-                    InlineKeyboardButton("128k (Standard)", callback_data="bitrate_128"),
-                ],
-                [
-                    InlineKeyboardButton("96k (Small)", callback_data="bitrate_96"),
-                    InlineKeyboardButton("✏️ Custom", callback_data="bitrate_custom"),
+                    _preset("96"),
+                    _custom_bitrate_button(current, "bitrate_custom", mark="✏️ Custom", choices=offered),
                 ],
             ]
         else:  # video
@@ -288,15 +361,17 @@ class MediaMenuBuilder:
 
         ``current`` is the bitrate that will be used if the user re-opens the
         menu, and is marked in the labels so it is obvious which one is active.
+        A value that is not one of the presets is marked on the Custom row as
+        itself, so a custom pick is readable back.
         """
-        current = current or MP3_DEFAULT_BITRATE
+        active = _active_bitrate(current)
 
         def _label(value: str) -> str:
-            return f"{'✅ ' if value == current else ''}{value}"
+            return f"{'✅ ' if value == active else ''}{value}"
 
         rows = [MP3_QUALITY_CHOICES[i : i + 2] for i in range(0, len(MP3_QUALITY_CHOICES), 2)]
         buttons = [[InlineKeyboardButton(_label(v), callback_data=mp3_quality_key(v)) for v in row] for row in rows]
-        buttons.append([InlineKeyboardButton("✏️ Custom bitrate", callback_data=mp3_quality_key("custom"))])
+        buttons.append([_custom_bitrate_button(current, mp3_quality_key("custom"))])
         buttons.append([InlineKeyboardButton("↩️ Back", callback_data=MENU_MAIN)])
         return InlineKeyboardMarkup(buttons)
 
@@ -425,14 +500,14 @@ class MediaMenuBuilder:
         Same choices as the single-file video -> MP3 picker so the two never
         drift, but with bulk triggers so choosing one never starts a conversion.
         """
-        active = current if current in MP3_QUALITY_CHOICES else BULK_BITRATE_DEFAULT
+        active = _active_bitrate(current, default=BULK_BITRATE_DEFAULT)
 
         def _label(value: str) -> str:
             return f"{'✅ ' if value == active else ''}{value}"
 
         rows = [MP3_QUALITY_CHOICES[i : i + 2] for i in range(0, len(MP3_QUALITY_CHOICES), 2)]
         buttons = [[InlineKeyboardButton(_label(v), callback_data=bulk_bitrate_key(v)) for v in row] for row in rows]
-        buttons.append([InlineKeyboardButton("✏️ Custom bitrate", callback_data=bulk_bitrate_key("custom"))])
+        buttons.append([_custom_bitrate_button(current, bulk_bitrate_key("custom"))])
         buttons.append([InlineKeyboardButton("↩️ Back", callback_data="bulk_menu")])
         return InlineKeyboardMarkup(buttons)
 
@@ -801,7 +876,7 @@ class MediaMenuBuilder:
         Same choices as the bulk and video -> MP3 pickers, but with settings
         triggers so choosing one only stores it.
         """
-        active = current if current in MP3_QUALITY_CHOICES else MP3_DEFAULT_BITRATE
+        active = _active_bitrate(current)
 
         def _label(value: str) -> str:
             return f"{'✅ ' if value == active else ''}{value}"
@@ -810,7 +885,7 @@ class MediaMenuBuilder:
         buttons = [
             [InlineKeyboardButton(_label(v), callback_data=settings_bitrate_key(v)) for v in row] for row in rows
         ]
-        buttons.append([InlineKeyboardButton("✏️ Custom bitrate", callback_data=settings_bitrate_key("custom"))])
+        buttons.append([_custom_bitrate_button(current, settings_bitrate_key("custom"))])
         buttons.append([InlineKeyboardButton("↩️ Back", callback_data="settings_page:2")])
         return InlineKeyboardMarkup(buttons)
 

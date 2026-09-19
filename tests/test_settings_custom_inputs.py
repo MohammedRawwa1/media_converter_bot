@@ -300,10 +300,54 @@ class RepeatTrimJobTests(unittest.TestCase):
         self.assertEqual(job["output_filename"], "clip_trimmed.mkv")
 
 
-class CustomBitrateTests(unittest.TestCase):
+class _MemorySettings:
+    """An in-memory stand-in for the settings store.
+
+    A bitrate chosen anywhere is kept as the user's setting (see
+    ``_remember_audio_bitrate``), so a test that runs the real ``adjust_bitrate``
+    would otherwise write ``storage/user_settings.json`` - a file the repository
+    does not track, created by the suite and left behind by it.
+    """
+
+    def __init__(self):
+        self.values: dict = {}
+
+    def set_user_setting(self, user_id, key, value):
+        self.values.setdefault(str(user_id), {})[key] = value
+        return True
+
+    def get_user_setting(self, user_id, key, default=None):
+        return (self.values.get(str(user_id)) or {}).get(key, default)
+
+    def get_user_settings(self, user_id):
+        return dict(self.values.get(str(user_id)) or {})
+
+
+class _SettingsStubCase(unittest.TestCase):
+    """Base for the tests that drive a real conversion method.
+
+    ``adjust_bitrate`` keeps the bitrate it is given as the user's *setting*, so a
+    test that runs it against the real store writes ``storage/user_settings.json`` -
+    a file the repository does not track, created by the suite and left behind by
+    it. Every such case stands the store in for memory instead.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.settings = _MemorySettings()
+        self.settings_patch = patch.object(handlers_module, "user_settings", self.settings)
+        self.settings_patch.start()
+
+    def tearDown(self):
+        self.settings_patch.stop()
+        super().tearDown()
+
+
+class CustomBitrateTests(_SettingsStubCase):
     """The typed bitrate must actually be applied and acknowledged."""
 
     def setUp(self):
+        super().setUp()
         self.tmp = tempfile.TemporaryDirectory()
         self.output_patch = patch.object(handlers_module, "config", SimpleNamespace(OUTPUT_PATH=self.tmp.name))
         self.output_patch.start()
@@ -311,6 +355,7 @@ class CustomBitrateTests(unittest.TestCase):
     def tearDown(self):
         self.output_patch.stop()
         self.tmp.cleanup()
+        super().tearDown()
 
     def _audio_file(self):
         path = os.path.join(self.tmp.name, "track.mp3")
@@ -355,6 +400,25 @@ class CustomBitrateTests(unittest.TestCase):
         self.assertTrue(user_data.get("awaiting_bitrate"))
         self.assertTrue(any("Enter bitrate" in text for text, _ in replies), replies)
 
+    def test_the_chosen_bitrate_is_kept_as_the_users_setting(self):
+        """A bitrate picked here is the preference too, not only this file's argument.
+
+        The picker is the same one the settings page drives, and a custom value has
+        no preset button to mark - so a value that was only ever put on the file it
+        was typed for could not be read back anywhere: the next conversion started
+        from whatever the setting still said, and the menu had nothing to show.
+        """
+        self._run("64k")
+
+        self.assertEqual(self.settings.get_user_setting(7, "audio_bitrate"), "64k")
+
+    def test_an_out_of_range_bitrate_never_becomes_the_setting(self):
+        # Sanitising falls back to the default, so what is stored is a value ffmpeg
+        # can actually take, never the raw text.
+        self._run("9999k")
+
+        self.assertEqual(self.settings.get_user_setting(7, "audio_bitrate"), handlers_module._DEFAULT_AUDIO_BITRATE)
+
     def test_missing_file_is_answered_on_the_message_path(self):
         _converter, replies, _sent, _user_data = self._run("64k", current_file={})
 
@@ -362,10 +426,11 @@ class CustomBitrateTests(unittest.TestCase):
         self.assertTrue(any("No audio file found" in text for text, _ in replies), replies)
 
 
-class RepeatBitrateJobTests(unittest.TestCase):
+class RepeatBitrateJobTests(_SettingsStubCase):
     """Re-encoding a cached media must reuse its stored object, not Pyrogram."""
 
     def setUp(self):
+        super().setUp()
         self.tmp = tempfile.TemporaryDirectory()
         self.output_patch = patch.object(handlers_module, "config", SimpleNamespace(OUTPUT_PATH=self.tmp.name))
         self.output_patch.start()
@@ -381,6 +446,7 @@ class RepeatBitrateJobTests(unittest.TestCase):
         self.enqueue_patch.stop()
         self.output_patch.stop()
         self.tmp.cleanup()
+        super().tearDown()
 
     def test_bitrate_repeat_queues_a_keyed_job_without_a_local_encode(self):
         class NoLocalConverter(_BitrateConverter):
@@ -418,7 +484,7 @@ class RepeatBitrateJobTests(unittest.TestCase):
         self.assertEqual(job["original_filename"], "song.mp3")
 
 
-class BitrateFailureTests(unittest.TestCase):
+class BitrateFailureTests(_SettingsStubCase):
     """A failed inline encode is moved to a worker, and says why if it cannot be.
 
     Re-encoding in the web process is bounded by whatever else that process holds
@@ -428,6 +494,7 @@ class BitrateFailureTests(unittest.TestCase):
     """
 
     def setUp(self):
+        super().setUp()
         self.tmp = tempfile.TemporaryDirectory()
         self.output_patch = patch.object(handlers_module, "config", SimpleNamespace(OUTPUT_PATH=self.tmp.name))
         self.output_patch.start()
@@ -443,6 +510,7 @@ class BitrateFailureTests(unittest.TestCase):
         self.enqueue_patch.stop()
         self.output_patch.stop()
         self.tmp.cleanup()
+        super().tearDown()
 
     def _source(self):
         path = os.path.join(self.tmp.name, "track.mp3")

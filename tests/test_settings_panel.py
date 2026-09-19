@@ -262,6 +262,42 @@ class SettingsBitratePickerTests(unittest.TestCase):
         self.assertFalse(buttons[settings_bitrate_key("128k")].startswith("✅"))
         self.assertIn(settings_bitrate_key("custom"), buttons)
 
+    def test_a_custom_value_is_shown_on_the_custom_row(self):
+        """A bitrate that is not a preset has to be readable back somewhere.
+
+        It used to mark the *default* preset instead and leave the Custom row
+        unchanged, so a stored 100k showed a check beside 128k and nothing at all
+        beside the value the user had just typed - the setting looked dropped.
+        """
+        from utils.callbacks import settings_bitrate_key
+
+        buttons = dict(
+            zip(
+                _callbacks(MediaMenuBuilder.get_settings_bitrate_menu("100k")),
+                _labels(MediaMenuBuilder.get_settings_bitrate_menu("100k")),
+                strict=True,
+            )
+        )
+        custom = buttons[settings_bitrate_key("custom")]
+        self.assertTrue(custom.startswith("✅"), custom)
+        self.assertIn("100k", custom)
+        # And no preset claims to be the active one.
+        for preset in ("64k", "96k", "128k", "192k", "256k", "320k"):
+            self.assertFalse(buttons[settings_bitrate_key(preset)].startswith("✅"), preset)
+
+    def test_an_unset_bitrate_still_marks_the_default(self):
+        from utils.callbacks import MP3_DEFAULT_BITRATE, settings_bitrate_key
+
+        buttons = dict(
+            zip(
+                _callbacks(MediaMenuBuilder.get_settings_bitrate_menu(None)),
+                _labels(MediaMenuBuilder.get_settings_bitrate_menu(None)),
+                strict=True,
+            )
+        )
+        self.assertTrue(buttons[settings_bitrate_key(MP3_DEFAULT_BITRATE)].startswith("✅"))
+        self.assertEqual(buttons[settings_bitrate_key("custom")], "✏️ Custom bitrate")
+
     def test_uses_settings_triggers_not_the_conversion_ones(self):
         from utils.callbacks import SETTINGS_BITRATE_PREFIX
 
