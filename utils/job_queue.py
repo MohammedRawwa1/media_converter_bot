@@ -549,12 +549,21 @@ async def publish_update(channel: str, payload: dict) -> None:
         logger.debug("job_queue: progress event mirror failed")
 
 
-async def cancel_job(job_id: str) -> None:
+async def cancel_job(job_id: str) -> str:
     """Cancel a job: set cancel=1 flag in the hash and release the input lock.
 
     Running workers detect cancel=1 in the hash and stop processing. The hash
     is preserved (with cancel=1) so the worker sees it; cleanup is handled by
     the hash's TTL (default 1 day).
+
+    Returns what actually happened, because "cancelled" is not the only honest
+    answer: a job that already delivered its file is ``"done"``, one that
+    failed is ``"error"``, one this deployment has no record of is
+    ``"missing"``, and anything else is ``"cancelled"``. Every caller that
+    reports to a user needs those apart - the terminal hash is deliberately
+    kept so a watcher can render the outcome, which means an old Cancel button
+    can outlive its job, and blindly overwriting that hash reported a delivered
+    file as a cancellation the user never got.
     """
     import hashlib as _hl
 
@@ -563,13 +572,38 @@ async def cancel_job(job_id: str) -> None:
         key = f"ffmpeg:job:{job_id}"
 
         # 1. Read the job hash before deleting to extract lock inputs
+        _hash_read = True
         try:
             stored = await r.hgetall(key)
         except Exception:
             stored = {}
+            _hash_read = False
+
+        _stored_status = str((stored or {}).get("status") or "").strip().lower()
+
+        # A job that already reached its end is not cancelled: its hash is the
+        # record of what it did, and a file the user has in hand cannot be
+        # un-delivered by a button pressed afterwards.
+        if _stored_status in ("done", "error"):
+            logger.info("cancel_job: job %s already finished (status=%s); nothing to cancel", job_id, _stored_status)
+            return _stored_status
+        if _stored_status == "cancelled":
+            logger.info("cancel_job: job %s was already cancelled", job_id)
+            return "cancelled"
+        # No hash at all - and the read succeeded, so this is a fact rather than
+        # a Redis outage: nothing is queued or running under this id.
+        if _hash_read and not stored:
+            logger.info("cancel_job: no job hash for %s; nothing to cancel", job_id)
+            return "missing"
 
         # 2. Set cancel flag in the hash so running workers detect it
         #    and stop processing. The hash will be cleaned up by TTL.
+        #
+        #    ``cancel_notified`` rides in the same write as ``status``: the
+        #    progress watcher reads the hash in one go, so it can never see the
+        #    cancellation without also seeing that the user was already told
+        #    about it - which is what the separate pre-write this replaces
+        #    existed to approximate.
         try:
             await r.hset(
                 key,
@@ -578,6 +612,7 @@ async def cancel_job(job_id: str) -> None:
                     "status": "cancelled",
                     "message": "cancelled by user",
                     "progress": "0",
+                    "cancel_notified": "1",
                 },
             )
         except Exception:
@@ -626,6 +661,7 @@ async def cancel_job(job_id: str) -> None:
             logger.debug("cancel_job: lock release failed for %s", job_id)
 
         logger.info("cancel_job: cancelled job %s (cancel=1 set in hash)", job_id)
+        return "cancelled"
     finally:
         await r.close()
 

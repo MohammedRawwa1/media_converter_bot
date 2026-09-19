@@ -193,6 +193,126 @@ def test_a_verdict_already_on_the_file_short_circuits_every_probe(monkeypatch):
     assert verdict == (64000, "mp3")
 
 
+def test_the_media_cache_answers_a_media_that_was_already_ingested(monkeypatch):
+    """Check one (where the object is) and check two (what it carries) in one read.
+
+    The descriptor the ingest wrote says both: the key the bytes were stored under
+    and the ffprobe verdict it captured. Reading it here is what makes a media
+    this bot has already fetched answerable from a dictionary lookup instead of
+    falling through to a userbot header read - and a header read that account
+    cannot reach answers "nothing", which is how a file already at the bitrate
+    used to be fetched over again and re-encoded into itself.
+    """
+    import utils.media_cache as media_cache
+
+    async def _lookup(uid, *, expected_size=None):
+        return {
+            "input_key": "inputs/library/abc/source",
+            "source_meta": {"audio_bitrate": 64000, "audio_codec": "mp3"},
+        }
+
+    async def _boom(*args, **kwargs):
+        raise AssertionError("a descriptor that carries the verdict needs no read at all")
+
+    monkeypatch.setattr(media_cache, "lookup", _lookup)
+    monkeypatch.setattr(gate, "_probe_file", _boom)
+    monkeypatch.setattr(gate, "_probe_stored", _boom)
+    monkeypatch.setattr(gate, "_probe_telegram", _boom)
+
+    assert _run(gate.source_verdict({"file_unique_id": "uid", "size": 49289926})) == (64000, "mp3")
+    assert _run(gate.already_at_bitrate({"file_unique_id": "uid", "name": "Module 02.mp3"}, "64k")) == 64000
+
+
+def test_a_descriptor_without_a_verdict_still_names_the_object_to_read(monkeypatch):
+    """A descriptor that only knows where the media lives still saves the fetch."""
+    import utils.media_cache as media_cache
+
+    async def _lookup(uid, *, expected_size=None):
+        return {"input_key": "inputs/library/abc/source"}
+
+    seen = {}
+
+    async def _stored(current_file, dest_dir, timeout=None):
+        seen["key"] = current_file.get("input_key")
+        return {"audio_bitrate": 64000, "audio_codec": "mp3"}
+
+    monkeypatch.setattr(media_cache, "lookup", _lookup)
+    monkeypatch.setattr(gate, "_probe_stored", _stored)
+
+    assert _run(gate.source_verdict({"file_unique_id": "uid"})) == (64000, "mp3")
+    assert seen["key"] == "inputs/library/abc/source"
+
+
+def test_the_shared_library_key_names_the_object_without_any_descriptor():
+    """The media's own identity names the object its bytes live under.
+
+    That key is derived rather than remembered, so a media this deployment has
+    ingested is still readable here after the Redis descriptor that named it has
+    expired - and a key nothing was stored under just fails the ranged GET.
+    """
+    from utils.media_cache import media_library_key
+
+    assert gate._storage_key({"file_unique_id": "AgADzRkAAtS8OVE"}) == media_library_key("AgADzRkAAtS8OVE")
+    assert gate._storage_key({"input_key": "inputs/x/source", "file_unique_id": "u"}) == "inputs/x/source"
+    assert gate._storage_key({}) is None
+    assert gate._storage_key(None) is None
+
+
+def test_a_cache_that_cannot_be_reached_is_not_a_blocker(monkeypatch):
+    import utils.media_cache as media_cache
+
+    async def _boom(uid, *, expected_size=None):
+        raise RuntimeError("redis is gone")
+
+    async def _telegram(*args, **kwargs):
+        return {"audio_bitrate": 64000, "audio_codec": "mp3"}
+
+    monkeypatch.setattr(media_cache, "lookup", _boom)
+    monkeypatch.setattr(gate, "_probe_telegram", _telegram)
+
+    assert _run(gate.source_verdict({"file_unique_id": "uid", "chat_id": 1, "msg_id": 2})) == (64000, "mp3")
+
+
+def test_a_cached_descriptor_at_another_bitrate_is_still_a_conversion(monkeypatch):
+    """Where the media is and what it carries are two separate answers."""
+    import utils.media_cache as media_cache
+
+    async def _lookup(uid, *, expected_size=None):
+        return {
+            "input_key": "inputs/library/abc/source",
+            "source_meta": {"audio_bitrate": 128000, "audio_codec": "mp3"},
+        }
+
+    async def _nothing(*args, **kwargs):
+        return None
+
+    monkeypatch.setattr(media_cache, "lookup", _lookup)
+    monkeypatch.setattr(gate, "_probe_stored", _nothing)
+    monkeypatch.setattr(gate, "_probe_telegram", _nothing)
+
+    current = {"file_unique_id": "uid", "name": "Module 02.mp3"}
+    # What the media carries is still read - and it is a different bitrate, so
+    # the request is a real conversion rather than a no-op.
+    assert _run(gate.source_verdict(current)) == (128000, "mp3")
+    assert _run(gate.already_at_bitrate(current, "64k")) is None
+
+
+def test_a_deployment_with_no_media_identity_is_not_asked_for_one(monkeypatch):
+    """No ``file_unique_id`` means no descriptor to look up - and no lookup."""
+    import utils.media_cache as media_cache
+
+    async def _boom(uid, *, expected_size=None):
+        raise AssertionError("a media with no identity has no descriptor")
+
+    async def _stored(current_file, dest_dir, timeout=None):
+        return {"audio_bitrate": 64000, "audio_codec": "mp3"}
+
+    monkeypatch.setattr(media_cache, "lookup", _boom)
+    monkeypatch.setattr(gate, "_probe_stored", _stored)
+
+    assert _run(gate.source_verdict({"input_key": "inputs/x/source"})) == (64000, "mp3")
+
+
 def test_a_local_copy_is_probed_before_storage_is_read(monkeypatch, tmp_path):
     local = tmp_path / "src.mp3"
     local.write_bytes(b"x")

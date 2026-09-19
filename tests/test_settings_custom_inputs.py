@@ -108,6 +108,11 @@ class _StubHandler:
     async def _watch_job_progress(self, *args, **kwargs):
         return None
 
+    async def _watch_queued_message(self, *args, **kwargs):
+        # The handoff to a progress watcher is pinned by test_pipeline_job_watch;
+        # here the queueing itself is what is under test.
+        return None
+
 
 class _TrimConverter:
     supported_formats = {"audio": [".mp3", ".wav", ".flac"], "video": [".mp4", ".mkv"]}

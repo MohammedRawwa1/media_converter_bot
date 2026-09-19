@@ -413,6 +413,86 @@ class RealWatcherTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(notice.deleted)
 
 
+class QueuedWorkerJobWatchTests(unittest.IsolatedAsyncioTestCase):
+    """The worker-queue path a typed bitrate request actually takes.
+
+    ``adjust_bitrate`` answers a repeat out of the media cache - ``path`` is
+    ``None`` and only ``input_key`` is set - so the job goes through the worker,
+    and on a *typed* request that path posts the job's only message itself. No
+    watcher was started for it: the "⏳ Queued format audio — job ..." line stayed
+    in the chat, ❌ Cancel button and all, for a job that had already delivered
+    the file - and pressing that button then reported a cancellation of work
+    that was finished.
+    """
+
+    async def _enqueue(self, handler, typed, *, query=None, notify=None, superseded=None):
+        with patch.object(handlers_module, "enqueue_job", AsyncMock()):
+            return await handler._enqueue_worker_job(
+                _update(message=typed, query=query),
+                SimpleNamespace(bot=SimpleNamespace()),
+                {"id": "CQACAgQAA", "name": "Module 02.mp3", "input_key": "inputs/library/abc/source"},
+                output_path="storage/output/Module_02.mp3",
+                ffmpeg_args=["-c:a", "libmp3lame", "-b:a", "64k"],
+                output_ext=".mp3",
+                job_type="format_audio",
+                caption="Module 02",
+                delivery_name="Module 02.mp3",
+                query=query,
+                notify=notify,
+                superseded=superseded,
+            )
+
+    async def test_a_typed_request_watches_the_queued_message_it_posted(self):
+        handler, rec = _handler()
+        typed = FakeMessage()
+        ack = await typed.reply_text("🎚️ Setting bitrate to 64k...")
+
+        async def _notify(text, **kwargs):
+            return await typed.reply_text(text, **kwargs)
+
+        queued = await self._enqueue(handler, typed, notify=_notify, superseded=ack)
+        await asyncio.sleep(0)
+
+        self.assertTrue(queued)
+        self.assertTrue(typed.sent[-1].text.startswith("⏳ Queued format audio"))
+        self.assertEqual(len(rec.watched), 1)
+        self.assertIsNone(rec.watched[0].query)
+        # The message it posted is the one it watches - and the one the watcher
+        # deletes, so nothing is left holding a Cancel button.
+        self.assertIs(rec.watched[0].progress_msg, typed.sent[-1])
+        button = typed.replies[-1][1]["reply_markup"].inline_keyboard[0][0].callback_data
+        self.assertEqual(rec.watched[0].job_id, button.split(":", 1)[1])
+        # The request's own acknowledgement goes with the request.
+        self.assertTrue(ack.deleted)
+
+    async def test_a_callback_still_watches_the_message_the_user_pressed(self):
+        handler, rec = _handler()
+        pressed = FakeMessage()
+        query = SimpleNamespace(message=pressed)
+
+        await self._enqueue(handler, pressed, query=query)
+        await asyncio.sleep(0)
+
+        self.assertEqual(len(rec.edited), 1)
+        self.assertTrue(rec.edited[0][1].startswith("⏳ Queued format audio"))
+        self.assertEqual(len(rec.watched), 1)
+        self.assertIs(rec.watched[0].query, query)
+        self.assertFalse(hasattr(rec.watched[0], "progress_msg"))
+
+    async def test_a_queued_message_that_cannot_be_edited_is_not_watched(self):
+        """A ``notify`` that reports through the callback leaves nothing to watch."""
+        handler, rec = _handler()
+        typed = FakeMessage()
+
+        async def _notify(text, **kwargs):
+            return True
+
+        await self._enqueue(handler, typed, notify=_notify)
+        await asyncio.sleep(0)
+
+        self.assertEqual(rec.watched, [])
+
+
 class TypedBitrateWiringTests(unittest.TestCase):
     """Both typed-bitrate entry points must thread the notice through."""
 

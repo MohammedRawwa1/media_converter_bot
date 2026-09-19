@@ -172,7 +172,7 @@ git push origin main
 | `/addthumb` | Set a custom default thumbnail |
 | `/delthumb` | Remove custom default thumbnail |
 | `/loginstatus` | Live session health check (Telethon + Pyrogram) |
-| `/session_status` | Queue depth, memory, storage, online users & session health (`live` arg forces a real check) — comes with **🔄 Refresh** and **♻️ Restart worker** buttons |
+| `/session_status` | Queue depth, memory, storage, the online-user count and session health (`live` arg forces a real check) — comes with **🔄 Refresh** and **♻️ Restart worker** buttons |
 | `/login [phone]` | Start Telethon login flow |
 | `/loginpyro [phone]` | Start Pyrogram login flow (handles 2FA reliably) |
 | `/logout` | Log out Telethon session (per-user) |
@@ -241,6 +241,8 @@ The tombstone is written only while it has something to stop. A batch whose memb
 A file that the pipeline already queued is counted toward the batch by the **worker** that runs that job, not by the apply — the apply only counts the job when it carries no tag of this batch (one the user already had in flight). Counting both ways used to finish the batch at half its files and take its progress message down while work was still queued.
 
 A `WORKER_MEMORY_CEILING_BYTES` ceiling makes the worker refuse to start a conversion while the process is still above it (after a few bounded deferrals it runs anyway, so a mis-set ceiling degrades throughput rather than stalling the queue). `WORKER_RESTART_AFTER_JOB_BYTES` additionally makes the standalone worker exit for a clean container restart when it is still above the ceiling after cleanup; the worker's `restartPolicyMaxRetries` is `10` so those planned restarts cannot exhaust the budget and leave the worker down.
+
+Its **users** block is counted, never listed: how many users are online and how much of the queue belongs to them (waiting, running, and the soonest turn), with no Telegram id and no username anywhere in the report — including the admin's own.
 
 `/session_status` (admin) shows a **Capacity** block with this state: how many conversion slots are in use against `MAX_CONCURRENT_FFMPEG`, and the peak worker RSS against the ceiling with its remaining headroom. Workers publish their RSS to `ffmpeg:worker:rss:<host:pid>` (TTL'd, refreshed after every job and on a slow idle timer), so the figure is live even when the dashboard runs in a different service.
 

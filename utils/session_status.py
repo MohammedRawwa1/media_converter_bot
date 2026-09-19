@@ -1,11 +1,18 @@
-"""The ``/session_status`` dashboard: who is using the bot and what is queued.
+"""The ``/session_status`` dashboard: how busy the bot is and what is queued.
 
 Answers the three questions the existing ``/loginstatus`` does not:
 
-1. How busy is the bot?      -> waiting / running / delayed jobs, plus broker depths
-2. Who is using it right now? -> the Redis presence heartbeat (``utils.presence``)
-3. When does my work run?    -> the queue turn, i.e. the position of a user's
-                                oldest waiting job in the FIFO job list
+1. How busy is the bot?          -> waiting / running / delayed jobs, plus broker depths
+2. How many are using it now?    -> the Redis presence heartbeat (``utils.presence``),
+                                    as a count and never as identities: the report
+                                    shows how much queued work belongs to someone
+                                    who is online, not who they are
+3. When does my work run?        -> the queue turn, i.e. the position of a user's
+                                    oldest waiting job in the FIFO job list
+
+The dashboard is deliberately people-free beyond the caller's own turn: no
+Telegram id and no username is ever rendered, so an admin reading it learns the
+load, not the users.
 
 The admin view also carries a **Capacity** block: how many of the global
 conversion slots (``ffmpeg:slot:*``, see ``utils.batch_pipeline``) are in use
@@ -65,7 +72,6 @@ CANCELLED_STATUSES = frozenset({"cancelled", "canceled"})
 QUEUE_SCAN_LIMIT = int(os.getenv("STATUS_QUEUE_SCAN_LIMIT", "2000"))
 HASH_SCAN_LIMIT = int(os.getenv("STATUS_HASH_SCAN_LIMIT", "5000"))
 FETCH_CHUNK = 200
-ACTIVE_LIST_LIMIT = 10
 
 # ── Memory ──────────────────────────────────────────────────────────────
 # Warn while there is still room to act: at 80% the next 1 GB source is a risk,
@@ -881,14 +887,20 @@ def _admin_sections(payload: dict) -> list[str]:
     if users.get("source") == "memory":
         lines.append("<i>⚠️ Redis presence unavailable — this count only covers this worker</i>")
     active = users.get("active") or []
-    for row in active[:ACTIVE_LIST_LIMIT]:
-        turn = row.get("turn")
-        turn_txt = f", next #{turn}" if turn else ""
-        lines.append(f"• <code>{row['user_id']}</code> — {row['waiting']} waiting, {row['running']} running{turn_txt}")
-    if len(active) > ACTIVE_LIST_LIMIT:
-        lines.append(f"<i>…and {len(active) - ACTIVE_LIST_LIMIT} more</i>")
     if not active:
         lines.append("<i>No active users in the heartbeat window.</i>")
+        return lines
+    # Counts, never identities. A Telegram id (or a username) is a person, and
+    # "how much of the queue belongs to someone who is online" is the question
+    # this section answers - not which person, and not who is the admin. The
+    # caller's own id is not printed here either, for the same reason: reading
+    # the dashboard is not a reason for the bot to keep a list of faces.
+    waiting_online = sum(int(row.get("waiting") or 0) for row in active)
+    running_online = sum(int(row.get("running") or 0) for row in active)
+    lines.append(f"• Their jobs: <b>{_num(waiting_online)}</b> waiting, <b>{_num(running_online)}</b> running")
+    turns = [int(row["turn"]) for row in active if row.get("turn")]
+    if turns:
+        lines.append(f"• Soonest online job: <b>#{min(turns)}</b> in the queue")
     return lines
 
 

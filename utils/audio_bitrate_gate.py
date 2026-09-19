@@ -10,8 +10,14 @@ The verdict is reached in three steps, in this order:
 
   compare   read what the source already carries - from the ingest's ffprobe
             verdict when the media has been through the pipe, otherwise from a
-            small *header* read: the local file, a ranged GET of the stored
-            object, or the first bytes over MTProto;
+            small *header* read. Where that read is aimed comes first from the
+            media cache descriptor the ingest wrote (it names the object the
+            media was stored under, and carries the verdict it probed), and then
+            from the shared library key the media's own identity derives - so a
+            media this deployment already holds is answered from storage rather
+            than from Telegram. A small *header* read is what answers the rest:
+            the local file, a ranged GET of the stored object, or the first
+            bytes over MTProto;
   validate  a bitrate alone is not a match. The source has to be the codec the
             request would produce, or "AAC 64k -> MP3 64k" would be read as a
             no-op when it is a real conversion. Anything unknown is not a match;
@@ -62,8 +68,8 @@ PROBE_TIMEOUT_SECONDS = float(os.getenv("BITRATE_PROBE_TIMEOUT_SECONDS", "60"))
 #: not one more - past the budget the tier stops and the request takes the path it
 #: always took, which costs the fetch it was meant to avoid but never leaves
 #: someone watching a button that appears to have done nothing. Each tier gets
-#: what is left of it, not a fresh timeout of its own, or three tiers would add up
-#: to three budgets.
+#: what is left of it, not a fresh timeout of its own, or four tiers would add up
+#: to four budgets.
 PROBE_BUDGET_SECONDS = float(os.getenv("BITRATE_PROBE_BUDGET_SECONDS", "15"))
 
 #: How close two bitrates have to be to count as the same one.
@@ -168,6 +174,81 @@ def _time_left(deadline: float) -> float:
     return max(0.0, deadline - time.monotonic())
 
 
+async def _cached_source(current_file: dict | None, timeout: float | None = None) -> dict | None:
+    """The media-cache descriptor for this media, when one exists.
+
+    The cheapest evidence there is, and the only tier that costs no egress at
+    all: the descriptor the ingest wrote when it stored the media carries both
+    the ffprobe verdict it captured (``source_meta``) and the key the bytes live
+    under (``input_key``). Reading it here is what lets the check answer a media
+    this deployment already holds *without* falling through to Telegram - and
+    falling through to Telegram is how the check used to fail: a header read the
+    userbot account cannot reach answers "nothing", so a verdict that was one
+    dictionary lookup away was missed and the request went on to fetch and
+    re-encode a file that was already the answer. Answers ``None`` for a lookup
+    that misses, times out or fails, which leaves every caller on the path it
+    had before this tier existed.
+    """
+    uid = (current_file or {}).get("file_unique_id")
+    if not uid:
+        return None
+    try:
+        from utils import media_cache
+
+        if not media_cache.cache_enabled():
+            return None
+        entry = await asyncio.wait_for(
+            media_cache.lookup(uid, expected_size=(current_file or {}).get("size")),
+            timeout=min(timeout or PROBE_TIMEOUT_SECONDS, PROBE_TIMEOUT_SECONDS),
+        )
+    except TimeoutError:
+        logger.debug("bitrate gate: the media-cache lookup for %s timed out", uid)
+        return None
+    except Exception:
+        logger.debug("bitrate gate: the media-cache lookup for %s failed", uid)
+        return None
+    return entry if isinstance(entry, dict) and entry else None
+
+
+def _source_view(current_file: dict | None, entry: dict | None) -> dict:
+    """The media as the cache descriptor describes it, when there is one.
+
+    A descriptor answers *where* the media already is - the object key it was
+    stored under, or the local copy a previous request downloaded. Carrying
+    those onto the file is what turns the byte probes below from "nothing to
+    read" into a ranged GET of a few hundred kilobytes: a media that has never
+    been fetched to this disk is exactly the one with no ``path`` of its own.
+    """
+    info = dict(current_file or {})
+    if entry:
+        if not info.get("input_key") and entry.get("input_key"):
+            info["input_key"] = entry["input_key"]
+        if not info.get("path") and entry.get("path"):
+            info["path"] = entry["path"]
+    return info
+
+
+def _storage_key(info: dict | None) -> str | None:
+    """The stored object to read this media's header from, or ``None``.
+
+    An explicitly named key wins. Failing that, the media's own identity names
+    the object its bytes were stored under: the shared library key is derived
+    from ``file_unique_id``, so a media this deployment has ingested is still
+    readable here after the Redis descriptor that named it has expired. A key
+    nothing was ever stored under simply fails the ranged GET, which is the
+    "not already" answer this whole module is careful to give.
+    """
+    key = (info or {}).get("input_key")
+    if isinstance(key, str) and key:
+        return key
+    try:
+        from utils.media_cache import shared_library_key
+
+        return shared_library_key((info or {}).get("file_unique_id"))
+    except Exception:
+        return None
+
+
 async def _probe_file(path: str, timeout: float | None = None) -> dict | None:
     """ffprobe a file, answering ``None`` rather than raising."""
     if not path or not os.path.exists(path):
@@ -204,8 +285,8 @@ def _local_candidate(current_file: dict | None) -> str | None:
 
 async def _probe_stored(current_file: dict | None, dest_dir: str, timeout: float | None = None) -> dict | None:
     """Probe the first bytes of the media out of object storage (a Range GET)."""
-    key = (current_file or {}).get("input_key")
-    if not key or not isinstance(key, str):
+    key = _storage_key(current_file)
+    if not key:
         return None
     dest = os.path.join(dest_dir, f"bitrate_probe_{uuid.uuid4().hex}.bin")
     try:
@@ -313,7 +394,9 @@ async def source_verdict(
     """``(audio_bitrate_bps, audio_codec)`` for the media, or ``(None, None)``.
 
     Cheapest evidence first: a verdict an earlier probe already recorded, then
-    the local copy, then the stored object, and only then Telegram. Each step
+    the media cache's own descriptor (which may answer outright, and which also
+    says which object to read), then the local copy, then the stored object, and
+    only then Telegram. Each step
     answers "nothing" instead of raising, so the worst case is the behaviour the
     callers had before this module - and each gets only what is left of
     :data:`PROBE_BUDGET_SECONDS`, so the whole check is bounded rather than every
@@ -332,19 +415,32 @@ async def source_verdict(
 
     dest_dir = tempfile.gettempdir()
 
-    local = _local_candidate(current_file)
+    # Where the media already is, and what it was probed as when it got there:
+    # a lookup rather than a read, so it comes before everything that costs
+    # bytes - including the Telegram header read that an unreachable media
+    # answers "nothing" to.
+    entry = None
+    if left() > 0:
+        entry = await _cached_source(current_file, timeout=left())
+        if entry:
+            cached_bitrate, cached_codec = known_verdict({"source_metadata": entry.get("source_meta")})
+            if cached_bitrate:
+                return cached_bitrate, cached_codec
+    source = _source_view(current_file, entry)
+
+    local = _local_candidate(source)
     if local and left() > 0:
         meta = await _probe_file(local, timeout=left())
         if meta and meta.get("audio_bitrate"):
             return meta.get("audio_bitrate"), meta.get("audio_codec")
 
     if left() > 0:
-        meta = await _probe_stored(current_file, dest_dir, timeout=left())
+        meta = await _probe_stored(source, dest_dir, timeout=left())
         if meta and meta.get("audio_bitrate"):
             return meta.get("audio_bitrate"), meta.get("audio_codec")
 
     if left() > 0:
-        meta = await _probe_telegram(current_file, user_id, dest_dir, timeout=left())
+        meta = await _probe_telegram(source, user_id, dest_dir, timeout=left())
         if meta and meta.get("audio_bitrate"):
             return meta.get("audio_bitrate"), meta.get("audio_codec")
 

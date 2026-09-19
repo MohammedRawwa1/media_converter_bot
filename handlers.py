@@ -2037,6 +2037,38 @@ class EnhancedMediaHandler:
         except Exception:
             logger.exception("_watch_job_progress failed for %s", job_id)
 
+    async def _watch_queued_message(self, query, context, job_id: str, queued_message, superseded=None) -> None:
+        """Hand a queued job's own message to a watcher, whichever update queued it.
+
+        A callback names the message the watcher renders on: the one the user
+        pressed. A *typed* request names nothing, and the "⏳ Queued ... — job ..."
+        message this is looking at was the job's only message - so nothing
+        watched it, and it stayed in the chat with its ❌ Cancel button long after
+        the file had been delivered (pressing it then "cancelled" a job that had
+        already finished). The watcher takes that message instead and deletes it
+        once the job reaches a terminal state, which is the lifecycle every
+        button-driven conversion already ends with.
+
+        ``superseded`` is the typed request's own acknowledgement ("🎚️ Setting
+        bitrate to 64k..."). It spoke for the request, not the job, so it goes as
+        soon as the job has a message of its own.
+        """
+        try:
+            if query is not None:
+                asyncio.create_task(self._watch_job_progress(query, job_id, bot=context.bot))
+                return
+            # No callback query: the posted message is the watcher's target, and
+            # the one it deletes when the job finishes. A `notify` that reports
+            # through the callback instead (a bool) leaves nothing to watch.
+            if not callable(getattr(queued_message, "edit_text", None)):
+                return
+            if superseded is not None and callable(getattr(superseded, "delete", None)):
+                with contextlib.suppress(Exception):
+                    await superseded.delete()
+            asyncio.create_task(self._watch_job_progress(None, job_id, progress_msg=queued_message, bot=context.bot))
+        except RuntimeError:
+            logger.debug("queued job %s: no running loop to watch its message on", job_id)
+
     async def _watch_pipeline_job(
         self,
         update: Update,
@@ -8733,27 +8765,28 @@ class EnhancedMediaHandler:
                     return
 
                 try:
-                    from utils.job_queue import cancel_job, get_redis
+                    from utils.job_queue import cancel_job
 
-                    # Set cancel_notified=1 first so _watch_job_progress() sees it
-                    # before cancel_job() sets status=cancelled (eliminates race window).
-                    try:
-                        _r = await get_redis()
-                        try:
-                            await _r.hset(f"ffmpeg:job:{job_id}", "cancel_notified", "1")
-                        finally:
-                            _aclose = getattr(_r, "aclose", None)
-                            if _aclose is not None:
-                                await _aclose()
-                            else:
-                                await _r.close()
-                    except Exception:
-                        pass
-
-                    await cancel_job(job_id)
-                    await self.safe_edit(query, f"⏹️ Job {job_id} cancelled and removed from queue.")
-                    with contextlib.suppress(BadRequest):
-                        await query.answer("Job removed")
+                    # The outcome decides what the user is told: a job that has
+                    # already delivered their file is not "cancelled", and the
+                    # message they pressed the button on is a leftover the
+                    # watcher failed to clean up rather than a job still in the
+                    # queue. Claiming otherwise rewrote a finished job's
+                    # hash into a cancelled one - and told the user a delivery
+                    # they had already received never happened.
+                    _outcome = await cancel_job(job_id)
+                    if _outcome in ("done", "error"):
+                        await self.safe_edit(query, f"✅ Job {job_id} already finished — nothing to cancel.")
+                        with contextlib.suppress(BadRequest):
+                            await query.answer("Job already finished")
+                    elif _outcome == "missing":
+                        await self.safe_edit(query, f"ℹ️ Job {job_id} is no longer in the queue.")
+                        with contextlib.suppress(BadRequest):
+                            await query.answer("Job not in the queue")
+                    else:
+                        await self.safe_edit(query, f"⏹️ Job {job_id} cancelled and removed from queue.")
+                        with contextlib.suppress(BadRequest):
+                            await query.answer("Job removed")
                 except Exception:
                     logger.exception("Failed to cancel job %s", job_id)
                     await self.safe_edit(query, "⚠️ Failed to cancel job.")
@@ -9108,6 +9141,7 @@ class EnhancedMediaHandler:
         caption: str | None = None,
         query=None,
         notify=None,
+        superseded=None,
         extra: dict | None = None,
     ) -> bool:
         """Queue a worker job whose source is an object-storage key.
@@ -9180,13 +9214,12 @@ class EnhancedMediaHandler:
             return False
         kb = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data=f"cancel_job:{job_id}")]])
         text = f"⏳ Queued {job_type.replace('_', ' ')} — job {job_id[:8]}"
+        _queued_message = None
         if notify is not None:
-            await notify(text, reply_markup=kb)
+            _queued_message = await notify(text, reply_markup=kb)
         elif query is not None:
-            await self.safe_edit(query, text, reply_markup=kb)
-        if query is not None:
-            with contextlib.suppress(RuntimeError):
-                asyncio.create_task(self._watch_job_progress(query, job_id, bot=context.bot))
+            _queued_message = await self.safe_edit(query, text, reply_markup=kb)
+        await self._watch_queued_message(query, context, job_id, _queued_message, superseded)
         return True
 
     async def _enqueue_worker_job(
@@ -9203,6 +9236,7 @@ class EnhancedMediaHandler:
         delivery_name: str | None = None,
         query=None,
         notify=None,
+        superseded=None,
     ) -> bool:
         """Queue this file's conversion for a worker, from disk or from storage.
 
@@ -9263,13 +9297,12 @@ class EnhancedMediaHandler:
             return False
         kb = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data=f"cancel_job:{job_id}")]])
         text = f"⏳ Queued {job_type.replace('_', ' ')} — job {job_id[:8]}"
+        _queued_message = None
         if notify is not None:
-            await notify(text, reply_markup=kb)
+            _queued_message = await notify(text, reply_markup=kb)
         elif query is not None:
-            await self.safe_edit(query, text, reply_markup=kb)
-        if query is not None:
-            with contextlib.suppress(RuntimeError):
-                asyncio.create_task(self._watch_job_progress(query, job_id, bot=context.bot))
+            _queued_message = await self.safe_edit(query, text, reply_markup=kb)
+        await self._watch_queued_message(query, context, job_id, _queued_message, superseded)
         return True
 
     async def convert_to_mp3(
@@ -9469,6 +9502,7 @@ class EnhancedMediaHandler:
                 caption=caption,
                 query=query,
                 notify=notify,
+                superseded=_ack,
             )
             if not queued:
                 await notify("❌ Local file missing. Try re-downloading or use the web uploader.")
@@ -10748,6 +10782,7 @@ class EnhancedMediaHandler:
                 delivery_name=delivery_name,
                 query=query,
                 notify=notify,
+                superseded=_ack,
             ):
                 await notify("❌ Failed to adjust bitrate.")
             return
@@ -10804,6 +10839,7 @@ class EnhancedMediaHandler:
             delivery_name=delivery_name,
             query=query,
             notify=notify,
+            superseded=_ack,
         )
         if not queued:
             await notify(f"❌ Failed to adjust bitrate.{_short_reason(reason)}")

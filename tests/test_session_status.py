@@ -226,7 +226,52 @@ def test_format_shows_the_admin_dashboard():
     assert "Running: <b>1</b>" in text
     assert "Jobs online (waiting+running): <b>3</b>" in text
     assert "Users online:</b> <b>2</b>" in text
-    assert "<code>5</code>" in text
+    # How much of the queue belongs to someone who is online, counted - 2 waiting
+    # and 1 running across those two users.
+    assert "Their jobs: <b>2</b> waiting, <b>1</b> running" in text
+    assert "Soonest online job: <b>#1</b> in the queue" in text
+
+
+def test_the_dashboard_renders_no_user_identity_at_all():
+    """An admin reading the load must not be handed a list of people.
+
+    The users block used to print each online user's Telegram id (and the caller
+    was shown among them), so the dashboard doubled as a roster of who is using
+    the bot. It is counted now: what is queued, and how much of it belongs to
+    someone online - never which person, and not the admin's own id either.
+    """
+    payload = summarize(
+        jobs=[{"status": "processing", "owner": 5}],
+        queued=[{"job_id": "k", "owner": 6}],
+        waiting=1,
+        delayed=0,
+        online_ids=[5, 6],
+        me_id=5,
+    )
+    payload["redis"] = {"connected": True, "ping_ms": 1.0, "error": None}
+    payload["users"]["source"] = "redis"
+
+    text = format_status(payload, is_admin=True)
+
+    users_block = text[text.index("Users online") : text.index("🔐")]
+    assert "<code>" not in users_block, f"no identity may be rendered in the users block: {users_block!r}"
+    assert "Their jobs:" in users_block
+
+
+def test_the_session_health_block_names_sessions_not_accounts():
+    """The userbot block reports each kind of session, never whose."""
+    payload = summarize(jobs=[], queued=[], waiting=0, delayed=0, online_ids=[1405333465])
+    payload["redis"] = {"connected": True, "ping_ms": 1.0, "error": None}
+    payload["sessions"] = {
+        "checked": True,
+        "live": True,
+        "sessions": {"telethon": {"alive": True, "latency_ms": 20}, "pyrogram": {"alive": True, "latency_ms": 30}},
+    }
+
+    text = format_status(payload, is_admin=True)
+
+    assert "Telethon: ✅ working (20 ms)" in text
+    assert "1405333465" not in text
 
 
 def test_format_personal_view_hides_global_counts():
