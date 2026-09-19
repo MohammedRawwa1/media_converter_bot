@@ -52,6 +52,7 @@ from .callbacks import (
     SUBTITLE_MERGER,
     THUMBNAIL_EXTRACTOR,
     THUMBNAIL_GRID,
+    TRIM_AUDIO,
     TRIM_VIDEO,
     TRIMMER_1,
     TRIMMER_2,
@@ -96,7 +97,14 @@ class MediaMenuBuilder:
             row("✏️ Caption And Buttons Editor", CAPTION_EDITOR, "🔀 Batch Process", "batch_process"),
             row("📝 Metadata Editor", EDIT_METADATA, "📤 Media Forwarder", MEDIA_FORWARDER),
             row("🔇 Stream Remover", STREAM_REMOVER, "🎵 Stream Extractor", STREAM_EXTRACTOR),
-            row("✂️ Video Trimmer", TRIM_VIDEO, "➕ Video Merger", MERGE_MENU),
+            # Trim and merge act on the media that is actually loaded: an audio
+            # file must not be sent to the video-only trimmer/merger.
+            row(
+                "✂️ Audio Trimmer" if file_type == "audio" else "✂️ Video Trimmer",
+                TRIM_AUDIO if file_type == "audio" else TRIM_VIDEO,
+                "➕ Audio Merger" if file_type == "audio" else "➕ Video Merger",
+                "merge_audio" if file_type == "audio" else MERGE_MENU,
+            ),
             row("🔉 Remove Audio", REMOVE_AUDIO, "🔀 Merge And", MERGE_VIEW),
             row(conv_label, conv_cb, split_label, VIDEOS_SPLITTER),
             row("🖼️ Screenshots", SCREENSHOTS_MENU, "🖼️ Manual Shots", MANUAL_SHOTS),

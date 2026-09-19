@@ -874,6 +874,75 @@ async def normalize_audio(input_path: str, output_path: str) -> tuple[bool, str]
         return False, str(e)
 
 
+async def apply_fade(
+    input_path: str,
+    output_path: str,
+    fade_in_duration: float = 0.0,
+    fade_out_duration: float = 0.0,
+) -> tuple[bool, str]:
+    """Apply a fade-in and/or fade-out to the audio track of a media file.
+
+    Counterpart of ``ExtendedMediaConverter.apply_fade`` for the worker, which
+    has no converter instance. A fade-out starts relative to the end of the
+    media, so the duration has to be probed from the resolved source first -
+    that is why this runs as its own job type rather than as a static
+    ``ffmpeg_args`` list built by the caller (which has no source to probe on a
+    cache repeat).
+    """
+    try:
+        fade_in_duration = float(fade_in_duration or 0.0)
+        fade_out_duration = float(fade_out_duration or 0.0)
+    except (TypeError, ValueError):
+        return False, "invalid fade duration"
+
+    if fade_in_duration <= 0 and fade_out_duration <= 0:
+        logger.warning("apply_fade: both durations are zero, nothing to do")
+        return False, "no fade duration"
+
+    afilters = []
+    if fade_in_duration > 0:
+        afilters.append(f"afade=t=in:st=0:d={fade_in_duration}")
+
+    if fade_out_duration > 0:
+        duration = 0.0
+        try:
+            from utils.ffmpeg_runner import probe_duration
+
+            duration = float(await probe_duration(input_path) or 0.0)
+        except Exception:
+            logger.debug("apply_fade: duration probe failed for %s", input_path)
+        if duration <= 0:
+            logger.error("apply_fade: cannot determine media duration for fade-out")
+            return False, "cannot determine media duration"
+        fade_out_start = max(0.0, duration - fade_out_duration)
+        afilters.append(f"afade=t=out:st={fade_out_start}:d={fade_out_duration}")
+
+    cmd = [
+        FFMPEG_PATH,
+        "-y",
+        "-i",
+        input_path,
+        "-af",
+        ",".join(afilters),
+        "-c:v",
+        "copy",
+        output_path,
+    ]
+
+    try:
+        process = await _spawn_process(*cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+        _stdout, stderr = await process.communicate()
+    except Exception as e:
+        logger.error(f"Exception in apply_fade: {e}")
+        return False, str(e)
+
+    if process.returncode == 0:
+        logger.info("Successfully applied fade (%s)", ",".join(afilters))
+        return True, "Fade applied"
+
+    return False, stderr.decode("utf-8", errors="ignore")[:200]
+
+
 async def extract_subtitles(input_path: str, output_path: str) -> tuple[bool, str]:
     """Extract subtitles from video asynchronously."""
     try:

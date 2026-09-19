@@ -30,6 +30,7 @@ from telegram import Bot
 
 import config
 from tasks import (
+    apply_fade,
     create_archive,
     create_slideshow,
     extract_streams,
@@ -2345,6 +2346,32 @@ async def handle_job(job: dict):
                         start_time = job.get("start_time")
                         end_time = job.get("end_time")
                         ok, msg = await trim_media(input_path, output_path, start_time, end_time)
+                        success = ok
+                        info = output_path if ok else msg
+                        await publish_update(
+                            progress_channel,
+                            {
+                                "job_id": job_id,
+                                "progress": 100 if ok else 0,
+                                "message": "done" if ok else "error",
+                                "output": output_path if ok else None,
+                            },
+                        )
+
+                    elif job_type == "fade":
+                        # A fade-out is anchored to the end of the media, so the
+                        # duration is probed here from the resolved source: the
+                        # producer of a cache repeat has no local file to probe
+                        # and therefore cannot build these args itself.
+                        await publish_update(
+                            progress_channel, {"job_id": job_id, "progress": 5, "message": "applying fade"}
+                        )
+                        try:
+                            _fade_in = float(job.get("fade_in") or 0.0)
+                            _fade_out = float(job.get("fade_out") or 0.0)
+                        except (TypeError, ValueError):
+                            _fade_in, _fade_out = 0.0, 0.0
+                        ok, msg = await apply_fade(input_path, output_path, _fade_in, _fade_out)
                         success = ok
                         info = output_path if ok else msg
                         await publish_update(

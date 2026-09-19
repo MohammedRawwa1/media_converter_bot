@@ -5340,6 +5340,151 @@ class EnhancedMediaHandler:
             reply_markup=MediaMenuBuilder.get_main_menu(file_type),
         )
 
+    async def _trim_current_media(
+        self,
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+        session: dict,
+        current_file: dict,
+        start_time: str,
+        end_time: str,
+    ) -> None:
+        """Trim ``current_file`` between two times and deliver the result.
+
+        Shared by the Trimmer menu (Trimmer 1 & 2) and the audio-tools Trim
+        button so both behave identically: the output container follows the
+        source type (audio in -> audio out, not a hard-coded ``.mp4``), the
+        times are normalized to ``HH:MM:SS`` so ``MM:SS`` and plain-seconds
+        input also work, and every outcome - including the failure reason - is
+        reported instead of failing silently.
+
+        A media-cache repeat has no local copy but does have an ``input_key``:
+        that path queues the object-storage ``trim`` worker job rather than
+        pulling the media back over Pyrogram, so a repeat never re-downloads
+        what the first run already streamed to storage.
+        """
+        message = getattr(update, "message", None)
+
+        async def notify(text: str, **kwargs) -> None:
+            if message is not None:
+                await message.reply_text(text, **kwargs)
+            else:
+                await context.bot.send_message(update.effective_chat.id, text, **kwargs)
+
+        if not current_file:
+            await notify("❌ No file available to trim. Send a file first.")
+            return
+
+        try:
+            start_s = _parse_time_to_seconds(start_time)
+            end_s = _parse_time_to_seconds(end_time)
+        except ValueError as exc:
+            await notify(f"❌ {exc}")
+            return
+
+        if end_s <= start_s:
+            await notify("❌ End time must be after the start time. Please restart the trimmer.")
+            return
+
+        # The ffmpeg trim helper only understands HH:MM:SS, so normalize both
+        # endpoints before they reach it.
+        start_norm = _format_seconds_to_hhmmss(start_s)
+        end_norm = _format_seconds_to_hhmmss(end_s)
+
+        # Checked before either branch so a stored-object repeat is metered the
+        # same way a local trim is.
+        if not await self._check_conversion_quota(update, context):
+            return
+
+        # Lazy-download: a media-cache repeat has no local copy yet, and the
+        # trim used to dead-end on those with "No file available to trim".
+        if not current_file.get("path") or not os.path.exists(current_file.get("path") or ""):
+            try:
+                await self._ensure_current_file_downloaded(update, context, session)
+                current_file = session.get("current_file") or current_file
+            except Exception as exc:
+                await notify(f"❌ Failed to download file: {exc}")
+                return
+
+        is_audio = current_file.get("type") == "audio"
+        ext = os.path.splitext(current_file.get("name") or current_file.get("path") or "")[1].lower()
+        supported = self.converter.supported_formats.get("audio" if is_audio else "video") or ()
+        if ext not in supported:
+            ext = ".mp3" if is_audio else ".mp4"
+
+        output_base = getattr(config, "OUTPUT_PATH", "storage/output") if config else "storage/output"
+        with contextlib.suppress(OSError):
+            os.makedirs(output_base, exist_ok=True)
+        output_path = os.path.join(output_base, f"{current_file['id']}_trimmed{ext}")
+
+        _stem = os.path.splitext(os.path.basename(current_file.get("name") or ""))[0] or str(
+            current_file.get("id") or "media"
+        )
+        delivery_name = (
+            _audio_delivery_name(current_file.get("name"), current_file.get("id"), extension=ext)
+            if is_audio
+            else f"{_stem}_trimmed{ext}"
+        )
+
+        local_input = current_file.get("path") or current_file.get("_local_input_path")
+        if not (local_input and os.path.exists(local_input)):
+            # ── No local copy: serve the repeat from the object it already lives
+            #    in. ``input_key`` is the S3/MinIO object the first run streamed
+            #    to storage (or its probe header); the worker reads it from there
+            #    (or the shared source cache) instead of a new Pyrogram download.
+            queued = await self._enqueue_keyed_job(
+                update,
+                context,
+                current_file,
+                output_path=output_path,
+                ffmpeg_args=None,
+                output_ext=ext,
+                job_type="trim",
+                caption=_metadata_caption(current_file),
+                notify=notify,
+                extra={
+                    "start_time": start_norm,
+                    "end_time": end_norm,
+                    "output_filename": delivery_name,
+                },
+            )
+            if not queued:
+                await notify("❌ File is no longer available to trim. Send it again.")
+            return
+
+        await notify(f"✂️ Trimming from {start_norm} to {end_norm}...")
+
+        # trim_video delegates to the shared trim_media implementation, which
+        # stream-copies either container, so it is safe for audio too.
+        success = await self.converter.trim_video(local_input, output_path, start_norm, end_norm)
+
+        if not (success and os.path.exists(output_path)):
+            await notify("❌ Failed to trim media. Check that the times are within the file duration and try again.")
+            return
+
+        try:
+            if is_audio:
+                with open(output_path, "rb") as audio_file:
+                    await context.bot.send_audio(
+                        chat_id=update.effective_chat.id,
+                        audio=audio_file,
+                        caption=_metadata_caption(current_file),
+                        title=os.path.splitext(delivery_name)[0],
+                        filename=delivery_name,
+                        performer="",
+                    )
+            else:
+                await self._send_video_result(
+                    context.bot,
+                    update.effective_chat.id,
+                    output_path,
+                    caption=_metadata_caption(current_file),
+                )
+            await notify(f"✅ Trim complete ({start_norm} → {end_norm}).")
+        finally:
+            with contextlib.suppress(OSError):
+                os.remove(output_path)
+
     async def _apply_fade(
         self,
         update: Update,
@@ -5348,7 +5493,13 @@ class EnhancedMediaHandler:
         fade_in: float = 0.0,
         fade_out: float = 0.0,
     ):
-        """Apply audio fade-in and/or fade-out to the current file."""
+        """Apply audio fade-in and/or fade-out to the current file.
+
+        A media-cache repeat has no local copy but does have an ``input_key``:
+        that path queues a ``fade`` worker job instead of failing with "File not
+        found on disk". The worker owns the duration probe a fade-out needs,
+        because it is the side that can see the resolved source.
+        """
         query = getattr(update, "callback_query", None)
         if query is None:
             return
@@ -5365,25 +5516,64 @@ class EnhancedMediaHandler:
         if not await self._check_conversion_quota(update, context):
             return
 
+        is_audio = current_file.get("type") == "audio"
+        ext = os.path.splitext(current_file.get("name") or "")[1].lower()
+        supported = self.converter.supported_formats.get("audio" if is_audio else "video") or ()
+        if ext not in supported:
+            ext = ".mp3" if is_audio else ".mp4"
+
+        _stem = os.path.splitext(os.path.basename(current_file.get("name") or ""))[0] or str(
+            current_file.get("id") or "media"
+        )
+        delivery_name = (
+            _audio_delivery_name(current_file.get("name"), current_file.get("id"), extension=ext)
+            if is_audio
+            else f"{_stem}_faded{ext}"
+        )
+
+        output_dir = getattr(config, "OUTPUT_PATH", "storage/output") if config else "storage/output"
+        with contextlib.suppress(OSError):
+            os.makedirs(output_dir, exist_ok=True)
+        output_path = os.path.join(output_dir, f"{current_file.get('id', 'unknown')}_faded{ext}")
+
         await self.safe_edit(query, "📈 Applying fade effect...", reply_markup=MediaMenuBuilder.get_back_button())
 
         if not current_file.get("path") or not os.path.exists(current_file.get("path") or ""):
             try:
                 await self._ensure_current_file_downloaded(update, context, session)
-                current_file = session.get("current_file")
+                current_file = session.get("current_file") or current_file
             except Exception as e:
                 await self.safe_edit(query, f"❌ Failed to download file: {e}")
                 return
 
-        input_path = current_file.get("path")
-        if not input_path or not os.path.exists(input_path):
-            await self.safe_edit(query, "❌ File not found on disk.", reply_markup=MediaMenuBuilder.get_back_button())
+        input_path = current_file.get("path") or current_file.get("_local_input_path")
+        if not (input_path and os.path.exists(input_path)):
+            # ── No local copy: apply the fade from the stored object. The worker
+            #    probes the duration for a fade-out from the source it resolves,
+            #    so no repeat has to come back over Pyrogram.
+            queued = await self._enqueue_keyed_job(
+                update,
+                context,
+                current_file,
+                output_path=output_path,
+                ffmpeg_args=None,
+                output_ext=ext,
+                job_type="fade",
+                caption=_metadata_caption(current_file),
+                query=query,
+                extra={
+                    "fade_in": fade_in,
+                    "fade_out": fade_out,
+                    "output_filename": delivery_name,
+                },
+            )
+            if not queued:
+                await self.safe_edit(
+                    query,
+                    "❌ File is no longer available to fade. Send it again.",
+                    reply_markup=MediaMenuBuilder.get_back_button(),
+                )
             return
-        ext = os.path.splitext(input_path)[1] or ".mp3"
-        output_dir = getattr(config, "OUTPUT_PATH", "storage/output") if config else "storage/output"
-        with contextlib.suppress(OSError):
-            os.makedirs(output_dir, exist_ok=True)
-        output_path = os.path.join(output_dir, f"{current_file.get('id', 'unknown')}_faded{ext}")
 
         success = await self.converter.apply_fade(input_path, output_path, fade_in, fade_out)
         if success and os.path.exists(output_path):
@@ -5392,11 +5582,8 @@ class EnhancedMediaHandler:
                 query, "✅ Fade applied! Sending file...", reply_markup=MediaMenuBuilder.get_back_button()
             )
             try:
-                if current_file.get("type") == "audio":
+                if is_audio:
                     # Deliver faded audio as streamable audio, not as a document.
-                    delivery_name = _audio_delivery_name(
-                        current_file.get("name"), current_file.get("id"), extension=ext or ".mp3"
-                    )
                     with open(output_path, "rb") as audio_file:
                         await context.bot.send_audio(
                             chat_id=update.effective_chat.id,
@@ -5415,10 +5602,9 @@ class EnhancedMediaHandler:
                     "✅ Fade applied but failed to send. Check the output folder.",
                     reply_markup=MediaMenuBuilder.get_back_button(),
                 )
-        else:
-            await self.safe_edit(
-                query, "❌ Failed to apply fade effect.", reply_markup=MediaMenuBuilder.get_back_button()
-            )
+            return
+
+        await self.safe_edit(query, "❌ Failed to apply fade effect.", reply_markup=MediaMenuBuilder.get_back_button())
 
     async def callback_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle all callback queries with enhanced features."""
@@ -5622,10 +5808,16 @@ class EnhancedMediaHandler:
                 await self.compress_video(update, context, session, crf)
 
             elif data == "trim_video":
+                # Refuse early when there is no file at all; an audio file is
+                # still allowed here because the trimmer handles both types.
+                if not current_file:
+                    await self.safe_edit(query, "❌ No file to trim. Send a file first.")
+                    return
                 # Open trimmer selection menu with two dynamic modes
+                _kind = "Audio" if current_file.get("type") == "audio" else "Video"
                 await self.safe_edit(
                     query,
-                    "✂️ **Video Trimming**\nChoose a trimmer mode:",
+                    f"✂️ **{_kind} Trimming**\nChoose a trimmer mode:",
                     reply_markup=MediaMenuBuilder.get_trimmer_menu(),
                 )
 
@@ -5964,6 +6156,17 @@ class EnhancedMediaHandler:
                 await self.adjust_bitrate(update, context, session, bitrate)
 
             elif data == "trim_audio":
+                # Refuse early when there is nothing (or the wrong media) to
+                # trim, instead of collecting both times and then failing.
+                if not current_file:
+                    await self.safe_edit(query, "❌ No file to trim. Send an audio file first.")
+                    return
+                if current_file.get("type") != "audio":
+                    await self.safe_edit(
+                        query,
+                        "❌ That file is a video. Use ✂️ Video Trimmer instead.",
+                    )
+                    return
                 # Clear previous prompts *before* arming this one, otherwise the
                 # loop below would delete the flag we just set.
                 for key in list(context.user_data.keys()):
@@ -7379,6 +7582,7 @@ class EnhancedMediaHandler:
         caption: str | None = None,
         query=None,
         notify=None,
+        extra: dict | None = None,
     ) -> bool:
         """Queue a worker job whose source is an object-storage key.
 
@@ -7388,6 +7592,11 @@ class EnhancedMediaHandler:
         ``input_key``). The worker reads that object itself, so there is no
         Telegram download and no Pyrogram. Returns True when the job was
         queued, False when no key was available or enqueueing failed.
+
+        ``extra`` adds job-type specific fields (trim's ``start_time``/
+        ``end_time``, an explicit ``output_filename``) on top of the common
+        payload, so a repeat is served from the stored object rather than a
+        fresh Pyrogram fetch.
         """
         input_key = current_file.get("input_key")
         if not input_key:
@@ -7424,6 +7633,8 @@ class EnhancedMediaHandler:
             # is what keeps a repeat served from the stored object instead of
             # re-fetching the media over Telegram.
         }
+        if extra:
+            job.update(extra)
         # Hand the ingest's probe verdict to the worker so it skips the redundant
         # storage range-probe and reports real progress.
         _src_meta = current_file.get("_source_metadata")
@@ -7647,10 +7858,25 @@ class EnhancedMediaHandler:
         session: dict,
         crf: str,
     ):
-        """Compress video with specified CRF."""
-        if not await self._require_callback(update):
+        """Compress video with specified CRF.
+
+        Accepts either a callback (a preset button) or a plain text message (the
+        custom-CRF prompt), so a value typed after "Custom" is actually used and
+        acknowledged instead of hitting an early ``_require_callback`` return.
+        """
+        query = getattr(update, "callback_query", None)
+        message = getattr(update, "message", None)
+        if query is None and message is None:
+            logger.warning("compress_video invoked without callback_query or message")
             return
-        query = update.callback_query
+
+        async def notify(text, **kwargs):
+            """Report progress through whichever update context triggered this run."""
+            if query is not None:
+                await self.safe_edit(query, text, **kwargs)
+            else:
+                await message.reply_text(text, **kwargs)
+
         user_id = update.effective_user.id
 
         if not await self._check_conversion_quota(update, context):
@@ -7664,12 +7890,12 @@ class EnhancedMediaHandler:
                 if key.startswith("awaiting_"):
                     del context.user_data[key]
             context.user_data["awaiting_crf"] = True
-            await self.safe_edit(query, "✏️ Enter CRF value (18-51, lower=better quality):")
+            await notify("✏️ Enter CRF value (18-51, lower=better quality):")
             return
 
         current_file = session.get("current_file")
         if not current_file or current_file["type"] != "video":
-            await self.safe_edit(query, "❌ No video file found.")
+            await notify("❌ No video file found.")
             return
 
         active_count = len(self.active_conversions)
@@ -7677,14 +7903,13 @@ class EnhancedMediaHandler:
 
         if active_count >= max_conversions:
             queue_position = active_count - max_conversions + 1
-            await self.safe_edit(
-                query,
+            await notify(
                 f"⏳ Queue position: #{queue_position}\n"
                 f"Active conversions: {active_count}/{max_conversions}\n"
                 f"Your compression will start soon...",
             )
         else:
-            await self.safe_edit(query, f"📉 Compressing with CRF {crf}...")
+            await notify(f"📉 Compressing with CRF {crf}...")
 
         async def do_compression():
             output_dir = getattr(config, "OUTPUT_PATH", "storage/output") if config else "storage/output"
@@ -7710,11 +7935,11 @@ class EnhancedMediaHandler:
             if success and os.path.exists(output_path):
                 file_size = os.path.getsize(output_path)
                 if file_size > 2 * 1024**3:  # 2GB
-                    await self.safe_edit(
-                        query,
+                    await notify(
                         f"❌ Compressed file still too large ({file_size // 1024 // 1024}MB).\nTry higher compression.",
                     )
-                    os.remove(output_path)
+                    with contextlib.suppress(OSError):
+                        os.remove(output_path)
                 else:
                     await self._send_video_result(
                         context.bot,
@@ -7722,9 +7947,11 @@ class EnhancedMediaHandler:
                         output_path,
                         caption=_metadata_caption(current_file),
                     )
-                    os.remove(output_path)
+                    with contextlib.suppress(OSError):
+                        os.remove(output_path)
+                    await notify(f"✅ Compression complete (CRF {crf}). Here is your file.")
             else:
-                await self.safe_edit(query, "❌ Compression failed.")
+                await notify("❌ Compression failed.")
 
         # ── Store conversion metadata so the BigFilePipeline knows what to produce ──
         _crf_value = int(crf) if isinstance(crf, str) and crf.isdigit() else 28
@@ -7757,16 +7984,16 @@ class EnhancedMediaHandler:
                     kb = InlineKeyboardMarkup(
                         [[InlineKeyboardButton("❌ Cancel", callback_data=f"cancel_job:{_pipeline_job_id}")]]
                     )
-                    await self.safe_edit(
-                        query,
+                    await notify(
                         f"✅ Large file queued (Job: {_pipeline_job_id[:8]}...). I'll send the compressed video when ready.",
                         reply_markup=kb,
                     )
-                    with contextlib.suppress(RuntimeError):
-                        asyncio.create_task(self._watch_job_progress(query, _pipeline_job_id, bot=context.bot))
+                    if query is not None:
+                        with contextlib.suppress(RuntimeError):
+                            asyncio.create_task(self._watch_job_progress(query, _pipeline_job_id, bot=context.bot))
                     return
             except Exception as e:
-                await self.safe_edit(query, f"❌ Failed to download file: {e}")
+                await notify(f"❌ Failed to download file: {e}")
                 return
 
         # ── Cancel any stale pipeline job so user's specific settings take effect ──
@@ -7789,9 +8016,10 @@ class EnhancedMediaHandler:
                 job_type="compress_video",
                 caption=current_file.get("_pipeline_caption"),
                 query=query,
+                notify=notify,
             )
             if not queued:
-                await self.safe_edit(query, "❌ Local file missing. Try re-downloading or use the web uploader.")
+                await notify("❌ Local file missing. Try re-downloading or use the web uploader.")
             return
 
         await self._run_with_concurrency_limit(user_id, "compression", do_compression())
@@ -8709,20 +8937,36 @@ class EnhancedMediaHandler:
         session: dict,
         bitrate: str,
     ):
-        """Re-encode the current audio file at a specific bitrate."""
-        if not await self._require_callback(update):
+        """Re-encode the current audio file at a specific bitrate.
+
+        Accepts either a callback (a picker button) or a plain text message (the
+        custom-bitrate prompt), mirroring ``convert_to_mp3``. Previously this
+        required a callback, so a value typed into the "Custom" prompt reached
+        an early ``_require_callback`` return and vanished with no reply at all.
+        """
+        query = getattr(update, "callback_query", None)
+        message = getattr(update, "message", None)
+        if query is None and message is None:
+            logger.warning("adjust_bitrate invoked without callback_query or message")
             return
-        query = update.callback_query
+
+        async def notify(text, **kwargs):
+            """Report progress through whichever update context triggered this run."""
+            if query is not None:
+                await self.safe_edit(query, text, **kwargs)
+            else:
+                await message.reply_text(text, **kwargs)
+
         current_file = session.get("current_file")
 
         if not current_file:
-            await self.safe_edit(query, "❌ No audio file found.")
+            await notify("❌ No audio file found.")
             return
 
         if current_file.get("type") != "audio":
             # Videos are handled by the Video -> Audio flow so the user also
             # gets to pick the container/quality before anything is encoded.
-            await self.safe_edit(query, "❌ No audio file found. Use 🎵 Video To Audio for videos.")
+            await notify("❌ No audio file found. Use 🎵 Video To Audio for videos.")
             return
 
         if not await self._check_conversion_quota(update, context):
@@ -8735,14 +8979,14 @@ class EnhancedMediaHandler:
                 if key.startswith("awaiting_"):
                     del context.user_data[key]
             context.user_data["awaiting_bitrate"] = True
-            await self.safe_edit(query, "✏️ Enter bitrate (32k-320k, e.g. 128k, 320k):")
+            await notify("✏️ Enter bitrate (32k-320k, e.g. 128k, 320k):")
             return
 
         audio_bitrate = _sanitize_audio_bitrate(bitrate)
         current_file["audio_bitrate"] = audio_bitrate
         session["current_file"] = current_file
 
-        await self.safe_edit(query, f"🎚️ Setting bitrate to {audio_bitrate}...")
+        await notify(f"🎚️ Setting bitrate to {audio_bitrate}...")
 
         output_base = getattr(config, "OUTPUT_PATH", "storage/output") if config else "storage/output"
         with contextlib.suppress(OSError):
@@ -8758,7 +9002,7 @@ class EnhancedMediaHandler:
                 await self._ensure_current_file_downloaded(update, context, session)
                 current_file = session.get("current_file")
             except Exception as e:
-                await self.safe_edit(query, f"❌ Failed to download file: {e}")
+                await notify(f"❌ Failed to download file: {e}")
                 return
 
         local_input = current_file.get("path") or current_file.get("_local_input_path")
@@ -8773,8 +9017,9 @@ class EnhancedMediaHandler:
                 job_type="format_audio",
                 caption=_metadata_caption(current_file),
                 query=query,
+                notify=notify,
             ):
-                await self.safe_edit(query, "❌ Failed to adjust bitrate.")
+                await notify("❌ Failed to adjust bitrate.")
             return
 
         success, _ = await self.converter.execute_ffmpeg(cmd, local_input, output_path)
@@ -8790,9 +9035,11 @@ class EnhancedMediaHandler:
                     filename=delivery_name,
                     performer="",
                 )
-            os.remove(output_path)
+            with contextlib.suppress(OSError):
+                os.remove(output_path)
+            await notify(f"✅ Bitrate set to {audio_bitrate}. Here is your file.")
         else:
-            await self.safe_edit(query, "❌ Failed to adjust bitrate.")
+            await notify("❌ Failed to adjust bitrate.")
 
     async def normalize_audio(self, update: Update, context: ContextTypes.DEFAULT_TYPE, session: dict):
         """Normalize audio volume."""
@@ -9184,6 +9431,21 @@ class EnhancedMediaHandler:
         # --- Dynamic trimmer flow (Trimmer 1 & 2) ---
         if context.user_data.get("awaiting_trimmer"):
             mode = context.user_data.get("awaiting_trimmer")
+
+            def _clear_trimmer_state() -> None:
+                for k in list(context.user_data.keys()):
+                    if k.startswith("awaiting_") or k.startswith("trimmer"):
+                        del context.user_data[k]
+
+            # A trim without a registered file used to be discovered only after
+            # both times were collected. Say so up front instead.
+            if not current_file:
+                await update.message.reply_text(
+                    "❌ No file available to trim. Send a file first, then open the trimmer."
+                )
+                _clear_trimmer_state()
+                return
+
             try:
                 if mode == "trimmer1_start":
                     # Validate start time
@@ -9199,45 +9461,17 @@ class EnhancedMediaHandler:
                     start = context.user_data.get("trimmer_start")
                     if not start:
                         await update.message.reply_text("❌ Missing start time. Please restart Trimmer.")
-                        for k in list(context.user_data.keys()):
-                            if k.startswith("awaiting_") or k.startswith("trimmer_"):
-                                del context.user_data[k]
+                        _clear_trimmer_state()
                         return
 
-                    # Parse times
-                    start_s = _parse_time_to_seconds(start)
-                    end_s = _parse_time_to_seconds(user_input)
-                    if end_s <= start_s:
+                    # Validate before trimming so a bad end time keeps the
+                    # prompt open instead of discarding the user's start time.
+                    if _parse_time_to_seconds(user_input) <= _parse_time_to_seconds(start):
                         await update.message.reply_text("❌ End time must be after start time. Send END time again.")
                         return
 
-                    # Perform trim
-                    await update.message.reply_text(f"✂️ Trimming from {start} to {user_input}...")
-                    output_base = getattr(config, "OUTPUT_PATH", "storage/output") if config else "storage/output"
-                    with contextlib.suppress(OSError):
-                        os.makedirs(output_base, exist_ok=True)
-                    output_path = os.path.join(
-                        output_base, f"{current_file['id']}_trim_{int(start_s)}_{int(end_s)}.mp4"
-                    )
-                    success = await self.converter.trim_video(
-                        current_file["path"], output_path, start, user_input.strip()
-                    )
-
-                    if success and os.path.exists(output_path):
-                        await self._send_video_result(
-                            context.bot,
-                            update.effective_chat.id,
-                            output_path,
-                            caption=_metadata_caption(current_file),
-                        )
-                        os.remove(output_path)
-                    else:
-                        await update.message.reply_text("❌ Failed to trim video.")
-
-                    # Cleanup state
-                    for k in list(context.user_data.keys()):
-                        if k.startswith("awaiting_") or k.startswith("trimmer_") or k.startswith("trimmer"):
-                            del context.user_data[k]
+                    await self._trim_current_media(update, context, session, current_file, start, user_input)
+                    _clear_trimmer_state()
                     return
 
                 elif mode == "trimmer2_start":
@@ -9254,49 +9488,18 @@ class EnhancedMediaHandler:
                     start = context.user_data.get("trimmer_start")
                     if not start:
                         await update.message.reply_text("❌ Missing start time. Please restart Trimmer.")
-                        for k in list(context.user_data.keys()):
-                            if k.startswith("awaiting_") or k.startswith("trimmer_"):
-                                del context.user_data[k]
+                        _clear_trimmer_state()
                         return
 
-                    try:
-                        start_s = _parse_time_to_seconds(start)
-                        dur_s = _parse_time_to_seconds(user_input)
-                        end_s = start_s + dur_s
-                        end_str = _format_seconds_to_hhmmss(end_s)
-                    except ValueError:
-                        await update.message.reply_text("❌ Invalid duration format. Use HH:MM:SS or seconds.")
-                        return
+                    start_s = _parse_time_to_seconds(start)
+                    dur_s = _parse_time_to_seconds(user_input)
+                    end_str = _format_seconds_to_hhmmss(start_s + dur_s)
 
-                    await update.message.reply_text(
-                        f"✂️ Trimming from {start} for duration {user_input} (to {end_str})..."
-                    )
-                    output_base = getattr(config, "OUTPUT_PATH", "storage/output") if config else "storage/output"
-                    with contextlib.suppress(OSError):
-                        os.makedirs(output_base, exist_ok=True)
-                    output_path = os.path.join(
-                        output_base, f"{current_file['id']}_trim_{int(start_s)}_{int(end_s)}.mp4"
-                    )
-                    success = await self.converter.trim_video(current_file["path"], output_path, start, end_str)
-
-                    if success and os.path.exists(output_path):
-                        await self._send_video_result(
-                            context.bot,
-                            update.effective_chat.id,
-                            output_path,
-                            caption=_metadata_caption(current_file),
-                        )
-                        os.remove(output_path)
-                    else:
-                        await update.message.reply_text("❌ Failed to trim video.")
-
-                    # Cleanup
-                    for k in list(context.user_data.keys()):
-                        if k.startswith("awaiting_") or k.startswith("trimmer_") or k.startswith("trimmer"):
-                            del context.user_data[k]
+                    await self._trim_current_media(update, context, session, current_file, start, end_str)
+                    _clear_trimmer_state()
                     return
             except ValueError as e:
-                await update.message.reply_text(str(e))
+                await update.message.reply_text(f"❌ {e}")
                 return
 
         # Check what we're waiting for
@@ -9598,6 +9801,20 @@ class EnhancedMediaHandler:
             # otherwise the second reply never reaches this branch.
             context.user_data["trim_time"] = user_input
             if context.user_data["awaiting_trim"] == "start":
+                # Validate before collecting the end time: without a file the
+                # old code asked for both times and only then said it could not
+                # trim anything.
+                if not current_file:
+                    await update.message.reply_text("❌ No file available to trim. Send an audio or video file first.")
+                    for key in list(context.user_data.keys()):
+                        if key.startswith("awaiting_"):
+                            del context.user_data[key]
+                    return
+                try:
+                    _parse_time_to_seconds(user_input)
+                except ValueError as exc:
+                    await update.message.reply_text(f"❌ {exc}")
+                    return
                 context.user_data["start_time"] = user_input.strip()
                 context.user_data["awaiting_trim"] = "end"
                 await update.message.reply_text(
@@ -9605,59 +9822,10 @@ class EnhancedMediaHandler:
                 )
                 return
 
-            # Perform trim
             start_time = context.user_data.get("start_time", "00:00:00")
             end_time = user_input
 
-            if not current_file or not current_file.get("path"):
-                await update.message.reply_text("❌ No file available to trim.")
-                for key in list(context.user_data.keys()):
-                    if key.startswith("awaiting_"):
-                        del context.user_data[key]
-                return
-
-            await update.message.reply_text(f"✂️ Trimming from {start_time} to {end_time}...")
-
-            if not await self._check_conversion_quota(update, context):
-                return
-
-            _is_audio_trim = current_file.get("type") == "audio"
-            _trim_ext = os.path.splitext(current_file.get("name") or "")[1].lower()
-            if _trim_ext not in (self.converter.supported_formats["audio"] if _is_audio_trim else []):
-                _trim_ext = ".mp3" if _is_audio_trim else ".mp4"
-
-            output_base = getattr(config, "OUTPUT_PATH", "storage/output") if config else "storage/output"
-            with contextlib.suppress(OSError):
-                os.makedirs(output_base, exist_ok=True)
-            output_path = os.path.join(output_base, f"{current_file['id']}_trimmed{_trim_ext}")
-            # trim_video delegates to the shared trim_media implementation, which
-            # stream-copies either container, so it is safe for audio too.
-            success = await self.converter.trim_video(current_file["path"], output_path, start_time, end_time)
-
-            if success and os.path.exists(output_path):
-                if _is_audio_trim:
-                    delivery_name = _audio_delivery_name(
-                        current_file.get("name"), current_file.get("id"), extension=_trim_ext
-                    )
-                    with open(output_path, "rb") as audio_file:
-                        await context.bot.send_audio(
-                            chat_id=update.effective_chat.id,
-                            audio=audio_file,
-                            caption=_metadata_caption(current_file),
-                            title=os.path.splitext(delivery_name)[0],
-                            filename=delivery_name,
-                            performer="",
-                        )
-                else:
-                    await self._send_video_result(
-                        context.bot,
-                        update.effective_chat.id,
-                        output_path,
-                        caption=_metadata_caption(current_file),
-                    )
-                os.remove(output_path)
-            else:
-                await update.message.reply_text("❌ Failed to trim media.")
+            await self._trim_current_media(update, context, session, current_file, start_time, end_time)
             for key in list(context.user_data.keys()):
                 if key.startswith("awaiting_"):
                     del context.user_data[key]

@@ -11,6 +11,7 @@ from .cleanup_tasks import (
 )
 from .conversion_tasks import (
     adjust_bitrate,
+    apply_fade,
     change_resolution,
     compress_video,
     convert_audio_format,
@@ -66,6 +67,7 @@ except ImportError:
 
 __all__ = [
     "convert_video_to_mp3",
+    "apply_fade",
     "compress_video",
     "extract_audio",
     "merge_videos",
