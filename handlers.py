@@ -2549,7 +2549,7 @@ class EnhancedMediaHandler:
             try:
                 # Check if this part exceeds the Bot API limit - if so, use userbot
                 part_size = os.path.getsize(part) if os.path.exists(part) else 0
-                if part_size > config.BOT_API_MAX_BYTES and ENABLE_USERBOT:
+                if part_size > config.BOT_API_MAX_BYTES and getattr(config, "ENABLE_USERBOT", False):
                     # Route large parts through userbot for direct MTProto delivery
                     sent_ok = await self._send_part_via_userbot(
                         chat_id, part, caption, part_name, as_audio, current_file, label
@@ -2814,7 +2814,7 @@ class EnhancedMediaHandler:
             _delivery_parts = [p for p in parts if p not in _junk_parts]
             _junk_count = len(_junk_parts)
 
-            sent = await self._deliver_split_parts(
+            _sent = await self._deliver_split_parts(
                 update, context, current_file, _delivery_parts, status_message=status_message, as_audio=as_audio
             )
 
@@ -2839,10 +2839,10 @@ class EnhancedMediaHandler:
                 # target the previous part simply keeps going.
                 whole, remainder = divmod(duration, seconds) if seconds else (0, 0)
                 expected = max(1, int(whole) + (1 if remainder else 0))
-                delivered = len(parts) - _junk_count
-                summary = f"✅ Split into {len(parts)} parts of {format_clock(seconds)}, sent {delivered} in order."
+                _delivered = _sent if _sent is not None else (len(parts) - _junk_count)
+                summary = f"✅ Split into {len(parts)} parts of {format_clock(seconds)}, sent {_delivered} in order."
                 if _junk_count > 0:
-                    summary += f"\n(Filtered { _junk_count} junk tail part(s) - MP3 frame quantization noise, not real content.)"
+                    summary += f"\n(Filtered {_junk_count} junk tail part(s) - MP3 frame quantization noise, not real content.)"
                 if duration > 0 and len(parts) < expected:
                     summary += f"\n(You asked for {expected}: cuts land on the source's keyframes, so the parts came out longer.)"
             if status_message is not None:
