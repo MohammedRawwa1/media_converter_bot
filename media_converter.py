@@ -460,66 +460,16 @@ class ExtendedMediaConverter:
     async def apply_fade(
         self, input_path: str, output_path: str, fade_in_duration: float = 0.0, fade_out_duration: float = 0.0
     ) -> bool:
-        """Apply fade-in and/or fade-out to audio track of a media file.
+        """Apply fade-in and/or fade-out to the audio track of a media file.
 
-        Uses the afade audio filter. Both durations are in seconds.
-        At least one must be > 0.
+        Delegates to ``tasks.conversion_tasks.apply_fade`` - the function the
+        worker's ``fade`` job type runs - so an inline fade and a cached repeat
+        build the same filter chain from the same duration probe. The local copy
+        of this used to probe the audio stream and fall back to a raw ffprobe,
+        which could place a fade-out at a slightly different point than the
+        worker's did for the very same file.
         """
-        if fade_in_duration <= 0 and fade_out_duration <= 0:
-            logger.warning("apply_fade: both durations are zero, nothing to do")
-            return False
+        from tasks.conversion_tasks import apply_fade as _apply_fade
 
-        # Build the audio filter chain
-        afilters = []
-        if fade_in_duration > 0:
-            afilters.append(f"afade=t=in:st=0:d={fade_in_duration}")
-
-        if fade_out_duration > 0:
-            # Probe the file for audio duration
-            audio_duration = 0.0
-            try:
-                if ffmpeg is not None:
-                    probe = ffmpeg.probe(input_path)
-                    audio_stream = next(
-                        (s for s in probe.get("streams", []) if s.get("codec_type") == "audio"),
-                        None,
-                    )
-                    if audio_stream is not None:
-                        audio_duration = float(audio_stream.get("duration", probe.get("format", {}).get("duration", 0)))
-                    else:
-                        audio_duration = float(probe.get("format", {}).get("duration", 0))
-            except Exception as e:
-                logger.error("apply_fade: probe failed: %s", e)
-
-            # Fallback: use ffprobe directly
-            if audio_duration <= 0:
-                try:
-                    import asyncio as _aio
-
-                    proc = await _aio.create_subprocess_exec(
-                        "ffprobe",
-                        "-v",
-                        "error",
-                        "-show_entries",
-                        "format=duration",
-                        "-of",
-                        "default=noprint_wrappers=1:nokey=1",
-                        input_path,
-                        stdout=_aio.subprocess.PIPE,
-                        stderr=_aio.subprocess.PIPE,
-                    )
-                    stdout, _ = await proc.communicate()
-                    audio_duration = float(stdout.decode().strip()) if stdout else 0.0
-                except Exception:
-                    logger.debug("ffprobe fallback failed for audio duration")
-
-            if audio_duration <= 0:
-                logger.error("apply_fade: cannot determine audio duration")
-                return False
-
-            fade_out_start = max(0.0, audio_duration - fade_out_duration)
-            afilters.append(f"afade=t=out:st={fade_out_start}:d={fade_out_duration}")
-
-        filter_str = ",".join(afilters)
-        cmd = ["-af", filter_str, "-c:v", "copy"]
-        return (await self.execute_ffmpeg(cmd, input_path, output_path))[0]
+        success, _ = await _apply_fade(input_path, output_path, fade_in_duration, fade_out_duration)
+        return success

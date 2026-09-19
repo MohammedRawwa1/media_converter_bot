@@ -69,6 +69,5 @@ ignore = [
 "utils/telethon_session.py" = ["SIM112"]
 "utils/forward_store.py" = ["SIM105"]
 "tools/telethon_ingest.py" = ["SIM105"]
-"web/ffmpeg_worker.py" = ["S603"]
 "web/middleware.py" = ["B023"]
 "workers/ffmpeg_worker.py" = ["B023", "B025", "SIM117", "S607"]

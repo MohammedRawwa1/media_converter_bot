@@ -135,6 +135,319 @@ BOT_APPLICATION = None
 BOT_STARTED_AT = None
 START_TIME = time.time()
 BOT_READY = asyncio.Event()
+
+# Wall-clock stamp of the last completed getUpdates from whichever long-poller is
+# running. Health reports how old it is, because the failure this guards against -
+# a poller that exited, leaving the process HTTP-healthy but deaf - used to be
+# visible only in the logs.
+LONG_POLLER_HEARTBEAT = 0.0
+
+# Set by main() once it has settled how updates will be consumed (webhook
+# registered, or its own long-poller started / deliberately skipped). The ASGI
+# startup handler waits on this before deciding whether a fallback poller is
+# needed: probing BOT_APPLICATION before main() had run always saw None, which is
+# why the fallback started on every boot and preempted the poller main() was
+# about to create.
+BOT_POLLING_DECIDED = asyncio.Event()
+
+# Name and ttl shared by every long-poller, so two workers - or two replicas -
+# can never both call getUpdates on the same token.
+LONG_POLLER_LOCK_NAME = "longpoller"
+LONG_POLLER_LOCK_TTL = 35
+
+# A poller that loses the lock to another owner stamps this instead of the
+# heartbeat: the update consumer is alive, it just is not this process. Health
+# treats either stamp as proof of life, so a shared deployment does not look deaf
+# from the instances that are not the ones polling.
+LONG_POLLER_DEFERRED_AT = 0.0
+
+# How long a polling deployment may go without a completed getUpdates before the
+# watchdog restarts the poller and /health reports the bot unhealthy. The restart
+# happens in-process; the non-200 is the last resort for the platform.
+LONG_POLLER_STALE_SECONDS = float(os.environ.get("LONG_POLLER_STALE_SECONDS", str(3 * 60)))
+LONG_POLLER_WATCHDOG_INTERVAL = float(os.environ.get("LONG_POLLER_WATCHDOG_INTERVAL", str(60)))
+
+# How long the ASGI startup handler waits for main() to settle its update consumer
+# before evaluating the fallback with whatever state it has.
+ASGI_BOT_SETTLE_TIMEOUT = float(os.environ.get("ASGI_BOT_SETTLE_TIMEOUT", "60"))
+
+# The single watchdog task (started once, by the ASGI startup handler).
+LONG_POLLER_WATCHDOG = None
+
+
+def _long_poller_stamp() -> float:
+    """The newest proof that the update consumer is alive."""
+    return max(
+        float(globals().get("LONG_POLLER_HEARTBEAT") or 0.0),
+        float(globals().get("LONG_POLLER_DEFERRED_AT") or 0.0),
+    )
+
+
+def long_poller_idle_seconds() -> float | None:
+    """Seconds since the update consumer was last known to be alive.
+
+    ``None`` until startup has recorded something, so a slow boot is never
+    mistaken for a dead poller.
+    """
+    stamp = _long_poller_stamp()
+    if stamp:
+        return max(0.0, time.time() - stamp)
+    started_at = globals().get("BOT_STARTED_AT") or 0.0
+    if started_at:
+        return max(0.0, time.time() - started_at)
+    return None
+
+
+def long_poller_state() -> dict:
+    """Snapshot of the update consumer, shared by /health and the watchdog."""
+    idle = long_poller_idle_seconds()
+    return {
+        "started": bool(globals().get("LONG_POLLER_STARTED", False)),
+        "restartable": callable(globals().get("LONG_POLLER_RESTART")),
+        "idle_seconds": round(idle, 1) if idle is not None else None,
+    }
+
+
+def polling_is_expected() -> bool:
+    """True when this process is configured to consume updates by polling."""
+    force_polling = os.environ.get("FORCE_POLLING", "").lower() in ("1", "true", "yes")
+    return not (WEBHOOK_URL and not force_polling)
+
+
+def long_poller_is_stale() -> bool:
+    """True when polling is expected but the update consumer has gone silent.
+
+    The single verdict behind both the watchdog restart and the /health status, so
+    the two can never disagree about whether the bot is deaf.
+    """
+    if not polling_is_expected():
+        return False
+    idle = long_poller_idle_seconds()
+    return idle is not None and idle >= LONG_POLLER_STALE_SECONDS
+
+
+async def _long_poller_lock():
+    """The distributed lock that admits one poller at a time, or None without Redis."""
+    try:
+        from utils.redis_lock import RedisLock
+
+        return RedisLock(LONG_POLLER_LOCK_NAME, ttl=LONG_POLLER_LOCK_TTL)
+    except Exception:
+        logger.debug("long-poller: Redis lock unavailable; relying on the local guard")
+        return None
+
+
+async def _acquire_long_poller_lock(lock) -> bool:
+    """True when this process may call getUpdates now.
+
+    Holding the lock is the normal case, so it is not re-acquired - a fresh
+    ``SET NX`` would fail against our own key and the loop would sleep forever.
+    Losing it to another owner is not an error: it means another worker or replica
+    is polling, which is what the lock is for, and it is recorded so health does
+    not read a busy peer as a dead bot.
+    """
+    if lock is None:
+        return True
+    if lock.is_acquired:
+        return True
+    if await lock.acquire():
+        with contextlib.suppress(Exception):
+            await lock.renew()
+        return True
+    globals()["LONG_POLLER_DEFERRED_AT"] = time.time()
+    return False
+
+
+async def _release_long_poller_lock(lock) -> None:
+    """Best-effort release so a restart, or another instance, can take over now."""
+    if lock is None or not lock.is_acquired:
+        return
+    with contextlib.suppress(Exception):
+        await lock.release()
+
+
+# Label of the most recent poller, reused when the watchdog restarts it so the
+# logs keep saying which path owns the update consumer.
+LONG_POLLER_SOURCE = ""
+
+
+async def _long_poll_forever(source: str, *, ready_timeout: float | None = None, bot=None) -> None:
+    """Consume updates with getUpdates until cancelled.
+
+    The single implementation behind every poller this process runs. Both callers
+    used to carry their own near-identical loop, so every fix had to be made
+    twice: the ``409 Conflict`` that must back off rather than end polling, the
+    lock that must not be re-acquired against itself, and the heartbeat that is
+    the only sign a deaf bot leaves behind. Keeping one copy is what makes those
+    three behaviours impossible to lose in one path and keep in the other.
+    """
+    prefix = f"{source} long-poller" if source else "long-poller"
+    lock = None
+    try:
+        if ready_timeout is not None:
+            try:
+                await asyncio.wait_for(BOT_READY.wait(), timeout=ready_timeout)
+            except TimeoutError:
+                logger.error("%s: the bot was not ready within %ss; not polling", prefix, ready_timeout)
+                return
+
+        bot = bot if bot is not None else getattr(globals().get("BOT_APPLICATION"), "bot", None)
+        if bot is None:
+            logger.error("%s could not start because BOT_APPLICATION is not initialized", prefix)
+            return
+
+        offset = None
+        # Grows while Telegram refuses getUpdates and resets on a good poll, so a
+        # brief conflict backs off instead of hot-looping.
+        conflict_backoff = 0
+        # The lock every poller shares: across two workers, or two replicas, only
+        # one of them can ever call getUpdates on this token.
+        lock = await _long_poller_lock()
+        while True:
+            try:
+                # Losing the lock to a peer is not an error: that peer is doing this
+                # process's polling, and _acquire_long_poller_lock records that as
+                # proof of life for /health.
+                if not await _acquire_long_poller_lock(lock):
+                    logger.debug("%s: another poller holds the lock; sleeping", prefix)
+                    await asyncio.sleep(5)
+                    continue
+                # Use a modest timeout so we can react to shutdown promptly.
+                sem = globals().get("GET_UPDATES_SEMAPHORE")
+                get_bot = globals().get("GET_UPDATES_BOT")
+                if sem is None:
+                    sem = asyncio.Semaphore(1)
+                acquired = False
+                try:
+                    await sem.acquire()
+                    acquired = True
+                    if get_bot:
+                        updates = await get_bot.get_updates(offset=offset, timeout=30)
+                    else:
+                        updates = await bot.get_updates(offset=offset, timeout=30)
+                finally:
+                    if acquired:
+                        with contextlib.suppress(Exception):
+                            sem.release()
+                # Proof of life for /health: a poller that has exited stops
+                # refreshing this, which is the only externally visible sign that
+                # the bot has gone deaf.
+                globals()["LONG_POLLER_HEARTBEAT"] = time.time()
+                conflict_backoff = 0
+                if updates:
+                    for u in updates:
+                        try:
+                            if getattr(u, "update_id", None) is not None:
+                                offset = int(u.update_id) + 1
+                        except Exception:
+                            logger.debug("%s: could not advance the offset", prefix)
+                        try:
+                            # Dispatch directly via process_update (non-deprecated API)
+                            asyncio.create_task(_dispatch_update_task(u))
+                        except Exception:
+                            logger.exception("%s failed to schedule update dispatch", prefix)
+                else:
+                    # no updates; brief pause before the next long-poll
+                    await asyncio.sleep(0.1)
+            except asyncio.CancelledError:
+                break
+            except (TimedOut, httpx.PoolTimeout) as e:
+                logger.warning("%s timed out (pool exhausted): %s. Backing off 5s", prefix, e)
+                await asyncio.sleep(5)
+            except Conflict as e:
+                # A 409 is what a rolling deploy looks like from here: the previous
+                # container is still long-polling while this one starts. Ending the
+                # loop on it leaves the process with no update consumer at all, and
+                # because /health keeps answering 200 nothing restarts it, so the
+                # bot stays silent until a manual redeploy. Back off and retry
+                # instead; whichever instance is really serving fails first and
+                # stops on its own.
+                conflict_backoff = min(conflict_backoff * 2, 60) if conflict_backoff else 5
+                logger.warning(
+                    "%s conflict (another getUpdates active): %s. Retrying in %ss instead of stopping",
+                    prefix,
+                    e,
+                    conflict_backoff,
+                )
+                # Yield the lock while the peer that is actually serving keeps it.
+                await _release_long_poller_lock(lock)
+                await asyncio.sleep(conflict_backoff)
+                continue
+            except Exception as e:
+                logger.exception("%s error: %s", prefix, e)
+                await asyncio.sleep(1)
+            finally:
+                # Keep the lock fresh across the long-poll: at a 35s ttl it would
+                # otherwise expire mid-poll and let a second worker start polling
+                # the same token.
+                if lock is not None and lock.is_acquired:
+                    with contextlib.suppress(Exception):
+                        await lock.renew()
+    finally:
+        # Dropping the flag is what lets the watchdog start a fresh poller when
+        # this one ends for any reason at all.
+        globals()["LONG_POLLER_STARTED"] = False
+        await _release_long_poller_lock(lock)
+
+
+def start_long_poller(source: str, *, ready_timeout: float | None = None, bot=None):
+    """Start this process's poller, or return None when one already runs.
+
+    Claiming the flag before creating the task is what makes this idempotent: the
+    ASGI startup handler, main() and the watchdog can all call it without racing
+    into duplicate getUpdates loops (nothing awaits between the check and the
+    set).
+    """
+    if globals().get("LONG_POLLER_STARTED", False):
+        return None
+    globals()["LONG_POLLER_STARTED"] = True
+    globals()["LONG_POLLER_SOURCE"] = source
+    return asyncio.create_task(_long_poll_forever(source, ready_timeout=ready_timeout, bot=bot))
+
+
+def restart_long_poller():
+    """(Re)start this process's poller; None when one is already running.
+
+    The watchdog's restart hook, so a consumer that died comes back in-process
+    instead of waiting for the container to be recycled.
+    """
+    return start_long_poller(globals().get("LONG_POLLER_SOURCE") or "watchdog")
+
+
+# Registered once for both entry points: the watchdog only calls it when polling
+# is expected and the heartbeat has gone cold, so a webhook deployment is never
+# affected by it.
+LONG_POLLER_RESTART = restart_long_poller
+
+
+async def long_poller_watchdog() -> None:
+    """Restart the long-poller when polling is expected but nothing is polling.
+
+    The poller is the one component whose death does not stop /health from
+    answering, so nothing else notices: the process sits there deaf until someone
+    redeploys it. Restarting it here recovers in about a minute, without recycling
+    the container or interrupting a conversion in progress.
+    """
+    while True:
+        await asyncio.sleep(LONG_POLLER_WATCHDOG_INTERVAL)
+        try:
+            if not long_poller_is_stale():
+                continue
+            restart = globals().get("LONG_POLLER_RESTART")
+            if not callable(restart):
+                continue
+            logger.warning(
+                "long-poller watchdog: no completed getUpdates for %.0fs; restarting the poller",
+                long_poller_idle_seconds() or 0.0,
+            )
+            if restart() is None:
+                logger.warning("long-poller watchdog: a poller task is already running")
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("long-poller watchdog iteration failed")
+
+
 # Simple Prometheus-style in-memory metrics for ASGI endpoints and dispatch tracking
 METRICS = {
     "webhooks_received": 0,
@@ -2190,93 +2503,23 @@ async def main(background: bool = False) -> None:
                 except Exception as e:
                     logger.debug("Could not stop built-in Updater: %s", e)
 
-                # Distributed lock to prevent multiple workers from polling simultaneously
-                _longpoll_redis_lock = None
+                # One loop for the whole process (see _long_poll_forever), which
+                # takes the shared Redis lock itself. There is deliberately no
+                # pre-acquire here: if another worker is polling, this task waits
+                # its turn and takes over the moment that worker stops, instead of
+                # skipping and leaving the bot unserved by anyone.
                 try:
-                    from utils.redis_lock import RedisLock
-
-                    _longpoll_redis_lock = RedisLock("longpoller", ttl=35)
-                except Exception:
-                    _longpoll_redis_lock = None
-
-                async def _longpoll_loop():
-                    offset = None
-                    bot = application.bot
-                    while True:
-                        try:
-                            # Acquire distributed lock (only one worker polls at a time)
-                            if _longpoll_redis_lock is not None:
-                                if not await _longpoll_redis_lock.acquire():
-                                    logger.debug("Long-poller: another worker holds the lock; sleeping")
-                                    await asyncio.sleep(5)
-                                    continue
-                                with contextlib.suppress(Exception):
-                                    await _longpoll_redis_lock.renew()
-                            # Use a modest timeout so we can react to shutdown_event
-                            sem = globals().get("GET_UPDATES_SEMAPHORE")
-                            get_bot = globals().get("GET_UPDATES_BOT")
-                            if sem is None:
-                                sem = asyncio.Semaphore(1)
-                            acquired = False
-                            try:
-                                await sem.acquire()
-                                acquired = True
-                                if get_bot:
-                                    updates = await get_bot.get_updates(offset=offset, timeout=30)
-                                else:
-                                    updates = await bot.get_updates(offset=offset, timeout=30)
-                            finally:
-                                if acquired:
-                                    with contextlib.suppress(Exception):
-                                        sem.release()
-                            if updates:
-                                for u in updates:
-                                    try:
-                                        if getattr(u, "update_id", None) is not None:
-                                            offset = int(u.update_id) + 1
-                                    except Exception:
-                                        logger.debug("main: operation failed")
-                                    try:
-                                        # Dispatch directly via process_update (non-deprecated API)
-                                        asyncio.create_task(_dispatch_update_task(u))
-                                    except Exception:
-                                        logger.exception("Failed to schedule polled update dispatch")
-                            else:
-                                # no updates; brief pause before next long-poll
-                                await asyncio.sleep(0.1)
-                        except asyncio.CancelledError:
-                            break
-                        except (TimedOut, httpx.PoolTimeout) as e:
-                            logger.warning("Long-poller timed out (pool exhausted): %s. Backing off 5s", e)
-                            await asyncio.sleep(5)
-                        except Conflict as e:
-                            logger.warning("Long-poller conflict: %s. Releasing lock and retrying", e)
-                            if _longpoll_redis_lock is not None:
-                                with contextlib.suppress(Exception):
-                                    await _longpoll_redis_lock.release()
-                            await asyncio.sleep(10)
-                            continue
-                        except Exception as e:
-                            logger.exception(f"Long-poller error: {e}")
-                            await asyncio.sleep(1)
-                        finally:
-                            if _longpoll_redis_lock is not None and _longpoll_redis_lock.is_acquired:
-                                with contextlib.suppress(Exception):
-                                    await _longpoll_redis_lock.renew()
-
-                try:
-                    can_start = True
-                    if _longpoll_redis_lock is not None:
-                        can_start = await _longpoll_redis_lock.acquire()
-                    if can_start and not globals().get("LONG_POLLER_STARTED", False):
-                        globals()["LONG_POLLER_STARTED"] = True
-                        polling_task = asyncio.create_task(_longpoll_loop())
-                    elif globals().get("LONG_POLLER_STARTED", False):
+                    polling_task = start_long_poller("main", bot=application.bot)
+                    if polling_task is None:
                         logger.info("Background long-poller already running; skipping duplicate start")
-                    else:
-                        logger.info("Another worker holds long-poller lock; skipping")
                 except Exception:
                     logger.exception("Failed to start background long-poller")
+                    polling_task = None
+
+            # Updates now have a consumer: a webhook, this process's poller, or a
+            # deliberate skip because another worker polls. The ASGI startup handler
+            # waits on this before deciding whether a fallback poller is needed.
+            BOT_POLLING_DECIDED.set()
 
             # Fail loudly at startup when Kafka events are enabled but the
             # producer cannot publish: without this the layer reports
@@ -2469,6 +2712,7 @@ async def main(background: bool = False) -> None:
                             secret_token=WEBHOOK_SECRET or None,
                         )
                         logger.info(f"✅ Webhook set successfully: {WEBHOOK_URL}")
+                        BOT_POLLING_DECIDED.set()
                     except Exception as e:
                         logger.error(f"Failed to set webhook: {e}")
                         raise
@@ -2483,6 +2727,9 @@ async def main(background: bool = False) -> None:
                             logger.warning(f"Failed to delete existing webhook before polling: {e}")
 
                     logger.info("🚀 Starting bot in polling mode")
+                    # PTB now owns the consumer for good: record the decision before
+                    # blocking in run_polling().
+                    BOT_POLLING_DECIDED.set()
                     await application.run_polling(
                         allowed_updates=["message", "callback_query", "edited_message"], drop_pending_updates=False
                     )
@@ -2507,7 +2754,7 @@ if __name__ == "__main__":
 # FastAPI app for webhook handling - PTB v20+ compatible
 try:
     from fastapi import FastAPI, HTTPException, Request
-    from fastapi.responses import FileResponse, Response
+    from fastapi.responses import FileResponse, JSONResponse, Response
     from starlette.middleware.trustedhost import TrustedHostMiddleware
     from telegram import Update as TgUpdate
 
@@ -3322,10 +3569,16 @@ try:
             else:
                 _gu_info = {"error": "not initialized"}
 
+        # The long-poller is the one component whose death does not stop this
+        # endpoint answering 200, so surface its age: `null` means it never polled
+        # successfully, a growing number means it has stopped.
+        long_poller = long_poller_state()
+
         payload.update(
             {
                 "bot_initialized": BOT_APPLICATION is not None,
                 "bot_ready": BOT_READY.is_set(),
+                "long_poller": long_poller,
                 "dispatcher_ready": dispatcher_ready,
                 "startup_time": BOT_STARTED_AT,
                 "error": getattr(app.state, "startup_error", None),
@@ -3334,6 +3587,18 @@ try:
                 "get_updates_bot": _gu_info,
             }
         )
+
+        # A dead update consumer is the one degradation this endpoint must not hide
+        # behind a 200: nothing else in the process notices it, so the platform
+        # healthcheck is the last line of defence. Every other failure (Redis, the
+        # broker, an open flood window) keeps answering 200 with a degraded body, so
+        # a container that is still converting files is never recycled.
+        if long_poller_is_stale():
+            logger.warning(
+                "health: no completed getUpdates for %.0fs; reporting unhealthy so the platform can recover the bot",
+                long_poller.get("idle_seconds") or 0.0,
+            )
+            return JSONResponse(status_code=503, content={**payload, "poller": "stale"})
         return payload
 
     @app.get("/")
@@ -3730,87 +3995,73 @@ try:
 
             logger.info("Background bot task started via ASGI startup event")
 
+            # The poller is watched independently of which path ends up running it,
+            # so a consumer that dies later is recovered here rather than by
+            # recycling the container.
+            if globals().get("LONG_POLLER_WATCHDOG") is None:
+                globals()["LONG_POLLER_WATCHDOG"] = asyncio.create_task(long_poller_watchdog())
+                logger.info(
+                    "long-poller watchdog started (interval=%ss, stale after %ss)",
+                    LONG_POLLER_WATCHDOG_INTERVAL,
+                    LONG_POLLER_STALE_SECONDS,
+                )
+
+            # Wait for main() to come up and settle how updates will be consumed
+            # before probing for a dispatcher. Until it has run, BOT_APPLICATION is
+            # still None - main() is only a scheduled task at this point - so this
+            # probe used to report "dispatcher_present=False" on every single boot,
+            # start a fallback poller, and leave the poller main() was about to
+            # create unstarted.
+            decided = False
+            try:
+                await asyncio.wait_for(BOT_POLLING_DECIDED.wait(), timeout=ASGI_BOT_SETTLE_TIMEOUT)
+                decided = True
+            except TimeoutError:
+                logger.warning(
+                    "ASGI startup: bot did not settle its update consumer within %ss; "
+                    "evaluating the fallback with whatever is available",
+                    ASGI_BOT_SETTLE_TIMEOUT,
+                )
+
             # If dispatcher isn't available (some hosting variants), start a
             # fallback long-poller that uses getUpdates and dispatches updates
             # via Application.process_update so handlers still run.
             try:
-                force_polling_env = os.environ.get("FORCE_POLLING", "").lower() in ("1", "true", "yes")
-                dispatcher = getattr(BOT_APPLICATION, "dispatcher", None)
+                application_handle = BOT_APPLICATION
+                dispatcher = getattr(application_handle, "dispatcher", None)
                 has_dispatcher_proc = bool(dispatcher and hasattr(dispatcher, "process_update"))
-                app_has_proc = hasattr(BOT_APPLICATION, "process_update")
-                if force_polling_env or (not has_dispatcher_proc and not app_has_proc):
+                app_has_proc = hasattr(application_handle, "process_update")
+                already_polling = bool(globals().get("LONG_POLLER_STARTED", False))
+                # Only step in when this process has no consumer at all: main() never
+                # settled (it failed early), or its Application cannot dispatch. main()
+                # itself owns FORCE_POLLING and webhook mode, and a second poller here
+                # would only fight the one it started for getUpdates.
+                needs_fallback = not already_polling and (not decided or (not has_dispatcher_proc and not app_has_proc))
+                if needs_fallback:
                     logger.warning(
-                        "ASGI startup: starting fallback long-poller (FORCE_POLLING=%s, dispatcher_present=%s)",
-                        force_polling_env,
+                        "ASGI startup: starting fallback long-poller (settled=%s, dispatcher_present=%s)",
+                        decided,
                         has_dispatcher_proc,
                     )
 
-                    async def _asgi_longpoll_loop():
-                        offset = None
-                        await BOT_READY.wait()
-                        bot = BOT_APPLICATION.bot if BOT_APPLICATION is not None else None
-                        if bot is None:
-                            logger.error("ASGI long-poller could not start because BOT_APPLICATION is not initialized")
-                            return
-                        try:
-                            while True:
-                                try:
-                                    sem = globals().get("GET_UPDATES_SEMAPHORE")
-                                    get_bot = globals().get("GET_UPDATES_BOT")
-                                    if sem is None:
-                                        sem = asyncio.Semaphore(1)
-                                    acquired = False
-                                    try:
-                                        await sem.acquire()
-                                        acquired = True
-                                        if get_bot:
-                                            updates = await get_bot.get_updates(offset=offset, timeout=30)
-                                        else:
-                                            updates = await bot.get_updates(offset=offset, timeout=30)
-                                    finally:
-                                        if acquired:
-                                            with contextlib.suppress(Exception):
-                                                sem.release()
-                                    if updates:
-                                        for u in updates:
-                                            try:
-                                                if getattr(u, "update_id", None) is not None:
-                                                    offset = int(u.update_id) + 1
-                                            except Exception:
-                                                logger.debug("main: operation failed")
-                                            try:
-                                                # Dispatch directly via process_update (non-deprecated API)
-                                                asyncio.create_task(_dispatch_update_task(u))
-                                            except Exception:
-                                                logger.exception("ASGI long-poller failed to schedule update dispatch")
-                                    else:
-                                        await asyncio.sleep(0.1)
-                                except asyncio.CancelledError:
-                                    break
-                                except (TimedOut, httpx.PoolTimeout) as e:
-                                    logger.warning("ASGI long-poller timed out (pool exhausted): %s. Backing off 5s", e)
-                                    await asyncio.sleep(5)
-                                except Conflict as e:
-                                    logger.error(
-                                        "ASGI long-poller conflict (another getUpdates active): %s. Stopping long-poller",
-                                        e,
-                                    )
-                                    break
-                                except Exception as e:
-                                    logger.exception("ASGI long-poller error: %s", e)
-                                    await asyncio.sleep(1)
-                        except Exception:
-                            logger.exception("ASGI long-poller fatal error")
-
+                    # The shared loop, gated on the bot becoming ready so it can
+                    # resolve BOT_APPLICATION.bot at start (it is still None here).
                     try:
-                        if not globals().get("LONG_POLLER_STARTED", False):
-                            globals()["LONG_POLLER_STARTED"] = True
-                            app.state.longpoll = asyncio.create_task(_asgi_longpoll_loop())
+                        app.state.longpoll = start_long_poller("ASGI fallback", ready_timeout=ASGI_BOT_SETTLE_TIMEOUT)
+                        if app.state.longpoll is not None:
                             logger.info("ASGI long-poller started")
                         else:
-                            logger.info("ASGI long-poller skipped; background poller already running")
+                            logger.info("ASGI long-poller skipped; another poller is already running")
                     except Exception:
                         logger.exception("Failed to start ASGI long-poller")
+                else:
+                    logger.info(
+                        "ASGI startup: no fallback poller needed (settled=%s, already_polling=%s, "
+                        "dispatcher_present=%s)",
+                        decided,
+                        already_polling,
+                        has_dispatcher_proc,
+                    )
             except Exception:
                 logger.exception("Failed to evaluate ASGI long-poller fallback")
         except Exception as e:
@@ -3835,6 +4086,16 @@ try:
                     logger.info("Background bot task cancelled on ASGI shutdown")
         except Exception as e:
             logger.error(f"Error stopping background bot task: {e}")
+        # Cancel the poller watchdog: it is only useful while the bot is running.
+        try:
+            wd = globals().get("LONG_POLLER_WATCHDOG")
+            if wd is not None and not wd.done():
+                wd.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await wd
+            globals()["LONG_POLLER_WATCHDOG"] = None
+        except Exception as e:
+            logger.error(f"Error stopping long-poller watchdog: {e}")
         # Cancel ASGI long-poller if started
         try:
             lp = getattr(app.state, "longpoll", None)

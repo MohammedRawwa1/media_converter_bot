@@ -725,9 +725,13 @@ def upload():
         )
         t.start()
     else:
-        # Fallback: start a background thread that runs a synchronous conversion
+        # Fallback: the queue is unavailable, so this background thread runs the job
+        # itself - but through the same runner the ffmpeg worker calls
+        # (utils.ffmpeg_runner.run_ffmpeg), honouring the job's own ffmpeg_args. The
+        # encode, its progress parsing and its failure reporting therefore cannot
+        # drift from the queued path, which the previous inline conversion did.
         try:
-            from media_converter import ExtendedMediaConverter
+            from utils.ffmpeg_runner import run_ffmpeg
 
             def _worker(j):
                 jid = j["job_id"]
@@ -738,16 +742,27 @@ def upload():
                     "created_at": time.time(),
                 }
                 _job_store_prune()
+
+                def _report(pct, message):
+                    # Called by the runner on this same thread, between reads of its
+                    # progress pipe, so the store needs no lock of its own.
+                    store = JOB_STORE.get(jid)
+                    if store is not None:
+                        store["progress"] = float(pct)
+                        store["message"] = message
+
                 try:
-                    conv = ExtendedMediaConverter()
-                    loop = asyncio.new_event_loop()
-                    try:
-                        asyncio.set_event_loop(loop)
-                        # Use optimize_video as a sensible default to produce MP4 preview
-                        success = loop.run_until_complete(conv.optimize_video(j["input_path"], j["output_path"]))
-                    finally:
-                        with contextlib.suppress(Exception):
-                            loop.close()
+                    ffmpeg_args = j.get("ffmpeg_args") if isinstance(j.get("ffmpeg_args"), list) else None
+                    success, reason = asyncio.run(
+                        run_ffmpeg(
+                            j["input_path"],
+                            j["output_path"],
+                            jid,
+                            ffmpeg_args=ffmpeg_args,
+                            progress_channel=None,
+                            on_progress=_report,
+                        )
+                    )
 
                     if success and os.path.exists(j["output_path"]):
                         JOB_STORE[jid]["progress"] = 100.0
@@ -758,6 +773,9 @@ def upload():
                         JOB_STORE[jid]["progress"] = 0.0
                         JOB_STORE[jid]["status"] = "error"
                         JOB_STORE[jid]["message"] = "conversion_failed"
+                        # Keep the runner's reason in the logs, which the inline
+                        # conversion used to discard along with its stderr.
+                        logger.warning("webapp: fallback conversion failed for %s: %s", jid, reason)
                 except Exception as ex:
                     JOB_STORE[jid]["progress"] = 0.0
                     JOB_STORE[jid]["status"] = "error"
