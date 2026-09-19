@@ -408,7 +408,13 @@ def test_the_worker_never_encodes_a_probe_header():
     """The read-back side of the contract the producers write."""
     src = read_source("workers", "ffmpeg_worker.py")
     assert "input_header_only" in src
-    assert "reading the source from Telegram" in src
+    # The object it names is refused, and the worker says so: a header is not a
+    # source, so the bytes have to come from a whole stored copy or Telegram.
+    assert "is only the probe header, not the media" in src
+    assert "input_key = None" in src
+    # And it is refused *before* anything reads that object - including the
+    # bucket-first check, which would otherwise call the header readable.
+    assert src.index("input_header_only") < src.index("_stored_source_available(input_key)")
 
 
 def test_the_producer_and_the_worker_agree_on_the_flag():

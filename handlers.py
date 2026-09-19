@@ -9,7 +9,7 @@ import shutil
 import time
 from datetime import UTC, datetime
 
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto, Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto, Message, Update
 from telegram.error import BadRequest
 from telegram.ext import ContextTypes, ConversationHandler
 
@@ -2037,6 +2037,67 @@ class EnhancedMediaHandler:
         except Exception:
             logger.exception("_watch_job_progress failed for %s", job_id)
 
+    async def _watch_pipeline_job(
+        self,
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+        job_id: str,
+        summary: str,
+        *,
+        query=None,
+        message=None,
+        notice=None,
+        superseded=None,
+    ) -> None:
+        """Hand a queued pipeline job to a watcher, whichever update opened it.
+
+        A queued job is watched on one message, and that message is the whole
+        point: it is what shows the live progress, its 📊 Progress button (the
+        job's own page in the web UI) and its ❌ Cancel button - and it is what
+        the watcher deletes once the job is done.
+
+        A callback names that message: the one the user pressed. A *typed* value
+        (the custom-bitrate prompt, a bitrate typed for a video) names nothing,
+        so the pipeline's own "queued for processing" notice is taken over
+        instead. Posting a second message in its place is what left a user
+        holding a queued notice nobody cleaned up and a Cancel button for a job
+        that had already delivered their file - while every button-driven
+        conversion of the same media ended with no trace at all.
+
+        ``superseded`` is the typed request's own acknowledgement ("🎚️ Setting
+        bitrate to 32k...") - what was true while the file was still being
+        fetched. It spoke for the request, not the job, so it goes as soon as
+        the job has a message of its own; leaving it is the second stale line
+        about work the progress message is already reporting.
+        """
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data=f"cancel_job:{job_id}")]])
+        if query is not None:
+            await self.safe_edit(query, summary, reply_markup=kb)
+            with contextlib.suppress(RuntimeError):
+                asyncio.create_task(self._watch_job_progress(query, job_id, bot=context.bot))
+            return
+
+        if notice is not None:
+            # The pipeline already owns a message for this job: say the same
+            # thing on it that the button-driven path says on the user's.
+            with contextlib.suppress(BadRequest):
+                await notice.edit_text(summary, reply_markup=kb)
+        elif message is not None:
+            with contextlib.suppress(BadRequest):
+                notice = await message.reply_text(summary, reply_markup=kb)
+        if notice is None:
+            logger.debug("pipeline job %s: no message to watch it on", job_id)
+            return
+        # Only once the job owns a message: if there is nothing to watch it on,
+        # the acknowledgement is the only thing the user has and it stays.
+        if superseded is not None and callable(getattr(superseded, "delete", None)):
+            with contextlib.suppress(Exception):
+                await superseded.delete()
+        # No callback query, so the message itself is the watcher's target - and
+        # the one it will delete when the job reaches a terminal state.
+        with contextlib.suppress(RuntimeError):
+            asyncio.create_task(self._watch_job_progress(None, job_id, progress_msg=notice, bot=context.bot))
+
     async def _await_job_finished(self, job_id: str, poll_interval: float = 2.0, timeout: float = 0.0) -> str | None:
         """Wait for a queued job to reach a terminal state **without editing Telegram**.
 
@@ -3824,8 +3885,16 @@ class EnhancedMediaHandler:
             # the pipeline already tried and failed to convert.
             file_info["_pipeline_failed"] = True
 
-    async def _ensure_current_file_downloaded(self, update: Update, context: ContextTypes.DEFAULT_TYPE, session: dict):
-        """Ensure the session's current_file is downloaded locally. Raises Exception on failure."""
+    async def _ensure_current_file_downloaded(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE, session: dict
+    ) -> Message | None:
+        """Ensure the session's current_file is downloaded locally. Raises Exception on failure.
+
+        Returns the message a queued pipeline job was announced on, or ``None``
+        when nothing was queued (the media is local) - so a caller with no
+        callback message of its own can watch the job on that message instead of
+        posting a second one, which is what :meth:`_watch_pipeline_job` does.
+        """
         user_id = update.effective_user.id if update and update.effective_user else None
         current_file = session.get("current_file") if session else None
         if not current_file:
@@ -4414,7 +4483,13 @@ class EnhancedMediaHandler:
                             #    message instead of the apply's - because while nothing
                             #    watched those jobs, a batch file showed nothing at all
                             #    between download and delivery. ──
-                            return
+                            #
+                            #    The notice this announced the job on is handed back, so
+                            #    a caller with no callback message of its own - a typed
+                            #    value, like the custom-bitrate prompt - can give *that*
+                            #    message to its watcher (see _watch_pipeline_job) instead
+                            #    of posting a second one nothing would ever clean up.
+                            return _queued_message
                         else:
                             logger.warning(
                                 "Big files pipeline failed: %s (chat=%s msg=%s); falling back to Bot API",
@@ -9218,11 +9293,15 @@ class EnhancedMediaHandler:
             return
 
         async def notify(text, **kwargs):
-            """Report progress through whichever update context triggered this run."""
+            """Report progress through whichever update context triggered this run.
+
+            Returns what the send returned - a ``Message`` for a typed request, a
+            bool for a button - because a typed request's acknowledgement is a
+            message of its own, and the queued path has to be able to remove it.
+            """
             if query is not None:
-                await self.safe_edit(query, text, **kwargs)
-            else:
-                await message.reply_text(text)
+                return await self.safe_edit(query, text, **kwargs)
+            return await message.reply_text(text)
 
         current_file = session.get("current_file")
         user_id = update.effective_user.id
@@ -9259,15 +9338,18 @@ class EnhancedMediaHandler:
         active_count = len(self.active_conversions)
         max_conversions = getattr(self, "_max_conversions", 1)
 
+        # Kept so the queued path below can drop it: it says what is being asked
+        # for, not what the job is doing, and the job gets a message that says
+        # the second one live.
         if active_count >= max_conversions:
             queue_position = active_count - max_conversions + 1
-            await notify(
+            _ack = await notify(
                 f"⏳ Queue position: #{queue_position}\n"
                 f"Active conversions: {active_count}/{max_conversions}\n"
                 f"Your conversion will start soon...",
             )
         else:
-            await notify(f"🎵 Converting to MP3 ({audio_bitrate})...")
+            _ack = await notify(f"🎵 Converting to MP3 ({audio_bitrate})...")
 
         async def do_conversion():
             # Lock the input file to prevent concurrent access
@@ -9343,21 +9425,23 @@ class EnhancedMediaHandler:
         # Ensure file downloaded before conversion (lazy-download)
         if not current_file.get("path") or not os.path.exists(current_file.get("path") or ""):
             try:
-                await self._ensure_current_file_downloaded(update, context, session)
+                _pipeline_notice = await self._ensure_current_file_downloaded(update, context, session)
                 current_file = session.get("current_file")
+                # The pipeline queued the conversion itself: it owns the fetch,
+                # the encode and the delivery, so queueing a second job for the
+                # same file here would convert and send it twice.
                 if current_file and current_file.get("_pipeline_job_id"):
                     _pipeline_job_id = current_file["_pipeline_job_id"]
-                    kb = InlineKeyboardMarkup(
-                        [[InlineKeyboardButton("❌ Cancel", callback_data=f"cancel_job:{_pipeline_job_id}")]]
-                    )
-                    await notify(
+                    await self._watch_pipeline_job(
+                        update,
+                        context,
+                        _pipeline_job_id,
                         f"✅ Large file queued (Job: {_pipeline_job_id[:8]}...). I'll send the MP3 when ready.",
-                        reply_markup=kb,
+                        query=query,
+                        message=message,
+                        notice=_pipeline_notice,
+                        superseded=_ack,
                     )
-                    # Progress can only be watched when we own the callback message.
-                    if query is not None:
-                        with contextlib.suppress(RuntimeError):
-                            asyncio.create_task(self._watch_job_progress(query, _pipeline_job_id, bot=context.bot))
                     return
             except Exception as e:
                 await notify(f"❌ Failed to download file: {e}")
@@ -10402,6 +10486,22 @@ class EnhancedMediaHandler:
 
         await self.safe_edit(query, f"🔄 Converting to {format_type.upper()}...")
 
+        # ── Compare → validate → already exists (MP3 targets only) ──
+        # Convert Format asks for a codec *and* the bitrate that goes with it -
+        # MP3 is encoded at ``_DEFAULT_AUDIO_BITRATE``, the one this branch would
+        # pass to ffmpeg - so a source that already is an MP3 at that bitrate has
+        # nothing to encode, the same no-op Adjust Bitrate refuses to spend a
+        # fetch on. The other targets are codec changes: the gate speaks about
+        # MP3 only, so they are left alone entirely.
+        if format_type == "mp3":
+            _existing = await _already_at_bitrate(
+                current_file, _DEFAULT_AUDIO_BITRATE, user_id=update.effective_user.id
+            )
+            if _existing:
+                session["current_file"] = current_file
+                await self.safe_edit(query, _already_at_bitrate_text(_DEFAULT_AUDIO_BITRATE))
+                return
+
         # Ensure file downloaded (lazy-download)
         if not current_file.get("path") or not os.path.exists(current_file.get("path") or ""):
             try:
@@ -10501,11 +10601,15 @@ class EnhancedMediaHandler:
             return
 
         async def notify(text, **kwargs):
-            """Report progress through whichever update context triggered this run."""
+            """Report progress through whichever update context triggered this run.
+
+            Returns what the send returned - a ``Message`` for a typed request, a
+            bool for a button - because a typed request's acknowledgement is a
+            message of its own, and the queued path has to be able to remove it.
+            """
             if query is not None:
-                await self.safe_edit(query, text, **kwargs)
-            else:
-                await message.reply_text(text, **kwargs)
+                return await self.safe_edit(query, text, **kwargs)
+            return await message.reply_text(text, **kwargs)
 
         current_file = session.get("current_file")
 
@@ -10543,6 +10647,16 @@ class EnhancedMediaHandler:
         # visible only on the file it was made for.
         _remember_audio_bitrate(update, audio_bitrate)
 
+        # The acknowledgement goes first. The check below reads the media's own
+        # header to answer, and that read can go over the network (a range GET of
+        # the stored object, or the first bytes off Telegram), so a button that
+        # said nothing while it ran looked like a button that did nothing.
+        #
+        # It is also kept: it says what is being asked for, not what the job is
+        # doing, and the queued path below drops it once the job has a message of
+        # its own that says the second one live.
+        _ack = await notify(f"🎚️ Setting bitrate to {audio_bitrate}...")
+
         # ── Compare → validate → already exists ──
         # A bitrate change on an audio file is the one request whose answer can
         # already be in the user's hands: they sent the media, so a file that
@@ -10551,14 +10665,20 @@ class EnhancedMediaHandler:
         # a 47MB audio is past what the Bot API will hand a bot, so acting on
         # "64k" for a file that is already 64k used to mean a full userbot
         # download of the media to re-encode it into an identical file. An
-        # unknown verdict falls through to the normal path, exactly as before.
+        # unknown verdict falls through to the normal path, exactly as before,
+        # and the check is bounded to a few seconds either way.
         _existing = await _already_at_bitrate(current_file, audio_bitrate, user_id=update.effective_user.id)
         if _existing:
             session["current_file"] = current_file
-            await notify(_already_at_bitrate_text(audio_bitrate))
+            _already_text = _already_at_bitrate_text(audio_bitrate)
+            # On the message the user just answered in, where there is one: the
+            # answer replaces the acknowledgement instead of arriving beside it.
+            if callable(getattr(_ack, "edit_text", None)):
+                with contextlib.suppress(Exception):
+                    await _ack.edit_text(_already_text)
+            else:
+                await notify(_already_text)
             return
-
-        await notify(f"🎚️ Setting bitrate to {audio_bitrate}...")
 
         output_base = getattr(config, "OUTPUT_PATH", "storage/output") if config else "storage/output"
         with contextlib.suppress(OSError):
@@ -10591,24 +10711,23 @@ class EnhancedMediaHandler:
         # Ensure file downloaded (lazy-download)
         if not current_file.get("path") or not os.path.exists(current_file.get("path") or ""):
             try:
-                await self._ensure_current_file_downloaded(update, context, session)
+                _pipeline_notice = await self._ensure_current_file_downloaded(update, context, session)
                 current_file = session.get("current_file")
                 # The pipeline queued the conversion itself: it owns the fetch,
                 # the encode and the delivery, so queueing a second job for the
                 # same file here would convert and send it twice.
                 if current_file and current_file.get("_pipeline_job_id"):
                     _pipeline_job_id = current_file["_pipeline_job_id"]
-                    kb = InlineKeyboardMarkup(
-                        [[InlineKeyboardButton("❌ Cancel", callback_data=f"cancel_job:{_pipeline_job_id}")]]
-                    )
-                    await notify(
+                    await self._watch_pipeline_job(
+                        update,
+                        context,
+                        _pipeline_job_id,
                         f"✅ Large file queued (Job: {_pipeline_job_id[:8]}...). I'll send the MP3 when ready.",
-                        reply_markup=kb,
+                        query=query,
+                        message=message,
+                        notice=_pipeline_notice,
+                        superseded=_ack,
                     )
-                    # Progress can only be watched when we own the callback message.
-                    if query is not None:
-                        with contextlib.suppress(RuntimeError):
-                            asyncio.create_task(self._watch_job_progress(query, _pipeline_job_id, bot=context.bot))
                     return
             except Exception as e:
                 await notify(f"❌ Failed to download file: {e}")

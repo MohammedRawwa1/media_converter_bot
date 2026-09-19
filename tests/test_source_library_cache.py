@@ -17,7 +17,7 @@ import pytest
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
-from source_helpers import read_object_source  # noqa: E402
+from source_helpers import read_object_source, read_source  # noqa: E402
 
 from tasks import cleanup_tasks as cleanup_mod  # noqa: E402
 from utils import media_cache  # noqa: E402
@@ -294,3 +294,72 @@ def test_public_probe_delegates(name, tmp_path, monkeypatch):
 
     monkeypatch.setattr(uploader, "_probe_audio_metadata", _fake)
     assert asyncio.run(uploader.probe_audio_metadata(str(src))) == {"seen": str(src)}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Which copy the worker reads: the bucket before Telegram
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+class _ExistsBackend:
+    """A backend that only answers the HEAD the fetch order turns on."""
+
+    def __init__(self, readable):
+        self.readable = set(readable)
+        self.checked = []
+
+    async def exists(self, key):
+        self.checked.append(key)
+        return key in self.readable
+
+
+def _install_exists_backend(monkeypatch, readable=()):
+    backend = _ExistsBackend(readable)
+
+    async def _get():
+        return backend
+
+    monkeypatch.setattr(ffmpeg_worker, "get_storage_backend", _get)
+    return backend
+
+
+def test_a_readable_stored_object_needs_no_telegram_at_all(monkeypatch):
+    backend = _install_exists_backend(monkeypatch, [LIBRARY_KEY])
+
+    assert asyncio.run(ffmpeg_worker._stored_source_available(LIBRARY_KEY)) is True
+    assert backend.checked == [LIBRARY_KEY]
+
+
+def test_a_missing_object_leaves_telegram_as_the_copy_that_is_there(monkeypatch):
+    _install_exists_backend(monkeypatch, [])
+
+    assert asyncio.run(ffmpeg_worker._stored_source_available(LIBRARY_KEY)) is False
+    # No key to read, and no key to read it with: both mean Telegram.
+    assert asyncio.run(ffmpeg_worker._stored_source_available(None)) is False
+    assert asyncio.run(ffmpeg_worker._stored_source_available("")) is False
+
+
+def test_a_backend_that_cannot_answer_does_not_break_the_fetch(monkeypatch):
+    """A HEAD that fails must not fail the job - it decides the order, nothing else."""
+
+    async def _boom():
+        raise RuntimeError("storage is down")
+
+    monkeypatch.setattr(ffmpeg_worker, "get_storage_backend", _boom)
+
+    assert asyncio.run(ffmpeg_worker._stored_source_available(LIBRARY_KEY)) is False
+
+
+def test_the_worker_asks_the_bucket_before_it_opens_telegram():
+    """The fetch order is the point, so it is asserted on the source itself."""
+    body = read_source("workers", "ffmpeg_worker.py")
+
+    assert "_stored_readable = await _stored_source_available(input_key)" in body
+    assert "and not _stored_readable" in body
+    # Telegram is what the guard above leaves for the case the bucket cannot
+    # serve: it may not be reached before the stored copy has been ruled out.
+    assert body.index("_stored_source_available(input_key)") < body.index("download_forward_via_userbot(")
+    # And the registry is consulted before Telegram too, not only after a failed
+    # Telegram fetch: a whole copy another producer wrote is reachable without
+    # asking Telegram for the media.
+    assert body.index("_stored_source_for_job(job)") < body.index("download_forward_via_userbot(")

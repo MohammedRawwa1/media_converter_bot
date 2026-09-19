@@ -14,6 +14,8 @@ happened to default to in each command.
 
 import ast
 import asyncio
+import time
+from types import SimpleNamespace
 
 import pytest
 from source_helpers import find_function, flatten, parse_source, read_source
@@ -196,7 +198,7 @@ def test_a_local_copy_is_probed_before_storage_is_read(monkeypatch, tmp_path):
     local.write_bytes(b"x")
     order = []
 
-    async def _file(path):
+    async def _file(path, timeout=None):
         order.append("local")
         return {"audio_bitrate": 64000, "audio_codec": "mp3"}
 
@@ -212,7 +214,7 @@ def test_a_local_copy_is_probed_before_storage_is_read(monkeypatch, tmp_path):
 
 
 def test_a_stored_object_is_read_when_there_is_no_local_copy(monkeypatch):
-    async def _stored(current_file, dest_dir):
+    async def _stored(current_file, dest_dir, timeout=None):
         return {"audio_bitrate": 64000, "audio_codec": "mp3"}
 
     async def _no_telegram(*args, **kwargs):
@@ -222,6 +224,60 @@ def test_a_stored_object_is_read_when_there_is_no_local_copy(monkeypatch):
     monkeypatch.setattr(gate, "_probe_telegram", _no_telegram)
 
     assert _run(gate.source_verdict({"input_key": "inputs/x/source"})) == (64000, "mp3")
+
+
+def test_an_exhausted_budget_reads_nothing_at_all(monkeypatch):
+    """Past the budget the request takes the path it always took, at once."""
+
+    async def _boom(*args, **kwargs):
+        raise AssertionError("no tier may run once the budget is spent")
+
+    monkeypatch.setattr(gate, "_probe_file", _boom)
+    monkeypatch.setattr(gate, "_probe_stored", _boom)
+    monkeypatch.setattr(gate, "_probe_telegram", _boom)
+
+    assert _run(gate.source_verdict({"input_key": "inputs/x/source"}, budget_seconds=0)) == (None, None)
+
+
+def test_every_tier_gets_only_what_is_left_of_one_budget(monkeypatch):
+    """Three tiers must not add up to three timeouts inside a button press."""
+    seen = []
+
+    async def _stored(current_file, dest_dir, timeout=None):
+        seen.append(timeout)
+        return None
+
+    async def _telegram(current_file, user_id, dest_dir, timeout=None):
+        seen.append(timeout)
+        return None
+
+    monkeypatch.setattr(gate, "_probe_stored", _stored)
+    monkeypatch.setattr(gate, "_probe_telegram", _telegram)
+
+    assert _run(gate.source_verdict({"input_key": "inputs/x/source"}, budget_seconds=5)) == (None, None)
+    assert len(seen) == 2
+    assert all(0 < left <= 5 for left in seen)
+    assert seen[1] <= seen[0], "the second attempt gets what the first left behind"
+
+
+def test_a_patient_probe_is_abandoned_at_the_budget(monkeypatch, tmp_path):
+    """The real ffprobe call is what the budget has to cut short."""
+    import utils.ffmpeg_runner as runner
+
+    local = tmp_path / "song.mp3"
+    local.write_bytes(b"x" * 32)
+
+    async def _hangs(path):
+        await asyncio.sleep(30)
+        return {"audio_bitrate": 64000}
+
+    monkeypatch.setattr(runner, "probe_media", _hangs)
+
+    started = time.monotonic()
+    verdict = _run(gate.source_verdict({"path": str(local)}, budget_seconds=0.05))
+
+    assert verdict == (None, None)
+    assert time.monotonic() - started < 5, "the check must not wait the probe out"
 
 
 def test_the_most_likely_telegram_pair_is_tried_first():
@@ -276,10 +332,61 @@ def test_the_gate_is_only_applied_where_the_user_already_holds_the_file():
 
     Reporting "already 64k" there would hand the user nothing at all, so the gate
     belongs to the requests that re-encode a file they already have - the
-    single-file bitrate picker and a batch's Extract Audio on an audio source.
+    single-file bitrate picker, a batch's Extract Audio on an audio source, and
+    Convert Format *to MP3*, which asks for a codec the user's audio may already
+    be, at the bitrate that branch encodes with.
     """
     for name in ("convert_to_mp3", "normalize_audio"):
         assert "_already_at_bitrate(" not in _method_body(name)
+
+
+def test_the_audio_format_converter_answers_an_mp3_that_is_already_one():
+    body = _method_body("convert_audio_format")
+
+    assert 'if format_type == "mp3":' in body
+    assert "_already_at_bitrate(current_file, _DEFAULT_AUDIO_BITRATE" in body
+    # Before the fetch it exists to avoid, like every other wired site.
+    assert body.index("_already_at_bitrate(") < body.index("_ensure_current_file_downloaded")
+    # Only the MP3 target: the other targets are codec changes, and the gate
+    # speaks about MP3 alone.
+    assert body.count("_already_at_bitrate(") == 1
+
+
+def test_the_format_converter_stops_instead_of_re_encoding_an_mp3(monkeypatch):
+    import handlers as handlers_module
+
+    handler = object.__new__(handlers_module.EnhancedMediaHandler)
+    edits = []
+
+    async def _yes(*_args, **_kwargs):
+        return True
+
+    async def _edit(query, text, **_kwargs):
+        edits.append(text)
+        return True
+
+    async def _no_fetch(*_args, **_kwargs):
+        raise AssertionError("an MP3 that is already an MP3 must not be fetched")
+
+    async def _already(*_args, **_kwargs):
+        return 128000
+
+    handler._require_callback = _yes
+    handler._check_conversion_quota = _yes
+    handler.safe_edit = _edit
+    handler._ensure_current_file_downloaded = _no_fetch
+    monkeypatch.setattr(handlers_module, "_already_at_bitrate", _already)
+
+    session = {"current_file": {"id": "x", "name": "song.mp3", "type": "audio"}}
+    update = SimpleNamespace(
+        callback_query=SimpleNamespace(message=SimpleNamespace()),
+        effective_user=SimpleNamespace(id=7),
+        effective_chat=SimpleNamespace(id=7),
+    )
+
+    _run(handler.convert_audio_format(update, SimpleNamespace(bot=SimpleNamespace()), session, "mp3"))
+
+    assert edits == ["🔄 Converting to MP3...", "ℹ️ Already 128k — nothing to re-encode."]
 
 
 def test_the_verdict_reads_like_the_answer_the_user_asked_for():

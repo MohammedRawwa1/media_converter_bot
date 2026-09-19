@@ -291,6 +291,31 @@ async def _stored_source_for_job(job: dict) -> str | None:
     return key
 
 
+async def _stored_source_available(input_key: str | None) -> bool:
+    """Whether a whole stored object for *input_key* can actually be read.
+
+    The one question the fetch order turns on. With a readable object in the
+    bucket the media never has to be pulled over MTProto, and that matters
+    because one media is one library object: every operation on it - the next
+    button, the second style, a requeue on another host - resolves to the same
+    key, so "read it over Telegram instead" means one full Pyrogram download per
+    operation, through a session whose limits are per account.
+
+    A HEAD costs no egress. A backend that cannot answer says "no", which leaves
+    Telegram as the fallback it already was.
+    """
+    if not input_key or get_storage_backend is None:
+        return False
+    try:
+        backend = await get_storage_backend()
+        if backend is None or not hasattr(backend, "exists"):
+            return False
+        return bool(await backend.exists(input_key))
+    except Exception:
+        logger.debug("ffmpeg worker: could not check whether %s is readable", input_key)
+        return False
+
+
 async def _fetch_source_url_to_path(url: str, dest_path: str, *, timeout: int = 60) -> bool:
     """Fetch a job's ``source_url`` onto disk - the one way this worker does it.
 
@@ -1463,18 +1488,49 @@ async def handle_job(job: dict):
         and (not input_path or not os.path.exists(input_path))
     ):
         logger.info(
-            "Job %s: %s is only the probe header, not the media; reading the source from Telegram",
+            "Job %s: %s is only the probe header, not the media; the source has to come "
+            "from a whole stored copy or from Telegram",
             job_id,
             input_key,
         )
         input_key = None
 
-    # ── Telegram first: the media is already there ──
-    # The userbot fetched this file through the relay chat, and that copy is
-    # still in it. Reading it over MTProto costs no bucket egress, so it is
-    # preferred over pulling a whole stored copy back out; a stored object stays
-    # the last resort for a worker with no session to read it with.
+    # ── S3 first: read the stored object before opening a userbot session ──
+    # One media is one library object, so every operation on it resolves to the
+    # same key. Reading that object is the only fetch the media needs, while
+    # asking Telegram for it once per operation is one full MTProto download
+    # each - the repetition the header/stream ingest exists to stop, and more
+    # than a session shared across a bot's users can carry without earning
+    # limits. The registry is consulted *here*, before Telegram, for the same
+    # reason: a whole copy another producer wrote (a promote-on-repeat,
+    # ``full``/``stream`` mode, the Bot-API path) is keyed on the media's own
+    # Telegram identity, so it can be found without asking Telegram for anything.
+    # Telegram stays exactly what it was for the case this cannot serve: the copy
+    # that is actually there when the bucket holds nothing readable.
+    _stored_readable = False
     if not input_path or not os.path.exists(input_path):
+        if not input_key:
+            _recovered_key = await _stored_source_for_job(job)
+            if _recovered_key:
+                input_key = _recovered_key
+                logger.info(
+                    "Job %s: adopting the stored copy of this media (%s) instead of fetching it over Telegram",
+                    job_id,
+                    _recovered_key,
+                )
+        _stored_readable = await _stored_source_available(input_key)
+        if input_key and not _stored_readable:
+            logger.info(
+                "Job %s: the stored copy %s is not readable; falling back to the Telegram copy",
+                job_id,
+                input_key,
+            )
+
+    # ── Telegram: only when the bucket cannot serve the source ──
+    # It used to be the preferred copy, because reading it costs no bucket
+    # egress. That trade spent a media's whole transfer on a session once per
+    # operation, which is the traffic this worker is meant to keep off the wire.
+    if (not input_path or not os.path.exists(input_path)) and not _stored_readable:
         _tg_chat = job.get("source_chat_id")
         _tg_msg = job.get("source_message_id")
         if _tg_chat and _tg_msg:
@@ -1519,24 +1575,6 @@ async def handle_job(job: dict):
                     job_id,
                     exc_info=True,
                 )
-
-    # ── Recover from the cache: the media may live under another name ──
-    # A header job carries no source object, so an unreadable Telegram copy used
-    # to be the end of it even when a stored copy of the same media existed - one
-    # written by a promote-on-repeat, by ``full``/``stream`` mode, or by the
-    # Bot-API path. The registry is keyed on the Telegram identity rather than on
-    # the job, which is what lets this run find those bytes. Adopting the key is
-    # all that is needed: the storage path below does the rest (HEAD pre-flight,
-    # shared local cache, atomic download).
-    if not input_key and (not input_path or not os.path.exists(input_path)):
-        _recovered_key = await _stored_source_for_job(job)
-        if _recovered_key:
-            input_key = _recovered_key
-            logger.info(
-                "Job %s: the Telegram copy was not readable; recovering the media from storage (%s)",
-                job_id,
-                _recovered_key,
-            )
 
     if input_key and (not input_path or not os.path.exists(input_path)):
         # ── Shared source cache ──

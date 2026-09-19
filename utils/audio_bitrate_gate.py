@@ -30,6 +30,7 @@ import contextlib
 import logging
 import os
 import tempfile
+import time
 import uuid
 
 logger = logging.getLogger(__name__)
@@ -49,9 +50,21 @@ GATE_ENV = "AUDIO_BITRATE_GATE"
 #: be a rounding error next to the download it replaces.
 HEAD_PROBE_BYTES = int(os.getenv("BITRATE_PROBE_BYTES", str(262144)))
 
-#: A header probe is a nicety, never a blocker: it is abandoned after this and
-#: the caller converts exactly as it always did.
+#: A header probe is a nicety, never a blocker: one attempt is abandoned after
+#: this and the caller converts exactly as it always did.
 PROBE_TIMEOUT_SECONDS = float(os.getenv("BITRATE_PROBE_TIMEOUT_SECONDS", "60"))
+
+#: The budget for the **whole** check, which is the number that actually matters.
+#:
+#: Every caller is interactive: the user has just pressed a bitrate button, or
+#: answered the prompt it opened. The check reads the media's header over the
+#: network to save a fetch that is minutes long, so it is worth a few seconds and
+#: not one more - past the budget the tier stops and the request takes the path it
+#: always took, which costs the fetch it was meant to avoid but never leaves
+#: someone watching a button that appears to have done nothing. Each tier gets
+#: what is left of it, not a fresh timeout of its own, or three tiers would add up
+#: to three budgets.
+PROBE_BUDGET_SECONDS = float(os.getenv("BITRATE_PROBE_BUDGET_SECONDS", "15"))
 
 #: How close two bitrates have to be to count as the same one.
 #:
@@ -150,14 +163,25 @@ def known_verdict(current_file: dict | None) -> tuple[object, object]:
     return bitrate, codec
 
 
-async def _probe_file(path: str) -> dict | None:
+def _time_left(deadline: float) -> float:
+    """Seconds left of the check's budget, never negative."""
+    return max(0.0, deadline - time.monotonic())
+
+
+async def _probe_file(path: str, timeout: float | None = None) -> dict | None:
     """ffprobe a file, answering ``None`` rather than raising."""
     if not path or not os.path.exists(path):
         return None
     try:
         from utils.ffmpeg_runner import probe_media
 
-        return await probe_media(path) or None
+        probe = probe_media(path)
+        if timeout is not None:
+            probe = asyncio.wait_for(probe, timeout=timeout)
+        return await probe or None
+    except TimeoutError:
+        logger.debug("bitrate gate: ffprobe of %s ran out of budget", path)
+        return None
     except Exception:
         logger.debug("bitrate gate: ffprobe failed for %s", path)
         return None
@@ -178,7 +202,7 @@ def _local_candidate(current_file: dict | None) -> str | None:
     return None
 
 
-async def _probe_stored(current_file: dict | None, dest_dir: str) -> dict | None:
+async def _probe_stored(current_file: dict | None, dest_dir: str, timeout: float | None = None) -> dict | None:
     """Probe the first bytes of the media out of object storage (a Range GET)."""
     key = (current_file or {}).get("input_key")
     if not key or not isinstance(key, str):
@@ -192,11 +216,11 @@ async def _probe_stored(current_file: dict | None, dest_dir: str) -> dict | None
             return None
         ok = await asyncio.wait_for(
             backend.download_range(key, dest, end=max(0, HEAD_PROBE_BYTES - 1)),
-            timeout=PROBE_TIMEOUT_SECONDS,
+            timeout=min(timeout or PROBE_TIMEOUT_SECONDS, PROBE_TIMEOUT_SECONDS),
         )
         if not ok or not os.path.exists(dest) or os.path.getsize(dest) <= 0:
             return None
-        return await _probe_file(dest)
+        return await _probe_file(dest, timeout=timeout)
     except TimeoutError:
         logger.debug("bitrate gate: the storage header read for %s timed out", key)
         return None
@@ -237,7 +261,9 @@ def _telegram_candidates(current_file: dict | None) -> list[tuple[object, object
     return pairs
 
 
-async def _probe_telegram(current_file: dict | None, user_id, dest_dir: str) -> dict | None:
+async def _probe_telegram(
+    current_file: dict | None, user_id, dest_dir: str, timeout: float | None = None
+) -> dict | None:
     """Probe the first bytes of the media straight off Telegram.
 
     This is what makes the check pay off for a media nothing has fetched yet -
@@ -263,10 +289,12 @@ async def _probe_telegram(current_file: dict | None, user_id, dest_dir: str) -> 
                 dest,
                 max_bytes=HEAD_PROBE_BYTES,
                 user_id=user_id,
-                timeout=PROBE_TIMEOUT_SECONDS,
+                # One candidate may not be readable at all, so each gets the
+                # remaining budget rather than the whole of it.
+                timeout=min(timeout or PROBE_TIMEOUT_SECONDS, PROBE_TIMEOUT_SECONDS),
             )
             if ok and os.path.exists(dest) and os.path.getsize(dest) > 0:
-                return await _probe_file(dest)
+                return await _probe_file(dest, timeout=timeout)
         except Exception:
             logger.debug("bitrate gate: the Telegram header read failed for %s/%s", chat_id, message_id)
         finally:
@@ -276,33 +304,49 @@ async def _probe_telegram(current_file: dict | None, user_id, dest_dir: str) -> 
     return None
 
 
-async def source_verdict(current_file: dict | None, *, user_id=None) -> tuple[object, object]:
+async def source_verdict(
+    current_file: dict | None,
+    *,
+    user_id=None,
+    budget_seconds: float | None = None,
+) -> tuple[object, object]:
     """``(audio_bitrate_bps, audio_codec)`` for the media, or ``(None, None)``.
 
     Cheapest evidence first: a verdict an earlier probe already recorded, then
     the local copy, then the stored object, and only then Telegram. Each step
     answers "nothing" instead of raising, so the worst case is the behaviour the
-    callers had before this module.
+    callers had before this module - and each gets only what is left of
+    :data:`PROBE_BUDGET_SECONDS`, so the whole check is bounded rather than every
+    attempt in it.
     """
     bitrate, codec = known_verdict(current_file)
     if bitrate:
         return bitrate, codec
 
+    budget = PROBE_BUDGET_SECONDS if budget_seconds is None else float(budget_seconds)
+    deadline = time.monotonic() + max(0.0, budget)
+
+    def left() -> float:
+        """What is left of the budget, so no single tier can outlast the check."""
+        return _time_left(deadline)
+
     dest_dir = tempfile.gettempdir()
 
     local = _local_candidate(current_file)
-    if local:
-        meta = await _probe_file(local)
+    if local and left() > 0:
+        meta = await _probe_file(local, timeout=left())
         if meta and meta.get("audio_bitrate"):
             return meta.get("audio_bitrate"), meta.get("audio_codec")
 
-    meta = await _probe_stored(current_file, dest_dir)
-    if meta and meta.get("audio_bitrate"):
-        return meta.get("audio_bitrate"), meta.get("audio_codec")
+    if left() > 0:
+        meta = await _probe_stored(current_file, dest_dir, timeout=left())
+        if meta and meta.get("audio_bitrate"):
+            return meta.get("audio_bitrate"), meta.get("audio_codec")
 
-    meta = await _probe_telegram(current_file, user_id, dest_dir)
-    if meta and meta.get("audio_bitrate"):
-        return meta.get("audio_bitrate"), meta.get("audio_codec")
+    if left() > 0:
+        meta = await _probe_telegram(current_file, user_id, dest_dir, timeout=left())
+        if meta and meta.get("audio_bitrate"):
+            return meta.get("audio_bitrate"), meta.get("audio_codec")
 
     return None, None
 
