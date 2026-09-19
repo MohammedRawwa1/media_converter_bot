@@ -13,12 +13,16 @@ FFMPEG_PATH = getattr(config, "FFMPEG_PATH", "ffmpeg") or "ffmpeg"
 logger = logging.getLogger(__name__)
 
 # Import timeout utilities
-try:
+with contextlib.suppress(ImportError):
     from utils.async_timeout_wrapper import (
         DEFAULT_FFMPEG_TIMEOUT,
         run_subprocess_with_timeout,
     )
-except ImportError:
+
+# Probe helper for getting media duration/metadata
+with contextlib.suppress(ImportError):
+    from utils.ffmpeg_runner import probe_media
+
     # Fallback if module not available
     async def run_subprocess_with_timeout(cmd, timeout_seconds=18000, operation_name="Operation"):
         if create_checked_subprocess_exec is not None:
@@ -652,7 +656,7 @@ async def split_media_segments(
     # ``Stem.%03d.ext``: ffmpeg numbers the parts itself, so the files on disk are
     # already named the way they are delivered - nothing has to be renamed later,
     # and no delivery can fall back to naming a part after its storage path.
-    pattern = os.path.join(output_dir, f"{safe_stem}.%03d{ext}")
+    _pattern = os.path.join(output_dir, f"{safe_stem}.%03d{ext}")
     cmd = [
         FFMPEG_PATH,
         "-y",
@@ -677,12 +681,43 @@ async def split_media_segments(
         # with only the final part showing correct duration when played.
         "-fflags",
         "+genpts",
-        # Write the index (moov atom for MP4) at the end of each segment,
-        # not just the final file. This ensures each part has valid metadata.
-        "-write_index",
-        "1",
-        pattern,
     ]
+
+    # Container-specific flags: MP4 needs -write_index for proper metadata per segment,
+    # but MP3/M4A audio files use different mechanisms.
+    ext_lower = ext.lower()
+    if ext_lower in (".mp4", ".mkv", ".avi", ".mov", ".webm"):
+        # Video containers: write the index (moov atom for MP4) at the end of each
+        # segment, not just the final file. This ensures each part has valid duration
+        # metadata when played.
+        cmd.extend(
+            [
+                "-write_index",
+                "1",
+            ]
+        )
+    elif ext_lower in (".mp3", ".m4a", ".aac", ".flac", ".ogg", ".opus", ".wav", ".wma"):
+        # Audio containers: ensure ID3 tags and proper framing for each segment.
+        # MP3 files need ID3v2 tags written for each segment so players can read
+        # the duration correctly. M4A/AAC needs similar treatment.
+        if ext_lower == ".mp3":
+            cmd.extend(
+                [
+                    "-id3v2_version",
+                    "3",
+                ]
+            )
+        # For all audio formats, write a fresh header for each segment so the
+        # player doesn't rely on the source file's metadata.
+        cmd.extend(
+            [
+                "-avoid_negative_ts",
+                "make_zero",
+            ]
+        )
+
+    # Add the output pattern as the last argument
+    cmd.append(_pattern)
 
     try:
         process = await _spawn_process(*cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
@@ -704,6 +739,49 @@ async def split_media_segments(
     )
     if not parts:
         return False, [], "ffmpeg produced no parts"
+
+    # Post-process audio files to fix duration metadata.
+    # MP3/MP4 audio segments created with stream copy often have incorrect or
+    # missing duration metadata in their headers. This causes players (including
+    # Telegram's audio player) to show wrong or no duration for intermediate parts.
+    # We probe each part and rewrite its metadata with the correct duration.
+    if ext_lower in (".mp3", ".m4a", ".aac", ".ogg", ".opus", ".flac"):
+        for part_path in parts:
+            try:
+                # Probe the actual duration of this part
+                _part_meta = await probe_media(part_path)
+                _part_duration = _part_meta.get("duration") if _part_meta else None
+                if _part_duration and float(_part_duration) > 0:
+                    # Rewrite the file with correct duration metadata.
+                    # For MP3: use ffmpeg to copy streams and write proper ID3 tags
+                    # with the correct duration. This is fast (no re-encode) and fixes
+                    # the metadata that Telegram's player reads.
+                    _temp_path = f"{part_path}.tmp"
+                    _fix_cmd = [
+                        FFMPEG_PATH,
+                        "-y",
+                        "-i",
+                        part_path,
+                        "-c",
+                        "copy",
+                        "-metadata",
+                        f"duration={_part_duration}",
+                        "-id3v2_version",
+                        "3",
+                        _temp_path,
+                    ]
+                    _fix_proc = await _spawn_process(
+                        *_fix_cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+                    )
+                    await _fix_proc.communicate()
+                    if _fix_proc.returncode == 0 and os.path.exists(_temp_path):
+                        os.replace(_temp_path, part_path)
+            except Exception:
+                logger.debug(
+                    "split_media_segments: could not fix metadata for %s",
+                    part_path,
+                )
+
     logger.info(f"Split media into {len(parts)} part(s) of ~{segment_arg}s")
     return True, parts, ""
 
