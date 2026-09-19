@@ -612,10 +612,10 @@ class PhotoBatchTests(unittest.TestCase):
 
 
 class BulkRenameTests(unittest.TestCase):
-    def test_applies_prefix_suffix_and_words_to_remove(self):
-        settings = {"prefix": "[Bot] ", "suffix": " HD", "words_remove": ["1080p", "x264"]}
+    def test_applies_the_prefix_and_the_suffix(self):
+        settings = {"prefix": "[Bot] ", "suffix": " HD"}
         name, changed = _bulk_rename_filename("Movie 1080p x264.mp4", settings)
-        self.assertEqual(name, "[Bot] Movie HD.mp4")
+        self.assertEqual(name, "[Bot] Movie 1080p x264 HD.mp4")
         self.assertTrue(changed)
 
     def test_keeps_extension_and_name_when_nothing_is_configured(self):
@@ -624,7 +624,7 @@ class BulkRenameTests(unittest.TestCase):
         self.assertFalse(changed)
 
     def test_never_renames_to_an_empty_stem(self):
-        name, _ = _bulk_rename_filename("1080p.mp4", {"words_remove": ["1080p"]})
+        name, _ = _bulk_rename_filename("  .mp4", {"prefix": " ", "suffix": " "})
         self.assertTrue(name.endswith(".mp4"))
         self.assertGreater(len(os.path.splitext(name)[0]), 0)
 
@@ -1211,7 +1211,10 @@ class MenuTriggerCoverageTests(unittest.TestCase):
         ("get_settings_page(2, {})", lambda b: b.get_settings_page(2, {})),
         ('get_settings_bitrate_menu("192k")', lambda b: b.get_settings_bitrate_menu("192k")),
         ("get_settings_rename_menu({})", lambda b: b.get_settings_rename_menu({})),
-        ("get_settings_words_menu({})", lambda b: b.get_settings_words_menu({})),
+        ("get_settings_quality_menu(23)", lambda b: b.get_settings_quality_menu(23)),
+        ('get_settings_preset_menu("web")', lambda b: b.get_settings_preset_menu("web")),
+        ("get_settings_slideshow_menu(3)", lambda b: b.get_settings_slideshow_menu(3)),
+        ('get_settings_bulk_bitrate_menu("128k")', lambda b: b.get_settings_bulk_bitrate_menu("128k")),
     )
 
     @classmethod

@@ -154,14 +154,45 @@ from flask import Response, stream_with_context
 
 from utils import file_utils
 
-# ── Per-thread event loop helpers for Flask routes ──────────────────────────
-# When Flask is mounted inside FastAPI via WSGIMiddleware, each request runs
-# in a separate WSGI thread with no running event loop.  Creating a new loop
-# with asyncio.run() per request is wasteful (no connection reuse) and can
-# raise RuntimeError in some ASGI server configurations.  Instead we maintain
-# one persistent event loop per thread, created on first use, and reuse it for
-# all async calls within that thread.
+# ── Running async work from Flask's worker threads ─────────────────────────
+# Flask is mounted inside FastAPI via WSGIMiddleware, so every request is served
+# by a plain worker thread that owns no event loop. The async clients a request
+# needs - the job queue's Redis client, Motor (job_store) and the Kafka/RabbitMQ
+# adapters (eventbus) - are created once, on the loop the ASGI app runs, and each
+# binds to it. Running a request's coroutines somewhere else fails the way an
+# unreadable session did: "got Future <Future pending> attached to a different
+# loop", swallowed by the best-effort wrappers around save_job/emit_event, so the
+# Mongo job record and the lifecycle events were silently never written.
+#
+# So: submit to the loop that owns those clients (`set_app_loop`, called from the
+# ASGI startup handler) and block this thread until it answers. Only when there is
+# no such loop - a process that never runs the ASGI app, or the loop's own thread -
+# do we fall back to a persistent per-thread loop, which is correct for everything
+# that keeps its clients per loop.
+_app_loop: asyncio.AbstractEventLoop | None = None
 _thread_loop = threading.local()
+
+
+def set_app_loop(loop: asyncio.AbstractEventLoop | None) -> None:
+    """Record the loop that owns the shared async clients (ASGI startup).
+
+    Pass ``None`` to forget it again (shutdown), so requests stop handing work to
+    a loop that is about to be closed.
+    """
+    global _app_loop
+    _app_loop = loop
+
+
+def _is_on(loop: asyncio.AbstractEventLoop) -> bool:
+    """True when the caller already runs on ``loop`` and so cannot await it.
+
+    ``asyncio`` records the running loop per thread, so a plain callback invoked by
+    the loop - which is what this is - can ask and get the loop back.
+    """
+    try:
+        return asyncio.get_running_loop() is loop
+    except RuntimeError:
+        return False
 
 
 def _ensure_loop() -> asyncio.AbstractEventLoop:
@@ -174,12 +205,31 @@ def _ensure_loop() -> asyncio.AbstractEventLoop:
     return loop
 
 
+# How long a request thread waits for the application loop to answer. Long enough
+# for a read, a presign or a small write, short enough that a wedged loop fails a
+# request instead of holding its worker thread - and the thread-pool slot that
+# thread owns - forever.
+_APP_LOOP_TIMEOUT_SECONDS = 30.0
+
+
 def _run_async(coro):
-    """Run an awaitable using the current thread's persistent event loop.
+    """Run an awaitable on the shared app loop, or on this thread's own loop.
 
     Safe to call from any WSGI/Flask route handler, including when Flask is
-    mounted inside FastAPI via WSGIMiddleware.
+    mounted inside FastAPI via WSGIMiddleware. Exceptions raised by the coroutine -
+    including a timeout while waiting for the loop - propagate to the caller.
     """
+    loop = _app_loop
+    if loop is not None and loop.is_running() and not _is_on(loop):
+        try:
+            return asyncio.run_coroutine_threadsafe(coro, loop).result(timeout=_APP_LOOP_TIMEOUT_SECONDS)
+        except TimeoutError:
+            logger.error(
+                "webapp: the application loop did not answer %s within %ss",
+                getattr(coro, "__qualname__", coro),
+                _APP_LOOP_TIMEOUT_SECONDS,
+            )
+            raise
     return _ensure_loop().run_until_complete(coro)
 
 
@@ -341,7 +391,6 @@ def upload():
             input_path = os.path.join(INPUT_DIR, f"{job_id}{ext}")
 
             def _poll_and_fetch(fid, inp_path, j_id, req_id, attempts=6, initial_delay=2):
-                import asyncio as _asyncio
                 import time
 
                 try:
@@ -357,7 +406,7 @@ def upload():
                 # Attempt to locate the forward metadata with exponential backoff
                 for attempt in range(attempts):
                     try:
-                        m = _asyncio.run(_load_forward(fid))
+                        m = _run_async(_load_forward(fid))
                     except Exception:
                         m = None
 
@@ -371,7 +420,7 @@ def upload():
 
                         _publish_upload_progress(j_id, 20, "Downloading forwarded media via userbot...")
                         try:
-                            ok_loc = _asyncio.run(
+                            ok_loc = _run_async(
                                 download_forward_via_userbot(
                                     m.get("chat_id"),
                                     m.get("message_id") or m.get("msg_id"),
@@ -403,7 +452,7 @@ def upload():
                                 # object under the identity key when the forward
                                 # carries one, and the configured mode decides
                                 # whether that object is the media or a probe header.
-                                _ref_loc = _asyncio.run(
+                                _ref_loc = _run_async(
                                     store_source(
                                         b,
                                         inp_path,
@@ -476,7 +525,7 @@ def upload():
                         job_loc["request_id"] = req_id
                         _publish_upload_progress(j_id, 90, "Enqueuing job...")
                         try:
-                            _asyncio.run(enqueue_job(job_loc))
+                            _run_async(enqueue_job(job_loc))
                             _publish_upload_progress(j_id, 100, "Job queued")
                         except Exception:
                             logger.exception("Failed to enqueue background fetched job %s", j_id)
@@ -484,7 +533,7 @@ def upload():
 
                         # cleanup forward metadata to avoid duplicates
                         with contextlib.suppress(Exception):
-                            _asyncio.run(_delete_forward(fid))
+                            _run_async(_delete_forward(fid))
 
                         return
 
@@ -526,13 +575,12 @@ def upload():
         # implementation simple to avoid deep nested try/except blocks which
         # previously caused indentation/syntax issues.
         def _bg_fetch_and_enqueue(meta_obj, inp_path, j_id, req_id):
-            import asyncio as _asyncio
 
             _publish_upload_progress(j_id, 10, "Downloading forwarded media via userbot...")
             try:
                 ok_loc = False
                 try:
-                    ok_loc = _asyncio.run(
+                    ok_loc = _run_async(
                         download_forward_via_userbot(
                             meta_obj.get("chat_id"),
                             meta_obj.get("message_id") or meta_obj.get("msg_id"),
@@ -560,7 +608,7 @@ def upload():
                     try:
                         b = get_storage_backend_sync()
                         # Same helper as every other producer (utils/source_store.py).
-                        _ref_loc = _asyncio.run(
+                        _ref_loc = _run_async(
                             store_source(
                                 b,
                                 inp_path,
@@ -652,7 +700,7 @@ def upload():
                 job_loc["request_id"] = req_id
                 _publish_upload_progress(j_id, 90, "Enqueuing job...")
                 try:
-                    _asyncio.run(enqueue_job(job_loc))
+                    _run_async(enqueue_job(job_loc))
                     _publish_upload_progress(j_id, 100, "Job queued")
                 except Exception:
                     logger.exception("Failed to enqueue background fetched job %s", j_id)
@@ -715,15 +763,13 @@ def upload():
                     b = get_storage_backend_sync()
                     # run the async upload in this background thread
                     try:
-                        import asyncio as _asyncio
-
                         _publish_upload_progress(jid, 20, "Uploading to S3 (0-50%)...", in_bytes=inp_bytes)
                         # The same helper as every other producer, on purpose: one
                         # key-choice rule and one mode decision for the whole
                         # system. This branch has no Telegram fallback - the bytes
                         # arrived over HTTP - so the object always has to be the
                         # media itself rather than a probe header.
-                        _ref = _asyncio.run(
+                        _ref = _run_async(
                             store_source(b, input_path, key=key, telegram_fallback=False, log_prefix="webapp")
                         )
                         _publish_upload_progress(jid, 80, "S3 upload complete, cleaning up...", in_bytes=inp_bytes)
@@ -749,9 +795,7 @@ def upload():
 
                 # enqueue the job (async helper run inside this thread)
                 try:
-                    import asyncio as _asyncio
-
-                    _asyncio.run(enqueue_job(j))
+                    _run_async(enqueue_job(j))
                     _publish_upload_progress(jid, 100, "Job queued", in_bytes=inp_bytes)
                 except Exception:
                     logger.exception("Background enqueue failed for job %s", j.get("job_id"))
@@ -1096,9 +1140,8 @@ def enqueue_from_url():
                     j["request_id"] = req_id
                 except Exception:
                     j["request_id"] = None
-                import asyncio as _asyncio
 
-                _asyncio.run(enqueue_job(j))
+                _run_async(enqueue_job(j))
             except Exception:
                 logger.exception("Background enqueue failed for URL job %s", j.get("job_id"))
 

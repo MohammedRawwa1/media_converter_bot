@@ -166,42 +166,37 @@ def carry_over_job_owners(job: dict, stored: dict | None, *, overwrite: bool = F
     return job
 
 
-async def get_redis():
-    # Use a shared aioredis client for the process to avoid exhausting
-    # Redis server client slots. We return a lightweight proxy whose
-    # `close()` is a no-op so existing call sites that `await r.close()`
-    # remain safe; call `close_redis()` at shutdown to close the real
-    # client.
-    global _redis_client, _redis_proxy
-    if not aioredis:
-        raise RuntimeError("redis.asyncio is required for job queue")
-    # read the env var at call-time so runtime env changes or late injection work
-    redis_url = os.environ.get("REDIS_URL")
-    if not redis_url:
-        raise RuntimeError("REDIS_URL environment variable is not set")
+# ── One Redis client per event loop ─────────────────────────────────────────
+# redis.asyncio binds every connection to the event loop that opened it, so one
+# client per *process* is only usable from the loop that created it. This process
+# runs more than one loop: the bot's, a persistent loop per WSGI thread for the
+# Flask uploader (web/webapp.py), and short-lived loops a few paths spin up in a
+# thread. Sharing a single client across them fails exactly the way an unreadable
+# session did - "got Future <Future pending> attached to a different loop" - on a
+# command that then never returns.
+#
+# The cache is keyed by ``id(loop)``, and the loop itself is kept as the value's
+# first element: an id reused by a *new* loop therefore cannot be handed the dead
+# loop's client. Entries whose loop has been closed are dropped on the next call,
+# and close_redis() closes whatever is left at shutdown.
+_redis_clients: dict[int, tuple] = {}
 
-    # If already created, return proxy
-    try:
-        if _redis_proxy is not None:
-            return _redis_proxy
-    except NameError:
-        # fall through to create
-        pass
 
-    # Log a masked host:port for diagnostics (do not print credentials)
-    try:
-        parsed = urlparse(redis_url)
-        hostport = parsed.hostname or ""
-        if parsed.port:
-            hostport = f"{hostport}:{parsed.port}"
-        logging.getLogger(__name__).debug("Connecting to Redis at %s (scheme=%s)", hostport, parsed.scheme)
-    except Exception:
-        logging.getLogger(__name__).debug("job_queue: failed to parse REDIS_URL for diagnostic logging")
+def _drop_closed_redis_clients() -> None:
+    """Forget the clients of loops that have been closed since the last call."""
+    for key, (loop, _proxy) in list(_redis_clients.items()):
+        if loop.is_closed():
+            _redis_clients.pop(key, None)
 
-    # module-level storage for the real client and proxy
-    _redis_client = aioredis.from_url(
-        redis_url, decode_responses=True, max_connections=int(os.getenv("REDIS_MAX_CONNECTIONS", "50"))
-    )
+
+def _loop_redis_proxy(redis_url: str):
+    """The client for one loop, wrapped so ``await r.close()`` stays safe.
+
+    The proxy's ``close()`` is a no-op because dozens of call sites end with
+    ``await r.close()`` and they are right to: the connection is the process's,
+    not theirs. The real client is closed by ``close_redis()`` at shutdown, or
+    when its loop is closed and the entry is dropped.
+    """
 
     class _RedisProxy:
         def __init__(self, client):
@@ -211,30 +206,100 @@ async def get_redis():
             return getattr(self._client, name)
 
         async def close(self):
-            # no-op: callers may `await r.close()` safely; call close_redis()
-            # at shutdown to close the real client.
             return
 
-    _redis_proxy = _RedisProxy(_redis_client)
-    return _redis_proxy
+    client = aioredis.from_url(
+        redis_url, decode_responses=True, max_connections=int(os.getenv("REDIS_MAX_CONNECTIONS", "50"))
+    )
+    return _RedisProxy(client)
+
+
+async def get_redis():
+    """The Redis client belonging to the running loop, created on first use.
+
+    One client per loop rather than one per process - see ``_redis_clients`` for
+    why, and note that every existing caller keeps working unchanged: it is the
+    *client*, not the caller, that had to be given the right loop.
+    """
+    if not aioredis:
+        raise RuntimeError("redis.asyncio is required for job queue")
+    # read the env var at call-time so runtime env changes or late injection work
+    redis_url = os.environ.get("REDIS_URL")
+    if not redis_url:
+        raise RuntimeError("REDIS_URL environment variable is not set")
+
+    loop = asyncio.get_running_loop()
+    cached = _redis_clients.get(id(loop))
+    if cached is not None and cached[0] is loop and not loop.is_closed():
+        return cached[1]
+
+    _drop_closed_redis_clients()
+
+    # Log a masked host:port for diagnostics (do not print credentials)
+    try:
+        parsed = urlparse(redis_url)
+        hostport = parsed.hostname or ""
+        if parsed.port:
+            hostport = f"{hostport}:{parsed.port}"
+        logger.debug("Connecting to Redis at %s (scheme=%s)", hostport, parsed.scheme)
+    except Exception:
+        logger.debug("job_queue: failed to parse REDIS_URL for diagnostic logging")
+
+    proxy = _loop_redis_proxy(redis_url)
+    _redis_clients[id(loop)] = (loop, proxy)
+    return proxy
 
 
 async def close_redis():
-    """Close the shared Redis client (call at process shutdown)."""
-    global _redis_client, _redis_proxy
+    """Close every loop's Redis client (call at process shutdown)."""
+    clients = [(loop, proxy) for loop, proxy in _redis_clients.values()]
+    _redis_clients.clear()
+    for _loop, proxy in clients:
+        client = getattr(proxy, "_client", None)
+        if client is None:
+            continue
+        try:
+            aclose = getattr(client, "aclose", None)
+            if aclose is not None:
+                await aclose()
+            else:
+                await client.close()
+        except Exception:
+            # A client whose loop is not this one can refuse to close from here;
+            # its sockets go when the process does.
+            logger.debug("job_queue: failed to close a Redis client during shutdown")
+
+
+# ── The Mongo write that follows a queue push ───────────────────────────────
+# Kept referenced until it finishes: an unreferenced task can be collected
+# mid-flight, which loses the job document, and its exception is retrieved so a
+# Mongo that is down is a debug line instead of a silent failure. The write stays
+# on the caller's loop, which is the loop job_store's client belongs to - a loop
+# of this module's own (the old ``run_until_complete`` fallback) would fail the
+# same way the session load did, "got Future ... attached to a different loop".
+_job_writes: set = set()
+
+
+def _schedule_job_write(save_job, job: dict) -> None:
+    """Persist one job document in the background, on the running loop."""
+    coro = save_job(job)
     try:
-        if _redis_client is not None:
-            try:
-                aclose = getattr(_redis_client, "aclose", None)
-                if aclose is not None:
-                    await aclose()
-                else:
-                    await _redis_client.close()
-            except Exception:
-                logger.debug("job_queue: failed to close Redis client during shutdown")
-    finally:
-        _redis_client = None
-        _redis_proxy = None
+        task = asyncio.create_task(coro)
+    except RuntimeError:
+        # No running loop to bind the write to; nothing awaited it, so close it.
+        coro.close()
+        logger.debug("job_queue: no running loop to persist job %s", job.get("job_id", "?"))
+        return
+    _job_writes.add(task)
+
+    def _finished(done) -> None:
+        _job_writes.discard(done)
+        with contextlib.suppress(Exception):
+            error = done.exception()
+            if error is not None:
+                logger.debug("job_queue: failed to persist job %s to Mongo: %s", job.get("job_id", "?"), error)
+
+    task.add_done_callback(_finished)
 
 
 async def enqueue_job(job: dict) -> None:
@@ -417,22 +482,8 @@ async def enqueue_job(job: dict) -> None:
         from .job_store import save_job
 
         # Fire-and-forget init if env provided
-        mongo_uri = os.environ.get("MONGO_URI")
-        if mongo_uri:
-            try:
-                try:
-                    loop = asyncio.get_running_loop()
-                    asyncio.create_task(save_job(job))
-                except RuntimeError:
-                    # Called from sync context (e.g. background thread)
-                    loop = asyncio.new_event_loop()
-                    asyncio.set_event_loop(loop)
-                    try:
-                        loop.run_until_complete(save_job(job))
-                    finally:
-                        loop.close()
-            except Exception:
-                logger.debug("job_queue: failed to persist job %s to Mongo", job.get("job_id", "?"))
+        if os.environ.get("MONGO_URI"):
+            _schedule_job_write(save_job, job)
     except Exception:
         logger.debug("job_queue: failed to import save_job")
 

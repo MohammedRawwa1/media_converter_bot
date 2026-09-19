@@ -12,17 +12,24 @@ from .callbacks import (
     BULK_BITRATE_MENU,
     BULK_CRF_CHOICES,
     BULK_CRF_DEFAULT,
+    BULK_CRF_MAX,
     BULK_CRF_MENU,
+    BULK_CRF_MIN,
+    BULK_EXTRACT_BITRATE_KEY,
     BULK_PRESET_CHOICES,
     BULK_PRESET_DEFAULT,
     BULK_PRESET_LABELS,
     BULK_PRESET_MENU,
     BULK_SLIDESHOW_CHOICES,
     BULK_SLIDESHOW_DEFAULT,
+    BULK_SLIDESHOW_MAX,
     BULK_SLIDESHOW_MENU,
+    BULK_SLIDESHOW_MIN,
     CANCEL,
     CAPTION_EDITOR,
     COMPRESS_MENU,
+    COMPRESS_QUALITY_KEY,
+    COMPRESS_QUALITY_LABELS,
     CONFIRM,
     CONVERT_FORMAT_MENU,
     CREATE_ARCHIVE,
@@ -48,13 +55,19 @@ from .callbacks import (
     MP3_QUALITY_CHOICES,
     MP3_TAG_EDITOR,
     OPTIMIZE_MENU,
+    OPTIMIZE_PRESET_KEY,
     REMOVE_AUDIO,
     RESOLUTION_MENU,
     SCREENSHOTS_MENU,
     SETTINGS_BITRATE_MENU,
+    SETTINGS_BULK_BITRATE_MENU,
+    SETTINGS_PAGE_COUNT,
+    SETTINGS_PRESET_MENU,
+    SETTINGS_QUALITY_MENU,
     SETTINGS_RENAME_MENU,
+    SETTINGS_SLIDESHOW_MENU,
     SETTINGS_UPLOAD_MODE_PREFIX,
-    SETTINGS_WORDS_MENU,
+    SLIDESHOW_SECONDS_KEY,
     STREAM_EXTRACTOR,
     STREAM_REMOVER,
     SUBTITLE_MERGER,
@@ -74,8 +87,15 @@ from .callbacks import (
     bulk_crf_key,
     bulk_preset_key,
     bulk_slideshow_key,
+    compress_quality_label,
     mp3_quality_key,
     settings_bitrate_key,
+    settings_bulk_bitrate_key,
+    settings_page_key,
+    settings_page_number,
+    settings_preset_key,
+    settings_quality_key,
+    settings_slideshow_key,
 )
 
 
@@ -163,17 +183,22 @@ class MediaMenuBuilder:
         return InlineKeyboardMarkup(buttons)
 
     @staticmethod
-    def get_compression_menu() -> InlineKeyboardMarkup:
-        """Get compression quality menu."""
+    def get_compression_menu(current=None) -> InlineKeyboardMarkup:
+        """Get compression quality menu.
+
+        *current* is the quality the user stored in /usersettings: it is marked
+        ``(default)`` so the number the panel shows is the one this menu offers,
+        and choosing a quality here still applies to this file only.
+        """
+        default = _sanitize_quality(current, default=None)
+
+        def _quality(crf: int) -> InlineKeyboardButton:
+            mark = " (default)" if crf == default else ""
+            return InlineKeyboardButton(f"{COMPRESS_QUALITY_LABELS[crf]}{mark}", callback_data=f"compress_{crf}")
+
         buttons = [
-            [
-                InlineKeyboardButton("🟢 High Quality", callback_data="compress_18"),
-                InlineKeyboardButton("🟡 Medium", callback_data="compress_23"),
-            ],
-            [
-                InlineKeyboardButton("🔴 Low", callback_data="compress_28"),
-                InlineKeyboardButton("⚫ Extreme", callback_data="compress_35"),
-            ],
+            [_quality(BULK_CRF_CHOICES[0]), _quality(BULK_CRF_CHOICES[1])],
+            [_quality(BULK_CRF_CHOICES[2]), _quality(BULK_CRF_CHOICES[3])],
             [InlineKeyboardButton("↩️ Back", callback_data="menu_main")],
         ]
         return InlineKeyboardMarkup(buttons)
@@ -379,13 +404,15 @@ class MediaMenuBuilder:
         except (TypeError, ValueError):
             active = BULK_CRF_DEFAULT
 
-        def _quality(crf: int, label: str) -> InlineKeyboardButton:
+        def _quality(crf: int) -> InlineKeyboardButton:
             mark = "✅ " if crf == active else ""
-            return InlineKeyboardButton(f"{mark}{label}", callback_data=bulk_crf_key(crf))
+            return InlineKeyboardButton(
+                f"{mark}{COMPRESS_QUALITY_LABELS[crf]} ({crf})", callback_data=bulk_crf_key(crf)
+            )
 
         buttons = [
-            [_quality(BULK_CRF_CHOICES[0], "🟢 High Quality (18)"), _quality(BULK_CRF_CHOICES[1], "🟡 Medium (23)")],
-            [_quality(BULK_CRF_CHOICES[2], "🔴 Low (28)"), _quality(BULK_CRF_CHOICES[3], "⚫ Extreme (35)")],
+            [_quality(BULK_CRF_CHOICES[0]), _quality(BULK_CRF_CHOICES[1])],
+            [_quality(BULK_CRF_CHOICES[2]), _quality(BULK_CRF_CHOICES[3])],
             [InlineKeyboardButton("✏️ Custom CRF", callback_data=bulk_crf_key("custom"))],
             [InlineKeyboardButton("↩️ Back", callback_data="bulk_menu")],
         ]
@@ -462,17 +489,19 @@ class MediaMenuBuilder:
         return InlineKeyboardMarkup(buttons)
 
     @staticmethod
-    def get_optimize_menu() -> InlineKeyboardMarkup:
-        """Get optimization presets menu."""
+    def get_optimize_menu(current: str = None) -> InlineKeyboardMarkup:
+        """Get optimization presets menu, marking the user's stored preset."""
+        default = current if current in BULK_PRESET_CHOICES else None
+        icons = {"web": "🌐", "mobile": "📱", "tv": "📺", "storage": "💾"}
+
+        def _preset(name: str) -> InlineKeyboardButton:
+            mark = " (default)" if name == default else ""
+            label = BULK_PRESET_LABELS.get(name, name.title())
+            return InlineKeyboardButton(f"{icons.get(name, '')} {label}{mark}", callback_data=f"optimize_{name}")
+
         buttons = [
-            [
-                InlineKeyboardButton("🌐 For Web", callback_data="optimize_web"),
-                InlineKeyboardButton("📱 For Mobile", callback_data="optimize_mobile"),
-            ],
-            [
-                InlineKeyboardButton("📺 For TV", callback_data="optimize_tv"),
-                InlineKeyboardButton("💾 For Storage", callback_data="optimize_storage"),
-            ],
+            [_preset("web"), _preset("mobile")],
+            [_preset("tv"), _preset("storage")],
             [InlineKeyboardButton("🔧 Custom", callback_data="optimize_custom")],
             [InlineKeyboardButton("↩️ Back", callback_data=MENU_MAIN)],
         ]
@@ -606,14 +635,47 @@ class MediaMenuBuilder:
 
     @staticmethod
     def get_settings_page(page: int = 1, settings: dict = None) -> InlineKeyboardMarkup:
-        """The preferences panel: page 1 general, page 2 audio."""
+        """One page of the preferences panel: 1 general, 2 quality, 3 batch.
+
+        The pager is built here from ``SETTINGS_PAGE_COUNT`` rather than written
+        out by hand, so adding a page means adding its rows and nothing else -
+        the Prev/Next row follows, and no page is reachable only from a stale
+        button on another one.
+        """
         s = settings or {}
+        page = settings_page_number(page)
         buttons: list[list[InlineKeyboardButton]] = []
 
-        if int(page or 1) == 2:
+        if page == 3:
+            seconds = _sanitize_slideshow(s.get(SLIDESHOW_SECONDS_KEY))
+            extract = s.get(BULK_EXTRACT_BITRATE_KEY) or BULK_BITRATE_DEFAULT
+            buttons.append(
+                [InlineKeyboardButton(f"🎞️ Slideshow: {seconds:g}s per photo", callback_data=SETTINGS_SLIDESHOW_MENU)]
+            )
+            buttons.append(
+                [InlineKeyboardButton(f"🎵 Batch Extract Bitrate: {extract}", callback_data=SETTINGS_BULK_BITRATE_MENU)]
+            )
+        elif page == 2:
+            crf = _sanitize_quality(s.get(COMPRESS_QUALITY_KEY))
+            preset = s.get(OPTIMIZE_PRESET_KEY)
+            preset = preset if preset in BULK_PRESET_CHOICES else BULK_PRESET_DEFAULT
             bitrate = s.get("audio_bitrate") or MP3_DEFAULT_BITRATE
-            buttons.append([InlineKeyboardButton(f"🎚️ Audio Bitrate: {bitrate}", callback_data=SETTINGS_BITRATE_MENU)])
-            buttons.append([InlineKeyboardButton("⬅️ Prev", callback_data="settings_page:1")])
+            buttons.append(
+                [
+                    InlineKeyboardButton(
+                        f"🎚️ Compress Quality: {compress_quality_label(crf)}", callback_data=SETTINGS_QUALITY_MENU
+                    )
+                ]
+            )
+            buttons.append(
+                [
+                    InlineKeyboardButton(
+                        f"⚡ Optimize Preset: {BULK_PRESET_LABELS.get(preset, preset.title())}",
+                        callback_data=SETTINGS_PRESET_MENU,
+                    )
+                ]
+            )
+            buttons.append([InlineKeyboardButton(f"🎧 Audio Bitrate: {bitrate}", callback_data=SETTINGS_BITRATE_MENU)])
         else:
             mode = str(s.get("upload_mode") or UPLOAD_MODE_VIDEO).lower()
             if mode not in (UPLOAD_MODE_VIDEO, UPLOAD_MODE_FILE):
@@ -635,14 +697,15 @@ class MediaMenuBuilder:
                     )
                 ]
             )
-            words = s.get("words_remove") or []
-            buttons.append(
-                [
-                    InlineKeyboardButton("✏️ Rename Files", callback_data=SETTINGS_RENAME_MENU),
-                    InlineKeyboardButton(f"🧹 Words: {len(words)}", callback_data=SETTINGS_WORDS_MENU),
-                ]
-            )
-            buttons.append([InlineKeyboardButton("Next ➡️", callback_data="settings_page:2")])
+            buttons.append([InlineKeyboardButton("✏️ Rename Files", callback_data=SETTINGS_RENAME_MENU)])
+
+        nav = []
+        if page > 1:
+            nav.append(InlineKeyboardButton("⬅️ Prev", callback_data=settings_page_key(page - 1)))
+        if page < SETTINGS_PAGE_COUNT:
+            nav.append(InlineKeyboardButton("Next ➡️", callback_data=settings_page_key(page + 1)))
+        if nav:
+            buttons.append(nav)
 
         buttons.append(
             [
@@ -650,6 +713,85 @@ class MediaMenuBuilder:
                 InlineKeyboardButton("✖️ Close", callback_data=MENU_MAIN),
             ]
         )
+        return InlineKeyboardMarkup(buttons)
+
+    @staticmethod
+    def get_settings_quality_menu(current=None) -> InlineKeyboardMarkup:
+        """Compress-quality (CRF) picker for /usersettings.
+
+        The same four qualities the Compress menu and the bulk picker offer, with
+        settings triggers so choosing one only stores it - it is the value a
+        conversion starts from when nothing was picked for the file itself.
+        """
+        active = _sanitize_quality(current)
+
+        def _quality(crf: int) -> InlineKeyboardButton:
+            mark = "✅ " if crf == active else ""
+            return InlineKeyboardButton(
+                f"{mark}{COMPRESS_QUALITY_LABELS[crf]} ({crf})", callback_data=settings_quality_key(crf)
+            )
+
+        buttons = [
+            [_quality(BULK_CRF_CHOICES[0]), _quality(BULK_CRF_CHOICES[1])],
+            [_quality(BULK_CRF_CHOICES[2]), _quality(BULK_CRF_CHOICES[3])],
+            [InlineKeyboardButton("✏️ Custom quality", callback_data=settings_quality_key("custom"))],
+            [InlineKeyboardButton("↩️ Back", callback_data=settings_page_key(2))],
+        ]
+        return InlineKeyboardMarkup(buttons)
+
+    @staticmethod
+    def get_settings_slideshow_menu(current=None) -> InlineKeyboardMarkup:
+        """Slideshow seconds-per-photo picker for /usersettings.
+
+        Same choices and same key as the bulk picker, so the length a batch uses is
+        the one this page shows, and a dash of custom covers the values in between.
+        """
+        active = _sanitize_slideshow(current)
+
+        def _choice(value: float) -> InlineKeyboardButton:
+            mark = "✅ " if abs(value - active) < 1e-9 else ""
+            return InlineKeyboardButton(f"{mark}{value:g}s", callback_data=settings_slideshow_key(value))
+
+        rows = [BULK_SLIDESHOW_CHOICES[i : i + 3] for i in range(0, len(BULK_SLIDESHOW_CHOICES), 3)]
+        buttons = [[_choice(v) for v in row] for row in rows]
+        buttons.append([InlineKeyboardButton("✏️ Custom", callback_data=settings_slideshow_key("custom"))])
+        buttons.append([InlineKeyboardButton("↩️ Back", callback_data=settings_page_key(3))])
+        return InlineKeyboardMarkup(buttons)
+
+    @staticmethod
+    def get_settings_bulk_bitrate_menu(current: str = None) -> InlineKeyboardMarkup:
+        """Batch extraction-bitrate picker for /usersettings, marking the active value."""
+        active = current if current in MP3_QUALITY_CHOICES else BULK_BITRATE_DEFAULT
+
+        def _label(value: str) -> str:
+            return f"{'✅ ' if value == active else ''}{value}"
+
+        rows = [MP3_QUALITY_CHOICES[i : i + 2] for i in range(0, len(MP3_QUALITY_CHOICES), 2)]
+        buttons = [
+            [InlineKeyboardButton(_label(v), callback_data=settings_bulk_bitrate_key(v)) for v in row] for row in rows
+        ]
+        buttons.append([InlineKeyboardButton("✏️ Custom bitrate", callback_data=settings_bulk_bitrate_key("custom"))])
+        buttons.append([InlineKeyboardButton("↩️ Back", callback_data=settings_page_key(3))])
+        return InlineKeyboardMarkup(buttons)
+
+    @staticmethod
+    def get_settings_preset_menu(current: str = None) -> InlineKeyboardMarkup:
+        """Optimize-preset picker for /usersettings, marking the active preset."""
+        active = current if current in BULK_PRESET_CHOICES else BULK_PRESET_DEFAULT
+        icons = {"web": "🌐", "mobile": "📱", "tv": "📺", "storage": "💾"}
+
+        def _preset(name: str) -> InlineKeyboardButton:
+            mark = "✅ " if name == active else ""
+            return InlineKeyboardButton(
+                f"{mark}{icons.get(name, '')} {BULK_PRESET_LABELS.get(name, name.title())}",
+                callback_data=settings_preset_key(name),
+            )
+
+        buttons = [
+            [_preset("web"), _preset("mobile")],
+            [_preset("tv"), _preset("storage")],
+            [InlineKeyboardButton("↩️ Back", callback_data=settings_page_key(2))],
+        ]
         return InlineKeyboardMarkup(buttons)
 
     @staticmethod
@@ -686,13 +828,37 @@ class MediaMenuBuilder:
         ]
         return InlineKeyboardMarkup(buttons)
 
-    @staticmethod
-    def get_settings_words_menu(settings: dict = None) -> InlineKeyboardMarkup:
-        """Words stripped out of every delivered filename."""
-        buttons = [
-            [InlineKeyboardButton("➕ Add Word", callback_data="settings_add_word")],
-            [InlineKeyboardButton("➖ Remove Word", callback_data="settings_remove_word")],
-            [InlineKeyboardButton("🗑️ Clear List", callback_data="settings_clear_words")],
-            [InlineKeyboardButton("↩️ Back", callback_data="settings_page:1")],
-        ]
-        return InlineKeyboardMarkup(buttons)
+
+def _sanitize_slideshow(value, default: float = BULK_SLIDESHOW_DEFAULT) -> float:
+    """Coerce a stored slideshow length into the range this bot will encode with.
+
+    The same bounds the bulk picker validates against, so a hand-edited settings
+    file cannot put a zero- or hour-long photo on an ffmpeg command line.
+    """
+    if isinstance(value, bool):
+        return default
+    try:
+        seconds = float(value)
+    except (TypeError, ValueError):
+        return default
+    if not (BULK_SLIDESHOW_MIN <= seconds <= BULK_SLIDESHOW_MAX):
+        return default
+    return seconds
+
+
+def _sanitize_quality(value, default: int = BULK_CRF_DEFAULT) -> int:
+    """Coerce a stored compress quality to a CRF this bot may encode with.
+
+    Anything unusable (missing, non-numeric, out of the accepted range) falls
+    back to the default, so a hand-edited settings file can never put arbitrary
+    text on an ffmpeg command line.
+    """
+    if isinstance(value, bool):
+        return default
+    try:
+        number = int(str(value).strip())
+    except (TypeError, ValueError):
+        return default
+    if not BULK_CRF_MIN <= number <= BULK_CRF_MAX:
+        return default
+    return number

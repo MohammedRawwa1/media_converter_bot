@@ -1049,6 +1049,45 @@ class LocalStorageBackend(AsyncStorageBackend):
         }
 
 
+class _PerLoopS3Session:
+    """Hands out one aioboto3 session per event loop.
+
+    aioboto3 keeps loop-affine state - the credential resolver's refresh lock, and
+    the connector behind every client it hands out - so a session built once and
+    used from a second loop fails the way a shared Redis client does ("got Future
+    <Future pending> attached to a different loop"). This process runs several
+    loops: the bot's, the per-WSGI-thread loops the Flask uploader dispatches on
+    (web/webapp.py), and the worker's. A session per loop, created on first use,
+    keeps each loop's clients on the loop that built them.
+
+    The object is a drop-in for ``aioboto3.Session`` where the backend uses it:
+    ``session.client("s3", **kwargs)`` returns that session's async context
+    manager, and assigning ``backend._session`` outright (a test's fake) keeps
+    working because the call sites still read the attribute.
+    """
+
+    def __init__(self, factory):
+        # ``factory`` builds a session: ``aioboto3.Session`` in production, a fake
+        # in the tests that need to see which loop got which session.
+        self._factory = factory
+        self._sessions: dict[int, tuple] = {}
+
+    def client(self, *args, **kwargs):
+        return self._session_for_running_loop().client(*args, **kwargs)
+
+    def _session_for_running_loop(self):
+        loop = asyncio.get_running_loop()
+        cached = self._sessions.get(id(loop))
+        if cached is not None and cached[0] is loop and not loop.is_closed():
+            return cached[1]
+        for key, (cached_loop, _session) in list(self._sessions.items()):
+            if cached_loop.is_closed():
+                self._sessions.pop(key, None)
+        session = self._factory()
+        self._sessions[id(loop)] = (loop, session)
+        return session
+
+
 class S3AsyncBackend(AsyncStorageBackend):
     def __init__(
         self,
@@ -1074,8 +1113,10 @@ class S3AsyncBackend(AsyncStorageBackend):
         self.aws_session_token = aws_session_token or os.getenv("AWS_SESSION_TOKEN") or None
         self.use_ssl = use_ssl
 
-        # async session only when aioboto3 is available
-        self._session = aioboto3.Session() if self._use_aioboto3 else None
+        # One session per event loop when aioboto3 is available (see
+        # _PerLoopS3Session); the boto3 fallback builds a client per call in a
+        # worker thread, so it has no session to share.
+        self._session = _PerLoopS3Session(aioboto3.Session) if self._use_aioboto3 else None
 
         # optional botocore config (used for both aioboto3 and boto3 clients)
         self._boto_config = None

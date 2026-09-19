@@ -164,11 +164,29 @@ def test_the_split_is_one_stream_copy_with_the_users_timing(tmp_path, monkeypatc
         "3600",
         "-f",
         "segment",
+        "-segment_start_number",
+        "1",
         "-reset_timestamps",
         "1",
         os.path.join(str(out_dir), "Concert.%03d.mp4"),
     ]
     assert [os.path.basename(p) for p in parts] == ["Concert.001.mp4", "Concert.002.mp4", "Concert.003.mp4"]
+
+
+def test_the_parts_are_numbered_from_one_not_from_ffmpegs_zero(tmp_path, monkeypatch):
+    """The segment muxer numbers from 000 unless it is told otherwise.
+
+    ``Concert.000.mp4`` is what a real run produced, next to a "part 1/N" caption:
+    the numbering the code, its replies and the users' expectations all describe as
+    starting at 001, so the flag that makes ffmpeg agree has to reach the command.
+    """
+    src = _source_file(tmp_path)
+    seen = _patch_spawn(monkeypatch)
+
+    _run(conversion_tasks.split_media_segments(src, str(tmp_path / "out"), 60, stem="Concert"))
+
+    cmd = seen["cmd"]
+    assert cmd[cmd.index("-segment_start_number") + 1] == "1"
 
 
 def test_a_fractional_length_reaches_ffmpeg_as_a_number(tmp_path, monkeypatch):

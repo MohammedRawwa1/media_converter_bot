@@ -7,6 +7,8 @@ Go/Laravel-style patterns:
   - PreparedQuery: like prepared statements in SQL
 """
 
+import asyncio
+import contextlib
 import logging
 import os
 import time
@@ -19,8 +21,52 @@ try:
 except Exception:
     AsyncIOMotorClient = None
 
-_client = None
-_db = None
+
+# ── One Motor client per event loop ────────────────────────────────────────
+# Motor binds its connections to the loop that opened them, so a single
+# process-wide client only works from the loop that created it. This process runs
+# more than one: the bot's (which the ASGI app also serves the Flask uploader
+# from), the ffmpeg worker's, and a fallback per-thread loop for Flask routes when
+# no app loop is registered. The second loop to touch a shared client failed with
+# "got Future <Future pending> attached to a different loop" - and because
+# save_job/update_job are best-effort, the job document was then silently never
+# written at all.
+#
+# The cache is keyed by ``id(loop)`` with the loop kept as the value's first
+# element, so an id reused by a new loop cannot be handed the closed loop's
+# client. ``close()`` closes every client that is still live.
+_clients: dict[int, tuple] = {}
+_uri: str | None = None
+_db_name = "media_bot"
+
+
+def _drop_closed_clients() -> None:
+    """Forget (and close) the clients of loops that have been closed."""
+    for key, (loop, client, _db) in list(_clients.items()):
+        if loop.is_closed():
+            with contextlib.suppress(Exception):
+                client.close()
+            _clients.pop(key, None)
+
+
+def _db_for_loop():
+    """The jobs database for the running loop, or None when never configured."""
+    if _uri is None:
+        return None
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        # Sync caller: there is no loop to bind a client to.
+        return None
+    cached = _clients.get(id(loop))
+    if cached is not None and cached[0] is loop:
+        return cached[2]
+    _drop_closed_clients()
+    client = AsyncIOMotorClient(_uri)
+    db = client[_db_name]
+    _clients[id(loop)] = (loop, client, db)
+    return db
+
 
 # ── Laravel-style $fillable fields for job documents ──
 # Only these fields are allowed in mass-assignment operations.
@@ -101,14 +147,17 @@ def _validate_field_names(fields: dict[str, Any]) -> dict[str, Any]:
 
 
 async def init(mongo_uri: str | None = None, db_name: str = "media_bot"):
-    global _client, _db
+    global _uri, _db_name
     if AsyncIOMotorClient is None:
         raise RuntimeError("motor is required for job_store")
     mongo_uri = mongo_uri or os.environ.get("MONGO_URI")
     if not mongo_uri:
         raise RuntimeError("MONGO_URI not set for job_store")
-    _client = AsyncIOMotorClient(mongo_uri)
-    _db = _client[db_name]
+    _uri = mongo_uri
+    _db_name = db_name
+    # Build this loop's client now: init() runs at startup, so a missing driver or
+    # an obviously bad URI surfaces there rather than on the first job write.
+    _db_for_loop()
 
 
 async def save_job(job: dict[str, Any]) -> None:
@@ -117,7 +166,8 @@ async def save_job(job: dict[str, Any]) -> None:
     Only fields in JOB_FILLABLE are persisted.  This prevents injection
     of arbitrary document fields via API payloads.
     """
-    if _db is None:
+    db = _db_for_loop()
+    if db is None:
         return
     # Apply fillable protection (like Laravel's Model::create($request->all()))
     safe_job = _filter_job_fields(job)
@@ -132,7 +182,7 @@ async def save_job(job: dict[str, Any]) -> None:
         logger.debug("Failed to close MongoDB client")
 
     # Parameterized insert (prepared-statement-like: data is validated and filtered)
-    await _db.jobs.insert_one(safe_job)
+    await db.jobs.insert_one(safe_job)
 
 
 async def update_job(job_id: str, fields: dict[str, Any]) -> None:
@@ -140,33 +190,37 @@ async def update_job(job_id: str, fields: dict[str, Any]) -> None:
 
     Like a prepared UPDATE with parameterized fields.
     """
-    if _db is None:
+    db = _db_for_loop()
+    if db is None:
         return
     # Apply fillable protection + validate field names
     safe_fields = _validate_field_names(_filter_job_fields(fields))
     if not safe_fields:
         return
-    await _db.jobs.update_one({"job_id": job_id}, {"$set": safe_fields}, upsert=False)
+    await db.jobs.update_one({"job_id": job_id}, {"$set": safe_fields}, upsert=False)
 
 
 async def get_job(job_id: str) -> dict[str, Any] | None:
     """Get a job by ID.  Returns None if not found."""
-    if _db is None:
+    db = _db_for_loop()
+    if db is None:
         return None
     # Parameterized query: job_id is passed as a value, not interpolated
-    return await _db.jobs.find_one({"job_id": job_id})
+    return await db.jobs.find_one({"job_id": job_id})
 
 
 async def get_jobs_by_status(status: str, limit: int = 100) -> list:
     """Get jobs by status (parameterized query)."""
-    if _db is None:
+    db = _db_for_loop()
+    if db is None:
         return []
-    cursor = _db.jobs.find({"status": status}).sort("created_at", -1).limit(limit)
+    cursor = db.jobs.find({"status": status}).sort("created_at", -1).limit(limit)
     return await cursor.to_list(length=limit)
 
 
 async def close():
-    global _client
-    if _client is not None:
-        _client.close()
-        _client = None
+    """Close every loop's client (call at process shutdown)."""
+    for _loop, client, _db in list(_clients.values()):
+        with contextlib.suppress(Exception):
+            client.close()
+    _clients.clear()

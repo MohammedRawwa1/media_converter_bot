@@ -16,7 +16,6 @@ DEFAULTS = {
     "upload_mode": "video",  # options: video, file
     "prefix": "",
     "suffix": "",
-    "words_remove": [],
     "save_thumbnail": False,
     "default_thumbnail": None,  # path or URL
     "use_custom_thumbnail": False,  # when True, use per-user custom thumbnail if set

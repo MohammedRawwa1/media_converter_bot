@@ -595,13 +595,21 @@ async def split_media_segments(
     audio file - only the extension of the parts differs::
 
         ffmpeg -i in.mp4 -c copy -map 0 -segment_time 3600 -f segment \\
-               -reset_timestamps 1 out/Concert.%03d.mp4
+               -segment_start_number 1 -reset_timestamps 1 out/Concert.%03d.mp4
 
     ``-c copy`` means no re-encode: the parts are the original bytes, cut at
     segment boundaries, so splitting an hour-long file costs seconds, not hours.
     ``-map 0`` keeps every stream of the source (video, audio, subtitle tracks),
-    and ``-reset_timestamps 1`` restarts each part at 00:00 so a player shows the
-    part's own duration instead of an hour-long timeline.
+    ``-reset_timestamps 1`` restarts each part at 00:00 so a player shows the
+    part's own duration instead of an hour-long timeline, and
+    ``-segment_start_number 1`` numbers the parts from **001** rather than the
+    segment muxer's own default of 000 - the numbering a user expects next to the
+    "part 1/N" caption that goes out with each file.
+
+    Cuts can only land on the source's keyframes, so a part can come out longer
+    than *segment_seconds* (and a source whose keyframes are farther apart than
+    that produces a single part). Re-encoding would fix the exact length and cost
+    the whole point of this command, so the caller explains the result instead.
 
     Returns ``(ok, parts, error)``: the sorted list of files that were written, so
     a caller can deliver them in order, and the ffmpeg stderr tail when it failed.
@@ -652,6 +660,10 @@ async def split_media_segments(
         segment_arg,
         "-f",
         "segment",
+        # 001, not the segment muxer's default 000: the parts are delivered under
+        # their own names, next to a "part 1/N" caption.
+        "-segment_start_number",
+        "1",
         "-reset_timestamps",
         "1",
         pattern,

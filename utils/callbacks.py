@@ -195,6 +195,32 @@ BULK_CRF_MIN = 18
 BULK_CRF_MAX = 51
 BULK_CRF_DEFAULT = 28
 
+#: The one label per CRF, so the Compress menu, the bulk picker and
+#: /usersettings cannot describe the same number two different ways.
+COMPRESS_QUALITY_LABELS = {
+    18: "🟢 High Quality",
+    23: "🟡 Medium",
+    28: "🔴 Low",
+    35: "⚫ Extreme",
+}
+
+#: Where the compress-quality and optimize-preset preferences live. They sit in
+#: the same store the bulk pickers write, under the same keys, because
+#: /usersettings and the bulk menu are two views of one choice - a second key
+#: would let them disagree about what "the user's quality" is.
+COMPRESS_QUALITY_KEY = "bulk_crf"
+OPTIMIZE_PRESET_KEY = "bulk_optimize_preset"
+
+
+def compress_quality_label(crf) -> str:
+    """``28`` -> ``"🔴 Low"``; a custom CRF falls back to the plain number."""
+    try:
+        number = int(crf)
+    except (TypeError, ValueError):
+        return "CRF"
+    return COMPRESS_QUALITY_LABELS.get(number, f"CRF {number}")
+
+
 # Optimize presets, mirroring the single-file optimize presets.
 BULK_PRESET_CHOICES = ("web", "mobile", "tv", "storage")
 BULK_PRESET_DEFAULT = "web"
@@ -236,6 +262,12 @@ BULK_SLIDESHOW_DEFAULT = 3.0
 BULK_SLIDESHOW_MIN = 0.5
 BULK_SLIDESHOW_MAX = 30.0
 
+#: Where the slideshow length and the batch extraction bitrate live. Same keys
+#: and same reasoning as the compress quality above: the panel and the bulk
+#: pickers write one preference, not two that can disagree.
+SLIDESHOW_SECONDS_KEY = "bulk_slideshow_seconds"
+BULK_EXTRACT_BITRATE_KEY = "bulk_extract_bitrate"
+
 
 def bulk_slideshow_key(val) -> str:
     return f"{BULK_SLIDESHOW_PREFIX}{val}"
@@ -245,11 +277,42 @@ def bulk_slideshow_key(val) -> str:
 # starts a conversion, so the panel stays a settings panel and opening it can
 # never encode whatever file happens to be loaded. Actions live in the menus.
 SETTINGS_RENAME_MENU = "settings_rename_menu"
-SETTINGS_WORDS_MENU = "settings_words_menu"
 SETTINGS_BITRATE_MENU = "settings_bitrate_menu"
+SETTINGS_QUALITY_MENU = "settings_quality_menu"
+SETTINGS_PRESET_MENU = "settings_preset_menu"
+SETTINGS_SLIDESHOW_MENU = "settings_slideshow_menu"
+SETTINGS_BULK_BITRATE_MENU = "settings_bulk_bitrate_menu"
 SETTINGS_BITRATE_PREFIX = "settings_set_bitrate:"
+SETTINGS_QUALITY_PREFIX = "settings_set_quality:"
+SETTINGS_PRESET_PREFIX = "settings_set_preset:"
+SETTINGS_SLIDESHOW_PREFIX = "settings_set_slideshow:"
+SETTINGS_BULK_BITRATE_PREFIX = "settings_set_bulk_bitrate:"
 SETTINGS_TOGGLE_PREFIX = "settings_toggle:"
 SETTINGS_TOOL_PREFIX = "settings_tool:"
+
+#: The panel's pages, in order. The page count and the Prev/Next row are built
+#: from this one tuple, so adding a page means adding its rows and nothing else -
+#: no page can end up reachable by "Next" but missing from the view.
+#:
+#: 1 general (delivery and naming), 2 quality (what a conversion encodes at),
+#: 3 batch (what a multi-file run produces).
+SETTINGS_PAGES = ("general", "quality", "batch")
+SETTINGS_PAGE_COUNT = len(SETTINGS_PAGES)
+
+
+def settings_page_number(page) -> int:
+    """Clamp a requested page to one of the pages the panel actually has."""
+    try:
+        number = int(page or 1)
+    except (TypeError, ValueError):
+        number = 1
+    return min(max(1, number), SETTINGS_PAGE_COUNT)
+
+
+def settings_page_key(page) -> str:
+    """The callback that opens a page (``settings_page:2``)."""
+    return f"settings_page:{settings_page_number(page)}"
+
 
 # The video delivery format: playable media (Telegram preview) or a document.
 # Shares the ``upload_mode`` user setting, so switching it here and switching it
@@ -266,6 +329,26 @@ UPLOAD_MODE_LABELS = {
 
 def settings_bitrate_key(val) -> str:
     return f"{SETTINGS_BITRATE_PREFIX}{val}"
+
+
+def settings_quality_key(crf) -> str:
+    """A settings trigger for one compress quality (or the ``custom`` prompt)."""
+    return f"{SETTINGS_QUALITY_PREFIX}{crf}"
+
+
+def settings_preset_key(name: str) -> str:
+    """A settings trigger for one optimize preset."""
+    return f"{SETTINGS_PRESET_PREFIX}{name}"
+
+
+def settings_slideshow_key(seconds) -> str:
+    """A settings trigger for one slideshow length (or the ``custom`` prompt)."""
+    return f"{SETTINGS_SLIDESHOW_PREFIX}{seconds}"
+
+
+def settings_bulk_bitrate_key(val) -> str:
+    """A settings trigger for one batch extraction bitrate."""
+    return f"{SETTINGS_BULK_BITRATE_PREFIX}{val}"
 
 
 def settings_upload_mode_key(mode: str) -> str:

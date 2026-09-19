@@ -13,6 +13,18 @@ from telegram import InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto
 from telegram.error import BadRequest
 from telegram.ext import ContextTypes, ConversationHandler
 
+# The settings panel's page list, its triggers and the one label per compress
+# quality live in utils.callbacks, next to the rest of the keyboard vocabulary.
+from utils.callbacks import (
+    BULK_EXTRACT_BITRATE_KEY,
+    BULK_PRESET_LABELS,
+    COMPRESS_QUALITY_KEY,
+    OPTIMIZE_PRESET_KEY,
+    SETTINGS_PAGE_COUNT,
+    SLIDESHOW_SECONDS_KEY,
+    compress_quality_label,
+    settings_page_number,
+)
 from utils.media_time import format_clock, segment_seconds_for_parts
 from utils.time_utils import utc_iso
 from utils.url_validation import _validate_url_safe
@@ -300,6 +312,12 @@ _BULK_JOB_WAIT_SECONDS = float(os.environ.get("BULK_JOB_WAIT_SECONDS", str(6 * 3
 # bound, under _BULK_JOB_WAIT_SECONDS like every other job the apply queues.
 _BULK_FETCH_TIMEOUT_SECONDS = float(os.environ.get("BULK_FETCH_TIMEOUT_SECONDS", str(45 * 60)))
 
+# How long reading a persisted session from MongoDB may take before it is given
+# up on. The caller is a button press, so the bound keeps an unreachable Mongo
+# from holding a whole callback - the per-user JSON file is checked first and
+# carries the same session.
+_SESSION_LOAD_TIMEOUT_SECONDS = 2.0
+
 
 # ── Bulk mode ────────────────────────────────────────────────────────────────
 # Each toggle maps to the same encoding the matching single-file action uses, so
@@ -554,8 +572,22 @@ def _metadata_caption(current_file: dict | None, fallback: str | None = None) ->
     return "media"
 
 
+def _session_lists_defaulted(data) -> dict | None:
+    """A persisted session with the list fields every caller indexes present.
+
+    One normalizer for both stores (the JSON file and MongoDB), because a session
+    that came from one of them missing ``merge_list`` used to be a ``KeyError``
+    waiting in whichever menu read it next.
+    """
+    if not isinstance(data, dict):
+        return None
+    data.setdefault("merge_list", [])
+    data.setdefault("bulk_list", [])
+    return data
+
+
 def _bulk_rename_filename(filename: str | None, settings: dict | None) -> tuple[str, bool]:
-    """Rename ``filename`` using the user's prefix/suffix/words-to-remove settings.
+    """Rename ``filename`` using the user's prefix/suffix settings.
 
     Returns ``(new_name, changed)``. The extension is always preserved.
     """
@@ -565,11 +597,7 @@ def _bulk_rename_filename(filename: str | None, settings: dict | None) -> tuple[
         return name, False
 
     settings = settings or {}
-    new_stem = stem
-    for word in settings.get("words_remove") or []:
-        if word:
-            new_stem = new_stem.replace(str(word), "")
-    new_stem = new_stem.strip() or stem
+    new_stem = stem.strip() or stem
     renamed = f"{settings.get('prefix') or ''}{new_stem}{settings.get('suffix') or ''}".strip() or new_stem
     new_name = f"{renamed}{ext}"
     return new_name, new_name != name
@@ -987,6 +1015,55 @@ def _user_audio_bitrate(user_id) -> str:
     return _DEFAULT_AUDIO_BITRATE
 
 
+def _user_compress_crf(user_id) -> int:
+    """The compress quality the user set in /usersettings, or the default CRF.
+
+    Stored under the same key the bulk picker writes (``COMPRESS_QUALITY_KEY``),
+    because the panel and the bulk menu are two views of one preference - so this
+    is the value the next bulk Compress uses when nothing else was picked.
+    """
+    try:
+        if user_settings:
+            return _sanitize_bulk_crf(user_settings.get_user_setting(user_id, COMPRESS_QUALITY_KEY))
+    except Exception:
+        logger.debug("handlers: could not read the compress quality preference for %s", user_id)
+    return _BULK_COMPRESS_CRF_DEFAULT
+
+
+def _user_optimize_preset(user_id) -> str:
+    """The optimize preset the user set in /usersettings, or the default one."""
+    try:
+        if user_settings:
+            return _sanitize_bulk_preset(user_settings.get_user_setting(user_id, OPTIMIZE_PRESET_KEY))
+    except Exception:
+        logger.debug("handlers: could not read the optimize preset preference for %s", user_id)
+    return _BULK_OPTIMIZE_DEFAULT
+
+
+def _user_slideshow_seconds(user_id) -> float:
+    """The slideshow length the user set in /usersettings, or the default.
+
+    Same key the bulk picker writes (``SLIDESHOW_SECONDS_KEY``): the panel and
+    the bulk menu are two views of one preference.
+    """
+    try:
+        if user_settings:
+            return _sanitize_bulk_slideshow_seconds(user_settings.get_user_setting(user_id, SLIDESHOW_SECONDS_KEY))
+    except Exception:
+        logger.debug("handlers: could not read the slideshow preference for %s", user_id)
+    return _BULK_SLIDESHOW_SECONDS
+
+
+def _user_bulk_extract_bitrate(user_id) -> str:
+    """The batch extraction bitrate the user set in /usersettings, or the default."""
+    try:
+        if user_settings:
+            return _sanitize_bulk_extract_bitrate(user_settings.get_user_setting(user_id, BULK_EXTRACT_BITRATE_KEY))
+    except Exception:
+        logger.debug("handlers: could not read the batch extract bitrate preference for %s", user_id)
+    return _BULK_EXTRACT_BITRATE_DEFAULT
+
+
 def _user_upload_mode(user_id) -> str:
     """How the user wants videos delivered: playable media or a document."""
     try:
@@ -1044,6 +1121,10 @@ SELECT_TIME, SELECT_RESOLUTION, SELECT_BITRATE, MERGE_FILES, CUSTOM_INPUT = rang
 
 
 class EnhancedMediaHandler:
+    # A class-level default so an instance that never ran ``__init__`` (a stub in a
+    # test, a restored object) still has somewhere to keep its session writes.
+    _session_writes: set = set()
+
     def __init__(self, max_concurrent_conversions: int = 5):
         if ExtendedMediaConverter is None:
             raise ImportError("ExtendedMediaConverter not available")
@@ -1060,6 +1141,8 @@ class EnhancedMediaHandler:
         self._active_conversion_count: dict[int, int] = {}  # user_id -> running count
         # Telemetry for malformed callbacks
         self.bad_callback_counts: dict[str, int] = {}
+        # In-flight background session writes, kept referenced until they finish.
+        self._session_writes = set()
 
         # Ensure session persistence directory exists for multi-worker setups
         self._session_store_dir = os.path.join(os.path.dirname(__file__), "storage", "temp_sessions")
@@ -1917,78 +2000,89 @@ class EnhancedMediaHandler:
             except Exception:
                 logger.exception("Failed to write local session file for %s", user_id)
 
-            # Persist to MongoDB asynchronously when available (best-effort)
-            try:
-                if getattr(self, "db_model", None):
-                    try:
-                        try:
-                            loop = asyncio.get_running_loop()
-                            asyncio.create_task(self.db_model.save_session(user_id, minimal))
-                        except RuntimeError:
-                            # No running loop — create one and run synchronously
-                            loop = asyncio.new_event_loop()
-                            with contextlib.suppress(Exception):
-                                loop.run_until_complete(self.db_model.save_session(user_id, minimal))
-                            loop.close()
-                    except Exception:
-                        logger.exception("Failed scheduling DB session save for %s", user_id)
-            except Exception:
-                logger.debug("No db_model available to persist session for %s", user_id)
+            # Persist to MongoDB when available (best-effort). The write is
+            # scheduled on the running loop, which is the loop the Motor client
+            # belongs to. A loop of this function's own (the old
+            # ``run_until_complete`` fallback) would fail the same way the session
+            # *read* used to - "got Future attached to a different loop" - so
+            # without a running loop the JSON file written above is the record and
+            # the Mongo write is skipped rather than attempted from the wrong loop.
+            model = getattr(self, "db_model", None)
+            if model is not None:
+                try:
+                    asyncio.get_running_loop()
+                except RuntimeError:
+                    logger.debug("No running loop for user %s; Mongo session save left to the JSON file", user_id)
+                else:
+                    self._schedule_session_save(model, user_id, minimal)
         except Exception:
             logger.exception("Failed to persist session for user %s", user_id)
 
-    def _load_persisted_session(self, user_id: int) -> dict | None:
-        """Load persisted session if available. Returns session dict or None."""
+    def _schedule_session_save(self, model, user_id: int, minimal: dict) -> None:
+        """Write a session to MongoDB in the background, on this loop.
+
+        The task is kept referenced until it finishes (an unreferenced task can be
+        collected mid-flight) and its exception is retrieved, so a Mongo that is
+        down is a debug line rather than a silent failure plus a "task exception
+        was never retrieved" warning at shutdown.
+        """
         try:
-            path = self._session_file(user_id)
-            if not os.path.exists(path):
-                # Try loading from MongoDB when available (best-effort)
-                try:
-                    if getattr(self, "db_model", None):
-                        try:
-                            import asyncio as _asyncio
-                            import queue
-                            import threading
-
-                            q = queue.Queue()
-
-                            def _runner():
-                                try:
-                                    # Wrap in wait_for to prevent thread pile-up
-                                    # when MongoDB is unreachable (connection timeout).
-                                    _timeout_coro = _asyncio.wait_for(
-                                        self.db_model.load_session(user_id),
-                                        timeout=2.0,
-                                    )
-                                    res = _asyncio.run(_timeout_coro)
-                                    q.put(res)
-                                except TimeoutError:
-                                    q.put(None)
-                                except Exception:
-                                    q.put(None)
-
-                            t = threading.Thread(target=_runner, daemon=True)
-                            t.start()
-                            try:
-                                res = q.get(timeout=3)
-                            except Exception:
-                                res = None
-                            return res
-                        except Exception:
-                            return None
-                except Exception:
-                    return None
-            with open(path, encoding="utf-8") as fh:
-                data = json.load(fh)
-            # Ensure merge_list present
-            if "merge_list" not in data:
-                data["merge_list"] = []
-            if "bulk_list" not in data:
-                data["bulk_list"] = []
-            return data
+            task = asyncio.create_task(model.save_session(user_id, minimal))
         except Exception:
-            logger.exception("Failed to load persisted session for user %s", user_id)
+            logger.exception("Failed to schedule the DB session save for %s", user_id)
+            return
+        self._session_writes.add(task)
+
+        def _finished(done) -> None:
+            self._session_writes.discard(done)
+            with contextlib.suppress(Exception):
+                error = done.exception()
+                if error is not None:
+                    logger.debug("Mongo session save failed for %s: %s", user_id, error)
+
+        task.add_done_callback(_finished)
+
+    async def _load_persisted_session(self, user_id: int) -> dict | None:
+        """Load a persisted session: the local file first, then MongoDB.
+
+        Awaited on the loop the MongoDB client lives on, never from a thread with
+        an ``asyncio.run`` loop of its own. A Motor client is bound to the loop it
+        was created on, so a read from any other loop raises "got Future attached
+        to a different loop" - and because that failure was swallowed, every user
+        it happened to was answered "Session expired. Please send a file first."
+        with their session sitting in Mongo the whole time.
+
+        The JSON file is preferred (no network in the way) and a slow or
+        unreachable Mongo is abandoned after ``_SESSION_LOAD_TIMEOUT_SECONDS``,
+        because the caller is a button press: a menu must not hang on the
+        database, and the file next to it is the same session anyway.
+        """
+        path = self._session_file(user_id)
+        if os.path.exists(path):
+            try:
+                with open(path, encoding="utf-8") as fh:
+                    return _session_lists_defaulted(json.load(fh))
+            except Exception:
+                # An unreadable file is not a lost session: the database may still
+                # hold one, so the read continues instead of reporting nothing.
+                logger.exception("Failed to read the session file for user %s; asking MongoDB", user_id)
+
+        model = getattr(self, "db_model", None)
+        if model is None or not hasattr(model, "load_session"):
             return None
+        try:
+            stored = await asyncio.wait_for(model.load_session(user_id), timeout=_SESSION_LOAD_TIMEOUT_SECONDS)
+        except TimeoutError:
+            logger.warning(
+                "Session load for user %s timed out after %.0fs; the JSON file is the only record",
+                user_id,
+                _SESSION_LOAD_TIMEOUT_SECONDS,
+            )
+            return None
+        except Exception:
+            logger.exception("Failed to load the persisted session for user %s from MongoDB", user_id)
+            return None
+        return _session_lists_defaulted(stored)
 
     async def _run_with_concurrency_limit(self, user_id: int, task_name: str, coroutine):
         """Run a conversion task with concurrency limiting.
@@ -2426,8 +2520,11 @@ class EnhancedMediaHandler:
 
         A part is ordinary media, so it goes out the way every other result of
         these buttons does: the user's upload preference decides whether a video is
-        a playable video or a document, the original names are kept, and a part too
-        big for the Bot API travels the same large-file path as anything else.
+        a playable video or a document, the original names are kept.
+
+        Parts that exceed BOT_API_MAX_MB are routed through the big-file delivery
+        path (Pyrogram userbot -> direct MTProto send) rather than the Bot API, so
+        a large part does not fail with "Could not send part i/N".
 
         The parts are sent in order and one at a time on purpose - each one is a
         complete file the user can start watching while the next is still being
@@ -2450,37 +2547,121 @@ class EnhancedMediaHandler:
             # here can fall back to naming a part after an output path.
             part_name = _split_part_name(current_file, part, index, total)
             try:
-                if as_audio:
-                    # The media's own title/performer travel to every part, so the
-                    # metadata the source carried is preserved - with the part
-                    # number added, because otherwise Telegram's player shows the
-                    # same title for all of them.
-                    _title, _performer = _source_media_tags(current_file)
-                    if _title:
-                        _title = f"{_title} ({label})"
-                    await self._send_audio_result(
-                        context.bot,
-                        chat_id,
-                        part,
-                        caption=caption,
-                        title=_title or os.path.splitext(part_name)[0],
-                        performer=_performer or None,
-                        filename=part_name,
+                # Check if this part exceeds the Bot API limit - if so, use userbot
+                part_size = os.path.getsize(part) if os.path.exists(part) else 0
+                if part_size > config.BOT_API_MAX_BYTES and ENABLE_USERBOT:
+                    # Route large parts through userbot for direct MTProto delivery
+                    sent_ok = await self._send_part_via_userbot(
+                        chat_id, part, caption, part_name, as_audio, current_file, label
                     )
+                    if sent_ok:
+                        sent += 1
+                    else:
+                        logger.exception("handlers: could not send %s (%s) via userbot", label, part)
+                        await update.message.reply_text(f"⚠️ Could not send {label}.")
                 else:
-                    await self._send_video_result(
-                        context.bot,
-                        chat_id,
-                        part,
-                        caption=caption,
-                        delivery_name=part_name,
-                        upload_mode=upload_mode,
-                    )
-                sent += 1
+                    if as_audio:
+                        # The media's own title/performer travel to every part, so the
+                        # metadata the source carried is preserved - with the part
+                        # number added, because otherwise Telegram's player shows the
+                        # same title for all of them.
+                        _title, _performer = _source_media_tags(current_file)
+                        if _title:
+                            _title = f"{_title} ({label})"
+                        await self._send_audio_result(
+                            context.bot,
+                            chat_id,
+                            part,
+                            caption=caption,
+                            title=_title or os.path.splitext(part_name)[0],
+                            performer=_performer or None,
+                            filename=part_name,
+                        )
+                    else:
+                        await self._send_video_result(
+                            context.bot,
+                            chat_id,
+                            part,
+                            caption=caption,
+                            delivery_name=part_name,
+                            upload_mode=upload_mode,
+                        )
+                    sent += 1
             except Exception:
                 logger.exception("handlers: could not send %s (%s)", label, part)
                 await update.message.reply_text(f"⚠️ Could not send {label}.")
         return sent
+
+    async def _send_part_via_userbot(
+        self,
+        chat_id: int,
+        file_path: str,
+        caption: str,
+        delivery_name: str,
+        as_audio: bool,
+        current_file: dict,
+        label: str,
+    ) -> bool:
+        """Send a split part via userbot (MTProto) for files exceeding Bot API limits.
+
+        This is the large-file delivery path for split parts: when a part exceeds
+        BOT_API_MAX_MB, the Bot API cannot deliver it, so we use Pyrogram/Telethon
+        to send it directly via MTProto, which has no size limit.
+
+        Returns True on success, False on failure.
+        """
+        from utils.userbot_uploader import send_file_via_userbot
+
+        _media_kind = "audio" if as_audio else "video"
+        _thumb_path = None
+
+        # Probe metadata for video parts (audio doesn't need video metadata)
+        if not as_audio and os.path.exists(file_path):
+            try:
+                from utils.ffmpeg_runner import probe_video_for_delivery
+                _meta, _auto_thumb = await probe_video_for_delivery(file_path)
+                if _auto_thumb and os.path.exists(_auto_thumb):
+                    _thumb_path = _auto_thumb
+            except Exception:
+                logger.debug("handlers: probe_video_for_delivery failed for userbot send")
+
+        # Build audio metadata if needed
+        _audio_meta = None
+        if as_audio:
+            _title, _performer = _source_media_tags(current_file)
+            if _title:
+                _title = f"{_title} ({label})"
+            _audio_meta = {
+                "duration": None,  # Will be probed by send_file_via_userbot if needed
+                "title": _title or os.path.splitext(delivery_name)[0],
+                "performer": _performer or None,
+            }
+
+        try:
+            msg_id = await send_file_via_userbot(
+                chat_id=chat_id,
+                file_path=file_path,
+                caption=caption,
+                media_kind=_media_kind,
+                delivery_name=delivery_name,
+                video_meta=None,  # Will be probed inside
+                thumb_path=_thumb_path,
+                audio_meta=_audio_meta,
+                user_id=None,  # Use default userbot session
+                as_document=False if not as_audio else False,  # Audio should be sent as audio
+            )
+            if msg_id:
+                logger.info("handlers: sent %s via userbot (msg_id=%s)", label, msg_id)
+                return True
+            return False
+        except Exception:
+            logger.exception("handlers: userbot send failed for %s", label)
+            return False
+        finally:
+            # Cleanup thumbnail if we created one
+            if _thumb_path and os.path.exists(_thumb_path):
+                with contextlib.suppress(Exception):
+                    os.remove(_thumb_path)
 
     async def _handle_split_request(
         self,
@@ -2519,15 +2700,50 @@ class EnhancedMediaHandler:
         # better answer for which delivery to use.
         as_audio = kind == "audio" or ext in _AUDIO_SPLIT_EXTS
 
+        # Metered like the trimmer, and checked before the source is resolved: a
+        # rate-limited user must not start a download - or a stream copy - at all.
+        if not await self._check_conversion_quota(update, context):
+            return
+
         source_path = await self._split_local_source(current_file)
+        fetch_error = ""
         if not source_path:
+            # A media the user just sent is registered *lazily*: the upload was
+            # not downloaded, and nothing was streamed to the bucket either,
+            # because the bytes are only fetched when an action needs them.
+            # Every other action asks for that fetch here (see
+            # ``_ensure_current_file_downloaded``); the splitter used to skip
+            # the step and answer a fresh upload with "send the media again".
+            fetching = None
+            with contextlib.suppress(Exception):
+                fetching = await update.message.reply_text("⬇️ Fetching the media to split…")
+            try:
+                await self._ensure_current_file_downloaded(update, context, session)
+            except Exception as exc:
+                fetch_error = str(exc) or exc.__class__.__name__
+                logger.exception("handlers: could not fetch the source to split")
+            current_file = (session or {}).get("current_file") or current_file
+            source_path = await self._split_local_source(current_file)
+            if fetching is not None:
+                with contextlib.suppress(Exception):
+                    await fetching.delete()
+        if not source_path:
+            detail = f"\n`{fetch_error}`" if fetch_error else ""
             await update.message.reply_text(
-                "❌ The source file is no longer on disk. Send the media again and press the split button."
+                "❌ I could not get the source file to split it."
+                + detail
+                + "\nSend the media again and press the split button."
             )
             return
 
-        if mode == "parts":
+        # Known for the part-based modes: a *copy* can only cut on the source's
+        # keyframes, so the length that comes back is not always the one that was
+        # asked for, and the reply has to say so rather than claim a length ffmpeg
+        # never produced. A single range is one cut and needs no length of its own.
+        duration = 0.0
+        if mode != "range":
             duration = await self._split_source_duration(current_file, source_path)
+        if mode == "parts":
             try:
                 seconds = segment_seconds_for_parts(duration, int(value))
             except ValueError:
@@ -2571,16 +2787,64 @@ class EnhancedMediaHandler:
                     await update.message.reply_text(text)
                 return
 
+            # The split produced parts - optionally filter out obviously broken tail parts.
+            # MP3 frame quantization can produce a final part that is just 1-2 frames
+            # (e.g. 879 bytes = ~52ms of audio at 128kbps) which is unreadable noise,
+            # not real content. A 0.5s tail (~8KB at 128kbps) is real and must be kept.
+            #
+            # We detect junk by checking if the part is both tiny AND the last part:
+            # - Real short tails are meaningful content the user asked for (e.g. 10.5s 
+            #   video split into 10s parts gives a 0.5s final part).
+            # - Junk tails are frame quantization artifacts: too small to be useful.
+            #
+            # Threshold: <1KB AND is the last part AND audio → likely junk.
+            # Video parts are never filtered (keyframe alignment is the constraint there).
+            _junk_threshold_bytes = 1024  # 1KB: below this for audio tail, likely frame quantization noise
+            _junk_parts = []
+            if as_audio and parts:
+                _last_part = parts[-1]
+                _last_size = os.path.getsize(_last_part) if os.path.exists(_last_part) else 0
+                _last_ext = os.path.splitext(_last_part)[1].lower()
+                if _last_size < _junk_threshold_bytes and _last_ext in _AUDIO_SPLIT_EXTS:
+                    _junk_parts = [_last_part]
+                    logger.info(
+                        "handlers: split produced a junk MP3 tail part (<1KB, last part) - not delivering: %s",
+                        _split_part_name(current_file, _last_part, len(parts), len(parts)),
+                    )
+            _delivery_parts = [p for p in parts if p not in _junk_parts]
+            _junk_count = len(_junk_parts)
+
             sent = await self._deliver_split_parts(
-                update, context, current_file, parts, status_message=status_message, as_audio=as_audio
+                update, context, current_file, _delivery_parts, status_message=status_message, as_audio=as_audio
             )
+
             if mode == "range":
                 summary = f"✅ Cut {format_clock(value)}–{format_clock(float(end or 0))} out and sent it."
+            elif len(parts) == 1 and duration > seconds * 1.05:
+                # One part for a media that is *longer* than the part length: the
+                # cut was impossible, not unnecessary. Saying "the file is shorter
+                # than one part" here was simply false (a 24s video whose only
+                # keyframe is the first one comes back whole for "5s parts").
+                summary = (
+                    f"✅ The whole file was sent as it is: it is {format_clock(duration)} long and its next "
+                    f"keyframe is farther away than {format_clock(seconds)}. Without re-encoding a split can only "
+                    "cut on a keyframe, so there was nowhere to cut - ask for a longer part."
+                )
             elif len(parts) == 1:
                 # The media is shorter than the part length: nothing to cut.
                 summary = "✅ The file is shorter than one part, so it was sent as it is."
             else:
-                summary = f"✅ Split into {len(parts)} parts of {format_clock(seconds)}, sent {sent} in order."
+                # Say when the count is short of what was asked, because that is
+                # the same keyframe rule showing up again: with no keyframe at the
+                # target the previous part simply keeps going.
+                whole, remainder = divmod(duration, seconds) if seconds else (0, 0)
+                expected = max(1, int(whole) + (1 if remainder else 0))
+                delivered = len(parts) - _junk_count
+                summary = f"✅ Split into {len(parts)} parts of {format_clock(seconds)}, sent {delivered} in order."
+                if _junk_count > 0:
+                    summary += f"\n(Filtered { _junk_count} junk tail part(s) - MP3 frame quantization noise, not real content.)"
+                if duration > 0 and len(parts) < expected:
+                    summary += f"\n(You asked for {expected}: cuts land on the source's keyframes, so the parts came out longer.)"
             if status_message is not None:
                 with contextlib.suppress(Exception):
                     await status_message.edit_text(summary)
@@ -4695,32 +4959,52 @@ class EnhancedMediaHandler:
         context.user_data["settings_page"] = 1
 
     def _settings_view(self, user_id, page: int = 1) -> tuple[str, InlineKeyboardMarkup]:
-        """``(text, markup)`` for one page of the /usersettings panel."""
+        """``(text, markup)`` for one page of the /usersettings panel.
+
+        The page number is clamped through the shared pager, so every page the
+        keyboard offers has text here and every text here has a page - a page
+        cannot be reached by a button that renders something else.
+        """
         s = user_settings.get_user_settings(user_id) if user_settings else {}
-        page = 2 if int(page or 1) == 2 else 1
-        if page == 2:
-            bitrate = _sanitize_audio_bitrate(s.get("audio_bitrate"))
+        page = settings_page_number(page)
+        if page == 3:
+            seconds = _sanitize_bulk_slideshow_seconds(s.get(SLIDESHOW_SECONDS_KEY))
+            extract = _sanitize_bulk_extract_bitrate(s.get(BULK_EXTRACT_BITRATE_KEY))
             text = (
-                "🎧 <b>Your Settings — Audio</b>\n\n"
-                f"• Bitrate : <b>{bitrate}</b>\n\n"
-                "<i>Used whenever audio is converted without a quality of its own "
-                "(Video To Audio, Normalize, Bitrate). Picking a value here only "
-                "stores it — nothing is converted.</i>"
+                f"📦 <b>Your Settings — Batch</b> ({page}/{SETTINGS_PAGE_COUNT})\n\n"
+                f"• Slideshow : <b>{seconds:g}s</b> per photo\n"
+                f"• Batch Extract Bitrate : <b>{extract}</b>\n\n"
+                "<i>What a multi-file \u25b6\ufe0f Apply Bulk produces: the length of each "
+                "photo when two or more photos become one slideshow video, and the "
+                "quality of the audio it pulls out of videos. Picking a value here "
+                "only stores it — nothing is converted.</i>"
+            )
+        elif page == 2:
+            bitrate = _sanitize_audio_bitrate(s.get("audio_bitrate"))
+            crf = _sanitize_bulk_crf(s.get(COMPRESS_QUALITY_KEY))
+            preset = _sanitize_bulk_preset(s.get(OPTIMIZE_PRESET_KEY))
+            text = (
+                f"🎧 <b>Your Settings — Quality</b> ({page}/{SETTINGS_PAGE_COUNT})\n\n"
+                f"• Compress Quality : <b>{compress_quality_label(crf)}</b> (CRF {crf})\n"
+                f"• Optimize Preset : <b>{BULK_PRESET_LABELS.get(preset, preset.title())}</b>\n"
+                f"• Audio Bitrate : <b>{bitrate}</b>\n\n"
+                "<i>What a conversion starts from when nothing was picked for the "
+                "file itself (Compress, Optimize, Video To Audio, Normalize, "
+                "Bitrate, Apply Bulk). Picking a value here only stores it — "
+                "nothing is converted.</i>"
             )
         else:
             mode = str(s.get("upload_mode") or _UPLOAD_MODE_VIDEO).lower()
             if mode not in _UPLOAD_MODES:
                 mode = _UPLOAD_MODE_VIDEO
-            words = s.get("words_remove") or []
             text = (
-                "⚙️ <b>Your Settings — General</b>\n\n"
+                f"⚙️ <b>Your Settings — General</b> ({page}/{SETTINGS_PAGE_COUNT})\n\n"
                 f"• Upload as Video : {'preview' if mode == _UPLOAD_MODE_VIDEO else 'document'}\n"
                 f"• Custom Thumbnail : {'On' if s.get('use_custom_thumbnail') else 'Off'}\n"
                 f"• Rename prefix : {html.escape(str(s.get('prefix') or '(none)'))}\n"
-                f"• Rename suffix : {html.escape(str(s.get('suffix') or '(none)'))}\n"
-                f"• Words to remove : {html.escape(', '.join(words)) if words else '(none)'}\n\n"
-                "<i>Each option is stored and applied to your next conversion — "
-                "none of them start one.</i>"
+                f"• Rename suffix : {html.escape(str(s.get('suffix') or '(none)'))}\n\n"
+                "<i>Each option is stored and applied to your next delivery — "
+                "none of them start a conversion.</i>"
             )
         return text, MediaMenuBuilder.get_settings_page(page, s)
 
@@ -5542,8 +5826,6 @@ class EnhancedMediaHandler:
         try:
             if user_settings:
                 s = user_settings.get_user_settings(user_id)
-                for w in s.get("words_remove") or []:
-                    final_name = final_name.replace(w, "")
                 final_name = final_name.strip()
                 if not os.path.splitext(final_name)[1]:
                     final_name += ext
@@ -5708,8 +5990,6 @@ class EnhancedMediaHandler:
         try:
             if user_settings:
                 s = user_settings.get_user_settings(user_id)
-                for w in s.get("words_remove") or []:
-                    final_name = final_name.replace(w, "")
                 final_name = final_name.strip()
                 if not os.path.splitext(final_name)[1] and file_ext:
                     final_name += file_ext
@@ -6191,7 +6471,7 @@ class EnhancedMediaHandler:
             # Ensure session exists
             if user_id not in self.user_sessions:
                 # Try to load persisted session (useful when running multiple workers)
-                persisted = self._load_persisted_session(user_id)
+                persisted = await self._load_persisted_session(user_id)
                 if persisted:
                     # If the persisted apply guard is older than the guard window,
                     # treat it as expired and clear it to avoid a stale lock.
@@ -6262,10 +6542,12 @@ class EnhancedMediaHandler:
                 await self.convert_to_mp3(update, context, session, bitrate=quality)
 
             elif data == "compress_menu":
+                # The user's stored quality is marked "(default)": this menu still
+                # applies whatever is picked here to this file only.
                 await self.safe_edit(
                     query,
                     "📉 **Compression Options**\nSelect quality preset:",
-                    reply_markup=MediaMenuBuilder.get_compression_menu(),
+                    reply_markup=MediaMenuBuilder.get_compression_menu(_user_compress_crf(user_id)),
                 )
 
             elif isinstance(data, str) and data.startswith("compress_"):
@@ -6354,7 +6636,7 @@ class EnhancedMediaHandler:
                 await self.safe_edit(
                     query,
                     "⚡ **Optimize Video**\nSelect optimization preset:",
-                    reply_markup=MediaMenuBuilder.get_optimize_menu(),
+                    reply_markup=MediaMenuBuilder.get_optimize_menu(_user_optimize_preset(user_id)),
                 )
 
             elif data == "optimize_custom":
@@ -7671,6 +7953,105 @@ class EnhancedMediaHandler:
                             parse_mode="HTML",
                         )
 
+            elif data.startswith("settings_set_quality:"):
+                # Store the chosen compress quality (or arm the custom prompt).
+                value = data.split(":", 1)[1]
+                if user_settings is None:
+                    await self.safe_edit(query, "⚠️ Settings not available.")
+                elif value == "custom":
+                    for key in list(context.user_data.keys()):
+                        if key.startswith("awaiting_"):
+                            del context.user_data[key]
+                    context.user_data["awaiting_settings_quality"] = True
+                    await self.safe_edit(
+                        query,
+                        f"✏️ Send the quality (CRF {_BULK_COMPRESS_CRF_MIN}-{_BULK_COMPRESS_CRF_MAX}, "
+                        "e.g. 23 — lower means better quality):",
+                    )
+                else:
+                    crf = _parse_bulk_crf(value)
+                    if crf is None:
+                        await self.safe_edit(query, "⚠️ Invalid quality option.")
+                    else:
+                        user_settings.set_user_setting(user_id, COMPRESS_QUALITY_KEY, crf)
+                        await self.safe_edit(
+                            query,
+                            f"✅ Compress quality set to <b>{compress_quality_label(crf)}</b> (CRF {crf}).",
+                            reply_markup=MediaMenuBuilder.get_settings_quality_menu(crf),
+                            parse_mode="HTML",
+                        )
+
+            elif data.startswith("settings_set_slideshow:"):
+                # Store the chosen slideshow length (or arm the custom prompt).
+                value = data.split(":", 1)[1]
+                if user_settings is None:
+                    await self.safe_edit(query, "⚠️ Settings not available.")
+                elif value == "custom":
+                    for key in list(context.user_data.keys()):
+                        if key.startswith("awaiting_"):
+                            del context.user_data[key]
+                    context.user_data["awaiting_settings_slideshow"] = True
+                    await self.safe_edit(
+                        query,
+                        f"✏️ Send the seconds per photo ({_BULK_SLIDESHOW_MIN:g}-{_BULK_SLIDESHOW_MAX:g}, e.g. 4):",
+                    )
+                else:
+                    seconds = _sanitize_bulk_slideshow_seconds(value, default=0)
+                    if not seconds:
+                        await self.safe_edit(query, "⚠️ Invalid slideshow option.")
+                    else:
+                        user_settings.set_user_setting(user_id, SLIDESHOW_SECONDS_KEY, seconds)
+                        await self.safe_edit(
+                            query,
+                            f"✅ Slideshow set to <b>{seconds:g}s</b> per photo.",
+                            reply_markup=MediaMenuBuilder.get_settings_slideshow_menu(seconds),
+                            parse_mode="HTML",
+                        )
+
+            elif data.startswith("settings_set_bulk_bitrate:"):
+                # Store the chosen batch extraction bitrate (or arm the custom prompt).
+                value = data.split(":", 1)[1]
+                if user_settings is None:
+                    await self.safe_edit(query, "⚠️ Settings not available.")
+                elif value == "custom":
+                    for key in list(context.user_data.keys()):
+                        if key.startswith("awaiting_"):
+                            del context.user_data[key]
+                    context.user_data["awaiting_settings_bulk_bitrate"] = True
+                    await self.safe_edit(
+                        query,
+                        f"✏️ Send the batch extract bitrate ({_AUDIO_BITRATE_MIN_KBPS}k-"
+                        f"{_AUDIO_BITRATE_MAX_KBPS}k, e.g. 128k):",
+                    )
+                else:
+                    bitrate = _sanitize_audio_bitrate(value, default="")
+                    if not bitrate:
+                        await self.safe_edit(query, "⚠️ Invalid bitrate option.")
+                    else:
+                        user_settings.set_user_setting(user_id, BULK_EXTRACT_BITRATE_KEY, bitrate)
+                        await self.safe_edit(
+                            query,
+                            f"✅ Batch extract bitrate set to <b>{bitrate}</b>.",
+                            reply_markup=MediaMenuBuilder.get_settings_bulk_bitrate_menu(bitrate),
+                            parse_mode="HTML",
+                        )
+
+            elif data.startswith("settings_set_preset:"):
+                # Store the chosen optimize preset.
+                preset = data.split(":", 1)[1].strip().lower()
+                if user_settings is None:
+                    await self.safe_edit(query, "⚠️ Settings not available.")
+                elif preset not in _BULK_OPTIMIZE_PRESETS:
+                    await self.safe_edit(query, "⚠️ Invalid optimize preset.")
+                else:
+                    user_settings.set_user_setting(user_id, OPTIMIZE_PRESET_KEY, preset)
+                    await self.safe_edit(
+                        query,
+                        f"✅ Optimize preset set to <b>{BULK_PRESET_LABELS.get(preset, preset.title())}</b>.",
+                        reply_markup=MediaMenuBuilder.get_settings_preset_menu(preset),
+                        parse_mode="HTML",
+                    )
+
             elif data.startswith("settings_upload_mode:"):
                 # Video delivery format: playable media (preview) or document.
                 mode = data.split(":", 1)[1].strip().lower()
@@ -7733,42 +8114,55 @@ class EnhancedMediaHandler:
                         parse_mode="HTML",
                     )
 
-            elif data == "settings_words_menu":
-                if user_settings is None:
-                    await self.safe_edit(query, "⚠️ Settings not available.")
-                else:
-                    s = user_settings.get_user_settings(user_id)
-                    words = s.get("words_remove") or []
-                    _list = html.escape(", ".join(words)) if words else "(none)"
-                    await self.safe_edit(
-                        query,
-                        "🧹 <b>Words To Remove</b>\n\n"
-                        f"• Current : {_list}\n\n"
-                        "<i>Stripped out of every delivered filename.</i>",
-                        reply_markup=MediaMenuBuilder.get_settings_words_menu(s),
-                        parse_mode="HTML",
-                    )
+            elif data == "settings_quality_menu":
+                # Compress-quality preference. Stored under the key the bulk
+                # picker uses, so the panel and the bulk menu cannot disagree.
+                current = _user_compress_crf(user_id)
+                await self.safe_edit(
+                    query,
+                    "🎚️ <b>Compress Quality</b>\n\n"
+                    f"Current: <b>{compress_quality_label(current)}</b> (CRF {current})\n"
+                    "<i>Lower CRF means better quality and a larger file. This is "
+                    "what the next Compress and Apply Bulk start from.</i>",
+                    reply_markup=MediaMenuBuilder.get_settings_quality_menu(current),
+                    parse_mode="HTML",
+                )
 
-            elif data == "settings_add_word" or data == "settings_remove_word":
-                action = "add" if data.endswith("add_word") else "remove"
-                for key in list(context.user_data.keys()):
-                    if key.startswith("awaiting_"):
-                        del context.user_data[key]
-                context.user_data[f"awaiting_settings_word_{action}"] = True
-                await self.safe_edit(query, f"✏️ Send the word to {action}:")
+            elif data == "settings_slideshow_menu":
+                # Slideshow preference. Stored under the key the bulk picker
+                # writes, so the panel and the bulk menu cannot disagree.
+                current = _user_slideshow_seconds(user_id)
+                await self.safe_edit(
+                    query,
+                    "🎞️ <b>Slideshow</b>\n\n"
+                    f"Current: <b>{current:g}s</b> per photo\n"
+                    "<i>Applied when two or more photos are queued in a batch — they "
+                    "become one slideshow video.</i>",
+                    reply_markup=MediaMenuBuilder.get_settings_slideshow_menu(current),
+                    parse_mode="HTML",
+                )
 
-            elif data == "settings_clear_words":
-                if user_settings is None:
-                    await self.safe_edit(query, "⚠️ Settings not available.")
-                else:
-                    user_settings.set_user_setting(user_id, "words_remove", [])
-                    text, markup = self._settings_view(user_id, 1)
-                    await self.safe_edit(
-                        query,
-                        "✅ Words list cleared.\n\n" + text,
-                        reply_markup=markup,
-                        parse_mode="HTML",
-                    )
+            elif data == "settings_bulk_bitrate_menu":
+                current = _user_bulk_extract_bitrate(user_id)
+                await self.safe_edit(
+                    query,
+                    "🎵 <b>Batch Extract Bitrate</b>\n\n"
+                    f"Current: <b>{current}</b>\n"
+                    "<i>Applied when Apply Bulk pulls the audio out of a video.</i>",
+                    reply_markup=MediaMenuBuilder.get_settings_bulk_bitrate_menu(current),
+                    parse_mode="HTML",
+                )
+
+            elif data == "settings_preset_menu":
+                current = _user_optimize_preset(user_id)
+                await self.safe_edit(
+                    query,
+                    "⚡ <b>Optimize Preset</b>\n\n"
+                    f"Current: <b>{BULK_PRESET_LABELS.get(current, current.title())}</b>\n"
+                    "<i>What the next Optimize and Apply Bulk start from.</i>",
+                    reply_markup=MediaMenuBuilder.get_settings_preset_menu(current),
+                    parse_mode="HTML",
+                )
 
             elif isinstance(data, str) and data.startswith("toggle_"):
                 # toggle_<key>
@@ -10027,10 +10421,122 @@ class EnhancedMediaHandler:
             return
         await self.handle_custom_input(update, context)
 
+    async def _handle_settings_prompt(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE, user_id, user_input: str
+    ) -> bool:
+        """/usersettings prompts: store one preference and say so.
+
+        Returns True when this message was one of them, so the caller stops there -
+        a settings value must never fall through to a conversion.
+
+        Answering these is deliberately ahead of the session guard in
+        ``handle_custom_input``: a preference belongs to the *user*, and the panel
+        renders with no file loaded at all, so its prompts have to be answerable in
+        exactly that state. Behind the guard, a custom bitrate typed on a fresh
+        bot answered "Session expired. Please send a file first." and the value was
+        silently dropped.
+        """
+        pending = next(
+            (
+                flag
+                for flag in (
+                    "awaiting_settings_bitrate",
+                    "awaiting_settings_quality",
+                    "awaiting_settings_slideshow",
+                    "awaiting_settings_bulk_bitrate",
+                    "awaiting_settings_prefix",
+                    "awaiting_settings_suffix",
+                )
+                if context.user_data.get(flag)
+            ),
+            None,
+        )
+        if pending is None:
+            return False
+
+        text_value = user_input.strip()
+        if user_settings is None:
+            await update.message.reply_text("⚠️ Settings backend not available.")
+        elif pending == "awaiting_settings_bitrate":
+            parsed = _sanitize_audio_bitrate(text_value, default="")
+            if parsed:
+                user_settings.set_user_setting(user_id, "audio_bitrate", parsed)
+                await update.message.reply_text(
+                    f"✅ Audio bitrate set to {parsed}.",
+                    reply_markup=MediaMenuBuilder.get_settings_bitrate_menu(parsed),
+                )
+            else:
+                await update.message.reply_text(
+                    f"❌ Invalid bitrate. Use a value between {_AUDIO_BITRATE_MIN_KBPS}k and"
+                    f" {_AUDIO_BITRATE_MAX_KBPS}k (e.g. 128k)."
+                )
+        elif pending == "awaiting_settings_quality":
+            # Out-of-range input is refused outright rather than silently stored as
+            # the default, so the number the user typed and the number ffmpeg gets
+            # agree.
+            crf = _parse_bulk_crf(text_value)
+            if crf is None:
+                await update.message.reply_text(
+                    f"❌ Invalid quality. Send a CRF between {_BULK_COMPRESS_CRF_MIN} and"
+                    f" {_BULK_COMPRESS_CRF_MAX} (e.g. 23)."
+                )
+            else:
+                user_settings.set_user_setting(user_id, COMPRESS_QUALITY_KEY, crf)
+                await update.message.reply_text(
+                    f"✅ Compress quality set to {compress_quality_label(crf)} (CRF {crf}).",
+                    reply_markup=MediaMenuBuilder.get_settings_quality_menu(crf),
+                )
+        elif pending == "awaiting_settings_slideshow":
+            seconds = _sanitize_bulk_slideshow_seconds(text_value, default=0)
+            if not seconds:
+                await update.message.reply_text(
+                    f"❌ Invalid length. Send seconds between {_BULK_SLIDESHOW_MIN:g} and"
+                    f" {_BULK_SLIDESHOW_MAX:g} (e.g. 4)."
+                )
+            else:
+                user_settings.set_user_setting(user_id, SLIDESHOW_SECONDS_KEY, seconds)
+                await update.message.reply_text(
+                    f"✅ Slideshow set to {seconds:g}s per photo.",
+                    reply_markup=MediaMenuBuilder.get_settings_slideshow_menu(seconds),
+                )
+        elif pending == "awaiting_settings_bulk_bitrate":
+            bitrate = _sanitize_audio_bitrate(text_value, default="")
+            if not bitrate:
+                await update.message.reply_text(
+                    f"❌ Invalid bitrate. Use a value between {_AUDIO_BITRATE_MIN_KBPS}k and"
+                    f" {_AUDIO_BITRATE_MAX_KBPS}k (e.g. 128k)."
+                )
+            else:
+                user_settings.set_user_setting(user_id, BULK_EXTRACT_BITRATE_KEY, bitrate)
+                await update.message.reply_text(
+                    f"✅ Batch extract bitrate set to {bitrate}.",
+                    reply_markup=MediaMenuBuilder.get_settings_bulk_bitrate_menu(bitrate),
+                )
+        else:
+            which = "prefix" if pending.endswith("prefix") else "suffix"
+            # "-" is the documented way to clear one without retyping the other.
+            value = "" if text_value in ("-", "") else text_value
+            user_settings.set_user_setting(user_id, which, value)
+            _state = user_settings.get_user_settings(user_id)
+            await update.message.reply_text(
+                f"✅ Filename {which} set to {value or '(none)'}.",
+                reply_markup=MediaMenuBuilder.get_settings_rename_menu(_state),
+            )
+
+        for key in list(context.user_data.keys()):
+            if key.startswith("awaiting_"):
+                del context.user_data[key]
+        return True
+
     async def handle_custom_input(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle custom user input for various operations."""
         user_input = update.message.text.strip()
         user_id = update.effective_user.id
+
+        # Preference prompts are answered first, and before the session guard
+        # below - see _handle_settings_prompt for why.
+        if await self._handle_settings_prompt(update, context, user_id, user_input):
+            return ConversationHandler.END
 
         if user_id not in self.user_sessions:
             await update.message.reply_text("❌ Session expired. Please send a file first.")
@@ -10113,73 +10619,6 @@ class EnhancedMediaHandler:
                 await update.message.reply_text(f"❌ {e}")
                 return
 
-        # /usersettings prompts. Every one of these only stores a preference and
-        # re-renders the panel — they must never fall through to a conversion, so
-        # they return before the action prompts below are considered.
-        _settings_prompt = next(
-            (
-                flag
-                for flag in (
-                    "awaiting_settings_bitrate",
-                    "awaiting_settings_prefix",
-                    "awaiting_settings_suffix",
-                    "awaiting_settings_word_add",
-                    "awaiting_settings_word_remove",
-                )
-                if context.user_data.get(flag)
-            ),
-            None,
-        )
-        if _settings_prompt is not None:
-            text_value = user_input.strip()
-            if user_settings is None:
-                await update.message.reply_text("⚠️ Settings backend not available.")
-            elif _settings_prompt == "awaiting_settings_bitrate":
-                parsed = _sanitize_audio_bitrate(text_value, default="")
-                if parsed:
-                    user_settings.set_user_setting(user_id, "audio_bitrate", parsed)
-                    await update.message.reply_text(
-                        f"✅ Audio bitrate set to {parsed}.",
-                        reply_markup=MediaMenuBuilder.get_settings_bitrate_menu(parsed),
-                    )
-                else:
-                    await update.message.reply_text(
-                        f"❌ Invalid bitrate. Use a value between {_AUDIO_BITRATE_MIN_KBPS}k and"
-                        f" {_AUDIO_BITRATE_MAX_KBPS}k (e.g. 128k)."
-                    )
-            elif _settings_prompt in ("awaiting_settings_prefix", "awaiting_settings_suffix"):
-                which = "prefix" if _settings_prompt.endswith("prefix") else "suffix"
-                # "-" is the documented way to clear one without retyping the other.
-                value = "" if text_value in ("-", "") else text_value
-                user_settings.set_user_setting(user_id, which, value)
-                _state = user_settings.get_user_settings(user_id)
-                await update.message.reply_text(
-                    f"✅ Filename {which} set to {value or '(none)'}.",
-                    reply_markup=MediaMenuBuilder.get_settings_rename_menu(_state),
-                )
-            else:
-                adding = _settings_prompt == "awaiting_settings_word_add"
-                state = user_settings.get_user_settings(user_id)
-                words = list(state.get("words_remove") or [])
-                if adding:
-                    if text_value and text_value not in words:
-                        words.append(text_value)
-                        user_settings.set_user_setting(user_id, "words_remove", words)
-                        await update.message.reply_text(f"✅ Added word to remove: {text_value}")
-                    else:
-                        await update.message.reply_text("⚠️ Word empty or already present.")
-                elif text_value in words:
-                    words.remove(text_value)
-                    user_settings.set_user_setting(user_id, "words_remove", words)
-                    await update.message.reply_text(f"✅ Removed word: {text_value}")
-                else:
-                    await update.message.reply_text("⚠️ Word not found in the list.")
-
-            for key in list(context.user_data.keys()):
-                if key.startswith("awaiting_"):
-                    del context.user_data[key]
-            return ConversationHandler.END
-
         # Check what we're waiting for
         if context.user_data.get("awaiting_settings"):
             if user_settings is None:
@@ -10216,33 +10655,6 @@ class EnhancedMediaHandler:
                         user_settings.set_user_setting(user_id, "default_thumbnail", None)
                         user_settings.set_user_setting(user_id, "save_thumbnail", False)
                         await update.message.reply_text("✅ Default thumbnail cleared.")
-                    elif lower.startswith("add_word:"):
-                        word = cmd.split(":", 1)[1].strip()
-                        s = user_settings.get_user_settings(user_id)
-                        words = list(s.get("words_remove") or [])
-                        if word and word not in words:
-                            words.append(word)
-                            user_settings.set_user_setting(user_id, "words_remove", words)
-                            await update.message.reply_text(f"✅ Added word to remove: {word}")
-                        else:
-                            await update.message.reply_text("⚠️ Word empty or already present.")
-                    elif lower.startswith("remove_word:"):
-                        word = cmd.split(":", 1)[1].strip()
-                        s = user_settings.get_user_settings(user_id)
-                        words = list(s.get("words_remove") or [])
-                        if word in words:
-                            words.remove(word)
-                            user_settings.set_user_setting(user_id, "words_remove", words)
-                            await update.message.reply_text(f"✅ Removed word: {word}")
-                        else:
-                            await update.message.reply_text("⚠️ Word not found in list.")
-                    elif lower == "list_words":
-                        s = user_settings.get_user_settings(user_id)
-                        words = s.get("words_remove") or []
-                        await update.message.reply_text("Words to remove: " + (", ".join(words) if words else "(none)"))
-                    elif lower == "clear_words":
-                        user_settings.set_user_setting(user_id, "words_remove", [])
-                        await update.message.reply_text("✅ Cleared words remover list.")
                     else:
                         await update.message.reply_text(
                             "❓ Unknown settings command. Send /usersettings for instructions."

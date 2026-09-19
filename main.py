@@ -3977,6 +3977,22 @@ try:
         except Exception as _ws_e:
             logger.warning("Could not start WebSocket listener: %s", _ws_e)
 
+        # Hand this loop to the Flask uploader. Its routes run in WSGI worker
+        # threads that own no loop, while every async client they touch - the job
+        # queue's Redis client, Motor in job_store, the Kafka/RabbitMQ adapters -
+        # is created on the loop running here. A request coroutine therefore has to
+        # run on this loop too; on any other one it fails with "got Future <Future
+        # pending> attached to a different loop" and, since save_job/emit_event are
+        # best-effort, the Mongo job record and the lifecycle event are dropped
+        # without a trace. See web/webapp._run_async.
+        try:
+            import web.webapp as _flask_webapp
+
+            _flask_webapp.set_app_loop(asyncio.get_running_loop())
+            logger.info("Flask uploader running async work on the application loop")
+        except Exception:
+            logger.debug("main: could not hand the app loop to the Flask web UI")
+
         # Launch main() as a background task so uvicorn also serves ASGI endpoints
         try:
             task = asyncio.create_task(main(background=True))
@@ -4069,6 +4085,16 @@ try:
 
     @app.on_event("shutdown")
     async def _stop_bot_background():
+        # Stop routing Flask requests onto this loop before anything on it is
+        # closed, so a request that arrives mid-shutdown uses its own thread loop
+        # instead of a loop that is being torn down (web/webapp._run_async).
+        try:
+            import web.webapp as _flask_webapp
+
+            _flask_webapp.set_app_loop(None)
+        except Exception:
+            logger.debug("main: could not detach the app loop from the Flask web UI")
+
         # Stop WebSocket Redis listener and close connections (same-port WS)
         try:
             await _stop_ws_listener(app)
