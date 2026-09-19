@@ -606,6 +606,12 @@ async def split_media_segments(
     segment muxer's own default of 000 - the numbering a user expects next to the
     "part 1/N" caption that goes out with each file.
 
+    Each part gets proper duration metadata (-fflags +genpts generates presentation
+    timestamps for each segment, -write_index 1 writes the container index/moov atom
+    at the end of each part, not just the last one). Without these flags, only the
+    final part would show correct duration when played - the intermediate parts would
+    have incomplete metadata.
+
     Cuts can only land on the source's keyframes, so a part can come out longer
     than *segment_seconds* (and a source whose keyframes are farther apart than
     that produces a single part). Re-encoding would fix the exact length and cost
@@ -665,6 +671,15 @@ async def split_media_segments(
         "-segment_start_number",
         "1",
         "-reset_timestamps",
+        "1",
+        # Ensure proper timestamp generation for each segment. Without this,
+        # intermediate parts may have incomplete/missing duration metadata,
+        # with only the final part showing correct duration when played.
+        "-fflags",
+        "+genpts",
+        # Write the index (moov atom for MP4) at the end of each segment,
+        # not just the final file. This ensures each part has valid metadata.
+        "-write_index",
         "1",
         pattern,
     ]

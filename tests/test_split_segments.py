@@ -168,6 +168,10 @@ def test_the_split_is_one_stream_copy_with_the_users_timing(tmp_path, monkeypatc
         "1",
         "-reset_timestamps",
         "1",
+        "-fflags",
+        "+genpts",
+        "-write_index",
+        "1",
         os.path.join(str(out_dir), "Concert.%03d.mp4"),
     ]
     assert [os.path.basename(p) for p in parts] == ["Concert.001.mp4", "Concert.002.mp4", "Concert.003.mp4"]
