@@ -1337,9 +1337,7 @@ def _archive_summary_text(selection, name: str, part_value=None, *, cap_bytes=0)
         part_line += f" — about {parts} volumes"
     return (
         "📦 <b>Create Archive</b>\n\n"
-        f"Name: <b>{html.escape(name)}.zip</b>\n"
-        + part_line
-        + "\n"
+        f"Name: <b>{html.escape(name)}.zip</b>\n" + part_line + "\n"
         f"Ready to pack <b>{len(selection)}</b> file(s) from this batch:\n"
         + "\n".join(lines)
         + f"\n\nTotal size: {total}\n"
@@ -9684,8 +9682,7 @@ class EnhancedMediaHandler:
                     context.user_data["awaiting_settings_archive_part"] = True
                     await self.safe_edit(
                         query,
-                        "✏️ Send the archive part size (e.g. `500MB`, `1.5GB`) or a "
-                        "number of equal parts (e.g. `3`):",
+                        "✏️ Send the archive part size (e.g. `500MB`, `1.5GB`) or a number of equal parts (e.g. `3`):",
                     )
                 else:
                     canonical = archive_split.normalize(value)
@@ -12244,9 +12241,7 @@ class EnhancedMediaHandler:
         elif message is not None:
             await message.reply_text(text, reply_markup=markup, parse_mode="HTML")
 
-    async def _show_archive_summary(
-        self, session: dict, name: str, *, user_id=None, query=None, message=None
-    ) -> None:
+    async def _show_archive_summary(self, session: dict, name: str, *, user_id=None, query=None, message=None) -> None:
         """Render the confirm summary for a staged archive and its chosen name.
 
         Shared by both ways to choose the name (typed, or the default button) so
@@ -12273,11 +12268,11 @@ class EnhancedMediaHandler:
                 query, text, reply_markup=MediaMenuBuilder.get_archive_confirm_menu(), parse_mode="HTML"
             )
         elif message is not None:
-            await message.reply_text(
-                text, reply_markup=MediaMenuBuilder.get_archive_confirm_menu(), parse_mode="HTML"
-            )
+            await message.reply_text(text, reply_markup=MediaMenuBuilder.get_archive_confirm_menu(), parse_mode="HTML")
 
-    async def _archive_use_default_name(self, update: Update, context: ContextTypes.DEFAULT_TYPE, session: dict) -> None:
+    async def _archive_use_default_name(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE, session: dict
+    ) -> None:
         """Accept the name derived from the batch and show the summary."""
         if not await self._require_callback(update):
             return
@@ -12311,7 +12306,9 @@ class EnhancedMediaHandler:
             parse_mode="HTML",
         )
 
-    async def _archive_set_part(self, update: Update, context: ContextTypes.DEFAULT_TYPE, session: dict, value: str) -> None:
+    async def _archive_set_part(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE, session: dict, value: str
+    ) -> None:
         """Store a part size chosen from the archive flow and show the summary again.
 
         The same setting /usersettings writes, so a size picked here and one picked
@@ -12332,8 +12329,7 @@ class EnhancedMediaHandler:
             context.user_data["awaiting_archive_part_size"] = True
             await self.safe_edit(
                 query,
-                "✏️ Send the archive part size (e.g. `500MB`, `1.5GB`) or a number of "
-                "equal parts (e.g. `3`):",
+                "✏️ Send the archive part size (e.g. `500MB`, `1.5GB`) or a number of equal parts (e.g. `3`):",
             )
             return
         canonical = archive_split.normalize(value)
@@ -12727,8 +12723,7 @@ class EnhancedMediaHandler:
             name = _sanitize_archive_name(user_input)
             if not name:
                 await update.message.reply_text(
-                    "❌ That name has no usable characters. Send a name like `myclips`, "
-                    "or press ✅ Use default name."
+                    "❌ That name has no usable characters. Send a name like `myclips`, or press ✅ Use default name."
                 )
                 return ConversationHandler.END
             context.user_data.pop("awaiting_archive_name", None)

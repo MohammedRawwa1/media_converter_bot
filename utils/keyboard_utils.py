@@ -771,9 +771,7 @@ class MediaMenuBuilder:
                 )
             ]
         )
-        buttons.append(
-            [InlineKeyboardButton("✏️ Custom (size or parts)", callback_data=archive_part_key("custom"))]
-        )
+        buttons.append([InlineKeyboardButton("✏️ Custom (size or parts)", callback_data=archive_part_key("custom"))])
         buttons.append([InlineKeyboardButton("↩️ Back", callback_data=ARCHIVE_PART_BACK)])
         return InlineKeyboardMarkup(buttons)
 
@@ -974,11 +972,7 @@ class MediaMenuBuilder:
             ]
         )
         buttons.append(
-            [
-                InlineKeyboardButton(
-                    "✏️ Custom (size or parts)", callback_data=settings_archive_part_key("custom")
-                )
-            ]
+            [InlineKeyboardButton("✏️ Custom (size or parts)", callback_data=settings_archive_part_key("custom"))]
         )
         buttons.append([InlineKeyboardButton("↩️ Back", callback_data=settings_page_key(3))])
         return InlineKeyboardMarkup(buttons)

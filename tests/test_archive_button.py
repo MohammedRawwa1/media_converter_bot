@@ -452,10 +452,14 @@ class ArchivePartPickerTests(unittest.TestCase):
     def _set_part(self, value, session=None):
         edits = []
         handler = _handler(edits)
-        session = session if session is not None else {
-            "archive_pending": [{"name": "clip.mp4", "size": 1024}],
-            "archive_name": "My Clips",
-        }
+        session = (
+            session
+            if session is not None
+            else {
+                "archive_pending": [{"name": "clip.mp4", "size": 1024}],
+                "archive_name": "My Clips",
+            }
+        )
         fake = _FakeSettings()
         update = _FakeUpdate()
         context = _FakeContext()

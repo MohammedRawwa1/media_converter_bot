@@ -48,26 +48,20 @@ class SplitArchiveVolumesTests(unittest.TestCase):
 
     def test_an_archive_that_fits_one_send_is_not_split(self):
         payload = _write(self.archive, b"x" * 100)
-        volumes = asyncio.run(
-            split_archive_volumes(self.archive, archive_filename="bundle.zip", max_bytes=1000)
-        )
+        volumes = asyncio.run(split_archive_volumes(self.archive, archive_filename="bundle.zip", max_bytes=1000))
         self.assertEqual(volumes, [payload])
         self.assertTrue(os.path.exists(self.archive))
 
     def test_splitting_switched_off_keeps_one_file(self):
         payload = _write(self.archive, b"x" * 5000)
-        volumes = asyncio.run(
-            split_archive_volumes(self.archive, archive_filename="bundle.zip", max_bytes=0)
-        )
+        volumes = asyncio.run(split_archive_volumes(self.archive, archive_filename="bundle.zip", max_bytes=0))
         self.assertEqual(volumes, [payload])
         self.assertTrue(os.path.exists(self.archive))
 
     def test_the_volumes_reassemble_to_the_archive_and_use_the_part_names(self):
         data = os.urandom(1000)
         _write(self.archive, data)
-        volumes = asyncio.run(
-            split_archive_volumes(self.archive, archive_filename="bundle.zip", max_bytes=300)
-        )
+        volumes = asyncio.run(split_archive_volumes(self.archive, archive_filename="bundle.zip", max_bytes=300))
         names = [os.path.basename(v) for v in volumes]
         self.assertEqual(names, ["bundle.zip.001", "bundle.zip.002", "bundle.zip.003", "bundle.zip.004"])
         self.assertEqual(_reassemble(volumes), data)
@@ -76,26 +70,20 @@ class SplitArchiveVolumesTests(unittest.TestCase):
 
     def test_an_exact_multiple_has_no_empty_tail_volume(self):
         _write(self.archive, b"y" * 600)
-        volumes = asyncio.run(
-            split_archive_volumes(self.archive, archive_filename="bundle.zip", max_bytes=300)
-        )
+        volumes = asyncio.run(split_archive_volumes(self.archive, archive_filename="bundle.zip", max_bytes=300))
         self.assertEqual([os.path.basename(v) for v in volumes], ["bundle.zip.001", "bundle.zip.002"])
         self.assertEqual(_reassemble(volumes), b"y" * 600)
 
     def test_the_source_archive_is_removed_once_every_part_is_written(self):
         _write(self.archive, b"z" * 700)
-        volumes = asyncio.run(
-            split_archive_volumes(self.archive, archive_filename="bundle.zip", max_bytes=300)
-        )
+        volumes = asyncio.run(split_archive_volumes(self.archive, archive_filename="bundle.zip", max_bytes=300))
         self.assertEqual(len(volumes), 3)
         self.assertFalse(os.path.exists(self.archive))
 
     def test_keeping_the_source_is_opt_in(self):
         _write(self.archive, b"z" * 700)
         asyncio.run(
-            split_archive_volumes(
-                self.archive, archive_filename="bundle.zip", max_bytes=300, remove_source=False
-            )
+            split_archive_volumes(self.archive, archive_filename="bundle.zip", max_bytes=300, remove_source=False)
         )
         self.assertTrue(os.path.exists(self.archive))
 

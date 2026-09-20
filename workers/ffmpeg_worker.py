@@ -92,9 +92,7 @@ async def _split_and_deliver_archive(job, output_path: str, progress_channel) ->
         return None
 
     archive_name = os.path.basename(str(job.get("original_filename") or os.path.basename(output_path)))
-    volumes = await split_archive_volumes(
-        output_path, archive_filename=archive_name, max_bytes=cap, remove_source=True
-    )
+    volumes = await split_archive_volumes(output_path, archive_filename=archive_name, max_bytes=cap, remove_source=True)
     if len(volumes) <= 1:
         return None
 
@@ -136,6 +134,7 @@ async def _split_and_deliver_archive(job, output_path: str, progress_channel) ->
         with contextlib.suppress(OSError):
             os.remove(volume)
     return volumes
+
 
 # Every Bot this worker builds sends through the shared flood gate, so a window
 # earned here (or by the bot process) stops the write before it costs a 429.
