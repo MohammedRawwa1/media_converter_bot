@@ -382,6 +382,15 @@ async def _check_upload_cancelled(job_id: str) -> bool:
         return False
 
 
+# Upload progress pacing. Telegram edits are the scarce resource, and the
+# callbacks below fire once per 512KB part, so a large file would otherwise ask
+# for hundreds of edits a second.
+_UPLOAD_PROGRESS_INTERVAL: float = 1.5
+# The cancel flag is a blocking Redis read from the client's thread; polling it
+# at the update cadence would cost more than it is worth.
+_UPLOAD_CANCEL_CHECK_INTERVAL: float = 2.0
+
+
 async def _update_upload_progress(job_id: str, progress_channel: str, pct: int, message: str) -> None:
     """Update Redis job hash and publish progress for Telegram upload."""
     try:
@@ -454,54 +463,89 @@ def _make_upload_progress_callback(job_id: str, progress_channel: str):
 
     Returns a callable(sent_bytes, total_bytes) suitable for both
     Telethon's progress_callback and Pyrogram's progress parameter.
-    Updates are throttled to at most once per second or when the
-    percentage changes.
+
+    The clients do not agree on which thread this runs on: Telethon calls it on
+    the event loop, Pyrogram hands it to ``loop.run_in_executor``
+    (``save_file``), and the Bot API reads the file through
+    :class:`_ProgressFileWrapper` on an httpx worker thread. Only the first of
+    those has a running loop, so the loop is captured here and each update is
+    scheduled onto it. Looking one up inside the callback raised
+    ``RuntimeError`` on the other two, the update was dropped, and a long
+    upload (a 789MB WAV, say) showed nothing but a frozen "uploading" message.
+
+    Updates are throttled so a large file cannot flood Telegram: at most one
+    per :data:`_UPLOAD_PROGRESS_INTERVAL` seconds, and only when the percentage
+    on screen actually changed.
     """
     _last_pct = [-1]
     _last_update = [0.0]
-    _interval = 1.0
+    _last_cancel_check = [0.0]
+
+    try:
+        _loop = asyncio.get_running_loop()
+    except RuntimeError:  # built outside a loop: _dispatch resolves one instead
+        _loop = None
+
+    def _dispatch(pct: int, msg: str) -> None:
+        loop = _loop
+        if loop is None or loop.is_closed():
+            try:
+                loop = asyncio.get_running_loop()
+            except RuntimeError:
+                # Progress is display-only: without a loop to schedule onto the
+                # delivery still has to happen, so this is a no-op, not an error.
+                logger.debug("ffmpeg worker: no event loop for upload progress")
+                return
+        try:
+            asyncio.run_coroutine_threadsafe(_update_upload_progress(job_id, progress_channel, pct, msg), loop)
+        except Exception:
+            logger.debug("ffmpeg worker: could not schedule an upload progress update")
+
+    def _cancel_requested() -> bool:
+        """True when the user cancelled this job. Blocking, and throttled.
+
+        Redis is a plain ``redis.from_url`` call because this runs on whatever
+        thread the client chose, where no await is available.
+        """
+        now = time.time()
+        if (now - _last_cancel_check[0]) < _UPLOAD_CANCEL_CHECK_INTERVAL:
+            return False
+        _last_cancel_check[0] = now
+        try:
+            import redis as _redis
+
+            _redis_url = os.environ.get("REDIS_URL")
+            if not _redis_url:
+                return False
+            _rr = _redis.from_url(_redis_url, socket_timeout=2)
+            try:
+                return _rr.hget(f"ffmpeg:job:{job_id}", "cancel") == b"1"
+            finally:
+                _rr.close()
+        except Exception:
+            return False
 
     def _progress(sent_bytes: int, total_bytes: int) -> None:
         try:
             if total_bytes <= 0:
                 return
+            if _cancel_requested():
+                # ``CancelledError`` is a ``BaseException``, so it passes through
+                # every ``except Exception`` between here and the client's upload
+                # loop - which is the point: it is the only way to stop an upload
+                # whose connection we do not own.
+                raise asyncio.CancelledError("Upload cancelled by user")
             pct = min(int(sent_bytes * 100 / total_bytes), 100)
             now = time.time()
-            if pct != _last_pct[0] or (now - _last_update[0]) >= _interval:
-                _last_pct[0] = pct
-                _last_update[0] = now
-                mb_sent = sent_bytes // (1024 * 1024)
-                mb_total = total_bytes // (1024 * 1024)
-                msg = f"Uploading to Telegram: {pct}% ({mb_sent}MB / {mb_total}MB)"
-
-                # Cancel check: every ~5% bucket, check Redis cancel flag
-                # Sync redis.from_url() call in this sync callback.
-                if pct % 5 == 0 or pct == 100:
-                    try:
-                        import redis as _redis
-
-                        _redis_url = os.environ.get("REDIS_URL")
-                        if _redis_url:
-                            _rr = _redis.from_url(_redis_url, socket_timeout=2)
-                            try:
-                                _cancel_val = _rr.hget(f"ffmpeg:job:{job_id}", "cancel")
-                                if _cancel_val == b"1":
-                                    raise asyncio.CancelledError("Upload cancelled by user")
-                            finally:
-                                _rr.close()
-                    except asyncio.CancelledError:
-                        raise
-                    except Exception:
-                        pass
-
-                try:
-                    loop = asyncio.get_running_loop()
-                    asyncio.run_coroutine_threadsafe(
-                        _update_upload_progress(job_id, progress_channel, pct, msg),
-                        loop,
-                    )
-                except Exception:
-                    logger.debug("ffmpeg worker: operation failed")
+            if pct < 100 and (pct == _last_pct[0] or (now - _last_update[0]) < _UPLOAD_PROGRESS_INTERVAL):
+                return
+            _last_pct[0] = pct
+            _last_update[0] = now
+            mb_sent = sent_bytes // (1024 * 1024)
+            mb_total = total_bytes // (1024 * 1024)
+            _dispatch(pct, f"Uploading to Telegram: {pct}% ({mb_sent}MB / {mb_total}MB)")
+        except asyncio.CancelledError:
+            raise
         except Exception:
             logger.debug("ffmpeg worker: in _progress()")
 
@@ -738,6 +782,13 @@ async def _probe_audio_delivery(out_path: str, delivery_name: str) -> dict | Non
     except Exception:
         # Probing is best-effort; None hands the work back to the uploader.
         return None
+    if not meta:
+        # Nothing could be read at all - no ffprobe on the box, or a file it
+        # refuses. That is not a file with no tags: a title-only stub built from it
+        # would suppress the uploader's own probe, which is where the rest of this
+        # dict comes from, so the work is handed back to it exactly as for a probe
+        # that raised. A file that *does* answer keeps its tags.
+        return None
     # A converted file usually carries no title tag of its own, and Telegram shows
     # the media name in the player, so fall back to it exactly as the uploader does.
     if not meta.get("title"):
@@ -777,16 +828,31 @@ def _deliver_as_document(job) -> bool:
         return False
 
 
-def _deferred_media_kind(record: dict) -> str:
-    """How a deferred output has to be sent: audio, video, or a plain file."""
-    name = record.get("delivery_name") or record.get("output") or ""
+def _is_audio_output(out_path: str | None, media_kind: str | None = None) -> bool:
+    """Whether this output belongs in Telegram's player rather than the file view.
+
+    The containers that count as audio live in one place
+    (``is_audio_delivery_output``), so the inline Bot API branch, both MTProto
+    branches and a deferred retry all answer the same way for the same file. The
+    inline branch used to carry a hand-written list of seven extensions of its own:
+    it was missing ``.wma`` and ``.oga``, so those outputs left it as a plain
+    document - no player, and no duration for the send to state - while a retry of
+    the very same job sent them as audio.
+    """
     try:
         from utils.userbot_uploader import is_audio_delivery_output
 
-        if is_audio_delivery_output(name, media_kind=record.get("media_kind")):
-            return "audio"
+        return is_audio_delivery_output(str(out_path or ""), media_kind=media_kind)
     except Exception:
-        logger.debug("deferred delivery: audio detection unavailable for %s", name)
+        logger.debug("worker: audio detection unavailable for %s", out_path)
+        return False
+
+
+def _deferred_media_kind(record: dict) -> str:
+    """How a deferred output has to be sent: audio, video, or a plain file."""
+    name = record.get("delivery_name") or record.get("output") or ""
+    if _is_audio_output(name, record.get("media_kind")):
+        return "audio"
     # The user's choice outranks the extension: a retried delivery has to arrive
     # the same way the first attempt would have sent it.
     if _deliver_as_document(record):
@@ -2957,9 +3023,11 @@ async def handle_job(job: dict):
                                     _vid_duration = _probe_vm.get("duration") if _probe_vm else None
                                     _vid_width = _probe_vm.get("width") if _probe_vm else None
                                     _vid_height = _probe_vm.get("height") if _probe_vm else None
-                                    _output_ext = os.path.splitext(out)[1].lower() if out else ""
                                     _delivery_name = job.get("output_filename") or os.path.basename(out or "output")
-                                    if _output_ext in (".mp3", ".wav", ".m4a", ".aac", ".flac", ".ogg", ".opus"):
+                                    # One answer for every path: the container this job
+                                    # produced decides the same way here as it does for
+                                    # the MTProto sends and for a deferred retry.
+                                    if _is_audio_output(out):
                                         kind = "audio"
                                     elif _vid_width is not None or _probe_vm:
                                         kind = "video"

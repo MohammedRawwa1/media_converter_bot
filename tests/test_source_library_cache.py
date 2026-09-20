@@ -267,6 +267,29 @@ def test_audio_probe_returns_none_rather_than_a_partial_dict(tmp_path, monkeypat
     assert asyncio.run(ffmpeg_worker._probe_audio_delivery(str(src), "x.mp3")) is None
 
 
+def test_audio_probe_hands_the_work_back_when_it_could_read_nothing(tmp_path, monkeypatch):
+    """An empty probe must not become a half-filled dict.
+
+    ``probe_audio_metadata`` returns ``{}`` when ffprobe is missing or refuses the
+    file. Building the title fallback on top of that produced a title-only dict,
+    which *suppresses* the uploader's own probe - the one that fills in the
+    duration and the performer - so the send lost the very fields this exists to
+    carry. The probe that raised already hands the work back; an empty one does
+    too.
+    """
+    src = tmp_path / "song.mp3"
+    src.write_bytes(b"not really audio")
+
+    async def _nothing(path):
+        return {}
+
+    import utils.userbot_uploader as uploader
+
+    monkeypatch.setattr(uploader, "_probe_audio_metadata", _nothing)
+
+    assert asyncio.run(ffmpeg_worker._probe_audio_delivery(str(src), "My Song.mp3")) is None
+
+
 def test_delivery_sites_pass_the_audio_tags_through():
     src = read_object_source(ffmpeg_worker.handle_job)
     assert src.count("audio_meta=_pre_am") == 2

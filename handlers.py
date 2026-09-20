@@ -653,22 +653,62 @@ def _source_media_tags(current_file: dict | None) -> tuple[str, str]:
     )
 
 
-def _audio_tag_kwargs(current_file: dict | None, delivery_name: str | None) -> dict:
-    """The ``title``/``performer`` an audio delivery carries.
+def _audio_tag_kwargs(current_file: dict | None, delivery_name: str | None, duration: int | None = None) -> dict:
+    """The ``title``/``performer``/``duration`` an audio delivery carries.
 
     The media's own tags come first - that is the metadata preserved across the
     buttons - and the delivered name only fills in a title when the file carries
     none, which keeps untagged files behaving exactly as before.
+
+    *duration* is the length of the **file being sent** (the caller's own probe,
+    see :func:`_audio_delivery_duration`), and it is stated to Telegram because
+    Telegram will not derive it: for anything longer than a short clip the server
+    falls back to a container-derived duration it then omits, and the client
+    renders ``00:00`` with a progress bar that never moves. A caller with no
+    duration to give states none, and the send is exactly what it was.
     """
     title, performer = _source_media_tags(current_file)
     if not title:
         title = os.path.splitext(os.path.basename(str(delivery_name or "")))[0]
-    kwargs: dict[str, str] = {}
+    kwargs: dict[str, str | int] = {}
     if title:
         kwargs["title"] = title
     if performer:
         kwargs["performer"] = performer
+    if duration:
+        kwargs["duration"] = int(duration)
     return kwargs
+
+
+async def _audio_delivery_duration(file_path: str | None) -> int | None:
+    """How long the file about to be sent is, or ``None`` when it cannot be read.
+
+    Telegram only reads a clip's length out of the container for short recordings;
+    a longer one is delivered with duration 0 unless the sender states it, which
+    is what turns a long split part into ``00:00`` in the player with a bar that
+    never advances - the length is in the file, and the server is not the one that
+    reads it.
+
+    The file's own header answers this, so the *output* is probed rather than the
+    source: a part's length is what the cut produced, and a keyframe cut cannot
+    promise the length that was asked for. Best-effort by design - ``None`` states
+    no duration, so a probe that cannot read a file never costs the delivery it
+    was measuring.
+    """
+    if not file_path:
+        return None
+    try:
+        from utils.userbot_uploader import probe_audio_metadata
+
+        meta = await probe_audio_metadata(file_path)
+    except Exception:
+        logger.debug("handlers: could not probe the duration of an audio delivery")
+        return None
+    try:
+        duration = int((meta or {}).get("duration") or 0)
+    except (TypeError, ValueError):
+        return None
+    return duration if duration > 0 else None
 
 
 def _safe_media_stem(name: str | None, fallback: str = "media", limit: int = 80) -> str:
@@ -3025,6 +3065,10 @@ class EnhancedMediaHandler:
                             title=_title,
                             performer=_performer or None,
                             filename=part_name,
+                            # The part's own length, read off the part itself:
+                            # without it Telegram's player shows 00:00 for it
+                            # (see _audio_delivery_duration).
+                            duration=await _audio_delivery_duration(part),
                         )
                     else:
                         await self._send_video_result(
@@ -3093,7 +3137,11 @@ class EnhancedMediaHandler:
             _title, _performer = _source_media_tags(current_file)
             _title = f"{_title or _safe_media_stem(current_file.get('name'))} ({label})"
             _audio_meta = {
-                "duration": None,  # Will be probed by send_file_via_userbot if needed
+                # The part's own length. Pyrogram sends the duration it is handed,
+                # so leaving this unstated is what makes a long part arrive as
+                # 00:00 - the same blank the Bot API branch above has to state its
+                # way out of (see _audio_delivery_duration).
+                "duration": await _audio_delivery_duration(file_path),
                 "title": _title,
                 "performer": _performer or None,
             }
@@ -3126,6 +3174,59 @@ class EnhancedMediaHandler:
             if _thumb_path and os.path.exists(_thumb_path):
                 with contextlib.suppress(Exception):
                     os.remove(_thumb_path)
+
+    async def _send_audio_via_userbot(
+        self,
+        chat_id: int,
+        file_path: str,
+        caption: str,
+        delivery_name: str,
+        current_file: dict,
+        *,
+        user_id: int | None = None,
+    ) -> bool:
+        """Send one audio result over MTProto, for a file the Bot API will not carry.
+
+        The Bot API refuses anything over ``BOT_API_MAX_BYTES`` (50MB by default),
+        and a lossless target reaches that long before the media it came from does:
+        a WAV runs about 10MB a minute, so Convert Format → WAV could only ever work
+        for a short clip, and the over-limit send failed *after* the encode with
+        nothing said. This is the delivery a large split part already takes, and the
+        worker takes it for its own over-limit outputs: the userbot carries the file
+        and its player tags, whatever its size.
+
+        Returns True when the file was sent.
+        """
+        from utils.userbot_uploader import send_file_via_userbot
+
+        _title, _performer = _source_media_tags(current_file)
+        _audio_meta = {
+            # Stated, not left to the uploader: Pyrogram sends the duration it is
+            # handed, and 0 is what a player shows for a long track
+            # (see _audio_delivery_duration).
+            "duration": await _audio_delivery_duration(file_path),
+            "title": _title or _safe_media_stem(current_file.get("name")),
+            "performer": _performer or None,
+        }
+        try:
+            msg_id = await send_file_via_userbot(
+                chat_id=chat_id,
+                file_path=file_path,
+                caption=caption,
+                media_kind="audio",
+                delivery_name=delivery_name,
+                audio_meta=_audio_meta,
+                user_id=user_id,
+                # Never a document: the player is the point of an audio result.
+                as_document=False,
+            )
+        except Exception:
+            logger.exception("handlers: userbot send failed for %s", delivery_name)
+            return False
+        if msg_id:
+            logger.info("handlers: sent %s via userbot (msg_id=%s)", delivery_name, msg_id)
+            return True
+        return False
 
     async def _handle_split_request(
         self,
@@ -3595,6 +3696,7 @@ class EnhancedMediaHandler:
         caption: str = "",
         title: str | None = None,
         performer: str | None = None,
+        duration: int | None = None,
         filename: str | None = None,
         file_unique_id: str | None = None,
     ) -> str | None:
@@ -3603,6 +3705,10 @@ class EnhancedMediaHandler:
         Returns the Telegram file_id of the sent audio, or None on failure.
         The file_id is cached for reuse on subsequent sends of the same audio
         to avoid repeated egress from IDrive/object storage.
+
+        *duration* is stated to Telegram whenever the caller has it: the server
+        does not derive a long clip's length, and a player that was never told it
+        shows ``00:00`` (see :func:`_audio_delivery_duration`).
         """
         # ── Try to use cached file_id first ──
         if file_unique_id:
@@ -3624,6 +3730,10 @@ class EnhancedMediaHandler:
                     _send_kwargs["title"] = title
                 if performer:
                     _send_kwargs["performer"] = performer
+                if duration:
+                    # Stated outright: Telegram does not derive this for a long
+                    # clip, and a player left to work it out shows 00:00 forever.
+                    _send_kwargs["duration"] = int(duration)
                 if filename:
                     _send_kwargs["filename"] = filename
                 try:
@@ -3650,6 +3760,10 @@ class EnhancedMediaHandler:
                     _send_kwargs["title"] = title
                 if performer:
                     _send_kwargs["performer"] = performer
+                if duration:
+                    # Stated outright: Telegram does not derive this for a long
+                    # clip, and a player left to work it out shows 00:00 forever.
+                    _send_kwargs["duration"] = int(duration)
                 if filename:
                     _send_kwargs["filename"] = filename
                 _msg = await bot.send_audio(**_send_kwargs)
@@ -6672,6 +6786,9 @@ class EnhancedMediaHandler:
 
         try:
             if is_audio:
+                # The trimmed output's own length: Telegram will not derive it
+                # for a long clip (see _audio_delivery_duration).
+                _audio_duration = await _audio_delivery_duration(output_path)
                 with open(output_path, "rb") as audio_file:
                     await context.bot.send_audio(
                         chat_id=update.effective_chat.id,
@@ -6679,7 +6796,7 @@ class EnhancedMediaHandler:
                         caption=_metadata_caption(current_file),
                         # The media's own title/performer are preserved, so the
                         # delivered audio is the same track it was.
-                        **_audio_tag_kwargs(current_file, delivery_name),
+                        **_audio_tag_kwargs(current_file, delivery_name, _audio_duration),
                         filename=delivery_name,
                     )
             else:
@@ -6795,12 +6912,15 @@ class EnhancedMediaHandler:
             try:
                 if is_audio:
                     # Deliver faded audio as streamable audio, not as a document.
+                    # The faded output's own length: Telegram will not derive it
+                    # for a long clip (see _audio_delivery_duration).
+                    _audio_duration = await _audio_delivery_duration(output_path)
                     with open(output_path, "rb") as audio_file:
                         await context.bot.send_audio(
                             chat_id=update.effective_chat.id,
                             audio=audio_file,
                             caption=_metadata_caption(current_file),
-                            **_audio_tag_kwargs(session.get("current_file"), delivery_name),
+                            **_audio_tag_kwargs(session.get("current_file"), delivery_name, _audio_duration),
                             filename=delivery_name,
                         )
                 else:
@@ -9444,6 +9564,9 @@ class EnhancedMediaHandler:
                     return
                 # send_audio keeps the file in Telegram's music player (streamable)
                 # instead of delivering it as an opaque downloadable document.
+                # The extracted track's own length: Telegram will not derive it
+                # for a long clip (see _audio_delivery_duration).
+                _audio_duration = await _audio_delivery_duration(output_path)
                 with open(output_path, "rb") as audio_file:
                     await context.bot.send_audio(
                         chat_id=update.effective_chat.id,
@@ -9451,7 +9574,7 @@ class EnhancedMediaHandler:
                         caption=caption,
                         # The media's own title/performer are preserved, so the
                         # delivered audio is the same track it was.
-                        **_audio_tag_kwargs(current_file, delivery_name),
+                        **_audio_tag_kwargs(current_file, delivery_name, _audio_duration),
                         filename=delivery_name,
                     )
 
@@ -9801,12 +9924,15 @@ class EnhancedMediaHandler:
             # ``or "Merged Audio"`` already guarantees a non-empty name, so there is
             # no empty stem for a fallback id to fill in.
             delivery_name = _audio_delivery_name(_first_name or "Merged Audio", extension=".mp3")
+            # The merged output's own length: Telegram will not derive it for a
+            # long clip (see _audio_delivery_duration).
+            _audio_duration = await _audio_delivery_duration(output_path)
             with open(output_path, "rb") as audio_file:
                 await context.bot.send_audio(
                     chat_id=update.effective_chat.id,
                     audio=audio_file,
                     caption=_metadata_caption(session.get("current_file")),
-                    **_audio_tag_kwargs(session.get("current_file"), delivery_name),
+                    **_audio_tag_kwargs(session.get("current_file"), delivery_name, _audio_duration),
                     filename=delivery_name,
                 )
 
@@ -10542,19 +10668,26 @@ class EnhancedMediaHandler:
             return
 
         # ── Store conversion metadata so the BigFilePipeline knows what to produce ──
-        # Every target gets an explicit codec: anything missing here must not
-        # silently fall back to ``-c:a copy`` (that produces a file whose
-        # contents do not match its extension).
-        _format_ffmpeg_args = {
-            "mp3": ["-c:a", "libmp3lame", "-b:a", _DEFAULT_AUDIO_BITRATE],
-            "wav": ["-c:a", "pcm_s16le"],
-            "aac": ["-c:a", "aac", "-b:a", "128k"],
-            "m4a": ["-c:a", "aac", "-b:a", "128k"],
-            "flac": ["-c:a", "flac"],
-            "ogg": ["-c:a", "libvorbis", "-b:a", "128k"],
-            "opus": ["-c:a", "libopus", "-b:a", "96k"],
-        }
-        current_file["_pipeline_ffmpeg_args"] = _format_ffmpeg_args.get(format_type, ["-c:a", "copy"])
+        # The codec table lives in ``tasks.conversion_tasks`` - the same one the
+        # in-process converter below reads - so a target is encoded the same way
+        # whether the file is small enough to convert here or queued for the worker.
+        # This used to be a *second* table, and that is how the M4A button came to
+        # fail: the in-process converter had no entry for it and fell back to
+        # libmp3lame, which writes nothing into an MP4 container, while the very
+        # same media converted fine whenever it went to the worker instead. A target
+        # the table does not know is refused here - the old fallback handed the
+        # worker ``-c:a copy``, which writes a file whose contents do not match its
+        # extension.
+        from tasks.conversion_tasks import audio_format_ffmpeg_args
+
+        _pipeline_args = audio_format_ffmpeg_args(format_type, _DEFAULT_AUDIO_BITRATE)
+        if _pipeline_args is None:
+            await self.safe_edit(
+                query,
+                f"❌ Unsupported audio format: {format_type}.\nPick one of MP3, WAV, AAC, FLAC, OGG or M4A.",
+            )
+            return
+        current_file["_pipeline_ffmpeg_args"] = _pipeline_args
         current_file["_pipeline_output_ext"] = f".{format_type}"
         current_file["_pipeline_conversion_type"] = "format_audio"
         current_file["_pipeline_caption"] = _metadata_caption(current_file)
@@ -10626,7 +10759,7 @@ class EnhancedMediaHandler:
                 context,
                 current_file,
                 output_path=output_path,
-                ffmpeg_args=current_file.get("_pipeline_ffmpeg_args") or _format_ffmpeg_args.get(format_type),
+                ffmpeg_args=current_file.get("_pipeline_ffmpeg_args"),
                 output_ext=f".{format_type}",
                 job_type="format_audio",
                 caption=current_file.get("_pipeline_caption"),
@@ -10635,7 +10768,13 @@ class EnhancedMediaHandler:
                 await self.safe_edit(query, f"❌ Failed to convert to {format_type}: the source is not available.")
             return
 
-        success = await self.converter.convert_audio_format(local_input, output_path, format_type)
+        # The bitrate is stated rather than left to the quality default: the
+        # gate above answers "already at this bitrate" with ``_DEFAULT_AUDIO_BITRATE``,
+        # and the queued job for a larger source encodes with the same constant -
+        # so a small file and a large one have to come out at that same bitrate.
+        success = await self.converter.convert_audio_format(
+            local_input, output_path, format_type, bitrate=_DEFAULT_AUDIO_BITRATE
+        )
 
         if success and os.path.exists(output_path):
             # NOTE: Bot API infers the MIME type from the filename, and
@@ -10644,12 +10783,48 @@ class EnhancedMediaHandler:
             delivery_name = _audio_delivery_name(
                 current_file.get("name"), current_file.get("id"), extension=f".{format_type}"
             )
+            # ── A lossless target is large long before the source is: about 10MB a
+            #    minute for WAV, against a Bot API limit measured in tens of MB. The
+            #    over-limit send used to fail *after* the encode with nothing said,
+            #    which is what left this button looking stuck on "🔄 Converting to
+            #    WAV…", so an over-limit result takes the same road a large split
+            #    part does. ──
+            _output_size = os.path.getsize(output_path)
+            if _output_size > config.BOT_API_MAX_BYTES:
+                _sent_direct = False
+                if getattr(config, "ENABLE_USERBOT", False):
+                    _sent_direct = await self._send_audio_via_userbot(
+                        update.effective_chat.id,
+                        output_path,
+                        _metadata_caption(current_file),
+                        delivery_name,
+                        current_file,
+                        user_id=update.effective_user.id if update.effective_user else None,
+                    )
+                _output_mb = _output_size // 1024 // 1024
+                if _sent_direct:
+                    await self.safe_edit(
+                        query, f"✅ Converted to {format_type.upper()} — sent directly ({_output_mb}MB)."
+                    )
+                else:
+                    await self.safe_edit(
+                        query,
+                        f"❌ The {format_type.upper()} is {_output_mb}MB — over Telegram's Bot API limit. "
+                        "MP3 and M4A stay far smaller.",
+                    )
+                with contextlib.suppress(OSError):
+                    os.remove(output_path)
+                return
+            # The output's own length, not the source's: a re-encode can change
+            # it, and Telegram will not derive either for a long clip
+            # (see _audio_delivery_duration).
+            _audio_duration = await _audio_delivery_duration(output_path)
             with open(output_path, "rb") as audio_file:
                 await context.bot.send_audio(
                     chat_id=update.effective_chat.id,
                     audio=audio_file,
                     caption=_metadata_caption(current_file),
-                    **_audio_tag_kwargs(current_file, delivery_name),
+                    **_audio_tag_kwargs(current_file, delivery_name, _audio_duration),
                     filename=delivery_name,
                 )
             os.remove(output_path)
@@ -10842,12 +11017,16 @@ class EnhancedMediaHandler:
         success, reason = await self.converter.execute_ffmpeg(cmd, local_input, output_path)
 
         if success and os.path.exists(output_path):
+            # The output's own length, not the source's: a re-encode can change
+            # it, and Telegram will not derive either for a long clip
+            # (see _audio_delivery_duration).
+            _audio_duration = await _audio_delivery_duration(output_path)
             with open(output_path, "rb") as audio_file:
                 await context.bot.send_audio(
                     chat_id=update.effective_chat.id,
                     audio=audio_file,
                     caption=_metadata_caption(current_file),
-                    **_audio_tag_kwargs(current_file, delivery_name),
+                    **_audio_tag_kwargs(current_file, delivery_name, _audio_duration),
                     filename=delivery_name,
                 )
             with contextlib.suppress(OSError):
@@ -10949,12 +11128,16 @@ class EnhancedMediaHandler:
 
         if success and os.path.exists(output_path):
             delivery_name = _audio_delivery_name(current_file.get("name"), current_file.get("id"))
+            # The output's own length, not the source's: a re-encode can change
+            # it, and Telegram will not derive either for a long clip
+            # (see _audio_delivery_duration).
+            _audio_duration = await _audio_delivery_duration(output_path)
             with open(output_path, "rb") as audio_file:
                 await context.bot.send_audio(
                     chat_id=update.effective_chat.id,
                     audio=audio_file,
                     caption=_metadata_caption(current_file),
-                    **_audio_tag_kwargs(current_file, delivery_name),
+                    **_audio_tag_kwargs(current_file, delivery_name, _audio_duration),
                     filename=delivery_name,
                 )
             os.remove(output_path)
@@ -11680,13 +11863,18 @@ class EnhancedMediaHandler:
 
                         elif current_file.get("type") == "audio":
                             try:
+                                # The forwarded file's own length: Telegram will
+                                # not derive it for a long clip, and the copy
+                                # would land in the target chat as 00:00
+                                # (see _audio_delivery_duration).
+                                _forward_duration = await _audio_delivery_duration(path)
                                 with open(path, "rb") as f:
                                     await context.bot.send_audio(
                                         chat_id=dest_chat.id,
                                         audio=f,
                                         caption=caption,
                                         filename=_forward_audio,
-                                        **_audio_tag_kwargs(current_file, _forward_audio),
+                                        **_audio_tag_kwargs(current_file, _forward_audio, _forward_duration),
                                     )
                             except Exception:
                                 logger.exception("send_audio failed, trying send_document as fallback")

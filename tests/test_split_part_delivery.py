@@ -225,3 +225,106 @@ def test_the_userbot_send_keeps_a_video_in_the_requested_view(workdir):
     assert recorder.calls[0]["kwargs"]["as_document"] is True
     # No session of its own is the uploader's fallback to make, not a pass-through.
     assert recorder.calls[0]["kwargs"]["user_id"] is None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# The length of the part: stated, because Telegram will not derive it
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# A part longer than a short clip was delivered as ``00:00`` with a progress bar
+# that never moved: the send carried no duration, and Telegram only reads one out
+# of the container for short recordings. The part's own header knows its length,
+# so it is probed off the part - not guessed from the source or the requested
+# segment length, which a keyframe cut cannot promise - and stated to Telegram.
+
+
+def _probe_length(seconds):
+    """A stand-in for the probe: ffprobe is not what these tests are about."""
+
+    async def _probe(_path):
+        return {"duration": seconds}
+
+    return _probe
+
+
+def test_an_audio_part_states_its_own_length(workdir):
+    part = _big_part(workdir, "Track.001.mp3", size=16)
+    handler = _DeliveryHandler()
+    recorded: list[dict] = []
+
+    async def _send_audio(self, bot, chat_id, file_path, **kwargs):
+        recorded.append({"file_path": file_path, **kwargs})
+        return "file-id"
+
+    with (
+        patch.object(handlers_module, "config", _config()),
+        patch.object(handlers_module, "_user_upload_mode", lambda user_id: "video"),
+        patch("utils.userbot_uploader.probe_audio_metadata", _probe_length(3599)),
+        patch.object(Handler, "_send_audio_result", _send_audio),
+    ):
+        sent = _run(
+            handler._deliver_split_parts(
+                _FakeUpdate(), SimpleNamespace(bot=None), {"name": "Track.mp3"}, [part], as_audio=True
+            )
+        )
+
+    assert sent == 1
+    assert recorded[0]["duration"] == 3599
+    # The title still says which part this is: the length did not replace it.
+    assert recorded[0]["title"] == "Track (part 1/1)"
+
+
+def test_a_part_whose_length_cannot_be_read_is_delivered_anyway(workdir):
+    """The duration is a nicety; the part the user asked for is not."""
+    part = _big_part(workdir, "Track.001.mp3", size=16)
+    handler = _DeliveryHandler()
+    recorded: list[dict] = []
+
+    async def _send_audio(self, bot, chat_id, file_path, **kwargs):
+        recorded.append(kwargs)
+        return "file-id"
+
+    async def _boom(_path):
+        raise RuntimeError("no ffprobe here")
+
+    with (
+        patch.object(handlers_module, "config", _config()),
+        patch.object(handlers_module, "_user_upload_mode", lambda user_id: "video"),
+        patch("utils.userbot_uploader.probe_audio_metadata", _boom),
+        patch.object(Handler, "_send_audio_result", _send_audio),
+    ):
+        sent = _run(
+            handler._deliver_split_parts(
+                _FakeUpdate(), SimpleNamespace(bot=None), {"name": "Track.mp3"}, [part], as_audio=True
+            )
+        )
+
+    assert sent == 1
+    # Sent as it would have been before the probe existed.
+    assert recorded[0].get("duration") is None
+
+
+def test_a_large_audio_part_states_its_length_over_mtproto(workdir):
+    """The MTProto path sends the duration it is handed, so it has to be handed one."""
+    part = _big_part(workdir, "Track.001.mp3")
+    recorder = _UploadRecorder()
+
+    with (
+        patch("utils.userbot_uploader.send_file_via_userbot", recorder, create=True),
+        patch("utils.userbot_uploader.probe_audio_metadata", _probe_length(3599)),
+    ):
+        ok = _run(
+            _DeliveryHandler()._send_part_via_userbot(
+                99,
+                part,
+                "caption",
+                "Track.001.mp3",
+                True,
+                {"name": "Track.mp3"},
+                "part 1/1",
+                user_id=7,
+            )
+        )
+
+    assert ok is True
+    assert recorder.calls[0]["kwargs"]["audio_meta"]["duration"] == 3599

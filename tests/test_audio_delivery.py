@@ -1,6 +1,7 @@
 """Tests for audio extraction delivery: naming, bitrate and streamable audio."""
 
 import ast
+import asyncio
 import contextlib
 import inspect
 import os
@@ -28,7 +29,9 @@ from handlers import (
     _BULK_LIST_LIMIT,
     _BULK_OPTIMIZE_DEFAULT,
     _BULK_OPTIMIZE_PRESETS,
+    _audio_delivery_duration,
     _audio_delivery_name,
+    _audio_tag_kwargs,
     _bulk_photo_supported,
     _bulk_quality_label,
     _bulk_rename_filename,
@@ -79,6 +82,62 @@ class AudioDeliveryNameTests(unittest.TestCase):
 
     def test_custom_extension_is_used(self):
         self.assertEqual(_audio_delivery_name("Track.wav", 3, extension=".m4a"), "Track.m4a")
+
+
+class AudioDurationTests(unittest.TestCase):
+    """Telegram will not derive a long clip's length, so the send has to state it.
+
+    A part or a re-encoded track longer than a short clip arrives as ``00:00``
+    with a progress bar that never moves: the server only reads a duration out of
+    the container for short recordings and omits it otherwise. The file's own
+    header knows the length, so it is probed off the *output* right before the
+    send and handed to Telegram, and a probe that cannot read the file states
+    nothing rather than costing the delivery it was measuring.
+    """
+
+    def test_the_tags_state_the_duration_when_the_caller_has_one(self):
+        current = {"name": "track.mp3", "_source_metadata": {"title": "T", "performer": "P"}}
+
+        tags = _audio_tag_kwargs(current, "track.mp3", 3599)
+
+        self.assertEqual(tags, {"title": "T", "performer": "P", "duration": 3599})
+
+    def test_a_duration_nobody_could_read_is_a_duration_nobody_states(self):
+        """No answer must leave the send exactly what it was."""
+        current = {"name": "track.mp3", "_source_metadata": {"title": "T"}}
+
+        self.assertEqual(_audio_tag_kwargs(current, "track.mp3"), {"title": "T"})
+        self.assertEqual(_audio_tag_kwargs(current, "track.mp3", None), {"title": "T"})
+        self.assertEqual(_audio_tag_kwargs(current, "track.mp3", 0), {"title": "T"})
+
+    def test_the_probe_reads_the_file_it_was_handed(self):
+        async def _read(path):
+            self.assertEqual(path, "storage/output/Track.001.mp3")
+            return {"title": "T", "performer": "P", "duration": 123}
+
+        with patch("utils.userbot_uploader.probe_audio_metadata", _read):
+            self.assertEqual(asyncio.run(_audio_delivery_duration("storage/output/Track.001.mp3")), 123)
+
+    def test_a_probe_that_cannot_read_the_file_states_nothing(self):
+        async def _boom(path):
+            raise RuntimeError("no ffprobe here")
+
+        async def _empty(path):
+            return {}
+
+        async def _zero(path):
+            return {"duration": 0}
+
+        for probe in (_boom, _empty, _zero):
+            with self.subTest(probe=probe.__name__), patch("utils.userbot_uploader.probe_audio_metadata", probe):
+                self.assertIsNone(asyncio.run(_audio_delivery_duration("whatever.mp3")))
+
+    def test_a_delivery_with_no_path_is_never_probed(self):
+        with patch("utils.userbot_uploader.probe_audio_metadata") as probe:
+            self.assertIsNone(asyncio.run(_audio_delivery_duration(None)))
+            self.assertIsNone(asyncio.run(_audio_delivery_duration("")))
+
+        probe.assert_not_called()
 
 
 class AudioDetectionTests(unittest.TestCase):
@@ -1229,6 +1288,40 @@ class DocumentDeliveryPreferenceTests(unittest.TestCase):
         # A document carries only the filename attribute: a video attribute would
         # put it back in the media view it was meant to leave.
         self.assertIn("attributes=[raw.types.DocumentAttributeFilename(file_name=name)]", src)
+
+
+class WorkerAudioClassificationTests(unittest.TestCase):
+    """One answer to "is this output audio?", asked by every delivery path.
+
+    The inline Bot API branch carried a hand-written list of seven container
+    extensions of its own; the MTProto sends and a deferred retry ask
+    ``is_audio_delivery_output``. The two disagreed about ``.wma`` and ``.oga``, so
+    an output in one of those containers was delivered as a plain document - no
+    player, and no duration for the send to state - while a retry of the very same
+    job sent it as audio.
+    """
+
+    def test_the_container_the_bot_calls_audio_is_audio_on_every_path(self):
+        from workers.ffmpeg_worker import _deferred_media_kind, _is_audio_output
+
+        for name in ("track.wma", "track.oga", "track.flac", "Track.001.mp3", "ALBUM.MP3"):
+            with self.subTest(name=name):
+                self.assertTrue(_is_audio_output(name))
+                self.assertEqual(_deferred_media_kind({"delivery_name": name}), "audio")
+
+    def test_a_video_or_a_path_that_is_not_there_is_not_audio(self):
+        from workers.ffmpeg_worker import _is_audio_output
+
+        for name in ("clip.mp4", "bundle.zip", "", None):
+            with self.subTest(name=name):
+                self.assertFalse(_is_audio_output(name))
+
+    def test_the_inline_branch_keeps_no_container_list_of_its_own(self):
+        src = read_source("workers", "ffmpeg_worker.py")
+
+        self.assertIn("if _is_audio_output(out):", src)
+        # The copy that answered differently is gone, container by container.
+        self.assertNotIn("_output_ext", src)
 
 
 class MenuTriggerCoverageTests(unittest.TestCase):

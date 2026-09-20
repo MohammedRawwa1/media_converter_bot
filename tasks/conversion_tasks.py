@@ -1204,26 +1204,72 @@ async def extract_streams(input_path: str, output_dir: str) -> tuple[bool, dict[
         return False, {}
 
 
+#: The audio targets this bot converts to, and the codec each one is written with.
+#: ONE table: the in-process converter below reads it, and so does the worker job
+#: the handler queues for a source too large to convert here - those used to be two
+#: tables, and the in-process one had no ``m4a`` entry at all.
+AUDIO_FORMAT_CODECS: dict[str, str] = {
+    "mp3": "libmp3lame",
+    "wav": "pcm_s16le",
+    "aac": "aac",
+    "m4a": "aac",
+    "flac": "flac",
+    "ogg": "libvorbis",
+    "opus": "libopus",
+}
+
+#: The targets whose encoder takes a bitrate. PCM has no bitrate to set, and flac
+#: refuses one outright ("Codec AVOption b ... has not been used for any stream").
+_AUDIO_BITRATE_TARGETS = frozenset({"mp3", "aac", "m4a", "ogg", "opus"})
+
+
+def audio_format_ffmpeg_args(target_format: str, bitrate: str = "128k") -> list[str] | None:
+    """The ffmpeg arguments one audio target is encoded with, or ``None`` for a target nothing knows.
+
+    ``m4a`` is the entry that has to be stated: it is AAC inside an MP4 container,
+    and ffmpeg writes nothing else into that container - the converter used to have
+    no entry for it and fell back to ``libmp3lame``, so the M4A button failed
+    outright ("Nothing was written into output file, because at least one of its
+    streams received no packets") for every file small enough to be converted in
+    process, while the very same media handed to the worker converted fine.
+
+    A target this table does not know is refused rather than written as an MP3
+    under another extension, which is what the old fallback did - the caller gets
+    ``None`` and says so.
+
+    The tag recipe travels with the codec, because the tags are part of the result:
+    ``-map_metadata 0`` states the copy instead of leaving it to an invisible
+    default, and an MP3 is written as ID3v2.3 (see :data:`MP3_METADATA_ARGS`) - the
+    version the properties panel a user actually opens reads.
+    """
+    target = str(target_format or "").lower()
+    codec = AUDIO_FORMAT_CODECS.get(target)
+    if codec is None:
+        return None
+    args = ["-c:a", codec]
+    if target in _AUDIO_BITRATE_TARGETS:
+        args += ["-b:a", str(bitrate)]
+    args += list(MP3_METADATA_ARGS) if target == "mp3" else ["-map_metadata", "0"]
+    return args
+
+
 async def convert_audio_format(
     input_path: str, output_path: str, target_format: str = "mp3", bitrate: str = "192k"
 ) -> tuple[bool, str]:
-    """Convert audio format asynchronously."""
+    """Convert audio to *target_format*, keeping the media's own tags.
+
+    The codec comes from :func:`audio_format_ffmpeg_args`, so this and the worker
+    job encode a target the same way - a small file and a large one are the same
+    button - and a target the table does not know is refused instead of being
+    written as an MP3 under the wrong extension.
+    """
     try:
-        codec_map = {"mp3": "libmp3lame", "wav": "pcm_s16le", "aac": "aac", "flac": "flac", "ogg": "libvorbis"}
+        args = audio_format_ffmpeg_args(target_format, bitrate)
+        if args is None:
+            logger.warning("convert_audio_format: unsupported target %r", target_format)
+            return False, f"unsupported audio format: {target_format}"
 
-        codec = codec_map.get(target_format, "libmp3lame")
-
-        cmd = [
-            "ffmpeg",
-            "-y",
-            "-i",
-            input_path,
-            "-c:a",
-            codec,
-            "-b:a",
-            bitrate if codec != "pcm_s16le" else "1411k",
-            output_path,
-        ]
+        cmd = ["ffmpeg", "-y", "-i", input_path, *args, output_path]
 
         process = await _spawn_process(*cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
 

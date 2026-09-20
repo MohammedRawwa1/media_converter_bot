@@ -363,12 +363,24 @@ class ExtendedMediaConverter:
         return success
 
     async def convert_audio_format(
-        self, input_path: str, output_path: str, target_format: str = "mp3", quality: int = 2
+        self,
+        input_path: str,
+        output_path: str,
+        target_format: str = "mp3",
+        quality: int = 2,
+        bitrate: str | None = None,
     ) -> bool:
         """Convert audio between formats.
 
-        Delegates to the canonical implementation in ``tasks.conversion_tasks``.
-        Maps the ``quality`` parameter to an approximate CBR bitrate.
+        Delegates to the canonical implementation in ``tasks.conversion_tasks``,
+        which owns the codec each target is written with, so this and the worker job
+        for a larger source encode the same button the same way.
+
+        *bitrate*, when given, is used as-is; otherwise the ``quality`` parameter is
+        mapped to an approximate CBR bitrate. The Convert Format button states its
+        own (``_DEFAULT_AUDIO_BITRATE``), because the bitrate the menu promises and
+        the one the queued job encodes at have to be the same number - they were not
+        while this mapped every call to 192k.
         """
         from tasks.conversion_tasks import convert_audio_format as _convert_audio
 
@@ -385,7 +397,7 @@ class ExtendedMediaConverter:
             8: "48k",
             9: "32k",
         }
-        bitrate = _bitrate_map.get(quality, "192k")
+        bitrate = bitrate or _bitrate_map.get(quality, "192k")
 
         success, _ = await _convert_audio(input_path, output_path, target_format=target_format, bitrate=bitrate)
         return success

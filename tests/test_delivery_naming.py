@@ -101,6 +101,37 @@ def test_an_audio_delivery_says_the_name_it_wants_and_keeps_the_tags():
     assert problems == [], "; ".join(problems)
 
 
+def _enclosing_node(tree: ast.Module, lineno: int):
+    """The innermost function containing *lineno*, as the node itself."""
+    best = None
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        if node.lineno <= lineno <= (node.end_lineno or 0) and (best is None or node.lineno > best.lineno):
+            best = node
+    return best
+
+
+def test_every_audio_delivery_states_how_long_the_file_is():
+    """Telegram will not derive a long clip's length: the send has to state it.
+
+    A track longer than a short clip is delivered with duration 0 unless the
+    caller passes one - the player shows ``00:00`` and the progress bar never
+    moves - and the answer has to come from a probe of the *output* file, because
+    a re-encode and a keyframe cut both cannot promise the source's length. So
+    every raw ``send_audio`` probes the file it is about to send.
+    """
+    tree = parse_source(*HANDLERS)
+    problems = []
+    for lineno, _name, _keywords, _expansion in _calls(tree, {"send_audio"}):
+        if _enclosing(tree, lineno) in DELIVERY_HELPERS:
+            continue
+        enclosing = _enclosing_node(tree, lineno)
+        if "_audio_delivery_duration" not in (ast.unparse(enclosing) if enclosing else ""):
+            problems.append(f"L{lineno}: sent without a probed duration")
+    assert problems == [], "; ".join(problems)
+
+
 def test_the_video_metadata_is_probed_not_invented():
     """The auto-driven tags for a video: duration, dimensions and a thumbnail."""
     src = read_source("handlers.py")
