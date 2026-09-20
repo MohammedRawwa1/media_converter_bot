@@ -164,7 +164,7 @@ class SplitQuotaTests(unittest.TestCase):
         context.application = SimpleNamespace(bot_data={"conversion_rate_limiter": limiter})
         session = {"current_file": {"id": "abc123", "name": "Album.mp3", "path": None, "type": "audio"}}
 
-        async def _split(input_path, output_dir, segment_seconds, *, ext=".mp4", stem="part"):
+        async def _split(input_path, output_dir, segment_seconds, *, ext=".mp4", stem="part", source_meta=None):
             os.makedirs(output_dir, exist_ok=True)
             part = os.path.join(output_dir, f"{stem}.001{ext}")
             with open(part, "wb") as fh:
@@ -289,7 +289,7 @@ class SplitSummaryTests(unittest.TestCase):
         }
         count = handler._parts_to_write
 
-        async def _split(input_path, output_dir, segment_seconds, *, ext=".mp4", stem="part"):
+        async def _split(input_path, output_dir, segment_seconds, *, ext=".mp4", stem="part", source_meta=None):
             os.makedirs(output_dir, exist_ok=True)
             parts = []
             for index in range(1, count + 1):
@@ -384,7 +384,7 @@ class SplitLazySourceTests(unittest.TestCase):
         logic that filters sub-KB tail parts does not interfere with this test.
         """
 
-        async def _split(input_path, output_dir, segment_seconds, *, ext=".mp4", stem="part"):
+        async def _split(input_path, output_dir, segment_seconds, *, ext=".mp4", stem="part", source_meta=None):
             os.makedirs(output_dir, exist_ok=True)
             parts = [os.path.join(output_dir, f"{stem}.{index:03d}{ext}") for index in range(1, parts_to_write + 1)]
             for part in parts:

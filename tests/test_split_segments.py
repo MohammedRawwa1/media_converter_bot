@@ -119,22 +119,41 @@ class _FakeProcess:
         return b"", self.stderr
 
 
-def _patch_spawn(monkeypatch, *, returncode=0, stderr=b"", parts=3, size=16):
-    """Record the argv and write the part files ffmpeg would have written."""
+def _patch_spawn(monkeypatch, *, returncode=0, stderr=b"", parts=3, size=16, stamp_returncode=0):
+    """Record the argv and write the part files ffmpeg would have written.
+
+    The source-tag probe is neutralised: these tests are about the cut itself,
+    and the stand-in sources are not readable media, so what a real ffprobe makes
+    of one of them is not something the command they pin should depend on. The
+    tags the parts are given have their own tests.
+
+    ``seen["cmd"]`` is the **cut** - the call that carries the ``%03d`` pattern -
+    because a split of an audio container is followed by one tag pass per part
+    (see ``_stamp_split_part``); those are collected in ``seen["tag_calls"]``.
+    """
     seen = {}
 
     async def _spawn(*cmd, **kwargs):
-        seen["cmd"] = list(cmd)
-        seen.setdefault("calls", []).append(list(cmd))
-        pattern = cmd[-1]
-        if returncode == 0:
-            for index in range(1, parts + 1):
-                path = pattern.replace("%03d", f"{index:03d}")
-                with open(path, "wb") as fh:
-                    fh.write(b"x" * size)
-        return _FakeProcess(returncode, stderr)
+        if "%03d" in str(cmd[-1]):
+            seen["cmd"] = list(cmd)
+            if returncode == 0:
+                for index in range(1, parts + 1):
+                    path = cmd[-1].replace("%03d", f"{index:03d}")
+                    with open(path, "wb") as fh:
+                        fh.write(b"x" * size)
+            seen.setdefault("calls", []).append(list(cmd))
+            return _FakeProcess(returncode, stderr)
+        seen.setdefault("tag_calls", []).append(list(cmd))
+        if stamp_returncode == 0:
+            with open(cmd[-1], "wb") as fh:
+                fh.write(b"tagged")
+        return _FakeProcess(stamp_returncode, b"" if stamp_returncode == 0 else b"nothing to write")
+
+    async def _no_tags(_path):
+        return None
 
     monkeypatch.setattr(conversion_tasks, "_spawn_process", _spawn)
+    monkeypatch.setattr(conversion_tasks, "_probe_split_source_meta", _no_tags)
     return seen
 
 
@@ -173,6 +192,10 @@ def test_the_split_is_one_stream_copy_with_the_users_timing(tmp_path, monkeypatc
         "+genpts",
         "-segment_format_options",
         "movflags=+faststart",
+        # Stated, because ffmpeg's default copy does not carry every format field:
+        # a real mp4 part came back without its ``creation_time``.
+        "-map_metadata",
+        "0",
         os.path.join(str(out_dir), "Concert.%03d.mp4"),
     ]
     assert [os.path.basename(p) for p in parts] == ["Concert.001.mp4", "Concert.002.mp4", "Concert.003.mp4"]
@@ -218,13 +241,17 @@ def test_containers_that_reject_the_flag_do_not_get_it(tmp_path, monkeypatch, ex
 
 
 def test_an_audio_part_keeps_the_header_that_states_its_length(tmp_path, monkeypatch):
-    """A CBR mp3 part carries a Xing/Info header: no rewrite is needed (or wanted).
+    """The part's own header is written for ID3v2.3 and never asked for a time.
 
-    The splitter used to rewrite every audio part afterwards with ``-metadata
-    duration=…`` into a ``<part>.tmp`` file - which ffmpeg cannot even open (no
-    output format for ``.tmp``), so the pass only burned a process per part and
-    never fixed anything. The header ffmpeg writes for the part is what states the
-    length, so the split has to leave the file alone.
+    The splitter once rewrote every audio part with ``-metadata duration=…`` into
+    a ``<part>.tmp`` file - which ffmpeg cannot even open (no output format for
+    ``.tmp``), so the pass burned a process per part and fixed nothing. What
+    states a part's length is the Xing/Info header the muxer writes for it.
+
+    The parts *are* post-processed now, for the one thing the cut cannot state
+    (each part's own title and track number) - and that pass keeps this promise:
+    it is a stream copy into a sibling that keeps the part's extension, so the
+    frames, and with them that header, are copied through untouched.
     """
     src = _source_file(tmp_path, "Album.mp3")
     seen = _patch_spawn(monkeypatch)
@@ -234,8 +261,10 @@ def test_an_audio_part_keeps_the_header_that_states_its_length(tmp_path, monkeyp
     cmd = seen["cmd"]
     assert cmd[cmd.index("-id3v2_version") + 1] == "3"
     assert cmd[cmd.index("-avoid_negative_ts") + 1] == "make_zero"
-    # One ffmpeg run: the parts are never post-processed behind the splitter's back.
-    assert len(seen["calls"]) == 1
+    # No part is ever asked to carry a duration, and no output is called ".tmp".
+    assert not any(part.startswith("duration=") for part in cmd)
+    for call in seen["calls"] + seen.get("tag_calls", []):
+        assert not call[-1].endswith(".tmp")
 
 
 def test_the_parts_are_numbered_from_one_not_from_ffmpegs_zero(tmp_path, monkeypatch):
@@ -356,6 +385,321 @@ def test_the_media_name_becomes_a_safe_file_name(name, expected):
     assert _safe_media_stem(name) == expected
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# The tags a part carries
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def test_a_media_with_no_tags_of_its_own_names_its_parts():
+    """The gap ``-map_metadata 0`` cannot fill: there is nothing to copy.
+
+    An ordinary untagged ``Module 02.mp3`` splits into parts whose only tag is the
+    encoder's, so nothing about the media shows in a player - that is ffmpeg's
+    default, and stating the name it does have is the way out of it.
+    """
+    assert conversion_tasks._split_metadata_args({"title": "", "performer": ""}, "Module 02") == [
+        "-metadata",
+        "title=Module 02",
+    ]
+    assert conversion_tasks._split_metadata_args({}, "Album") == ["-metadata", "title=Album"]
+
+
+def test_the_tags_the_source_does_carry_are_restated_along_with_them():
+    args = conversion_tasks._split_metadata_args({"title": "Real Title", "performer": "Real Artist"}, "Album")
+
+    assert args == ["-metadata", "title=Real Title", "-metadata", "artist=Real Artist"]
+    # The same thing under the other name the ingest verdicts use.
+    assert conversion_tasks._split_metadata_args({"title": "T", "artist": "A"}, "Album") == [
+        "-metadata",
+        "title=T",
+        "-metadata",
+        "artist=A",
+    ]
+
+
+def test_a_source_whose_tags_cannot_be_read_is_left_to_ffmpeg():
+    """A verdict nobody could read is not evidence of an empty one."""
+    assert conversion_tasks._split_metadata_args(None, "Album") == []
+    assert conversion_tasks._split_metadata_args("nonsense", "Album") == []
+
+
+def test_a_media_nobody_can_read_is_described_with_nothing(tmp_path, monkeypatch):
+    """An unreadable probe is not a media with no tags.
+
+    When the verdict comes back empty - no ffprobe on the box, a file it refuses -
+    the split has two options: state the file name as the title, or leave the tags
+    alone. Stating it overwrites the real title ffmpeg is about to copy, which is
+    the one outcome worse than the blank this exists to fix, so nothing is stated
+    and the cut copies whatever the source has.
+    """
+    src = _source_file(tmp_path, "Module 02.mp3")
+    seen = _patch_spawn(monkeypatch)
+
+    async def _unreadable(_path):
+        return {}
+
+    monkeypatch.setattr(conversion_tasks, "_probe_split_source_meta", _unreadable)
+
+    _run(conversion_tasks.split_media_segments(src, str(tmp_path / "out"), 600, ext=".mp3", stem="Module 02"))
+
+    assert "-metadata" not in seen["cmd"]
+    # Nothing is stated to the parts either: no pass is run at all.
+    assert not seen.get("tag_calls")
+
+
+def test_the_probe_answers_none_when_it_has_nothing(tmp_path, monkeypatch):
+    """Both ways of having no answer are one answer: ``None``."""
+
+    async def _empty(_path):
+        return {}
+
+    async def _read(_path):
+        return {"title": "Real Title", "duration": 12.5}
+
+    import utils.ffmpeg_runner as ffmpeg_runner
+
+    monkeypatch.setattr(ffmpeg_runner, "probe_media", _empty)
+    assert _run(conversion_tasks._probe_split_source_meta("whatever.mp3")) is None
+
+    monkeypatch.setattr(ffmpeg_runner, "probe_media", _read)
+    assert _run(conversion_tasks._probe_split_source_meta("whatever.mp3"))["title"] == "Real Title"
+
+    async def _boom(_path):
+        raise RuntimeError("no ffprobe here")
+
+    monkeypatch.setattr(ffmpeg_runner, "probe_media", _boom)
+    assert _run(conversion_tasks._probe_split_source_meta("whatever.mp3")) is None
+
+
+def test_the_parts_are_told_what_the_media_is(tmp_path, monkeypatch):
+    src = _source_file(tmp_path, "Module 02.mp3")
+    seen = _patch_spawn(monkeypatch)
+
+    async def _tags(_path):
+        return {"title": "", "performer": "", "album": ""}
+
+    monkeypatch.setattr(conversion_tasks, "_probe_split_source_meta", _tags)
+
+    _run(conversion_tasks.split_media_segments(src, str(tmp_path / "out"), 600, ext=".mp3", stem="Module 02"))
+
+    cmd = seen["cmd"]
+    assert cmd[cmd.index("-metadata") + 1] == "title=Module 02"
+    # ``-map_metadata 0`` still runs: a part keeps whatever else the source had.
+    assert cmd[cmd.index("-map_metadata") + 1] == "0"
+    # The cut is one run, and a stream copy.
+    assert len(seen["calls"]) == 1
+    assert [cmd[cmd.index("-c") + 1]] == ["copy"]
+
+
+def test_every_audio_part_is_given_its_own_title_and_track_number(tmp_path, monkeypatch):
+    """A player has to be able to list the parts separately, not the media twice.
+
+    The segment muxer writes one set of global tags to every part - ffmpeg has no
+    per-segment metadata option - so ``Module 02`` would arrive as three files a
+    player shows under the same title with no number between them. Each part gets
+    its own pass, and that pass is a stream copy: nothing is re-encoded.
+    """
+    src = _source_file(tmp_path, "Module 02.mp3")
+    seen = _patch_spawn(monkeypatch, parts=3)
+
+    async def _tags(_path):
+        return {"title": "", "performer": "Real Artist"}
+
+    monkeypatch.setattr(conversion_tasks, "_probe_split_source_meta", _tags)
+
+    ok, parts, _error = _run(
+        conversion_tasks.split_media_segments(src, str(tmp_path / "out"), 600, ext=".mp3", stem="Module 02")
+    )
+
+    assert ok and len(parts) == 3
+    assert len(seen["tag_calls"]) == 3
+    for index, call in enumerate(seen["tag_calls"], 1):
+        assert call[call.index("-c") + 1] == "copy"
+        assert call[call.index("-metadata") + 1] == f"title=Module 02 (part {index}/3)"
+        assert f"track={index}/3" in call
+        # Every part names the same album and album artist, the pair a player
+        # groups the three by.
+        assert "album=Module 02" in call
+        assert "album_artist=Real Artist" in call
+        # The artist the media did carry is still carried.
+        assert "artist=Real Artist" in call
+        # Each pass writes into its own part, through a sibling that keeps the
+        # extension (a `.tmp` name has no muxer ffmpeg would write).
+        assert call[-1] == os.path.join(str(tmp_path / "out"), f"Module 02.{index:03d}.tagging.mp3")
+        assert call[call.index("-i") + 1].endswith(f"Module 02.{index:03d}.mp3")
+
+
+def test_a_stream_tagged_container_is_told_on_the_stream(tmp_path, monkeypatch):
+    """Ogg/Opus keep their tags on the stream, where a global tag does not win.
+
+    ``-map_metadata 0`` has just copied the cut's own title onto that stream, and
+    the global ``-metadata`` is ignored for a key that is already there - the part
+    would come back with the un-numbered title and only the track number would
+    change. Verified against a real ogg: the global form silently kept
+    ``Track Title``, the stream form replaced it.
+    """
+    src = _source_file(tmp_path, "Album.ogg")
+    seen = _patch_spawn(monkeypatch, parts=2)
+
+    async def _tags(_path):
+        return {"title": "Album"}
+
+    monkeypatch.setattr(conversion_tasks, "_probe_split_source_meta", _tags)
+
+    _run(conversion_tasks.split_media_segments(src, str(tmp_path / "out"), 600, ext=".ogg", stem="Album"))
+
+    assert len(seen["tag_calls"]) == 2
+    for index, call in enumerate(seen["tag_calls"], 1):
+        assert "-metadata:s:a:0" in call
+        assert f"title=Album (part {index}/2)" in call
+        assert "album=Album" in call
+        # A global tag would be dropped here, so there must not be one at all.
+        assert all(item != "-metadata" for item in call)
+
+
+def test_the_parts_share_an_album_so_a_player_groups_them():
+    """Track numbers alone leave the parts unrelated; an album names the media.
+
+    An untagged media carries no album of its own, so its parts would be listed as
+    loose files that happen to number 1/2 and 2/2. The media's own name is the
+    album they belong to.
+    """
+    args = conversion_tasks._part_tag_args({"title": ""}, "Module 02", 1, 2)
+    assert "album=Module 02" in args
+    # n/total on its own means the part belongs to *some* media; the album says which.
+    assert "track=1/2" in args
+
+
+def test_an_album_the_media_carried_is_not_replaced_by_its_name():
+    """A real album is worth more than a grouping invented from a file name."""
+    args = conversion_tasks._part_tag_args({"title": "Track", "album": "Real Album"}, "Media", 2, 2)
+    assert "album=Real Album" in args
+    assert args.count("album=Media") == 0
+
+
+def test_the_parts_carry_the_album_artist_the_media_carried():
+    """Album and album artist are the pair a player groups a release by."""
+    args = conversion_tasks._part_tag_args(
+        {"title": "Track", "album": "Real Album", "album_artist": "The Band"}, "Media", 1, 2
+    )
+    assert "album=Real Album" in args
+    assert "album_artist=The Band" in args
+    # The probe's own spelling of the field, which is what an ingest writes.
+    assert "album_artist=The Band" in conversion_tasks._part_tag_args({"albumartist": "The Band"}, "M", 1, 2)
+    assert "album_artist=The Band" in conversion_tasks._part_tag_args({"band": "The Band"}, "M", 1, 2)
+
+
+def test_a_media_with_one_artist_fills_in_the_album_artist_it_lacks():
+    """One artist and no album-artist field is that artist's album.
+
+    Left blank, a library groups such a release by its *track* artists and files
+    it under "Various Artists"; the artist the media names is what it means.
+    """
+    args = conversion_tasks._part_tag_args({"title": "Track", "performer": "Real Artist"}, "Media", 1, 2)
+    assert "album_artist=Real Artist" in args
+    # And the album artist named outright is not overwritten by the track artist.
+    args = conversion_tasks._part_tag_args({"performer": "Track Artist", "album_artist": "The Band"}, "M", 1, 2)
+    assert "album_artist=The Band" in args
+    assert "album_artist=Track Artist" not in args
+
+
+def test_an_untagged_media_is_not_given_an_album_artist_it_never_had():
+    """The media's *name* is not an artist, so it is not filed as one.
+
+    The album it is grouped under is the name it does have; the field that names
+    a performer stays empty rather than crediting the file to "Module 02".
+    """
+    args = conversion_tasks._part_tag_args({"title": "", "performer": ""}, "Module 02", 1, 2)
+    assert "album=Module 02" in args
+    assert not any(item.startswith("album_artist=") for item in args)
+    assert not any(item.startswith("artist=") for item in args)
+
+
+def test_the_tag_option_follows_the_container():
+    assert conversion_tasks._part_tag_args({"title": "T"}, "Album", 1, 2) == [
+        "-metadata",
+        "title=T (part 1/2)",
+        "-metadata",
+        "track=1/2",
+        "-metadata",
+        "album=Album",
+    ]
+    assert conversion_tasks._part_tag_args({"title": "T"}, "Album", 1, 2, "-metadata:s:a:0") == [
+        "-metadata:s:a:0",
+        "title=T (part 1/2)",
+        "-metadata:s:a:0",
+        "track=1/2",
+        "-metadata:s:a:0",
+        "album=Album",
+    ]
+    # The artist the media carried is numbered with it, and nothing is invented
+    # for a source whose tags could not be read.
+    assert conversion_tasks._part_tag_args({"title": "T", "performer": "P"}, "A", 2, 2)[-2:] == [
+        "-metadata",
+        "artist=P",
+    ]
+    assert conversion_tasks._part_tag_args(None, "Album", 1, 2) == []
+
+
+def test_a_video_split_is_not_tagged_part_by_part(tmp_path, monkeypatch):
+    """Re-muxing a video part costs a second full copy for a field nothing shows."""
+    src = _source_file(tmp_path, "Concert.mp4")
+    seen = _patch_spawn(monkeypatch)
+
+    _run(conversion_tasks.split_media_segments(src, str(tmp_path / "out"), 600, ext=".mp4", stem="Concert"))
+
+    # One run, and no tag pass: ``tag_calls`` is only ever created by one.
+    assert "tag_calls" not in seen
+    assert len(seen["calls"]) == 1
+
+
+def test_a_part_that_cannot_be_tagged_keeps_the_bytes_ffmpeg_wrote(tmp_path, monkeypatch):
+    """The tags are a nicety; the media the user asked for is not."""
+    src = _source_file(tmp_path, "Album.mp3")
+    out_dir = tmp_path / "out"
+    seen = _patch_spawn(monkeypatch, parts=2, size=16, stamp_returncode=1)
+
+    async def _tags(_path):
+        return {"title": "Album"}
+
+    monkeypatch.setattr(conversion_tasks, "_probe_split_source_meta", _tags)
+
+    ok, parts, error = _run(conversion_tasks.split_media_segments(src, str(out_dir), 600, ext=".mp3", stem="Album"))
+
+    assert ok and error == ""
+    assert len(seen["tag_calls"]) == 2
+    # The parts are still the ones the cut produced, and no staging file is left
+    # behind for the next split of the same name to mistake for a part.
+    assert [os.path.getsize(part) for part in parts] == [16, 16]
+    assert sorted(os.listdir(out_dir)) == ["Album.001.mp3", "Album.002.mp3"]
+
+
+def test_a_verdict_the_caller_already_has_is_not_probed_again(tmp_path, monkeypatch):
+    """The ingest probed every stored media: the split must not do it twice."""
+    src = _source_file(tmp_path, "Album.mp3")
+    seen = _patch_spawn(monkeypatch)
+
+    async def _boom(_path):
+        raise AssertionError("the caller's verdict is the read")
+
+    monkeypatch.setattr(conversion_tasks, "_probe_split_source_meta", _boom)
+
+    _run(
+        conversion_tasks.split_media_segments(
+            src,
+            str(tmp_path / "out"),
+            600,
+            ext=".mp3",
+            stem="Album",
+            source_meta={"title": "Real Title", "performer": "Real Artist"},
+        )
+    )
+
+    cmd = seen["cmd"]
+    assert cmd[cmd.index("-metadata") + 1] == "title=Real Title"
+    assert "artist=Real Artist" in cmd
+
+
 def test_a_document_is_named_after_the_media_not_after_its_path():
     current = {"name": "My Movie.2024.mkv"}
     assert _document_delivery_name(current, "/storage/output/12345_optimized.mp4") == "My Movie.2024.mp4"
@@ -445,3 +789,84 @@ def test_the_converter_delegates_instead_of_splitting_its_own_way():
     src = read_source("media_converter.py")
     assert "from tasks.conversion_tasks import split_media_segments" in src
     assert "-segment_time" not in src
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# The single range: the same media, cut once
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def _patch_trim_spawn(monkeypatch, payload=b"cut"):
+    seen = {}
+
+    async def _spawn(*cmd, **kwargs):
+        seen["cmd"] = list(cmd)
+        with open(cmd[-1], "wb") as fh:
+            fh.write(payload)
+        return _FakeProcess(0, b"")
+
+    monkeypatch.setattr(conversion_tasks, "_spawn_process", _spawn)
+    return seen
+
+
+def test_a_range_cut_carries_the_metadata_and_the_streams(tmp_path, monkeypatch):
+    """A range is a part of the media, so it keeps what the media had.
+
+    The default stream selection picks one video and one audio track, so a range
+    of a subtitled video arrived with no subtitle track at all - and ffmpeg's
+    default metadata copy left out ``creation_time``, the date a player shows for
+    the file. Both are stated instead, which is a metadata and a mapping flag: the
+    cut is still ``-c copy``.
+    """
+    src = _source_file(tmp_path, "Concert.mp4")
+    target = str(tmp_path / "out" / "Concert.001.mp4")
+    os.makedirs(os.path.dirname(target), exist_ok=True)
+    seen = _patch_trim_spawn(monkeypatch)
+
+    ok, _message = _run(conversion_tasks.trim_media(src, target, "00:00:10", "00:00:40"))
+
+    assert ok
+    cmd = seen["cmd"]
+    assert cmd[0] == conversion_tasks.FFMPEG_PATH
+    assert cmd[cmd.index("-map") + 1] == "0"
+    assert cmd[cmd.index("-map_metadata") + 1] == "0"
+    assert cmd[cmd.index("-c") + 1] == "copy"
+    assert cmd[cmd.index("-t") + 1] == "30.0"
+
+
+def test_a_cut_into_another_container_does_not_map_every_stream(tmp_path, monkeypatch):
+    """A container the source's streams do not belong to may refuse them.
+
+    ``-map 0`` keeps a subtitle track in the source's own container, but the same
+    mapping into a different one can fail the whole run (an MP4 cannot hold the
+    subtitle codecs an MKV can) - a cut that drops a stream still produces the cut.
+    """
+    src = _source_file(tmp_path, "Concert.mkv")
+    target = str(tmp_path / "Concert.001.mp4")
+    seen = _patch_trim_spawn(monkeypatch)
+
+    ok, _message = _run(conversion_tasks.trim_media(src, target, "00:00:00", "00:00:10"))
+
+    assert ok
+    assert "-map" not in seen["cmd"]
+    # The metadata copy is not a stream mapping: it is asked for either way.
+    assert seen["cmd"].count("-map_metadata") == 1
+
+
+def test_the_audio_containers_this_bot_delivers_as_audio_are_numbered(tmp_path, monkeypatch):
+    """A part whose container carries tags is told which part it is; ``.aac`` cannot."""
+    assert ".wma" in conversion_tasks._SPLIT_TAG_AUDIO_EXTS
+    assert ".aac" not in conversion_tasks._SPLIT_TAG_AUDIO_EXTS
+    src = _source_file(tmp_path, "Track.wma")
+    seen = _patch_spawn(monkeypatch, parts=2)
+
+    async def _tags(_path):
+        return {"title": "", "performer": ""}
+
+    monkeypatch.setattr(conversion_tasks, "_probe_split_source_meta", _tags)
+
+    _run(conversion_tasks.split_media_segments(src, str(tmp_path / "out"), 600, ext=".wma", stem="Track"))
+
+    assert len(seen["tag_calls"]) == 2
+    assert "track=1/2" in seen["tag_calls"][0]
+    assert "album=Track" in seen["tag_calls"][0]

@@ -2981,9 +2981,21 @@ class EnhancedMediaHandler:
                 # Check if this part exceeds the Bot API limit - if so, use userbot
                 part_size = os.path.getsize(part) if os.path.exists(part) else 0
                 if part_size > config.BOT_API_MAX_BYTES and getattr(config, "ENABLE_USERBOT", False):
-                    # Route large parts through userbot for direct MTProto delivery
+                    # Route large parts through userbot for direct MTProto delivery.
+                    # The requester's own account where there is one - the session
+                    # the rest of the large-file delivery uses - and their upload
+                    # preference, which /usersettings applies to every other video
+                    # this bot sends and which this path used to drop.
                     sent_ok = await self._send_part_via_userbot(
-                        chat_id, part, caption, part_name, as_audio, current_file, label
+                        chat_id,
+                        part,
+                        caption,
+                        part_name,
+                        as_audio,
+                        current_file,
+                        label,
+                        user_id=user_id,
+                        as_document=(not as_audio and upload_mode == _UPLOAD_MODE_FILE),
                     )
                     if sent_ok:
                         sent += 1
@@ -2996,15 +3008,21 @@ class EnhancedMediaHandler:
                         # metadata the source carried is preserved - with the part
                         # number added, because otherwise Telegram's player shows the
                         # same title for all of them.
+                        #
+                        # A media that carries no title of its own gets its name
+                        # instead - the same string the splitter stamps into the
+                        # part itself (``_part_tag_args``). The alternative was the
+                        # part's file name (``Module 02.001``), which is a number
+                        # rather than a title and reads as no metadata at all.
                         _title, _performer = _source_media_tags(current_file)
-                        if _title:
-                            _title = f"{_title} ({label})"
+                        _fallback_title = _safe_media_stem(current_file.get("name"))
+                        _title = f"{_title or _fallback_title} ({label})"
                         await self._send_audio_result(
                             context.bot,
                             chat_id,
                             part,
                             caption=caption,
-                            title=_title or os.path.splitext(part_name)[0],
+                            title=_title,
                             performer=_performer or None,
                             filename=part_name,
                         )
@@ -3032,12 +3050,21 @@ class EnhancedMediaHandler:
         as_audio: bool,
         current_file: dict,
         label: str,
+        *,
+        user_id: int | None = None,
+        as_document: bool = False,
     ) -> bool:
         """Send a split part via userbot (MTProto) for files exceeding Bot API limits.
 
         This is the large-file delivery path for split parts: when a part exceeds
         BOT_API_MAX_MB, the Bot API cannot deliver it, so we use Pyrogram/Telethon
         to send it directly via MTProto, which has no size limit.
+
+        *user_id* is the requester's, so the send resolves the session the rest of
+        the pipeline uses for them instead of whatever account is configured
+        first; the uploader falls back on its own when a user has no session.
+        *as_document* carries the ``/usersettings`` preference through MTProto too -
+        the Bot API branch of this same delivery honours it.
 
         Returns True on success, False on failure.
         """
@@ -3060,12 +3087,14 @@ class EnhancedMediaHandler:
         # Build audio metadata if needed
         _audio_meta = None
         if as_audio:
+            # Same title the Bot API path sends: the media's own, or its name when
+            # it carries none, always with the part number that tells the parts
+            # apart in a player.
             _title, _performer = _source_media_tags(current_file)
-            if _title:
-                _title = f"{_title} ({label})"
+            _title = f"{_title or _safe_media_stem(current_file.get('name'))} ({label})"
             _audio_meta = {
                 "duration": None,  # Will be probed by send_file_via_userbot if needed
-                "title": _title or os.path.splitext(delivery_name)[0],
+                "title": _title,
                 "performer": _performer or None,
             }
 
@@ -3079,8 +3108,11 @@ class EnhancedMediaHandler:
                 video_meta=None,  # Will be probed inside
                 thumb_path=_thumb_path,
                 audio_meta=_audio_meta,
-                user_id=None,  # Use default userbot session
-                as_document=False if not as_audio else False,  # Audio should be sent as audio
+                user_id=user_id,
+                # Audio is never sent as a document: the player that makes a music
+                # file useful is lost that way, which is the rule every other
+                # delivery path in this bot follows as well.
+                as_document=bool(as_document) and not as_audio,
             )
             if msg_id:
                 logger.info("handlers: sent %s via userbot (msg_id=%s)", label, msg_id)
@@ -3208,7 +3240,17 @@ class EnhancedMediaHandler:
             else:
                 from tasks.conversion_tasks import split_media_segments
 
-                ok, parts, message = await split_media_segments(source_path, out_dir, seconds, ext=ext, stem=stem)
+                ok, parts, message = await split_media_segments(
+                    source_path,
+                    out_dir,
+                    seconds,
+                    ext=ext,
+                    stem=stem,
+                    # The ingest already probed this media, so its tags need no
+                    # second read - and a media that carries none still gets the
+                    # name it does have stated on each part.
+                    source_meta=current_file.get("_source_metadata"),
+                )
             if not parts:
                 detail = (message or "").strip()[:200]
                 text = "❌ The split produced no parts." + (f"\n`{detail}`" if detail else "")

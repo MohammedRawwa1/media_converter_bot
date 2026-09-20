@@ -207,11 +207,26 @@ delivered **one after another**, each with its part number in the caption, so th
 first part can be watched while the next one uploads. That is a split, not batch
 mode: there is no batch lock and no queue, just the parts in order.
 
-The metadata travels with them: an audio part keeps the source's `title` and
-`performer` (with the part number appended so the player can tell them apart), and
-a video part keeps the probed duration/dimensions and the metadata caption. A
-media whose source is no longer on disk is fetched back from the bucket before it
-is split, rather than failing.
+The metadata travels with them, in the part's own header and in the player. Every
+container gets `-map_metadata 0` (ffmpeg's default copy leaves out fields such as
+the mov family's `creation_time`), so a part keeps the tags, the subtitle tracks
+and the date the source had — chapter markers are the one thing the segment muxer
+writes none of.
+
+An **audio part** is then given its own pass — a stream copy, never a re-encode —
+that states what it is: `title` = the source's own (or the media's name when it
+carries none) with the part number on it, `track` = `1/N`, `album` = the source's
+album (or the media's name), and `album_artist` = the source's, or the artist it
+names when it does not. So `Concert.mp3` arrives as parts a player lists as tracks
+1, 2, 3 of one album instead of the same media three times. `.aac` is left out (raw
+ADTS has no tag carrier) and so is video, where such a pass would cost a second
+full copy of every part for a field the caption already carries.
+
+The **single range** cut is the same stream copy and keeps the same things, with
+`-map 0` added when the cut stays in the source's own container.
+
+A media whose source is no longer on disk is fetched back from the bucket before
+it is split, rather than failing.
 
 ### Bulk Batches
 

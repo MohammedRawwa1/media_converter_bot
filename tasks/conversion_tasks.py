@@ -73,6 +73,222 @@ async def _spawn_process(*cmd, **kwargs):
     return await asyncio.create_subprocess_exec(*cmd, **kwargs)
 
 
+def _split_metadata_args(source_meta: dict | None, stem: str) -> list[str]:
+    """The ``-metadata`` pairs that give a split part's header something to show.
+
+    ``-map_metadata 0`` copies whatever the source carried, and for a tagged media
+    that is the whole answer. It is *no* answer for a media that carries nothing:
+    an ordinary ``Module 02.mp3`` with no ID3 at all produces parts whose only tag
+    is the encoder's, so a player - and Telegram, which reads the header before it
+    decides what to show - displays a file name and no title. That is ffmpeg's
+    default, and it cannot be talked out of it: the tags have to be stated.
+
+    So the part is told what it is: the media's own name when the source had no
+    title of its own, and the artist it did carry when there was one. The source's
+    own title is restated when it exists, which leaves a tagged media's parts
+    exactly as ``-map_metadata 0`` already made them.
+
+    Returns ``[]`` for a source whose tags could not be read at all, which leaves
+    the command exactly as it was: a verdict nobody could read is not evidence of
+    an empty one, and overwriting a real title with the file name would be worse
+    than the blank this exists to fix.
+    """
+    if not isinstance(source_meta, dict):
+        return []
+    title = str(source_meta.get("title") or "").strip() or stem
+    artist = str(source_meta.get("performer") or source_meta.get("artist") or "").strip()
+    args = ["-metadata", f"title={title}"]
+    if artist:
+        args += ["-metadata", f"artist={artist}"]
+    return args
+
+
+#: The audio containers that are given per-part tags after the cut, which is why
+#: a split of one of these costs one extra ffmpeg run per part - a stream copy,
+#: never a re-encode (see ``_stamp_split_part``). Checked container by container:
+#: mp3/m4a/flac/wav report the tags as format tags and ogg/opus as stream tags,
+#: which is what a player reads either way; wma keeps them in its ASF header.
+#: The set is the delivery path's audio list too - a container this bot hands over
+#: as an audio file is one whose parts are numbered like audio (``.aac`` and
+#: ``.wma`` are both delivered as audio, but only the one with a tag carrier is
+#: here).
+#:
+#: Raw ADTS (``.aac``) is absent on purpose - it has no tag carrier at all, so a
+#: pass there would be a process that changes nothing. Video is absent for the
+#: mirror image of that reason: its parts would have to be re-muxed whole to hold
+#: a title nothing displays, which is a second full copy of a multi-gigabyte part
+#: for a field the caption already carries.
+_SPLIT_TAG_AUDIO_EXTS = frozenset({".mp3", ".m4a", ".flac", ".ogg", ".opus", ".wav", ".wma"})
+
+#: Containers whose tags are *stream*-level, where a global ``-metadata`` is
+#: ignored for a key the stream already carries - and ``-map_metadata 0`` has just
+#: copied the cut's own title onto that stream. Verified against ogg/opus: the
+#: global form there silently kept the un-numbered title while ``-metadata:s:a:0``
+#: replaced it. Every other container writes the tags globally, where the same
+#: override does win.
+_STREAM_TAG_SPLIT_EXTS = frozenset({".ogg", ".opus"})
+
+
+def _split_tag_value(source_meta: dict, *candidates: str) -> str:
+    """The first of *candidates* this probe verdict states, or ``""``.
+
+    The probe and the tag editor do not agree on every key name (``performer``
+    from ffprobe, ``artist`` from an edit, ``band`` for an album artist), so the
+    aliases are read in one place instead of each call site guessing.
+    """
+    for candidate in candidates:
+        value = str(source_meta.get(candidate) or "").strip()
+        if value:
+            return value
+    return ""
+
+
+def _part_tag_args(source_meta: dict | None, stem: str, index: int, total: int, flag: str = "-metadata") -> list[str]:
+    """The ``-metadata`` pairs that make one part its own track.
+
+    The segment muxer writes one set of *global* tags to every part - ffmpeg has
+    no per-segment metadata option - so a part cannot be told which one it is by
+    the command that cut it. This is what the second write states: the media's
+    title (or its own name, when it carries none) with the part number on it, the
+    number itself, and the album the parts share - so a player lists
+    ``Module 02 (part 1/2)`` and ``Module 02 (part 2/2)`` as tracks 1 and 2 of
+    *Module 02*, instead of showing the same media twice with no relation at all
+    between its parts.
+
+    The album is the source's own when it has one - a real album is not worth
+    overwriting with a file name - and the media's name when it does not, which is
+    the case this exists for: an untagged media has no album to group its parts
+    under, so they arrive as unrelated files.
+
+    The album artist is what the source says it is, and the artist it names when
+    it names no album artist of its own: that is the pair players actually group an
+    album by, so a part that carried one artist beside a blank album artist was
+    grouped by its track artists instead - and any library that files such a media
+    under "Various Artists" did so for every part of it. A source that names
+    neither gets none, exactly as it gets no artist: the media's *name* is not an
+    artist, and inventing one would file the parts under a performer nobody knows.
+
+    Returns ``[]`` for a source whose tags could not be read at all, exactly like
+    :func:`_split_metadata_args`: the part then keeps whatever ffmpeg made of it.
+    """
+    if not isinstance(source_meta, dict):
+        return []
+    base = str(source_meta.get("title") or "").strip() or stem
+    album = str(source_meta.get("album") or "").strip() or stem
+    label = f"part {index}/{total}"
+    args = [
+        flag,
+        f"title={base} ({label})",
+        flag,
+        f"track={index}/{total}",
+        flag,
+        f"album={album}",
+    ]
+    artist = _split_tag_value(source_meta, "performer", "artist", "artists", "author")
+    album_artist = _split_tag_value(source_meta, "album_artist", "albumartist", "band")
+    if album_artist or artist:
+        # The artist is the album artist only when the source named no other, which
+        # is what a file with one artist and no album-artist field means.
+        args += [flag, f"album_artist={album_artist or artist}"]
+    if artist:
+        args += [flag, f"artist={artist}"]
+    return args
+
+
+async def _stamp_split_part(
+    part: str,
+    *,
+    source_meta: dict | None,
+    stem: str,
+    index: int,
+    total: int,
+    ext: str,
+) -> bool:
+    """Write one part's own title, track number, album and album artist into its header.
+
+    A stream copy: the header is rewritten and the frames are copied through, so
+    nothing is decoded and the length the part states for itself is untouched.
+
+    The rewrite stages through a sibling file that keeps the part's own
+    extension - ffmpeg picks the muxer from it, and a ``.tmp`` name has no format
+    ffmpeg will write at all - and is swapped in only once it has succeeded. That
+    is what keeps a failed pass from costing the bytes the split already
+    produced: the caller keeps the part exactly as ffmpeg wrote it.
+    """
+    # Which option writes the tag depends on where the container keeps it: a
+    # stream-tagged one has to be told on the stream, or the title copied from the
+    # cut simply wins (see _STREAM_TAG_SPLIT_EXTS).
+    flag = "-metadata:s:a:0" if ext in _STREAM_TAG_SPLIT_EXTS else "-metadata"
+    tags = _part_tag_args(source_meta, stem, index, total, flag)
+    if not tags:
+        return False
+
+    root, extension = os.path.splitext(part)
+    staged = f"{root}.tagging{extension}"
+    cmd = [FFMPEG_PATH, "-y", "-i", part, "-c", "copy"]
+    # The same recipe the audio encodes use, so a part and a re-encoded file
+    # cannot disagree about the version of ID3 they are written with.
+    cmd += list(MP3_METADATA_ARGS) if ext == ".mp3" else ["-map_metadata", "0"]
+    cmd += tags
+    cmd.append(staged)
+    try:
+        process = await _spawn_process(*cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+        _stdout, stderr = await process.communicate()
+        if process.returncode != 0:
+            logger.debug(
+                "split: could not tag %s: %s",
+                os.path.basename(part),
+                stderr.decode("utf-8", errors="ignore")[-200:],
+            )
+            return False
+        os.replace(staged, part)
+        return True
+    except Exception:
+        logger.debug("split: tagging %s failed", os.path.basename(part))
+        return False
+    finally:
+        with contextlib.suppress(OSError):
+            if os.path.exists(staged):
+                os.remove(staged)
+
+
+async def _stamp_split_parts(parts: list[str], *, source_meta: dict | None, stem: str, ext: str) -> None:
+    """Give every part of a split its own title, track number, album and album artist, one at a time.
+
+    Best-effort by design: the parts are already the media the user asked for, so
+    one that cannot be tagged is delivered as ffmpeg wrote it rather than failing
+    the split that produced it.
+    """
+    if not isinstance(source_meta, dict):
+        return
+    total = len(parts)
+    for index, part in enumerate(parts, 1):
+        await _stamp_split_part(part, source_meta=source_meta, stem=stem, index=index, total=total, ext=ext)
+
+
+async def _probe_split_source_meta(input_path: str) -> dict | None:
+    """The source's own title/performer, or ``None`` when it cannot be read.
+
+    One local ffprobe, and only for a media whose verdict the caller does not
+    already have: the ingest probes every file it stores, so a split of one of
+    those passes that verdict in and never reaches this.
+
+    ``None`` covers both ways of having no answer: a probe that raised and a probe
+    that came back with nothing at all. An empty verdict is a probe that could not
+    read the file - a missing ffprobe, a file it refuses - not evidence that the
+    media carries no tags, and stating a file name as a title on that evidence
+    would overwrite the real one ffmpeg was about to copy.
+    """
+    try:
+        from utils.ffmpeg_runner import probe_media
+
+        meta = await probe_media(input_path)
+    except Exception:
+        logger.debug("split: could not probe the source's own tags")
+        return None
+    return dict(meta) if isinstance(meta, dict) and meta else None
+
+
 def _validate_input_file(input_path: str) -> tuple[bool, str]:
     """Validate input file exists and is readable."""
     if not input_path:
@@ -569,7 +785,21 @@ async def change_resolution(input_path: str, output_path: str, width: int, heigh
 
 
 async def trim_media(input_path: str, output_path: str, start_time: str, end_time: str) -> tuple[bool, str]:
-    """Trim video or audio asynchronously."""
+    """Trim video or audio asynchronously.
+
+    The cut is a stream copy, so what the source carried has to be carried across
+    rather than regenerated, and two flags are what do it:
+
+    * ``-map_metadata 0`` states the copy outright. ffmpeg's default copies the
+      global tags but not all of them - a real mp4 cut came back without its
+      ``creation_time``, which is the date a player shows for the file.
+    * ``-map 0`` keeps *every* stream. The default selection picks one video and
+      one audio track, so a range cut of a subtitled video quietly arrived with
+      no subtitle track at all. It is added only when the cut lands in the
+      source's own container: a different one (the caller can ask for one) may be
+      unable to hold the streams the source had, and a stream that cannot be
+      written fails the whole run where leaving it out at least produces the cut.
+    """
     try:
         duration_parts = end_time.split(":")
         duration_seconds = int(duration_parts[0]) * 3600 + int(duration_parts[1]) * 60 + float(duration_parts[2])
@@ -577,7 +807,11 @@ async def trim_media(input_path: str, output_path: str, start_time: str, end_tim
         start_seconds = int(start_parts[0]) * 3600 + int(start_parts[1]) * 60 + float(start_parts[2])
         duration = duration_seconds - start_seconds
 
-        cmd = ["ffmpeg", "-y", "-ss", start_time, "-i", input_path, "-t", str(duration), "-c", "copy", output_path]
+        same_container = os.path.splitext(str(input_path))[1].lower() == os.path.splitext(str(output_path))[1].lower()
+        cmd = [FFMPEG_PATH, "-y", "-ss", start_time, "-i", input_path, "-t", str(duration)]
+        if same_container:
+            cmd += ["-map", "0"]
+        cmd += ["-map_metadata", "0", "-c", "copy", output_path]
 
         process = await _spawn_process(*cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
 
@@ -602,6 +836,7 @@ async def split_media_segments(
     *,
     ext: str = ".mp4",
     stem: str = "part",
+    source_meta: dict | None = None,
 ) -> tuple[bool, list[str], str]:
     """Cut one media file into parts of *segment_seconds*, one file per part.
 
@@ -637,6 +872,12 @@ async def split_media_segments(
     than *segment_seconds* (and a source whose keyframes are farther apart than
     that produces a single part). Re-encoding would fix the exact length and cost
     the whole point of this command, so the caller explains the result instead.
+
+    The tags are stated on the command line rather than left to ffmpeg, because a
+    media that carries none produces parts that carry none (see
+    :func:`_split_metadata_args`). *source_meta* is the verdict the caller already
+    holds - the ingest's own probe - and a caller without one costs a single local
+    ffprobe here.
 
     Returns ``(ok, parts, error)``: the sorted list of files that were written, so
     a caller can deliver them in order, and the ffmpeg stderr tail when it failed.
@@ -719,6 +960,26 @@ async def split_media_segments(
     if ext_lower not in _FASTSTART_EXTS:
         # Every part starts at zero regardless of what the cut's timestamps were.
         cmd.extend(["-avoid_negative_ts", "make_zero"])
+    if ext_lower != ".mp3":
+        # Stated for every other container. ffmpeg copies the *global* tags by
+        # default, but that is not the whole verdict: a real mp4 part came back
+        # without its ``creation_time`` - the date every player's properties panel
+        # shows - until this was passed, and the mov family is where a file's
+        # other format-level fields live too. The mp3 branch above carries the
+        # same flag in MP3_METADATA_ARGS, so it is not repeated there.
+        cmd.extend(["-map_metadata", "0"])
+
+    # What every part states about itself, whichever container it is cut into.
+    # The caller's verdict is the ingest's own probe, so a media that came through
+    # the pipe costs nothing to describe; only a file nothing has probed yet is
+    # read here.
+    _meta = source_meta if isinstance(source_meta, dict) and source_meta else None
+    if _meta is None:
+        # ``or None``: an empty verdict is a probe that could not read the file, and
+        # stating the stem as the title on that evidence would overwrite the real
+        # one ffmpeg was about to copy off the source.
+        _meta = await _probe_split_source_meta(input_path) or None
+    cmd.extend(_split_metadata_args(_meta, safe_stem))
 
     # Add the output pattern as the last argument
     cmd.append(_pattern)
@@ -745,6 +1006,13 @@ async def split_media_segments(
         return False, [], "ffmpeg produced no parts"
 
     logger.info(f"Split media into {len(parts)} part(s) of ~{segment_arg}s")
+
+    # The cut gives every part the same global tags; the parts a player lists are
+    # the audio ones, so each of those is then given the number it is (one stream
+    # copy per part). A video part is left alone - see _SPLIT_TAG_AUDIO_EXTS.
+    if ext_lower in _SPLIT_TAG_AUDIO_EXTS:
+        await _stamp_split_parts(parts, source_meta=_meta, stem=safe_stem, ext=ext_lower)
+
     return True, parts, ""
 
 
