@@ -512,10 +512,11 @@ class AudioBitratePreferenceTests(unittest.TestCase):
     def test_conversions_fall_back_to_the_preference(self):
         text = "".join(read_source("handlers.py").split())
 
-        # Both audio paths read the user's bitrate rather than the module
-        # constant, and the helper reads it out of the settings store.
+        # Every audio path reads the user's bitrate through the one resolver,
+        # rather than the module constant, and the helper reads it out of the
+        # settings store.
         self.assertIn("or_user_audio_bitrate(user_id)", text)
-        self.assertIn("_user_audio_bitrate(update.effective_user.id)", text)
+        self.assertIn("_effective_audio_bitrate(", text)
         self.assertIn('get_user_setting(user_id,"audio_bitrate")', text)
 
     def test_the_adjust_bitrate_action_is_still_driven_by_its_own_menu(self):

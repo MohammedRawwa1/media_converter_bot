@@ -611,12 +611,45 @@ async def merge_audios(audio_paths: list[str], output_path: str, timeout_seconds
                 os.unlink(concat_file)
 
 
+#: The slideshow's own encode defaults, used when the batch that asked for it
+#: named no quality of its own. This is the recipe ``create_slideshow`` has
+#: always used.
+_SLIDESHOW_CRF = 23
+_SLIDESHOW_PRESET = "medium"
+_SLIDESHOW_CRF_MIN = 18
+_SLIDESHOW_CRF_MAX = 51
+_SLIDESHOW_PRESETS = frozenset(
+    {"ultrafast", "superfast", "veryfast", "faster", "fast", "medium", "slow", "slower", "veryslow"}
+)
+
+
+def _slideshow_crf(value) -> int:
+    """A quality for the slideshow encode, or its own default.
+
+    ``None`` and anything unusable fall back, so the plan's quality can only
+    ever replace the default with a value libx264 accepts.
+    """
+    try:
+        crf = int(value)
+    except (TypeError, ValueError):
+        return _SLIDESHOW_CRF
+    return crf if _SLIDESHOW_CRF_MIN <= crf <= _SLIDESHOW_CRF_MAX else _SLIDESHOW_CRF
+
+
+def _slideshow_preset(value) -> str:
+    """An x264 preset for the slideshow encode, or its own default."""
+    text = str(value or "").strip().lower()
+    return text if text in _SLIDESHOW_PRESETS else _SLIDESHOW_PRESET
+
+
 async def create_slideshow(
     image_paths: list[str],
     output_path: str,
     seconds_per_image: float = 3.0,
     music_path: str | None = None,
     timeout_seconds: int = 18000,
+    crf: int | None = None,
+    preset: str | None = None,
 ) -> tuple[bool, str]:
     """Build a slideshow video from images, one shown for ``seconds_per_image``.
 
@@ -625,6 +658,11 @@ async def create_slideshow(
     can be concatenated in a single pass. The result is a widely-playable H.264
     MP4. When ``music_path`` names a readable audio file it is looped underneath
     the slideshow and cut at the video's end.
+
+    ``crf``/``preset`` carry the *plan's* quality when the batch that asked for
+    the slideshow also asked to Compress or Optimize. Without them the slideshow
+    encoded at its own defaults while the apply reported the user's quality as
+    applied. ``None`` keeps those defaults, which is what a plain slideshow uses.
     """
     if not image_paths:
         return False, "No image paths provided"
@@ -676,9 +714,9 @@ async def create_slideshow(
             "-c:v",
             "libx264",
             "-preset",
-            "medium",
+            _slideshow_preset(preset),
             "-crf",
-            "23",
+            str(_slideshow_crf(crf)),
             "-pix_fmt",
             "yuv420p",
             "-movflags",
@@ -1222,6 +1260,36 @@ AUDIO_FORMAT_CODECS: dict[str, str] = {
 #: refuses one outright ("Codec AVOption b ... has not been used for any stream").
 _AUDIO_BITRATE_TARGETS = frozenset({"mp3", "aac", "m4a", "ogg", "opus"})
 
+#: The name ffprobe reports for each target's own audio stream.
+#:
+#: This is what lets a request whose source already *is* the target recognise
+#: itself before anything is fetched - the codec the table above names is the one
+#: ffmpeg *writes* with, which is not the name a probe reads back. It is not derived
+#: from :data:`AUDIO_FORMAT_CODECS` because the mapping is not one to one:
+#: ``libmp3lame`` writes what ffprobe calls ``mp3`` and ``libvorbis`` writes
+#: ``vorbis``, and both ``aac`` and ``m4a`` report ``aac``, because m4a is an AAC
+#: stream inside an MP4 container.
+AUDIO_FORMAT_PROBE_CODECS: dict[str, str] = {
+    "mp3": "mp3",
+    "wav": "pcm_s16le",
+    "aac": "aac",
+    "m4a": "aac",
+    "flac": "flac",
+    "ogg": "vorbis",
+    "opus": "opus",
+}
+
+
+def audio_format_takes_bitrate(target_format: str) -> bool:
+    """Whether the encoder for *target_format* accepts a bitrate.
+
+    PCM has no bitrate to set and flac refuses one outright, so a request to one
+    of those has no bitrate of its own to read back from /usersettings - which is
+    the question the audio-format button asks before it compares a source against
+    the target it would produce.
+    """
+    return str(target_format or "").strip().lower() in _AUDIO_BITRATE_TARGETS
+
 
 def audio_format_ffmpeg_args(target_format: str, bitrate: str = "128k") -> list[str] | None:
     """The ffmpeg arguments one audio target is encoded with, or ``None`` for a target nothing knows.
@@ -1471,19 +1539,217 @@ async def edit_metadata(input_path: str, output_path: str, metadata: dict[str, s
         return False, str(e)
 
 
-async def create_archive(file_paths: list[str], output_path: str) -> tuple[bool, str]:
-    """Create ZIP archive of files asynchronously."""
+def _unique_arcname(name: str, used: set[str]) -> str:
+    """A name that no earlier member already took, unique inside the archive.
+
+    Two media often share a basename (``video.mp4`` from two folders). A zip can
+    hold both names, but extractors write one over the other, so the archive
+    silently loses a file. Append ``_1``, ``_2`` ... before the extension instead.
+    """
+    base = os.path.basename(str(name or "")) or "file"
+    stem, ext = os.path.splitext(base)
+    candidate = base
+    counter = 1
+    while candidate.lower() in used:
+        candidate = f"{stem}_{counter}{ext}"
+        counter += 1
+    used.add(candidate.lower())
+    return candidate
+
+
+def _archive_compression_level() -> int:
+    """The deflate level for created archives (``ARCHIVE_COMPRESSION_LEVEL``).
+
+    Defaults to 6 - the level zlib itself defaults to, and the point past which a
+    level costs encode time for almost no size. Media is already compressed, so a
+    high level buys nothing and a level of 0 (store) makes the archive as large as
+    its contents; both are still selectable for a caller that wants them.
+    """
+    try:
+        level = int(os.environ.get("ARCHIVE_COMPRESSION_LEVEL", "6") or 6)
+    except (TypeError, ValueError):
+        return 6
+    return max(0, min(9, level))
+
+
+async def create_archive(
+    sources: list,
+    output_path: str,
+    *,
+    fetch=None,
+    on_progress=None,
+) -> tuple[bool, str]:
+    """Write the given media into a ZIP, one file at a time.
+
+    ``sources`` may mix local paths and dicts. A dict that carries no usable
+    ``path`` is resolved by ``fetch`` - an async callable returning a local path -
+    which is how a file that lives in object storage joins the archive without the
+    whole set being downloaded first. A fetched copy is removed immediately after
+    it is written, so peak disk is one member and peak memory is one read buffer,
+    the same shape the batch runs files in.
+
+    The archive is written with ZIP64 enabled: enough large media push it past the
+    classic 4 GiB / 65535-entry limits, and a run that produced an unreadable
+    archive is worse than a slow one. Names are made unique because extractors
+    overwrite on a collision, which would silently drop a file.
+
+    ``on_progress(done, total)`` - awaited when given - lets the worker publish a
+    per-file percentage instead of a bar that sits at 5% until the whole pack is
+    done. Returns ``(ok, message)``; a run that wrote nothing is a failure.
+    """
     try:
         import zipfile
 
-        with zipfile.ZipFile(output_path, "w", zipfile.ZIP_DEFLATED) as zipf:
-            for file_path in file_paths:
-                arcname = os.path.basename(file_path)
-                zipf.write(file_path, arcname)
+        entries = [src for src in (sources or []) if src]
+        if not entries:
+            return False, "no files to archive"
 
-        logger.info(f"Successfully created archive with {len(file_paths)} files")
+        os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+        used: set[str] = set()
+        failed: list[str] = []
+        written = 0
+        level = _archive_compression_level()
+
+        with zipfile.ZipFile(output_path, "w", zipfile.ZIP_DEFLATED, allowZip64=True, compresslevel=level) as zipf:
+            for index, src in enumerate(entries, start=1):
+                entry = src if isinstance(src, dict) else {"path": src}
+                name = str(
+                    entry.get("name")
+                    or os.path.basename(str(entry.get("path") or entry.get("input_key") or ""))
+                    or f"file_{index}"
+                )
+                path = entry.get("path")
+                fetched = None
+                if not (path and os.path.exists(path)) and fetch is not None:
+                    try:
+                        path = await fetch(entry)
+                        fetched = path
+                    except Exception:
+                        logger.exception("create_archive: could not fetch source for %s", name)
+                        path = None
+                if not path or not os.path.exists(path):
+                    failed.append(name)
+                    continue
+                try:
+                    zipf.write(path, _unique_arcname(name, used))
+                    written += 1
+                except Exception:
+                    logger.exception("create_archive: could not add %s", name)
+                    failed.append(name)
+                finally:
+                    # Only the copy this loop fetched is removed; a path the caller
+                    # passed in is the caller's to own.
+                    if fetched:
+                        with contextlib.suppress(OSError):
+                            os.remove(fetched)
+                if on_progress is not None:
+                    with contextlib.suppress(Exception):
+                        await on_progress(index, len(entries))
+
+        if not written:
+            reason = "no files could be archived"
+            if failed:
+                reason += f" ({len(failed)} unavailable)"
+            logger.error("create_archive: %s", reason)
+            return False, reason
+
+        logger.info("Successfully created archive with %d/%d files", written, len(entries))
+        if failed:
+            return True, f"Archive created ({len(failed)} of {len(entries)} skipped)"
         return True, "Archive created"
 
     except Exception as e:
         logger.error(f"Exception in create_archive: {e}")
         return False, str(e)
+
+
+# Read size for the volume splitter. Large enough to move a multi-gigabyte
+# archive without a syscall per kilobyte, small enough that the loop holds a few
+# megabytes rather than the whole part.
+_ARCHIVE_SPLIT_CHUNK = 8 * 1024 * 1024
+
+
+def _volume_name(archive_filename: str, index: int) -> str:
+    """The name of one volume: ``myclips.zip`` -> ``myclips.zip.001``.
+
+    The numbered suffix is the scheme 7-Zip, WinRAR and the mobile extractors
+    share, and it is what tells a recipient the pieces belong together and which
+    one to open. The base name (including ``.zip``) is preserved exactly, because
+    a set whose volumes disagree on the name cannot be joined.
+    """
+    base = os.path.basename(str(archive_filename or "")) or "archive.zip"
+    return f"{base}.{index:03d}"
+
+
+def _split_archive_sync(archive_path: str, archive_filename: str, max_bytes: int, remove_source: bool) -> list[str]:
+    """Split one finished archive into volumes of at most *max_bytes* bytes."""
+    try:
+        total = os.path.getsize(archive_path)
+    except OSError:
+        return [archive_path]
+
+    cap = int(max_bytes or 0)
+    # Nothing to do when the archive already fits one send, or when splitting is
+    # switched off: the caller gets the single file back and delivers it as-is.
+    if cap <= 0 or total <= cap:
+        return [archive_path]
+
+    out_dir = os.path.dirname(archive_path) or "."
+    volumes: list[str] = []
+    index = 1
+    try:
+        with open(archive_path, "rb") as src:
+            while True:
+                target = os.path.join(out_dir, _volume_name(archive_filename, index))
+                remaining = cap
+                written = 0
+                with open(target, "wb") as dst:
+                    while remaining > 0:
+                        chunk = src.read(min(_ARCHIVE_SPLIT_CHUNK, remaining))
+                        if not chunk:
+                            break
+                        dst.write(chunk)
+                        written += len(chunk)
+                        remaining -= len(chunk)
+                if written == 0:
+                    with contextlib.suppress(OSError):
+                        os.remove(target)
+                    break
+                volumes.append(target)
+                index += 1
+    except Exception:
+        # A half-written set is worse than none: drop what was created so the
+        # caller is left with the whole archive it can still deliver or retry.
+        for volume in volumes:
+            with contextlib.suppress(OSError):
+                os.remove(volume)
+        raise
+
+    if remove_source and volumes:
+        with contextlib.suppress(OSError):
+            os.remove(archive_path)
+    logger.info("Split %s (%d bytes) into %d volume(s) of up to %d bytes", archive_filename, total, len(volumes), cap)
+    return volumes
+
+
+async def split_archive_volumes(
+    archive_path: str,
+    *,
+    archive_filename: str,
+    max_bytes: int,
+    remove_source: bool = True,
+) -> list[str]:
+    """Split a finished archive into ``.001``, ``.002`` ... volumes.
+
+    Only a delivery concern: a multi-volume set is one archive cut into parts
+    small enough to each fit a single Telegram send, and it extracts only when
+    *every* part is present under the same name and the recipient opens the
+    first one. So the split happens only when it has to - an archive at or below
+    *max_bytes* comes straight back as a one-element list, and a ``max_bytes`` of
+    0 switches splitting off entirely.
+
+    The split keeps peak disk at the archive plus one volume: the source file is
+    read once, sequentially, and (by default) removed once every part is on disk.
+    The read is offloaded so a multi-gigabyte archive never blocks the loop.
+    """
+    return await asyncio.to_thread(_split_archive_sync, archive_path, archive_filename, max_bytes, remove_source)

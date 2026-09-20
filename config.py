@@ -83,6 +83,16 @@ MAX_CONCURRENT_TASKS = int(os.getenv("MAX_CONCURRENT_TASKS", "5"))
 BOT_API_MAX_MB = int(os.getenv("BOT_API_MAX_MB", "50"))
 BOT_API_MAX_BYTES = BOT_API_MAX_MB * 1024 * 1024
 
+# Largest single file the archive delivery may put in one Telegram message.
+#
+# A ZIP bigger than this is split into numbered volumes (``name.zip.001``,
+# ``.002``, ...) so every part fits one send - the default is Telegram's own
+# per-file ceiling for an MTProto/userbot upload, and the one the worker's
+# delivery reads. Set it to 0 to never split: an archive is then delivered as a
+# single ``.zip`` however large it is (and fails to send past the ceiling).
+ARCHIVE_SPLIT_MAX_MB = int(os.getenv("ARCHIVE_SPLIT_MAX_MB", "2000"))
+ARCHIVE_SPLIT_MAX_BYTES = ARCHIVE_SPLIT_MAX_MB * 1024 * 1024
+
 # Maximum file size (in MB) a bot may *download* through the Bot API.
 #
 # Telegram has two ceilings, and they are not the same number: a bot may upload

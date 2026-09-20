@@ -5,8 +5,14 @@ Keyboard menu builders for Telegram bot.
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
+from . import archive_split
 from .callbacks import (
     ADD_AUDIO,
+    ARCHIVE_CANCEL,
+    ARCHIVE_CONFIRM,
+    ARCHIVE_NAME_DEFAULT,
+    ARCHIVE_PART_BACK,
+    ARCHIVE_PART_MENU,
     BITRATE_PREFIX,
     BULK_BITRATE_DEFAULT,
     BULK_BITRATE_MENU,
@@ -59,6 +65,7 @@ from .callbacks import (
     REMOVE_AUDIO,
     RESOLUTION_MENU,
     SCREENSHOTS_MENU,
+    SETTINGS_ARCHIVE_PART_MENU,
     SETTINGS_BITRATE_MENU,
     SETTINGS_BULK_BITRATE_MENU,
     SETTINGS_PAGE_COUNT,
@@ -83,12 +90,14 @@ from .callbacks import (
     VIDEO_RENAMER,
     VIDEO_TO_AUDIO,
     VIDEOS_SPLITTER,
+    archive_part_key,
     bulk_bitrate_key,
     bulk_crf_key,
     bulk_preset_key,
     bulk_slideshow_key,
     compress_quality_label,
     mp3_quality_key,
+    settings_archive_part_key,
     settings_bitrate_key,
     settings_bulk_bitrate_key,
     settings_page_key,
@@ -697,6 +706,78 @@ class MediaMenuBuilder:
         return InlineKeyboardMarkup(buttons)
 
     @staticmethod
+    def get_archive_name_menu() -> InlineKeyboardMarkup:
+        """The two answers to the Create Archive name prompt.
+
+        The default is offered as a button because most archives are named after
+        the first file anyway - typing a name should be a choice, not a toll on
+        the way to an archive the user already described with the batch.
+        """
+        buttons = [
+            [InlineKeyboardButton("✅ Use default name", callback_data=ARCHIVE_NAME_DEFAULT)],
+            [InlineKeyboardButton("📐 Part size", callback_data=ARCHIVE_PART_MENU)],
+            [InlineKeyboardButton("❌ Cancel", callback_data=ARCHIVE_CANCEL)],
+        ]
+        return InlineKeyboardMarkup(buttons)
+
+    @staticmethod
+    def get_archive_confirm_menu() -> InlineKeyboardMarkup:
+        """The two answers to the Create Archive summary.
+
+        Its own triggers (not the generic ``confirm``/``cancel``) because those
+        are shared with other prompts: an answer meant for the archive must not
+        be read by whatever asked last.
+        """
+        buttons = [
+            [
+                InlineKeyboardButton("📦 Pack archive", callback_data=ARCHIVE_CONFIRM),
+                InlineKeyboardButton("📐 Part size", callback_data=ARCHIVE_PART_MENU),
+            ],
+            [InlineKeyboardButton("❌ Cancel", callback_data=ARCHIVE_CANCEL)],
+        ]
+        return InlineKeyboardMarkup(buttons)
+
+    @staticmethod
+    def get_archive_part_menu(current=None) -> InlineKeyboardMarkup:
+        """The part-size picker reached from the Create Archive summary.
+
+        Same choices and the same stored setting as /usersettings, but its Back
+        returns to the archive summary rather than the settings page - the flow
+        the user pressed the button from is the one they come back to.
+        """
+        active = archive_split.normalize(current)
+
+        def _size_button(size) -> InlineKeyboardButton:
+            value = archive_split.preset_value(size)
+            mark = "✅ " if value == active else ""
+            return InlineKeyboardButton(
+                f"{mark}{archive_split.format_size(size)}", callback_data=archive_part_key(value)
+            )
+
+        buttons = [[_size_button(size) for size in archive_split.PRESET_SIZES]]
+        buttons.append(
+            [
+                InlineKeyboardButton(
+                    f"{'✅ ' if active == archive_split.DEFAULT_VALUE else ''}♻️ Auto (split over the cap)",
+                    callback_data=archive_part_key(archive_split.DEFAULT_VALUE),
+                )
+            ]
+        )
+        buttons.append(
+            [
+                InlineKeyboardButton(
+                    f"{'✅ ' if active == archive_split.OFF_VALUE else ''}🚫 No split (one .zip)",
+                    callback_data=archive_part_key(archive_split.OFF_VALUE),
+                )
+            ]
+        )
+        buttons.append(
+            [InlineKeyboardButton("✏️ Custom (size or parts)", callback_data=archive_part_key("custom"))]
+        )
+        buttons.append([InlineKeyboardButton("↩️ Back", callback_data=ARCHIVE_PART_BACK)])
+        return InlineKeyboardMarkup(buttons)
+
+    @staticmethod
     def get_back_button() -> InlineKeyboardMarkup:
         """Get simple back button."""
         buttons = [[InlineKeyboardButton("🔙 Back", callback_data=MENU_MAIN)]]
@@ -729,6 +810,14 @@ class MediaMenuBuilder:
             )
             buttons.append(
                 [InlineKeyboardButton(f"🎵 Batch Extract Bitrate: {extract}", callback_data=SETTINGS_BULK_BITRATE_MENU)]
+            )
+            buttons.append(
+                [
+                    InlineKeyboardButton(
+                        f"📦 Archive Part Size: {archive_split.label(s.get('archive_part'))}",
+                        callback_data=SETTINGS_ARCHIVE_PART_MENU,
+                    )
+                ]
             )
         elif page == 2:
             crf = _sanitize_quality(s.get(COMPRESS_QUALITY_KEY))
@@ -846,6 +935,51 @@ class MediaMenuBuilder:
             [InlineKeyboardButton(_label(v), callback_data=settings_bulk_bitrate_key(v)) for v in row] for row in rows
         ]
         buttons.append([InlineKeyboardButton("✏️ Custom bitrate", callback_data=settings_bulk_bitrate_key("custom"))])
+        buttons.append([InlineKeyboardButton("↩️ Back", callback_data=settings_page_key(3))])
+        return InlineKeyboardMarkup(buttons)
+
+    @staticmethod
+    def get_settings_archive_part_menu(current=None) -> InlineKeyboardMarkup:
+        """Archive part-size picker for /usersettings.
+
+        One-tap sizes for the common cases plus a *custom* prompt that accepts a
+        typed size (``500MB``, ``1.5GB``) or a number of equal parts. The value
+        is what Create Archive splits a packed ZIP by (utils/archive_split.py),
+        so what is chosen here and what a delivery does are the same setting.
+        """
+        active = archive_split.normalize(current)
+
+        def _size_button(size) -> InlineKeyboardButton:
+            value = archive_split.preset_value(size)
+            mark = "✅ " if value == active else ""
+            return InlineKeyboardButton(
+                f"{mark}{archive_split.format_size(size)}", callback_data=settings_archive_part_key(value)
+            )
+
+        buttons = [[_size_button(size) for size in archive_split.PRESET_SIZES]]
+        buttons.append(
+            [
+                InlineKeyboardButton(
+                    f"{'✅ ' if active == archive_split.DEFAULT_VALUE else ''}♻️ Auto (split over the cap)",
+                    callback_data=settings_archive_part_key(archive_split.DEFAULT_VALUE),
+                )
+            ]
+        )
+        buttons.append(
+            [
+                InlineKeyboardButton(
+                    f"{'✅ ' if active == archive_split.OFF_VALUE else ''}🚫 No split (one .zip)",
+                    callback_data=settings_archive_part_key(archive_split.OFF_VALUE),
+                )
+            ]
+        )
+        buttons.append(
+            [
+                InlineKeyboardButton(
+                    "✏️ Custom (size or parts)", callback_data=settings_archive_part_key("custom")
+                )
+            ]
+        )
         buttons.append([InlineKeyboardButton("↩️ Back", callback_data=settings_page_key(3))])
         return InlineKeyboardMarkup(buttons)
 

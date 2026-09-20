@@ -228,6 +228,42 @@ The **single range** cut is the same stream copy and keeps the same things, with
 A media whose source is no longer on disk is fetched back from the bucket before
 it is split, rather than failing.
 
+#### 📦 Create Archive (named, and split into parts when needed)
+
+Pressing **📦 Create Archive** packs the batch you have collected — not a sweep of
+everything the account has ever produced. It asks for a name first (or offers the
+one derived from the first file), then shows a summary of exactly what will go in
+and what it will be called. Nothing is packed until you confirm, and confirming
+**clears the batch**.
+
+A ZIP larger than one Telegram send cannot be delivered as a single file, so it is
+split into numbered volumes — `myclips.zip.001`, `myclips.zip.002`, … — that you
+join by downloading every part into one folder and opening the **first** one
+(7-Zip, WinRAR and the mobile extractors understand the `.001` scheme; a stock OS
+unzip does not). The volumes go out one at a time over the userbot/MTProto path as
+documents, each named exactly as the set expects, because a part that is missing or
+renamed cannot be joined.
+
+How large a part is, is a preference rather than a per-archive question, so it
+lives in **/usersettings → Batch → 📦 Archive Part Size**:
+
+```
+♻️ Auto               — split only if the archive is larger than ARCHIVE_SPLIT_MAX_MB (default)
+500 MB / 1 GB / 2 GB  — one-tap part sizes
+🚫 No split           — always deliver one .zip
+✏️ Custom             — type a size (500MB, 1.5GB) or a number of equal parts (3)
+```
+
+Create Archive reads that setting and shows it on both the name prompt and the
+summary, so what it promises is what the worker's split does. Each of those
+screens carries a **📐 Part size** button that opens the same picker without
+leaving the flow, and the picker's Back returns to whichever stage it was opened
+from — the name prompt until a name is chosen, the summary afterwards. An archive
+at or below its part size is delivered whole — splitting is never applied for its
+own sake. The split parameter handling lives in one module
+(`utils/archive_split.py`), which parses, validates and labels the value for the
+panel, the archive picker, the summary and the queued job alike.
+
 ### Bulk Batches
 
 Every video, audio, document, or photo you send is collected into a batch automatically (deduped by file id, capped at 30). Sending an **album** collects it as a group and announces it once instead of once per file. Open `/bulkmenu`, toggle the actions and quality, then press **▶️ Apply Bulk** to run the whole batch; **🗑️ Clear List** drops it and the batch clears itself after a successful apply. Two or more queued photos are combined into a single **slideshow video** (3 s per photo, letterboxed onto a 1280x720 canvas); a lone photo is encoded with the selected video action, and audio-only actions skip it. The Apply summary lists every queued file next to the job id it became.
@@ -320,6 +356,7 @@ For Railway's 1 GB box the shipped `.env.example` is tuned to: `MAX_CONCURRENT_F
 | `S3_UPLOAD_PARTS_IN_FLIGHT` | `4` | Multipart parts a streaming upload keeps in flight at once |
 | `S3_UPLOAD_MAX_BUFFERED_MB` | `256` | Bytes a streaming upload may hold before it makes the producer wait (back-pressure) |
 | `STORAGE_PROBE_TIMEOUT_SECONDS` | `60` | Bound on the worker's header range-GET when it has to probe storage itself (it is skipped entirely when the ingest already ffprobed the file) |
+| `ARCHIVE_SPLIT_MAX_MB` | `2000` | Largest single file an archive delivery may send. A ZIP bigger than this is split into `.001`/`.002` volumes that each fit one send; `0` disables splitting. The per-user `/usersettings → Batch → 📦 Archive Part Size` preference overrides it (a size, a part count, or "no split") |
 
 ### S3 / MinIO / R2
 | Variable | Description |

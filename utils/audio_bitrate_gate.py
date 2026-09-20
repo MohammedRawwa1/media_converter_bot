@@ -20,9 +20,14 @@ The verdict is reached in three steps, in this order:
             bytes over MTProto;
   validate  a bitrate alone is not a match. The source has to be the codec the
             request would produce, or "AAC 64k -> MP3 64k" would be read as a
-            no-op when it is a real conversion. Anything unknown is not a match;
-  exists    when both agree, the file the request would produce already exists,
-            so the caller reports it and stops instead of fetching and encoding.
+            no-op when it is a real conversion. When the caller also names a
+            *container*, the source's own format has to match that too, because
+            AAC-in-MP4 and AAC-in-ADTS are one codec in two containers - a request
+            that only changes the container produces a different file. Anything
+            unknown is not a match;
+  exists    when they all agree, the file the request would produce already
+            exists, so the caller reports it and stops instead of fetching and
+            encoding.
 
 Nothing here is ever a blocker: an unreadable verdict, a failed probe or a
 timeout all answer "not already", which leaves the caller on exactly the path it
@@ -148,6 +153,26 @@ def codec_is_target(source_codec, current_file: dict | None, target_codec: str =
         return text == wanted
     extension = os.path.splitext(str((current_file or {}).get("name") or ""))[1].lower().lstrip(".")
     return bool(wanted) and extension == wanted
+
+
+def container_is_target(current_file: dict | None, target_format: str | None) -> bool:
+    """Whether the media's own container is already the requested format.
+
+    The codec is not enough to answer this: ``aac`` and ``m4a`` are the *same*
+    audio stream in two containers (raw ADTS against AAC inside MP4), so a request
+    that only changes the container is a real conversion even though the codec
+    matches. The media's extension is the container it was delivered in, and a
+    source whose extension is missing or different is not called a match - an
+    unproven request must never become the no-op this gate exists to spot.
+
+    ``None`` is always a match, which is what keeps the bitrate-only callers
+    (Adjust Bitrate, a batch extraction) on exactly the path they had.
+    """
+    wanted = str(target_format or "").strip().lower().lstrip(".")
+    if not wanted:
+        return True
+    extension = os.path.splitext(str((current_file or {}).get("name") or ""))[1].lower().lstrip(".")
+    return extension == wanted
 
 
 def known_verdict(current_file: dict | None) -> tuple[object, object]:
@@ -453,12 +478,18 @@ async def already_at_bitrate(
     *,
     user_id=None,
     target_codec: str = "mp3",
+    target_format: str | None = None,
 ) -> int | None:
     """The source's own bitrate when the request asks for what it already has.
 
+    ``target_format`` names the container the request would produce; when it is
+    given, the source has to already be in it as well as carrying the codec and
+    bitrate, so a request that only changes the container is not mistaken for the
+    answer (see :func:`container_is_target`).
+
     Returns ``None`` for every other outcome - unknown, unreadable, a different
-    bitrate, or a different codec - which is what keeps this a shortcut and never
-    a refusal.
+    bitrate, a different codec, a different container - which is what keeps this a
+    shortcut and never a refusal.
     """
     if not gate_enabled():
         return None
@@ -473,6 +504,8 @@ async def already_at_bitrate(
     if not bitrates_agree(source, wanted):
         return None
     if not codec_is_target(source_codec, current_file, target_codec):
+        return None
+    if not container_is_target(current_file, target_format):
         return None
     logger.info(
         "bitrate gate: %s already carries %s bps (%s) - the %s request needs no re-encode",

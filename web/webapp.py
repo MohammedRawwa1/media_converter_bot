@@ -3,6 +3,7 @@ import json
 import logging
 import os
 import re
+import shutil
 import subprocess
 import threading
 import time
@@ -14,6 +15,7 @@ from flask import Flask, jsonify, request, send_file, send_from_directory
 from flask_cors import CORS
 
 import config
+from utils.archive_input import expand_archive, is_archive
 from utils.job_access import JOB_CAPABILITY_PARAM, issue_job_token, job_token_ok
 from utils.source_store import source_library_key, store_source
 from utils.url_validation import _validate_url_safe
@@ -21,6 +23,7 @@ from utils.web_auth import debug_token_ok, diag_token_ok, upload_token_ok
 
 # Rate limiting for DoS/DDoS protection (token bucket per-endpoint per-IP)
 from utils.web_rate_limiter import get_client_ip, make_rate_limit_response, web_rate_limiter
+from utils.web_users import USER_TOKEN_PARAM, resolve_user_token
 
 try:
     import boto3
@@ -262,6 +265,81 @@ def _job_access_payload(job_id: str) -> dict:
     return {"job_id": job_id, JOB_CAPABILITY_PARAM: capability}
 
 
+# ── Per-user web identity ──────────────────────────────────────────────────
+# UPLOAD_SECRET says the service trusts the caller; it says nothing about *which*
+# user the caller is. A token issued per user id (utils/web_users.py) lets a
+# caller identify as that user, so a job queued over the web carries an owner and
+# a read can be authorized by ownership instead of only by the job's capability.
+# The shared secret still works - it is the service/admin credential - so nothing
+# that relied on it breaks.
+
+
+def _presented_user_token() -> object:
+    """The per-user token on the request: header first, then body/JSON."""
+    token = request.headers.get("X-User-Token")
+    if token:
+        return token
+    if request.is_json:
+        body = request.get_json(silent=True) or {}
+        if body.get(USER_TOKEN_PARAM):
+            return body.get(USER_TOKEN_PARAM)
+    try:
+        return request.form.get(USER_TOKEN_PARAM)
+    except Exception:
+        return None
+
+
+def _request_user_id() -> int | None:
+    """Resolve the caller's user id from a per-user token, or None.
+
+    Never raises: an unresolvable token is simply no identity, and the route's
+    own credential check decides what that means.
+    """
+    token = _presented_user_token()
+    if not token:
+        return None
+    try:
+        return _run_async(resolve_user_token(token))
+    except Exception:
+        logger.exception("webapp: per-user token resolution failed")
+        return None
+
+
+def _user_or_service_ok(incoming_service: object) -> tuple[bool, int | None]:
+    """Authorize a job-API route with the shared secret or a per-user token.
+
+    Returns ``(authorized, user_id)``. The user id is set only when a per-user
+    token carried it, which is what lets the route stamp the job with its owner;
+    a service-secret call has no user and leaves the job unattributed.
+    """
+    user_id = _request_user_id()
+    if user_id is not None:
+        return True, user_id
+    return upload_token_ok(incoming_service), None
+
+
+def _job_owner_ok(job_id: str) -> bool:
+    """True when the caller's per-user token owns the job it is asking about.
+
+    The second way into a job-scoped route: the capability is what a *link or a
+    browser tab* carries, and ownership is what a signed-in user has without it.
+    """
+    user_id = _request_user_id()
+    if user_id is None:
+        return False
+    try:
+        job_hash = _run_async(_get_job_hash(job_id)) if aioredis_available else None
+    except Exception:
+        job_hash = None
+    if not job_hash:
+        return False
+    owner = job_hash.get("user_id")
+    try:
+        return owner is not None and int(owner) == int(user_id)
+    except (TypeError, ValueError):
+        return False
+
+
 # ── Upload progress publishing helper ──────────────────────────────────────
 
 
@@ -307,6 +385,185 @@ def _publish_upload_progress(
         logger.debug("webapp: failed to publish upload progress for %s", job_id)
 
 
+# ── Archive inputs ─────────────────────────────────────────────────────────
+# Telegram Desktop zips a dragged folder and sends it "as a file", so the route
+# receives a ``.zip`` like any other upload. An archive is not a media file, so it
+# is expanded (utils/archive_input.py, which owns the zip-slip/symlink/zip-bomb
+# defenses) into the media it holds, one job per member. The parent job becomes the
+# receipt - it records how many members were queued - and each member carries its
+# own access capability, so no member is world-readable from a guessed id.
+
+
+def _archive_member_job(member, parent_job_id: str, request_id: str, user_id: int | None = None) -> dict:
+    """The job payload for one media file unpacked from an archive.
+
+    Built the way every other web job is - same ffmpeg defaults, same progress
+    channel - so a member cannot drift from a directly-uploaded file. The member
+    is named after its own entry, not its extraction path. ``user_id`` is the
+    caller's identity when it carried one, so every member of an archive belongs
+    to the same user as the upload that produced it.
+    """
+    member_id = str(uuid.uuid4())
+    base_name = os.path.splitext(member.name)[0] or member_id
+    output_filename = f"{base_name}.mp4"
+    output_path = os.path.join(OUTPUT_DIR, output_filename)
+    counter = 1
+    while os.path.exists(output_path):
+        output_filename = f"{base_name}_{counter}.mp4"
+        output_path = os.path.join(OUTPUT_DIR, output_filename)
+        counter += 1
+    job = {
+        "job_id": member_id,
+        "input_path": member.path,
+        "output_path": output_path,
+        "original_filename": member.name,
+        "output_filename": os.path.basename(output_path),
+        "ffmpeg_args": ["-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-c:a", "aac", "-b:a", "128k"],
+        "progress_channel": f"ffmpeg:progress:{member_id}",
+        "cleanup_input": True,
+        "cleanup_output": False,
+        "request_id": request_id,
+        "parent_job_id": parent_job_id,
+    }
+    if user_id is not None:
+        job["user_id"] = user_id
+    return job
+
+
+def _record_archive_receipt(
+    parent_job_id: str, archive_name: str, count: int, skipped: int, user_id: int | None = None
+) -> None:
+    """Record the parent job's receipt: how many members the archive yielded.
+
+    The parent does no conversion, so its status is ``done`` the moment its
+    members are queued - a client that still polls it finishes instead of waiting
+    on work that is happening under the members' own ids. The caller's user id is
+    recorded too, so the parent is readable by the user who uploaded it.
+    """
+    red_url = os.environ.get("REDIS_URL")
+    if not red_url:
+        return
+    try:
+        r = redis_sync.from_url(red_url, decode_responses=True)
+        try:
+            mapping = {
+                "status": "done",
+                "progress": "100",
+                "message": f"Queued {count} file(s) from {archive_name}",
+                "archive_count": str(count),
+                "archive_skipped": str(skipped),
+            }
+            if user_id is not None:
+                mapping["user_id"] = str(user_id)
+            r.hset(f"ffmpeg:job:{parent_job_id}", mapping=mapping)
+        finally:
+            r.close()
+    except Exception:
+        logger.debug("webapp: failed to record archive receipt for %s", parent_job_id)
+
+
+def _handle_archive_upload(
+    archive_path: str, archive_name: str, parent_job_id: str, request_id: str, user_id: int | None = None
+):
+    """Expand an uploaded archive and enqueue one job per media member.
+
+    Returns the Flask response. The caller has already saved the upload under
+    ``INPUT_DIR``; this consumes it - the archive itself is not a job input - and
+    leaves the members under one directory named after the parent, so a refused
+    archive is cleaned up as a unit. The archive is discarded either way, so a
+    re-submitted id cannot be re-expanded.
+    """
+    dest_dir = os.path.join(INPUT_DIR, parent_job_id)
+    try:
+        expansion = expand_archive(archive_path, dest_dir)
+    except Exception:
+        logger.exception("webapp: expanding archive %s failed", archive_path)
+        expansion = None
+
+    if expansion is None or not expansion.members:
+        with contextlib.suppress(Exception):
+            os.remove(archive_path)
+        shutil.rmtree(dest_dir, ignore_errors=True)
+        if expansion is None:
+            return jsonify({"error": "archive could not be read", "detail": "Check server logs for details."}), 400
+        return (
+            jsonify(
+                {
+                    "error": "archive contains no supported media files",
+                    "detail": f"{expansion.skipped} entry(ies) skipped",
+                    "skipped": expansion.skipped,
+                    "reasons": expansion.errors[:10],
+                }
+            ),
+            400,
+        )
+
+    # The archive is spent; the unpacked members are the inputs now.
+    with contextlib.suppress(Exception):
+        os.remove(archive_path)
+
+    if not enqueue_job:
+        shutil.rmtree(dest_dir, ignore_errors=True)
+        return jsonify({"error": "job queue not available on server"}), 503
+
+    jobs = [_archive_member_job(member, parent_job_id, request_id, user_id) for member in expansion.members]
+    archive_label = os.path.basename(str(archive_name or archive_path)) or "archive.zip"
+
+    backend_name = config.get_storage_backend_name()
+    use_remote = backend_name in ("s3", "r2") and get_storage_backend_sync is not None
+
+    def _bg_enqueue_archive():
+        """Upload each member if the backend is remote, then enqueue it."""
+        for job in jobs:
+            try:
+                if use_remote:
+                    _publish_upload_progress(job["job_id"], 50, "Uploading to S3...")
+                    b = get_storage_backend_sync()
+                    key = f"uploads/{job['job_id']}_{os.path.basename(job['input_path'])}"
+                    ref = _run_async(
+                        store_source(b, job["input_path"], key=key, telegram_fallback=False, log_prefix="webapp")
+                    )
+                    if ref.job_key:
+                        job["input_key"] = ref.job_key
+                    if ref.stored and os.environ.get("KEEP_LOCAL_UPLOADS", "").lower() not in ("1", "true", "yes"):
+                        with contextlib.suppress(Exception):
+                            os.remove(job["input_path"])
+                _publish_upload_progress(job["job_id"], 90, "Enqueuing job...")
+                _run_async(enqueue_job(job))
+                _publish_upload_progress(job["job_id"], 100, "Job queued")
+            except Exception:
+                logger.exception("webapp: failed to enqueue archive member %s", job.get("job_id"))
+                _publish_upload_progress(job["job_id"], 0, "Enqueue failed")
+
+    threading.Thread(target=_bg_enqueue_archive, daemon=True).start()
+
+    _record_archive_receipt(parent_job_id, archive_label, len(jobs), expansion.skipped, user_id)
+
+    payload = _job_access_payload(parent_job_id)
+    members = []
+    for job in jobs:
+        try:
+            capability = _run_async(issue_job_token(job["job_id"]))
+        except Exception:
+            logger.exception("webapp: could not mint a capability for archive member %s", job["job_id"])
+            capability = ""
+        members.append(
+            {
+                "job_id": job["job_id"],
+                "filename": job["original_filename"],
+                JOB_CAPABILITY_PARAM: capability,
+            }
+        )
+    payload["status"] = "accepted"
+    payload["archive"] = {
+        "archive_name": archive_label,
+        "count": len(members),
+        "skipped": expansion.skipped,
+        "members": members,
+    }
+    return jsonify(payload), 202
+
+
 @app.route("/", methods=["GET"])
 def index():
 
@@ -331,9 +588,12 @@ def upload():
     # Upload token protection. UPLOAD_SECRET fails closed when unset (see
     # utils/web_auth.py), and the credential is read from a header or the request
     # body only: a token in the query string leaks into access logs, browser
-    # history and Referer headers.
+    # history and Referer headers. A per-user token is accepted in its place
+    # (utils/web_users.py) and, unlike the shared secret, names the user the job
+    # belongs to.
     incoming_token = request.headers.get("X-Upload-Token") or request.form.get("upload_token")
-    if not upload_token_ok(incoming_token):
+    authorized, caller_user_id = _user_or_service_ok(incoming_token)
+    if not authorized:
         return (
             jsonify({"error": "unauthorized", "detail": "missing or invalid upload token"}),
             401,
@@ -355,6 +615,12 @@ def upload():
         ext = _safe_input_ext(filename)
         input_path = os.path.join(INPUT_DIR, f"{job_id}{ext}")
         f.save(input_path)
+
+        # An archive is not a media file, so it is expanded into the media it
+        # holds and each member becomes its own job - see _handle_archive_upload.
+        if is_archive(filename):
+            return _handle_archive_upload(input_path, filename, job_id, request_id, caller_user_id)
+
         # If configured with remote storage (S3/R2/MinIO), we'll upload the input
         # in a background thread and enqueue the job after upload completes.
         input_key = None
@@ -742,6 +1008,9 @@ def upload():
         "input_path": input_path,
         # when using remote storage the worker will download `input_key` before processing
         **({"input_key": input_key} if input_key else {}),
+        # The user this job belongs to, when the caller identified as one. A job
+        # queued with the shared secret stays unattributed, as it was before.
+        **({"user_id": caller_user_id} if caller_user_id is not None else {}),
         "output_path": output_path,
         "original_filename": original_filename,
         "output_filename": os.path.basename(output_path),
@@ -1015,7 +1284,7 @@ def presign():
             incoming_token = _body.get("upload_token")
     if not incoming_token:
         incoming_token = request.headers.get("X-Upload-Token") or request.form.get("upload_token")
-    if not upload_token_ok(incoming_token):
+    if not _user_or_service_ok(incoming_token)[0]:
         return (
             jsonify({"error": "unauthorized", "detail": "missing or invalid upload token"}),
             401,
@@ -1091,7 +1360,8 @@ def enqueue_from_url():
             incoming_token = _body.get("upload_token")
     if not incoming_token:
         incoming_token = request.headers.get("X-Upload-Token") or request.form.get("upload_token")
-    if not upload_token_ok(incoming_token):
+    authorized, caller_user_id = _user_or_service_ok(incoming_token)
+    if not authorized:
         return (
             jsonify({"error": "unauthorized", "detail": "missing or invalid upload token"}),
             401,
@@ -1130,6 +1400,7 @@ def enqueue_from_url():
         "ffmpeg_args": ["-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-c:a", "aac", "-b:a", "128k"],
         "progress_channel": f"ffmpeg:progress:{job_id}",
         "cleanup_input": True,
+        **({"user_id": caller_user_id} if caller_user_id is not None else {}),
     }
 
     if enqueue_job:
@@ -1190,7 +1461,7 @@ def status(job_id):
     # token (utils/job_access.py). The shared upload secret authorizes the
     # service as a whole, which is not the same thing as one job, so it no
     # longer stands in for a per-job check on a job-scoped route.
-    if not _job_access_ok(job_id):
+    if not (_job_access_ok(job_id) or _job_owner_ok(job_id)):
         return (
             jsonify({"error": "unauthorized", "detail": "missing or invalid job token"}),
             401,
@@ -1310,7 +1581,7 @@ def download(job_id):
     # token (utils/job_access.py). The shared upload secret authorizes the
     # service as a whole, which is not the same thing as one job, so it no
     # longer stands in for a per-job check on a job-scoped route.
-    if not _job_access_ok(job_id):
+    if not (_job_access_ok(job_id) or _job_owner_ok(job_id)):
         return (
             jsonify({"error": "unauthorized", "detail": "missing or invalid job token"}),
             401,
@@ -1408,7 +1679,7 @@ def events(job_id):
     # token (utils/job_access.py). The shared upload secret authorizes the
     # service as a whole, which is not the same thing as one job, so it no
     # longer stands in for a per-job check on a job-scoped route.
-    if not _job_access_ok(job_id):
+    if not (_job_access_ok(job_id) or _job_owner_ok(job_id)):
         return (
             jsonify({"error": "unauthorized", "detail": "missing or invalid job token"}),
             401,

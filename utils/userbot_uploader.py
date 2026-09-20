@@ -740,6 +740,11 @@ async def _send_with_telethon(
             kwargs = {
                 "caption": caption or "",
                 "attributes": [DocumentAttributeFilename(file_name=_delivery_name)],
+                # A filename-only attribute already files this as a document, but
+                # ``force_document`` makes it explicit: an archive volume (a
+                # ``.001`` part, or a ``.zip``) must never be pulled into a media
+                # view by its extension, and the bytes have to arrive untouched.
+                "force_document": True,
             }
             # Only pass progress_callback for sequential upload (parallel handles its own)
             if uploaded_file is None and progress_callback is not None:

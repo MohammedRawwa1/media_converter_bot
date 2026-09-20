@@ -32,6 +32,7 @@ from handlers import (
     _audio_delivery_duration,
     _audio_delivery_name,
     _audio_tag_kwargs,
+    _bulk_audio_supported,
     _bulk_photo_supported,
     _bulk_quality_label,
     _bulk_rename_filename,
@@ -698,6 +699,110 @@ class PhotoBatchTests(unittest.TestCase):
         self.assertIn("Skipped {photo_skipped} photo(s)", src)
 
 
+class AudioBatchTests(unittest.TestCase):
+    """An audio file can only run a plan that has audio to work with.
+
+    The mirror of ``PhotoBatchTests``: a batch can hold both kinds, and the plan
+    decides what can be produced, so an audio file handed a video encode is
+    skipped and reported rather than queued to write an MP4 with no video in it.
+    """
+
+    def test_audio_runs_the_extract(self):
+        for settings in (
+            {"bulk_extract_audio": True},
+            {"bulk_extract_audio": True, "bulk_compress": True},
+            {"bulk_extract_audio": True, "bulk_rename": True},
+        ):
+            plan = _resolve_bulk_plan(settings)
+            self.assertTrue(_bulk_audio_supported(plan), msg=repr(settings))
+
+    def test_audio_is_skipped_for_video_only_plans(self):
+        for settings in (
+            {},
+            {"bulk_convert_mp4": True},
+            {"bulk_compress": True},
+            {"bulk_optimize": True},
+            {"bulk_remove_audio": True},
+        ):
+            plan = _resolve_bulk_plan(settings)
+            self.assertFalse(_bulk_audio_supported(plan), msg=repr(settings))
+        self.assertFalse(_bulk_audio_supported(None))
+
+    def test_apply_loop_guards_audio(self):
+        src = read_source("handlers.py")
+        self.assertIn('if f.get("type") == "audio" and not _audio_ok:', src)
+        self.assertIn("Skipped {audio_skipped} audio file(s)", src)
+
+    def test_the_batch_answers_already_at_the_bitrate_with_all_three_answers(self):
+        """The batch asks the same three questions the single button asks.
+
+        The source's own header (read from storage first), its bitrate, and its
+        container - so a batch cannot call a file already the answer where the
+        button would convert it, or convert where the button would stop.
+        """
+        src = read_source("handlers.py")
+        self.assertIn(
+            'await _already_at_bitrate(f, _plan["extract_bitrate"], user_id=user_id, '
+            'target_codec="mp3", target_format="mp3")',
+            src,
+        )
+
+
+class MergeListKindTests(unittest.TestCase):
+    """A merge-list entry is stored as a bare path - it still has to have a kind.
+
+    The merge menu's "Add File" button appends a bare path string, and every
+    combination decision in the batch reads ``type``: the photo guard, the audio
+    guard, and the Extract Audio gate. An entry with no kind is not guarded, so an
+    audio document under Extract Audio was fetched and re-encoded even when it
+    already carried the bitrate asked for, and a photo never joined the slideshow.
+    """
+
+    def test_a_bare_path_infers_its_kind(self):
+        for name, kind in (
+            (os.path.join("tmp", "song.mp3"), "audio"),
+            (os.path.join("tmp", "clip.mp4"), "video"),
+            (os.path.join("tmp", "pic.jpg"), "photo"),
+        ):
+            self.assertEqual(_normalize_bulk_item(name).get("type"), kind, msg=name)
+
+    def test_a_kindless_dict_gets_one_in_place(self):
+        entry = {"id": "x", "path": os.path.join("tmp", "meeting.m4a")}
+        normalized = _normalize_bulk_item(entry)
+        self.assertIs(normalized, entry)
+        self.assertEqual(normalized["type"], "audio")
+
+    def test_an_existing_kind_is_never_overwritten(self):
+        entry = {"id": "x", "name": "called_video.mp3", "type": "video"}
+        self.assertEqual(_normalize_bulk_item(entry)["type"], "video")
+
+    def test_an_unknown_extension_is_left_unkind(self):
+        self.assertNotIn("type", _normalize_bulk_item(os.path.join("tmp", "notes.txt")))
+
+    def test_the_gates_read_the_inferred_kind(self):
+        """The two combinations this fixes: photos under Compress, audio docs under Extract.
+
+        An inferred audio entry is answered by the Extract Audio gate; an inferred
+        photo is grouped into the slideshow (and skipped when the plan cannot run
+        on it).
+        """
+        src = read_source("handlers.py")
+        self.assertIn("entry = _normalize_bulk_item(item)", src)
+        # Normalising happens while the batch is built, before the guards read it.
+        self.assertLess(
+            src.index("entry = _normalize_bulk_item(item)"),
+            src.index("_photo_ok = _bulk_photo_supported(_plan)"),
+        )
+
+        extract = _resolve_bulk_plan({"bulk_extract_audio": True})
+        self.assertTrue(_bulk_audio_supported(extract))
+        self.assertFalse(_bulk_photo_supported(extract))
+
+        compress = _resolve_bulk_plan({"bulk_compress": True})
+        self.assertTrue(_bulk_photo_supported(compress))
+        self.assertFalse(_bulk_audio_supported(compress))
+
+
 class BulkRenameTests(unittest.TestCase):
     def test_applies_the_prefix_and_the_suffix(self):
         settings = {"prefix": "[Bot] ", "suffix": " HD"}
@@ -709,6 +814,25 @@ class BulkRenameTests(unittest.TestCase):
         name, changed = _bulk_rename_filename("song.mp3", {})
         self.assertEqual(name, "song.mp3")
         self.assertFalse(changed)
+
+    def test_a_name_that_already_carries_the_affixes_is_left_alone(self):
+        """The ingest already renamed it, so the batch rename must not rename again.
+
+        A file is registered under a name the ingest has applied the prefix and
+        suffix to, so a batch rename that did not recognise its own work delivered
+        ``[Bot] [Bot] song_s.mp3`` - the same rename done twice by two paths.
+        """
+        settings = {"prefix": "[Bot] ", "suffix": "_s"}
+
+        name, changed = _bulk_rename_filename("[Bot] song_s.mp3", settings)
+        self.assertEqual(name, "[Bot] song_s.mp3")
+        self.assertFalse(changed)
+
+        # Applying it twice is the same as applying it once.
+        once, _ = _bulk_rename_filename("song.mp3", settings)
+        twice, _ = _bulk_rename_filename(once, settings)
+        self.assertEqual(once, twice)
+        self.assertEqual(twice.count("[Bot] "), 1)
 
     def test_never_renames_to_an_empty_stem(self):
         name, _ = _bulk_rename_filename("  .mp4", {"prefix": " ", "suffix": " "})

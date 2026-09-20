@@ -5,6 +5,7 @@ import os
 from typing import Any
 
 import config
+from utils import archive_split
 from utils.callbacks import MP3_DEFAULT_BITRATE
 
 logger = logging.getLogger(__name__)
@@ -23,6 +24,10 @@ DEFAULTS = {
     # quality of its own. Set from /usersettings - it is a preference, never a
     # conversion trigger.
     "audio_bitrate": MP3_DEFAULT_BITRATE,
+    # How a packed archive is split before delivery (one .zip, a size, or a
+    # number of equal parts). Read by Create Archive; the value grammar lives in
+    # utils/archive_split.py, next to the parsing and the labels.
+    "archive_part": archive_split.DEFAULT_VALUE,
 }
 
 

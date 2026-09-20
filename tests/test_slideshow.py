@@ -104,6 +104,36 @@ class CreateSlideshowTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(ok)
         self.assertIn("boom", msg)
 
+    async def test_the_batchs_quality_reaches_the_encode(self):
+        """A Compress or Optimize apply must not get a slideshow at the defaults."""
+        image = _write_image("ss_e.jpg")
+        runner = _RecordingRunner()
+        with patch.object(ct, "run_subprocess_with_timeout", runner):
+            await ct.create_slideshow(
+                image_paths=[image],
+                output_path=os.path.join(TMP, "slideshow_q.mp4"),
+                crf=28,
+                preset="veryfast",
+            )
+        cmd = runner.commands[-1]
+        self.assertEqual(cmd[cmd.index("-crf") + 1], "28")
+        self.assertEqual(cmd[cmd.index("-preset") + 1], "veryfast")
+
+    async def test_an_unusable_quality_falls_back_to_the_defaults(self):
+        image = _write_image("ss_f.jpg")
+        runner = _RecordingRunner()
+        for crf, preset in ((None, None), ("junk", "nonsense"), (99, "turbo")):
+            with patch.object(ct, "run_subprocess_with_timeout", runner):
+                await ct.create_slideshow(
+                    image_paths=[image],
+                    output_path=os.path.join(TMP, "slideshow_d.mp4"),
+                    crf=crf,
+                    preset=preset,
+                )
+            cmd = runner.commands[-1]
+            self.assertEqual(cmd[cmd.index("-crf") + 1], "23", repr(crf))
+            self.assertEqual(cmd[cmd.index("-preset") + 1], "medium", repr(preset))
+
 
 class SlideshowMusicTests(unittest.IsolatedAsyncioTestCase):
     """A queued audio file is layered under the slideshow and cut with the video."""
@@ -210,6 +240,13 @@ class ImageDocumentTests(unittest.TestCase):
         src = read_source("handlers.py")
         self.assertIn("if file_ext in _IMAGE_EXTS:", src)
         self.assertIn('_register_bulk_file(session, {**session["current_file"], "type": "photo"})', src)
+        # The image check comes *before* the media lists, which carry no image
+        # extension: behind them a photo sent uncompressed was rejected as an
+        # unsupported file and never reached the batch at all.
+        self.assertLess(
+            src.index("if file_ext in _IMAGE_EXTS:"),
+            src.index('if file_ext in self.converter.supported_formats["video"]:'),
+        )
 
 
 class BulkPreviewTests(unittest.TestCase):
@@ -247,8 +284,72 @@ class SlideshowWiringTests(unittest.TestCase):
         src = read_source("handlers.py")
         self.assertIn('"type": "slideshow",', src)
         self.assertIn("_slideshow_photos", src)
-        # Two photos are the album case; a lone photo keeps the single-file path.
-        self.assertIn("_photos if len(_photos) >= 2 else []", src)
+        # Two photos are the album case; a lone photo keeps the single-file path -
+        # and so does every photo under a plan that makes no video (see the guard).
+        self.assertIn("_photos if (len(_photos) >= 2 and _photo_ok) else []", src)
+
+    def test_the_slideshow_runs_only_for_a_plan_that_makes_video(self):
+        """One photo and two photos answer the same plan the same way.
+
+        A photo cannot run an audio-only plan (see ``_bulk_photo_supported``), and
+        grouping them into a slideshow anyway made two photos a video where one
+        was skipped - the same file, two answers, decided by how many came with
+        it. The grouping is gated on the answer the loop below already uses.
+        """
+        src = read_source("handlers.py")
+        self.assertIn("_slideshow_photos = _photos if (len(_photos) >= 2 and _photo_ok) else []", src)
+
+    def test_a_remove_audio_batch_builds_no_soundtrack(self):
+        """The slideshow must not add the audio its own batch asked to remove.
+
+        The batch's audio action and the slideshow's music were working against
+        each other: ``bulk_remove_audio`` produced a video with a soundtrack.
+        """
+        src = read_source("handlers.py")
+        self.assertIn('if "bulk_remove_audio" not in _plan["applied"]:', src)
+        # The music is only looked for inside that guard.
+        self.assertLess(
+            src.index('if "bulk_remove_audio" not in _plan["applied"]:'),
+            src.index("_music_entry = _bulk_slideshow_music(files)"),
+        )
+
+    def test_the_batch_hands_its_own_quality_to_the_slideshow(self):
+        """A Compress/Optimize apply is reported as applied - so it has to be.
+
+        The summary says which CRF or preset ran, and a photo group is a video
+        encode like any other; encoding it at the slideshow's defaults while
+        saying otherwise is the plan being dropped on the floor.
+        """
+        src = read_source("handlers.py")
+        self.assertIn('if "bulk_compress" in _plan["applied"]:', src)
+        self.assertIn('"crf": _ss_crf,', src)
+        self.assertIn('"preset": _ss_preset,', src)
+
+        worker = read_source("workers", "ffmpeg_worker.py")
+        self.assertIn('crf=job.get("crf"),', worker)
+        # No trailing comma on the assertion: ``flatten`` drops a magic trailing
+        # comma before a closing bracket, so the last keyword cannot match with one.
+        self.assertIn('preset=job.get("preset")', worker)
+
+    def test_apply_consumes_the_soundtrack_with_the_slideshow(self):
+        """The audio that scores the slideshow is not converted a second time.
+
+        The photos became the one video and the music was consumed to score it, so
+        both leave the per-file loop together. Keeping the audio in the loop would
+        fetch and encode the very bytes the slideshow is still using as its
+        soundtrack - the one combination in a batch that can race over a file.
+        """
+        src = read_source("handlers.py")
+
+        self.assertIn("_slideshow_inputs = list(_slideshow_photos)", src)
+        # Only the audio the slideshow actually got: no music, or a failed music
+        # download, consumes the photos alone.
+        self.assertIn("if _photo_paths and _music_entry is not None and _music_path:", src)
+        self.assertIn("_slideshow_ids = {id(f) for f in _slideshow_inputs}", src)
+        # Marked finished with the photos, so a resume cannot rebuild the slideshow
+        # or re-fetch its soundtrack.
+        self.assertIn("for _photo_entry in _slideshow_inputs:", src)
+        self.assertNotIn("_slideshow_ids = {id(f) for f in _slideshow_photos}", src)
 
 
 class BulkSummaryTests(unittest.TestCase):

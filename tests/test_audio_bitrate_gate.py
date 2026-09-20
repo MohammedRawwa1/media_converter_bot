@@ -91,6 +91,26 @@ def test_a_verdict_without_a_codec_falls_back_to_the_extension():
     assert gate.codec_is_target("", {}) is False
 
 
+def test_the_media_has_to_already_be_in_the_container_the_target_names():
+    """AAC and M4A are one codec in two containers - the container is the other half.
+
+    An ``.aac`` source asked for as ``m4a`` is AAC in ADTS against AAC in MP4: the
+    codec matches and the container does not, so it is a real conversion. The
+    extension is the container the media was delivered in, and a source with none
+    is never called a match.
+    """
+    assert gate.container_is_target({"name": "track.mp3"}, "mp3") is True
+    assert gate.container_is_target({"name": "Track.MP3"}, "mp3") is True
+    assert gate.container_is_target({"name": "track.m4a"}, "mp3") is False
+    assert gate.container_is_target({"name": "track.aac"}, "m4a") is False
+    assert gate.container_is_target({"name": "track.m4a"}, "m4a") is True
+    assert gate.container_is_target({"name": "track"}, "mp3") is False
+    assert gate.container_is_target({}, "mp3") is False
+    # No container asked for is no constraint - the bitrate-only callers.
+    assert gate.container_is_target({"name": "track.m4a"}, None) is True
+    assert gate.container_is_target(None, "") is True
+
+
 def test_an_earlier_probe_verdict_is_read_in_both_shapes():
     """What the ingest wrote, and what a flattened job/entry carries instead."""
     assert gate.known_verdict({"_source_metadata": {"audio_bitrate": 64000, "audio_codec": "mp3"}}) == (
@@ -139,6 +159,16 @@ def test_the_same_bitrate_in_another_codec_is_not_a_match(monkeypatch):
     """The bitrate alone must never be trusted: the codec is the other half."""
     _verdict(monkeypatch, 64000, "aac")
     assert _run(gate.already_at_bitrate({"name": "a.m4a"}, "64k")) is None
+
+
+def test_the_same_bitrate_in_another_container_is_not_a_match(monkeypatch):
+    """The codec is the same and the container is not - so it is a real conversion."""
+    _verdict(monkeypatch, 64000, "aac")
+    current = {"name": "track.aac"}
+
+    assert _run(gate.already_at_bitrate(current, "64k", target_codec="aac")) == 64000
+    assert _run(gate.already_at_bitrate(current, "64k", target_codec="aac", target_format="m4a")) is None
+    assert _run(gate.already_at_bitrate({"name": "track.m4a"}, "64k", target_codec="aac", target_format="m4a")) == 64000
 
 
 def test_an_unknown_verdict_leaves_the_conversion_alone(monkeypatch):
@@ -441,7 +471,12 @@ def test_a_batch_answers_an_audio_file_that_is_already_at_the_bitrate():
     body = flatten(read_source(HANDLERS))
 
     assert '_plan["convert_type"] == "extract_audio" and f.get("type") == "audio"' in body
-    assert 'await _already_at_bitrate(f, _plan["extract_bitrate"], user_id=user_id)' in body
+    # All three answers, the same ones the single-file button asks: the source's
+    # own header, its bitrate, and its container (an MP3 target, named here).
+    assert (
+        'await _already_at_bitrate(f, _plan["extract_bitrate"], user_id=user_id, '
+        'target_codec="mp3", target_format="mp3")' in body
+    )
     # Answered as its own outcome, never as a fetch failure or a skip.
     assert "already += 1" in body
     assert "nothing to re-encode" in body
@@ -460,15 +495,29 @@ def test_the_gate_is_only_applied_where_the_user_already_holds_the_file():
         assert "_already_at_bitrate(" not in _method_body(name)
 
 
-def test_the_audio_format_converter_answers_an_mp3_that_is_already_one():
+def test_the_audio_format_converter_checks_bitrate_format_and_container():
+    """All three answers, and all three before the fetch.
+
+    The button used to compare an MP3 request against a hard-coded 128k and leave
+    every other target alone. It now reads the user's own bitrate setting - the one
+    /usersettings stores - asks the source's codec against the target's, and asks
+    its container against the target's format, so an MP3 that is already 64k in the
+    container MP3 asks for is answered instead of fetched.
+    """
     body = _method_body("convert_audio_format")
 
-    assert 'if format_type == "mp3":' in body
-    assert "_already_at_bitrate(current_file, _DEFAULT_AUDIO_BITRATE" in body
+    assert 'if format_type == "mp3":' not in body, "the check is no longer MP3-only"
+    # The bitrate is read through the one resolver every audio button shares, so
+    # this button cannot carry a default of its own.
+    assert "audio_bitrate = _effective_audio_bitrate(current_file, update.effective_user.id)" in body
+    # The target's own codec and container travel with the request.
+    assert "AUDIO_FORMAT_PROBE_CODECS.get(format_type)" in body
+    assert "target_codec=_probe_codec" in body
+    assert "target_format=format_type" in body
+    # Only the targets whose encoder takes a bitrate: WAV and FLAC have none.
+    assert "audio_format_takes_bitrate(format_type)" in body
     # Before the fetch it exists to avoid, like every other wired site.
     assert body.index("_already_at_bitrate(") < body.index("_ensure_local_media")
-    # Only the MP3 target: the other targets are codec changes, and the gate
-    # speaks about MP3 alone.
     assert body.count("_already_at_bitrate(") == 1
 
 
@@ -496,6 +545,9 @@ def test_the_format_converter_stops_instead_of_re_encoding_an_mp3(monkeypatch):
     handler.safe_edit = _edit
     handler._ensure_current_file_downloaded = _no_fetch
     monkeypatch.setattr(handlers_module, "_already_at_bitrate", _already)
+    # The bitrate comes from /usersettings now; pin it so the answer does not
+    # depend on a settings file some other test may have written.
+    monkeypatch.setattr(handlers_module, "_user_audio_bitrate", lambda _uid: "128k")
 
     session = {"current_file": {"id": "x", "name": "song.mp3", "type": "audio"}}
     update = SimpleNamespace(
@@ -507,6 +559,95 @@ def test_the_format_converter_stops_instead_of_re_encoding_an_mp3(monkeypatch):
     _run(handler.convert_audio_format(update, SimpleNamespace(bot=SimpleNamespace()), session, "mp3"))
 
     assert edits == ["🔄 Converting to MP3...", "ℹ️ Already 128k — nothing to re-encode."]
+
+
+def test_every_audio_button_works_under_the_one_resolved_bitrate(monkeypatch):
+    """The file's own pick wins, then /usersettings, then the shared default.
+
+    One resolver is what keeps a button from carrying an idea of its own about the
+    quality: the number a picker marks and the number ffmpeg is given come from
+    the same place.
+    """
+    import handlers as handlers_module
+
+    monkeypatch.setattr(handlers_module, "_user_audio_bitrate", lambda _uid: "64k")
+
+    resolve = handlers_module._effective_audio_bitrate
+    # The settings menu's value, when the file has no pick of its own.
+    assert resolve({}, 7) == "64k"
+    assert resolve(None, 7) == "64k"
+    # The file's own pick wins over the setting.
+    assert resolve({"audio_bitrate": "192k"}, 7) == "192k"
+    # An explicit argument (the video -> MP3 quality picker) wins over both.
+    assert resolve({"audio_bitrate": "192k"}, 7, override="96k") == "96k"
+    # An unusable value falls back to the shared default rather than reaching ffmpeg.
+    assert resolve({"audio_bitrate": "nope"}, 7) == handlers_module._DEFAULT_AUDIO_BITRATE
+
+
+def test_the_format_picker_states_the_bitrate_it_will_use(monkeypatch):
+    """The audio picker names the constant, so the button visibly listens to it."""
+    import handlers as handlers_module
+
+    assert "_format_picker_prompt(" in read_source(HANDLERS)
+    monkeypatch.setattr(handlers_module, "_user_audio_bitrate", lambda _uid: "64k")
+
+    text = handlers_module._format_picker_prompt("Convert Format", "audio", {}, 7)
+    assert "64k" in text
+    assert "from /usersettings" in text
+    # A pick that is only on the file is not the preference, and is not called one.
+    per_file = handlers_module._format_picker_prompt("Convert Format", "audio", {"audio_bitrate": "192k"}, 7)
+    assert "192k" in per_file
+    assert "set for this file" in per_file
+    # The video picker has no bitrate constant to name.
+    assert "64k" not in handlers_module._format_picker_prompt("Convert Video Format", "video", {}, 7)
+
+
+def test_the_audio_menus_state_the_bitrate_in_force_and_where_it_came_from(monkeypatch):
+    """Video To Audio and Adjust Bitrate both name the value in force.
+
+    The pickers mark a value; these menus also say which value that is, read
+    through the one resolver - so the number the user sees is the number the
+    encode uses.
+    """
+    import handlers as handlers_module
+
+    monkeypatch.setattr(handlers_module, "_user_audio_bitrate", lambda _uid: "64k")
+
+    assert handlers_module._audio_bitrate_source({}) == "from /usersettings"
+    assert handlers_module._audio_bitrate_source({"audio_bitrate": "192k"}) == "set for this file"
+    assert handlers_module._audio_bitrate_source({"audio_bitrate": "nope"}) == "from /usersettings"
+
+    body = flatten(read_source(HANDLERS))
+    # Video To Audio's quality picker, the Adjust Bitrate picker, and the batch
+    # Extract Audio picker - each states the value in force and its source.
+    assert "Bitrate in force: **{current}** ({_audio_bitrate_source(current_file)})" in body
+    assert "Bitrate in force: **{_current_bitrate}** ({_audio_bitrate_source(current_file)})" in body
+    assert "Bitrate in force: <b>{current}</b> (from /usersettings)" in body
+
+
+def test_the_handler_wrapper_forwards_the_container_check(monkeypatch):
+    """A keyword the wrapper does not accept would be swallowed, not raised.
+
+    ``_already_at_bitrate`` answers "not already" for *any* failure - including a
+    call it cannot make - so a container check that never reached the gate looks
+    exactly like a file that is not a duplicate. Every keyword the gate takes has
+    to be accepted here and passed on.
+    """
+    import handlers as handlers_module
+    from utils import audio_bitrate_gate
+
+    seen = {}
+
+    async def _fake(current_file, target, *, user_id=None, target_codec="mp3", target_format=None):
+        seen.update(target=target, user_id=user_id, target_codec=target_codec, target_format=target_format)
+        return 64000
+
+    monkeypatch.setattr(audio_bitrate_gate, "already_at_bitrate", _fake)
+
+    found = _run(handlers_module._already_at_bitrate({}, "64k", user_id=7, target_codec="aac", target_format="m4a"))
+
+    assert found == 64000
+    assert seen == {"target": "64k", "user_id": 7, "target_codec": "aac", "target_format": "m4a"}
 
 
 def test_the_verdict_reads_like_the_answer_the_user_asked_for():

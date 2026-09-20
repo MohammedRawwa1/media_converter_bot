@@ -13,6 +13,16 @@ from telegram import InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto
 from telegram.error import BadRequest
 from telegram.ext import ContextTypes, ConversationHandler
 
+# The archive part-size preference: one place that reads, validates and explains
+# how a packed ZIP is split before delivery (see the Create Archive handlers and
+# utils/archive_split.py).
+from utils import archive_split
+
+# A sent .zip (Telegram Desktop zips a dragged folder and sends it "as a file")
+# is expanded into the media it holds, which then join the batch as local files
+# (see EnhancedMediaHandler.handle_archive_document).
+from utils.archive_input import expand_archive, is_archive
+
 # The settings panel's page list, its triggers and the one label per compress
 # quality live in utils.callbacks, next to the rest of the keyboard vocabulary.
 from utils.callbacks import (
@@ -93,6 +103,8 @@ except Exception:
         STORAGE_BACKEND = "local"
         BOT_API_MAX_MB = 50
         BOT_API_MAX_BYTES = BOT_API_MAX_MB * 1024 * 1024
+        ARCHIVE_SPLIT_MAX_MB = int(_cfg_os.getenv("ARCHIVE_SPLIT_MAX_MB", "2000"))
+        ARCHIVE_SPLIT_MAX_BYTES = ARCHIVE_SPLIT_MAX_MB * 1024 * 1024
         ENABLE_USERBOT = _cfg_os.getenv("ENABLE_USERBOT", "").lower() in ("1", "true", "yes")
         ENABLE_LINK_SEND = _cfg_os.getenv("ENABLE_LINK_SEND", "").lower() in ("1", "true", "yes")
         RELAY_CHAT_ID = _cfg_os.getenv("RELAY_CHAT_ID", "")
@@ -438,6 +450,12 @@ _BULK_NAME_MAX = 32
 # are the ones ffmpeg can read back out of the slideshow pipeline.
 _IMAGE_EXTS = (".jpg", ".jpeg", ".png", ".webp", ".bmp")
 
+# Video/audio extensions, mirroring the converter's own lists. Used only to infer
+# a batch entry's kind when the entry arrives without one - the merge list stores
+# bare path strings - so an inferred file is guarded *and* grouped as what it is.
+_VIDEO_EXTS = (".mp4", ".avi", ".mov", ".mkv", ".flv", ".wmv", ".m4v", ".3gp", ".webm")
+_AUDIO_EXTS = (".mp3", ".wav", ".aac", ".flac", ".ogg", ".m4a", ".wma", ".opus")
+
 # "Video Only" extraction: keep the first video stream, drop audio/subtitles.
 # Re-encoding to H.264 makes the result playable regardless of the source codec.
 _EXTRACT_VIDEO_FFMPEG_ARGS = [
@@ -525,6 +543,7 @@ async def _already_at_bitrate(
     *,
     user_id=None,
     target_codec: str = "mp3",
+    target_format: str | None = None,
 ) -> int | None:
     """Compare → validate → already exists: the bitrate the file already has.
 
@@ -533,6 +552,11 @@ async def _already_at_bitrate(
     reasoning behind calling a *fetch* the expensive part of a bitrate change -
     lives in ``utils.audio_bitrate_gate``; this is the import guard that keeps a
     missing or broken gate from ever failing a conversion the user asked for.
+
+    Every keyword the gate takes has to be accepted here and passed on. The
+    guard answers "not already" for *any* failure - including a call this wrapper
+    cannot make - so an argument that is dropped on the way through, or one it
+    does not name, silently disables the check instead of raising.
     """
     try:
         from utils.audio_bitrate_gate import already_at_bitrate
@@ -542,6 +566,7 @@ async def _already_at_bitrate(
             target,
             user_id=user_id,
             target_codec=target_codec,
+            target_format=target_format,
         )
     except Exception:
         logger.debug("handlers: the already-at-bitrate check could not run")
@@ -813,6 +838,12 @@ def _bulk_rename_filename(filename: str | None, settings: dict | None) -> tuple[
     """Rename ``filename`` using the user's prefix/suffix settings.
 
     Returns ``(new_name, changed)``. The extension is always preserved.
+
+    Applying this to a name that already carries the prefix and suffix leaves it
+    as it is. Every file is registered under a name the ingest has *already*
+    renamed (see ``handle_video``/``handle_audio``/``handle_document``), so a
+    batch rename that did not recognise its own work added them a second time -
+    ``[Bot] [Bot] song_s.mp3`` for a file that only ever had one of each.
     """
     name = os.path.basename(filename or "")
     stem, ext = os.path.splitext(name)
@@ -820,8 +851,19 @@ def _bulk_rename_filename(filename: str | None, settings: dict | None) -> tuple[
         return name, False
 
     settings = settings or {}
+    prefix = str(settings.get("prefix") or "")
+    suffix = str(settings.get("suffix") or "")
+
+    # Take off what is already there before putting it back, so the answer is the
+    # same whether this is applied once or twice.
     new_stem = stem.strip() or stem
-    renamed = f"{settings.get('prefix') or ''}{new_stem}{settings.get('suffix') or ''}".strip() or new_stem
+    if prefix and new_stem.startswith(prefix):
+        new_stem = new_stem[len(prefix) :]
+    if suffix and new_stem.endswith(suffix):
+        new_stem = new_stem[: -len(suffix)]
+    new_stem = new_stem.strip() or stem
+
+    renamed = f"{prefix}{new_stem}{suffix}".strip() or new_stem
     new_name = f"{renamed}{ext}"
     return new_name, new_name != name
 
@@ -1015,6 +1057,24 @@ def _bulk_photo_supported(plan: dict | None) -> bool:
     return any(key in applied for key in _BULK_PHOTO_ACTIONS)
 
 
+def _bulk_audio_supported(plan: dict | None) -> bool:
+    """Whether an audio input can run this resolved plan.
+
+    Extract Audio is the one plan with audio to work with: it re-encodes the
+    file's own stream to MP3. Every other plan is a *video* encode - Convert,
+    Compress and Optimize write a video stream, and Remove Audio would take the
+    only stream the file has - so an audio file in one of those is skipped and
+    reported instead of being queued to produce a video-less MP4 or nothing at
+    all.
+
+    The mirror of :func:`_bulk_photo_supported`, for the same reason: one batch
+    can hold both kinds, and what a plan can produce is a property of the plan,
+    not of the file it happens to be handed.
+    """
+    plan = plan or {}
+    return plan.get("output_ext") == ".mp3"
+
+
 def _read_bulk_settings(user_id, session: dict | None) -> dict:
     """Read the bulk settings the same way Apply does (settings store, else session).
 
@@ -1151,18 +1211,191 @@ def _bulk_slideshow_music(entries):
     return None
 
 
+def _archive_selection(entries) -> list[dict]:
+    """The batched files an archive will hold, normalized and de-duplicated.
+
+    Create Archive reads what *this batch* staged - the same source Apply Bulk
+    reads - and normalizes each entry the same way, so the summary the user
+    confirms and the files the worker packs cannot disagree about what goes in.
+
+    It used to pack every ``{user_id}_*`` file sitting in the output directory
+    instead, which is whatever the account happened to produce, not what the
+    user was working on.
+    """
+    selection: list[dict] = []
+    for item in entries or []:
+        entry = _normalize_bulk_item(item)
+        if entry is not None and entry not in selection:
+            selection.append(entry)
+    return selection
+
+
+def _archive_total_bytes(selection) -> int:
+    """Sum of the member sizes that are known, so the total is a floor.
+
+    A member whose size was never stated (a bare path, or an entry Telegram gave
+    no ``file_size`` for) is left out rather than guessed at, so the summary
+    never claims a number it cannot back.
+    """
+    total = 0
+    for entry in selection or []:
+        try:
+            size = int((entry or {}).get("size") or 0)
+        except (TypeError, ValueError):
+            size = 0
+        if size > 0:
+            total += size
+    return total
+
+
+def _archive_size_label(total_bytes) -> str:
+    """``1536`` -> ``"1.5 KB"``; a zero/unknown total reads ``"unknown"``."""
+    try:
+        value = float(total_bytes or 0)
+    except (TypeError, ValueError):
+        return "unknown"
+    if value <= 0:
+        return "unknown"
+    for unit, factor in (("GB", 1024**3), ("MB", 1024**2), ("KB", 1024)):
+        if value >= factor:
+            return f"{value / factor:.1f} {unit}"
+    return f"{int(value)} B"
+
+
+def _sanitize_archive_name(raw: object) -> str:
+    """A safe archive *stem* from what the user typed, or "" when unusable.
+
+    The name becomes a delivered filename, so it is reduced to one path segment
+    of plain characters: a separator, an extension or a control character the
+    user typed is dropped rather than allowed to shape a path or double the
+    ``.zip`` the delivery adds. Empty means the caller asks again.
+    """
+    text = str(raw or "").strip().replace("\\", "/")
+    # Split the path by hand rather than with ``os.path.basename``: on Windows a
+    # ":" reads as a drive separator, so the same typed name would lose a
+    # different prefix there than it does on the Linux host that serves it.
+    stem = text.rsplit("/", 1)[-1]
+    if stem.lower().endswith(".zip"):
+        stem = stem[:-4]
+    cleaned = "".join(ch for ch in stem if ch.isprintable() and ch not in '%:/\\*?"<>|')
+    cleaned = " ".join(cleaned.split()).strip("._ ")
+    return cleaned[:80]
+
+
+def _archive_default_name(selection) -> str:
+    """The name offered when the user does not type one: the first file's stem.
+
+    The archive used to be named this way unconditionally; keeping it as the
+    default preserves the old behaviour for anyone who wants it, while asking
+    once gives everyone else a name of their own.
+    """
+    if not selection:
+        return "media_archive"
+    stem = os.path.splitext(_bulk_display_name(selection[0]))[0]
+    return f"{stem or 'media'}_archive"
+
+
+def _archive_name_prompt_text(selection, default_name: str, part_value=None, *, cap_bytes=0) -> str:
+    """The prompt that asks for the archive's name, before the summary.
+
+    It also states the current part-size setting, because how the archive will be
+    split is part of deciding its name - and the 📐 button beside it opens the
+    picker for that setting without leaving the flow.
+    """
+    lines = _bulk_batch_lines(selection)
+    total_bytes = _archive_total_bytes(selection)
+    total = _archive_size_label(total_bytes)
+    parts = archive_split.estimate_parts(part_value, total_bytes, cap_bytes)
+    part_line = f"Part size: <b>{archive_split.label(part_value)}</b>"
+    if parts and parts > 1:
+        part_line += f" — about {parts} volumes"
+    return (
+        "📦 <b>Create Archive</b>\n\n"
+        f"Ready to pack <b>{len(selection)}</b> file(s) from this batch:\n"
+        + "\n".join(lines)
+        + f"\n\nTotal size: {total}\n"
+        + part_line
+        + "\n\n"
+        "Send a name for the archive (letters, numbers, spaces). For example:\n"
+        f"<code>{html.escape(default_name)}</code>\n\n"
+        "Or press <b>✅ Use default name</b> below."
+    )
+
+
+def _archive_summary_text(selection, name: str, part_value=None, *, cap_bytes=0) -> str:
+    """The summary the user confirms, for a batch, its name and the part size.
+
+    The part line comes from the user's setting (``archive_part``), so what the
+    summary promises about volumes is what the worker's split will actually do.
+    """
+    lines = _bulk_batch_lines(selection)
+    total_bytes = _archive_total_bytes(selection)
+    total = _archive_size_label(total_bytes)
+    parts = archive_split.estimate_parts(part_value, total_bytes, cap_bytes)
+    part_line = f"Parts: <b>{archive_split.label(part_value)}</b>"
+    if parts and parts > 1:
+        part_line += f" — about {parts} volumes"
+    return (
+        "📦 <b>Create Archive</b>\n\n"
+        f"Name: <b>{html.escape(name)}.zip</b>\n"
+        + part_line
+        + "\n"
+        f"Ready to pack <b>{len(selection)}</b> file(s) from this batch:\n"
+        + "\n".join(lines)
+        + f"\n\nTotal size: {total}\n"
+        "Files are packed one at a time, so memory stays flat no matter how large "
+        "the archive gets.\n"
+        "A split archive is delivered as .001/.002 parts — download every part and "
+        "open the first.\n"
+        "Packing clears the batch.\n"
+        "Change the part size with 📐 below (or in /usersettings → Batch).\n\n"
+        "Pack these into a ZIP?"
+    )
+
+
+def _bulk_type_for_name(name) -> str | None:
+    """The batch type a filename's extension implies, or None when unknown.
+
+    A merge-list entry can arrive with no ``type`` at all, and every combination
+    decision in the batch reads one: the photo guard, the audio guard, and the
+    extract-audio gate. An entry without a kind is not guarded, so an audio file
+    under Extract Audio was fetched and re-encoded even when it already carried
+    the bitrate asked for, and a photo never joined the slideshow.
+    """
+    ext = os.path.splitext(str(name or ""))[1].lower()
+    if ext in _IMAGE_EXTS:
+        return "photo"
+    if ext in _VIDEO_EXTS:
+        return "video"
+    if ext in _AUDIO_EXTS:
+        return "audio"
+    return None
+
+
 def _normalize_bulk_item(item):
     """Coerce a bulk/merge list entry to the file-dict shape Apply expects.
 
     Entries reach the list two ways: auto-collected sends and album photos store
-    dicts, while the merge menu's "Add File" button stores a bare path string.
-    Normalising here keeps the bulk loop from tripping over either shape.
+    dicts, while the merge menu's "Add File" button stores a bare path string -
+    and an older session's dict may carry no ``type``. A kind is inferred from
+    the name and written *in place* when one is missing, so the guards and the
+    slideshow grouping see the file for what it is. In place rather than a copy:
+    the apply consumes the slideshow's inputs by object identity (``id(f)``), so
+    a copy would leave the same file in the loop *and* in the slideshow.
     """
     if isinstance(item, dict):
+        if not item.get("type"):
+            inferred = _bulk_type_for_name(item.get("name") or item.get("path"))
+            if inferred:
+                item["type"] = inferred
         return item
     if isinstance(item, str) and item:
         name = os.path.basename(item)
-        return {"path": item, "id": name, "name": name}
+        entry = {"path": item, "id": name, "name": name}
+        inferred = _bulk_type_for_name(name)
+        if inferred:
+            entry["type"] = inferred
+        return entry
     return None
 
 
@@ -1240,6 +1473,58 @@ def _user_audio_bitrate(user_id) -> str:
     return _DEFAULT_AUDIO_BITRATE
 
 
+def _format_picker_prompt(title: str, media_type: str, current_file: dict | None, user_id) -> str:
+    """The text above the format picker, naming the constant the button works under.
+
+    An audio target is encoded at the bitrate the settings menu chose (or the
+    file's own pick), so the picker states it: the button listens to
+    /usersettings, and the user can see which value is in force before choosing a
+    target. The video picker has no such constant and reads as it always did.
+    """
+    text = f"🔄 **{title}**\nSelect target format:"
+    if media_type == "audio":
+        text += (
+            f"\n🎚️ Audio bitrate: **{_effective_audio_bitrate(current_file, user_id)}**"
+            f" ({_audio_bitrate_source(current_file)})"
+        )
+    return text
+
+
+def _effective_audio_bitrate(
+    current_file: dict | None,
+    user_id,
+    *,
+    override=None,
+    default: str = _DEFAULT_AUDIO_BITRATE,
+) -> str:
+    """The bitrate an audio conversion runs with, the settings menu first.
+
+    One resolver every audio entry point names, so no button carries an idea of
+    its own about the quality: the file's own pick when the user made one,
+    otherwise the value /usersettings stores (``_user_audio_bitrate``), otherwise
+    the shared default. The menus and the encoders both read it, which is what
+    keeps the number a picker marks and the number ffmpeg is given the *same* one
+    - a 64k chosen in the settings menu reaches the audio converter, Video To
+    Audio, Normalize and Adjust Bitrate alike.
+    """
+    return _sanitize_audio_bitrate(
+        override or (current_file or {}).get("audio_bitrate") or _user_audio_bitrate(user_id),
+        default=default,
+    )
+
+
+def _audio_bitrate_source(current_file: dict | None) -> str:
+    """Where the bitrate a menu is about to state came from.
+
+    A value that is only on *this file* is a different thing from the preference
+    the user set in /usersettings, so the menus say which one is in force instead
+    of attributing a per-file pick to the settings panel.
+    """
+    if _sanitize_audio_bitrate((current_file or {}).get("audio_bitrate"), default=""):
+        return "set for this file"
+    return "from /usersettings"
+
+
 def _remember_audio_bitrate(update, bitrate: str) -> bool:
     """Store a chosen bitrate as the user's audio-bitrate setting.
 
@@ -1311,6 +1596,21 @@ def _user_bulk_extract_bitrate(user_id) -> str:
     except Exception:
         logger.debug("handlers: could not read the batch extract bitrate preference for %s", user_id)
     return _BULK_EXTRACT_BITRATE_DEFAULT
+
+
+def _user_archive_part(user_id) -> str:
+    """The archive part-size preference the user set, normalized to a stored value.
+
+    Read at each Create Archive so the panel's choice and the packed ZIP's split
+    are the same setting, and a value an older build wrote cannot reach the
+    splitter as something it does not understand.
+    """
+    try:
+        if user_settings:
+            return archive_split.normalize(user_settings.get_user_setting(user_id, "archive_part"))
+    except Exception:
+        logger.debug("handlers: could not read the archive part-size preference for %s", user_id)
+    return archive_split.DEFAULT_VALUE
 
 
 def _user_upload_mode(user_id) -> str:
@@ -4045,6 +4345,161 @@ class EnhancedMediaHandler:
             logger.exception("handlers: failed to send document")
             return None
 
+    async def handle_archive_document(
+        self,
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+        session: dict,
+        document,
+        user_id: int,
+        file_name: str,
+    ) -> None:
+        """Expand a sent archive and register its media members for the batch.
+
+        Telegram Desktop zips a dragged folder and sends it "as a file", so a
+        folder reaches the bot as one ``.zip`` document. It is unpacked by
+        ``utils.archive_input.expand_archive``, which owns the zip-slip, symlink
+        and zip-bomb defenses, and every media member joins the bulk batch as a
+        *local* entry (``path`` set, no Telegram id) - which
+        ``_ensure_bulk_file_downloaded`` reuses as-is, so Apply never fetches it
+        from Telegram again.
+
+        The download goes through the guard every action uses
+        (:meth:`_ensure_local_media` -> :meth:`_ensure_current_file_downloaded`),
+        not a bare Bot API call: the cloud Bot API refuses files over 20 MB, and
+        that guard is what falls back to the userbot and the big-file pipeline. A
+        large archive is therefore fetched the same way a large video is.
+
+        Only video, audio and image members are kept: those are what a batch can
+        act on, so a stray ``.srt`` or nested archive is left in the archive
+        rather than handed to a plan with no step for it.
+        """
+        # Size guard before any fetch, the same one every document gets.
+        try:
+            max_size = int(MAX_FILE_SIZE)
+        except Exception:
+            max_size = 4 * 1024**3
+        doc_size = getattr(document, "file_size", None)
+        if doc_size and doc_size > max_size:
+            await update.message.reply_text(
+                f"❌ Archive too large ({doc_size // 1024 // 1024} MB). "
+                f"Maximum allowed is {max_size // 1024 // 1024} MB."
+            )
+            return
+
+        await update.message.reply_text("📥 Downloading archive...")
+
+        # The fetch works on ``session["current_file"]``, so lend it the archive
+        # for the duration and put whatever was there back afterwards.
+        entry = {
+            "path": None,
+            "type": "document",
+            "id": document.file_id,
+            "size": doc_size,
+            "name": file_name,
+            "thumbnail": None,
+            "forward": None,
+            "chat_id": getattr(getattr(getattr(update, "message", None), "chat", None), "id", None),
+            "msg_id": getattr(getattr(update, "message", None), "message_id", None),
+            "file_unique_id": getattr(document, "file_unique_id", None),
+        }
+        had_current = "current_file" in session
+        previous = session.get("current_file")
+        session["current_file"] = entry
+        archive_path = None
+        try:
+            current, _notice = await self._ensure_local_media(
+                update,
+                context,
+                session,
+                notify=lambda text: update.message.reply_text(text),
+            )
+            if current is None:
+                return
+            # A large archive is streamed by the pipeline on its own job; wait
+            # that job out (bounded) so there are bytes to unpack.
+            pending = current.get("_pipeline_job_id")
+            if pending:
+                with contextlib.suppress(Exception):
+                    await self._await_member_job(None, pending, name=file_name)
+            archive_path = self._local_copy(current)
+            if not archive_path:
+                archive_path = await self._resolve_local_source(current, user_id=user_id, session=session)
+        finally:
+            if had_current:
+                session["current_file"] = previous
+            else:
+                session.pop("current_file", None)
+
+        if not archive_path or not os.path.exists(archive_path):
+            await update.message.reply_text("❌ Could not fetch the archive. Please try again.")
+            return
+
+        input_dir = getattr(config, "INPUT_PATH", "storage/input") if config else "storage/input"
+        dest_dir = os.path.join(input_dir, f"archive_{user_id}_{document.file_id}")
+        try:
+            expansion = expand_archive(
+                archive_path,
+                dest_dir,
+                allowed_exts=frozenset((*_VIDEO_EXTS, *_AUDIO_EXTS, *_IMAGE_EXTS)),
+            )
+        except Exception:
+            logger.exception("archive: expanding %s failed", archive_path)
+            expansion = None
+
+        if expansion is None or not expansion.members:
+            shutil.rmtree(dest_dir, ignore_errors=True)
+            skipped = f" ({expansion.skipped} item(s) skipped)" if expansion is not None else ""
+            await update.message.reply_text(f"❌ The archive holds no supported media files.{skipped}")
+            return
+
+        # The batch is capped, and registering past the cap evicts its *oldest*
+        # entry - which could be a file the user sent before the archive. Take
+        # only what fits and say what was left out rather than silently dropping
+        # one of their earlier files.
+        queue = session.setdefault("bulk_list", [])
+        capacity = max(0, _BULK_LIST_LIMIT - len(queue))
+        added = 0
+        overflow = 0
+        for member in expansion.members:
+            if added >= capacity:
+                overflow += 1
+                continue
+            info = {
+                "path": member.path,
+                "type": _bulk_type_for_name(member.name) or "file",
+                "id": None,
+                "size": member.size,
+                "name": member.name,
+                "thumbnail": None,
+            }
+            if _register_bulk_file(session, info):
+                added += 1
+            else:
+                overflow += 1
+
+        with contextlib.suppress(Exception):
+            self._persist_session(user_id)
+
+        logger.info(
+            "archive: unpacked %s for user %s — %d added, %d skipped, %d over the batch cap",
+            file_name,
+            user_id,
+            added,
+            expansion.skipped,
+            overflow,
+        )
+        lines = [f"📦 Archive unpacked — added {added} file(s) to the batch."]
+        if expansion.skipped:
+            lines.append(f"↩️ {expansion.skipped} item(s) were not media and were skipped.")
+        if overflow:
+            lines.append(
+                f"⚠️ {overflow} file(s) did not fit — the batch holds at most {_BULK_LIST_LIMIT}. "
+                "Apply or clear it, then send the archive again for the rest."
+            )
+        lines.append("Open /bulkmenu and press ▶️ Apply Bulk when you are ready.")
+        await update.message.reply_text("\n".join(lines))
+
     async def _ensure_bulk_file_downloaded(
         self,
         update: Update,
@@ -5763,10 +6218,13 @@ class EnhancedMediaHandler:
                 f"• Compress Quality : <b>{compress_quality_label(crf)}</b> (CRF {crf})\n"
                 f"• Optimize Preset : <b>{BULK_PRESET_LABELS.get(preset, preset.title())}</b>\n"
                 f"• Audio Bitrate : <b>{bitrate}</b>\n\n"
-                "<i>What a conversion starts from when nothing was picked for the "
-                "file itself (Compress, Optimize, Video To Audio, Normalize, "
-                "Bitrate, Apply Bulk). Picking a value here only stores it — "
-                "nothing is converted.</i>"
+                "<i>What an audio conversion starts from when nothing was picked "
+                "for the file itself (Convert Format, Video To Audio, Normalize, "
+                "Bitrate). A batch's Extract Audio has its own value on the Batch "
+                "page. Picking a value here only stores it — "
+                "nothing is converted. The audio converter also treats a file "
+                "that already is the chosen format at this bitrate as the result "
+                "and skips the re-encode.</i>"
             )
         else:
             mode = str(s.get("upload_mode") or _UPLOAD_MODE_VIDEO).lower()
@@ -6739,8 +7197,20 @@ class EnhancedMediaHandler:
 
             return
 
-        # Determine file type
-        if file_ext in self.converter.supported_formats["video"]:
+        # A .zip is not a media file. Rather than reject it as an unknown
+        # document, expand it and let the media inside join the batch.
+        if is_archive(file_name):
+            await self.handle_archive_document(update, context, session, document, user_id, file_name)
+            return
+
+        # Determine file type. An image is checked *first*: a photo sent
+        # uncompressed arrives as a document, and the media lists below carry no
+        # image extension - so the branch that queues it as a photo sat behind a
+        # rejection it could never pass, and a photo sent this way was answered
+        # "unsupported file format" instead of joining the batch.
+        if file_ext in _IMAGE_EXTS:
+            file_type = "photo"
+        elif file_ext in self.converter.supported_formats["video"]:
             file_type = "video"
         elif file_ext in self.converter.supported_formats["audio"]:
             file_type = "audio"
@@ -7557,7 +8027,7 @@ class EnhancedMediaHandler:
 
                 await self.safe_edit(
                     query,
-                    "🔄 **Convert Format**\nSelect target format:",
+                    _format_picker_prompt("Convert Format", media_type, current_file, user_id),
                     reply_markup=MediaMenuBuilder.get_format_menu(media_type),
                 )
 
@@ -7569,7 +8039,9 @@ class EnhancedMediaHandler:
                     media_type = "video" if format_type == "video" else "audio"
                     await self.safe_edit(
                         query,
-                        f"🔄 **Convert {media_type.title()} Format**\nSelect target format:",
+                        _format_picker_prompt(
+                            f"Convert {media_type.title()} Format", media_type, current_file, user_id
+                        ),
                         reply_markup=MediaMenuBuilder.get_format_menu(media_type),
                     )
                     return
@@ -7588,14 +8060,14 @@ class EnhancedMediaHandler:
                 # file, or the user's own setting when nothing was picked for it
                 # yet. A custom value is shown on the Custom row (see
                 # _custom_bitrate_button), so the menu never marks a preset that
-                # is not the one in force.
-                _current_bitrate = _sanitize_audio_bitrate(
-                    (current_file or {}).get("audio_bitrate") or _user_audio_bitrate(user_id),
-                    default="",
-                )
+                # is not the one in force - and the value in force is stated, so
+                # the menu cannot leave the user guessing which one that is.
+                _current_bitrate = _effective_audio_bitrate(current_file, user_id)
                 await self.safe_edit(
                     query,
-                    "🎚️ **Adjust Bitrate**\nSelect bitrate:",
+                    "🎚️ **Adjust Bitrate**\n"
+                    "Select bitrate:\n"
+                    f"Bitrate in force: **{_current_bitrate}** ({_audio_bitrate_source(current_file)})",
                     reply_markup=MediaMenuBuilder.get_bitrate_menu("audio", _current_bitrate),
                 )
 
@@ -7837,6 +8309,43 @@ class EnhancedMediaHandler:
             elif data == "create_archive":
                 await self.create_archive(update, context, session)
 
+            elif data == "archive_name_default":
+                await self._archive_use_default_name(update, context, session)
+
+            elif data == "archive_part_menu":
+                await self._show_archive_part_menu(update, context, session)
+
+            elif isinstance(data, str) and data.startswith("archive_set_part:"):
+                await self._archive_set_part(update, context, session, data.split(":", 1)[1])
+
+            elif data == "archive_part_back":
+                # The picker's Back returns to the archive flow, not the settings
+                # page - and to whichever stage it was opened from: the name
+                # prompt until a name is chosen, the summary after that.
+                sess = session or self.user_sessions.get(user_id, {})
+                if sess.get("archive_name"):
+                    await self._show_archive_summary(sess, sess["archive_name"], user_id=user_id, query=query)
+                else:
+                    context.user_data["awaiting_archive_name"] = True
+                    await self._show_archive_name_prompt(sess, user_id=user_id, query=query)
+
+            elif data == "archive_confirm":
+                await self.confirm_archive(update, context, session)
+
+            elif data == "archive_cancel":
+                # Dropping the staged selection is the whole cancel: nothing was
+                # packed and the batch is untouched, so the user can retry.
+                sess = session or self.user_sessions.get(user_id, {})
+                sess.pop("archive_pending", None)
+                sess.pop("archive_name", None)
+                sess.pop("archive_pending_source", None)
+                for key in list(context.user_data.keys()):
+                    if key.startswith("awaiting_"):
+                        del context.user_data[key]
+                with contextlib.suppress(Exception):
+                    self._persist_session(user_id)
+                await self.safe_edit(query, "📦 Archive cancelled — your batch is unchanged.")
+
             elif data == "bulk_menu":
                 # Open the bulk action menu
                 await self.show_bulk_menu(update, context)
@@ -7872,6 +8381,7 @@ class EnhancedMediaHandler:
                     f"🎚️ <b>Bulk compress quality</b>\n\nCurrent: CRF {current}\n"
                     "<i>Lower CRF means better quality and a larger file.</i>",
                     reply_markup=MediaMenuBuilder.get_bulk_crf_menu(current),
+                    parse_mode="HTML",
                 )
 
             elif data == "bulk_preset_menu":
@@ -7883,17 +8393,23 @@ class EnhancedMediaHandler:
                     f"⚡ <b>Bulk optimize preset</b>\n\nCurrent: {current}\n"
                     "<i>Applied when the Optimize toggle is on.</i>",
                     reply_markup=MediaMenuBuilder.get_bulk_preset_menu(current),
+                    parse_mode="HTML",
                 )
 
             elif data == "bulk_bitrate_menu":
-                # Extract Audio bitrate picker for the next Apply
+                # Extract Audio bitrate picker for the next Apply. Like the audio
+                # pickers, it states the value in force and where it comes from:
+                # one preference (the settings panel's Batch Extract Bitrate) that
+                # this menu and /usersettings both write through the same key.
                 sess = session or self.user_sessions.setdefault(user_id, {})
                 current = _sanitize_bulk_extract_bitrate(_read_bulk_settings(user_id, sess).get("bulk_extract_bitrate"))
                 await self.safe_edit(
                     query,
-                    f"🎵 <b>Bulk Extract Audio bitrate</b>\n\nCurrent: {current}\n"
+                    f"🎵 <b>Bulk Extract Audio bitrate</b>\n\n"
+                    f"Bitrate in force: <b>{current}</b> (from /usersettings)\n"
                     "<i>Applied when the Extract Audio toggle is on — higher is better quality and a bigger file.</i>",
                     reply_markup=MediaMenuBuilder.get_bulk_bitrate_menu(current),
+                    parse_mode="HTML",
                 )
 
             elif data == "bulk_slideshow_menu":
@@ -7908,6 +8424,7 @@ class EnhancedMediaHandler:
                     "<i>Applied when two or more photos are queued — they become one "
                     "slideshow video.</i>",
                     reply_markup=MediaMenuBuilder.get_bulk_slideshow_menu(current),
+                    parse_mode="HTML",
                 )
 
             elif isinstance(data, str) and data.startswith("bulk_set_slideshow:"):
@@ -8073,11 +8590,16 @@ class EnhancedMediaHandler:
                     # A photo has no audio/video stream, so audio-only plans skip
                     # it (and are reported) instead of enqueuing a job that fails.
                     _photo_ok = _bulk_photo_supported(_plan)
+                    # A plan that produces a video cannot run on an audio file, and
+                    # the other way round (see _bulk_audio_supported). Both kinds
+                    # can sit in one batch, so each is answered for what it is.
+                    _audio_ok = _bulk_audio_supported(_plan)
                     _slideshow_seconds = _sanitize_bulk_slideshow_seconds(_bulk_settings.get("bulk_slideshow_seconds"))
 
                     enqueued = 0
                     skipped = 0
                     photo_skipped = 0
+                    audio_skipped = 0
                     # Files whose own audio already carries the bitrate the batch
                     # asked for, so the conversion would have produced a copy of
                     # what the user sent (see the compare/validate step below).
@@ -8152,7 +8674,12 @@ class EnhancedMediaHandler:
                     # per-photo still-image encode. A lone photo keeps the normal
                     # single-file path in the loop below.
                     _photos = [f for f in files if f.get("type") == "photo"]
-                    _slideshow_photos = _photos if len(_photos) >= 2 else []
+                    # Only when the plan can actually produce a video: the photo
+                    # guard below says an audio-only plan has nothing to run on a
+                    # photo, and grouping them into a slideshow anyway was how one
+                    # photo got skipped while two became a video - the same file,
+                    # two answers, decided by how many photos came with it.
+                    _slideshow_photos = _photos if (len(_photos) >= 2 and _photo_ok) else []
                     if _slideshow_photos:
                         _photo_paths: list[str] = []
                         for _pf in _slideshow_photos:
@@ -8167,9 +8694,15 @@ class EnhancedMediaHandler:
                                 skipped += 1
 
                         # Background music: the first queued audio file, looped to
-                        # cover the slideshow and cut at the video's end.
+                        # cover the slideshow and cut at the video's end - but only
+                        # when the plan keeps audio at all. A batch that asked to
+                        # remove audio must not come back with a video that has a
+                        # soundtrack, which is what the batch's own audio action
+                        # and the slideshow's music were doing to each other.
                         _music_path = None
-                        _music_entry = _bulk_slideshow_music(files)
+                        _music_entry = None
+                        if "bulk_remove_audio" not in _plan["applied"]:
+                            _music_entry = _bulk_slideshow_music(files)
                         if _music_entry is not None:
                             try:
                                 _mp = await self._ensure_bulk_file_downloaded(update, context, sess, _music_entry)
@@ -8178,6 +8711,17 @@ class EnhancedMediaHandler:
                                 _mp = None
                             if _mp and os.path.exists(_mp):
                                 _music_path = _mp
+
+                        # What the slideshow consumes: the photos that became it,
+                        # and - once it actually runs - the audio that scores it.
+                        # Both are done with this batch, so neither goes back into
+                        # the per-file loop: leaving the music there would fetch and
+                        # encode the very bytes the slideshow is still using as its
+                        # soundtrack, which is the one combination in this batch
+                        # that can race over a file.
+                        _slideshow_inputs = list(_slideshow_photos)
+                        if _photo_paths and _music_entry is not None and _music_path:
+                            _slideshow_inputs.append(_music_entry)
 
                         if _photo_paths:
                             _label = f"🎞 slideshow ({len(_photo_paths)} photos)"
@@ -8192,6 +8736,17 @@ class EnhancedMediaHandler:
                                 _renamed, _renamed_ok = _bulk_rename_filename(_ss_name, _bulk_settings)
                                 if _renamed_ok:
                                     _ss_name = _renamed
+                            # The plan's own quality travels with the slideshow. A
+                            # photo is a video encode like any other, so a batch that
+                            # asked to Compress or Optimize has to mean it here too -
+                            # otherwise the apply reported the user's CRF/preset as
+                            # applied while the slideshow encoded at its defaults.
+                            _ss_crf = None
+                            _ss_preset = None
+                            if "bulk_compress" in _plan["applied"]:
+                                _ss_crf = _plan["crf"]
+                            elif "bulk_optimize" in _plan["applied"]:
+                                _ss_preset, _ss_crf, _ = _BULK_OPTIMIZE_PRESETS[_plan["optimize_preset"]]
                             _ss_job = {
                                 "job_id": job_id,
                                 "type": "slideshow",
@@ -8201,6 +8756,8 @@ class EnhancedMediaHandler:
                                 "original_filename": _ss_name,
                                 "seconds_per_image": _slideshow_seconds,
                                 "music_path": _music_path,
+                                "crf": _ss_crf,
+                                "preset": _ss_preset,
                                 "progress_channel": f"ffmpeg:progress:{job_id}",
                                 "chat_id": update.effective_chat.id
                                 if update and getattr(update, "effective_chat", None)
@@ -8241,15 +8798,16 @@ class EnhancedMediaHandler:
                                         )
                                         == "done"
                                     ):
-                                        # The photos became this one video, so every
-                                        # photo that went into it is done - otherwise a
-                                        # resume would rebuild the slideshow.
+                                        # The photos became this one video and the
+                                        # music was consumed to score it, so both are
+                                        # done - otherwise a resume would rebuild the
+                                        # slideshow and re-fetch its soundtrack.
                                         with contextlib.suppress(Exception):
                                             from utils.batch_pipeline import mark_batch_entry_finished
                                             from utils.job_queue import get_redis as _get_redis_ss
 
                                             _r_ss = await _get_redis_ss()
-                                            for _photo_entry in _slideshow_photos:
+                                            for _photo_entry in _slideshow_inputs:
                                                 await mark_batch_entry_finished(
                                                     _r_ss, _batch_id, _bulk_entry_key(_photo_entry)
                                                 )
@@ -8262,8 +8820,8 @@ class EnhancedMediaHandler:
                                 enqueued += 1
                                 results.append((_label, f"📋 queued · {job_id}"))
 
-                        # Slideshow photos are handled — keep them out of the loop.
-                        _slideshow_ids = {id(f) for f in _slideshow_photos}
+                        # Slideshow inputs are handled — keep them out of the loop.
+                        _slideshow_ids = {id(f) for f in _slideshow_inputs}
                         files = [f for f in files if id(f) not in _slideshow_ids]
 
                     stopped = False
@@ -8304,6 +8862,14 @@ class EnhancedMediaHandler:
                                 results.append((_bulk_display_name(f), "⏭️ skipped — needs audio/video"))
                                 continue
 
+                            # The same guard for the other kind: an audio file in a
+                            # video-only plan is skipped and said so, rather than
+                            # queued to write an MP4 with no video in it.
+                            if f.get("type") == "audio" and not _audio_ok:
+                                audio_skipped += 1
+                                results.append((_bulk_display_name(f), "⏭️ skipped — this action needs video"))
+                                continue
+
                             # Say which file is being fetched, on the handler's
                             # own message. Downloading a 500 MB source takes
                             # minutes and the worker's bar only appears once a job
@@ -8324,7 +8890,19 @@ class EnhancedMediaHandler:
                             # a *video* produces a file the user does not have yet,
                             # matching bitrate or not.
                             if _plan["convert_type"] == "extract_audio" and f.get("type") == "audio":
-                                _existing = await _already_at_bitrate(f, _plan["extract_bitrate"], user_id=user_id)
+                                # The same three answers the single-file button asks -
+                                # the bitrate read from the source's own header (the
+                                # S3 ranged GET first), its codec, and its container -
+                                # so a batch cannot call a file "already" where the
+                                # button would convert it, or convert where the button
+                                # would stop.
+                                _existing = await _already_at_bitrate(
+                                    f,
+                                    _plan["extract_bitrate"],
+                                    user_id=user_id,
+                                    target_codec="mp3",
+                                    target_format="mp3",
+                                )
                                 if _existing:
                                     already += 1
                                     results.append(
@@ -8751,6 +9329,8 @@ class EnhancedMediaHandler:
                         )
                     if photo_skipped:
                         _head += f"\n⚠️ Skipped {photo_skipped} photo(s) — “{_applied}” needs an audio/video stream."
+                    if audio_skipped:
+                        _head += f"\n⚠️ Skipped {audio_skipped} audio file(s) — “{_applied}” needs a video stream."
                     if _plan["ignored"]:
                         _skipped = ", ".join(_BULK_ACTION_LABELS[key] for key in _plan["ignored"])
                         _head += f"\n⚠️ Skipped — cannot run in the same pass: {_skipped}"
@@ -9076,6 +9656,47 @@ class EnhancedMediaHandler:
                     parse_mode="HTML",
                 )
 
+            elif data == "settings_archive_part_menu":
+                # Archive part-size preference. Create Archive reads this same key,
+                # so the panel and a packed ZIP's split cannot disagree.
+                current = _user_archive_part(user_id)
+                await self.safe_edit(
+                    query,
+                    "📦 <b>Archive Part Size</b>\n\n"
+                    f"Current: <b>{archive_split.label(current)}</b>\n"
+                    "<i>How a packed archive is split before delivery. A ZIP larger "
+                    "than the part size becomes .001/.002 volumes the recipient joins "
+                    "by opening the first.</i>",
+                    reply_markup=MediaMenuBuilder.get_settings_archive_part_menu(current),
+                    parse_mode="HTML",
+                )
+
+            elif data.startswith("settings_set_archive_part:"):
+                # Store the chosen part size (or arm the custom prompt, which
+                # accepts a typed size like ``500MB`` or a count of equal parts).
+                value = data.split(":", 1)[1]
+                if user_settings is None:
+                    await self.safe_edit(query, "⚠️ Settings not available.")
+                elif value == "custom":
+                    for key in list(context.user_data.keys()):
+                        if key.startswith("awaiting_"):
+                            del context.user_data[key]
+                    context.user_data["awaiting_settings_archive_part"] = True
+                    await self.safe_edit(
+                        query,
+                        "✏️ Send the archive part size (e.g. `500MB`, `1.5GB`) or a "
+                        "number of equal parts (e.g. `3`):",
+                    )
+                else:
+                    canonical = archive_split.normalize(value)
+                    user_settings.set_user_setting(user_id, "archive_part", canonical)
+                    await self.safe_edit(
+                        query,
+                        f"✅ Archive part size set to <b>{archive_split.label(canonical)}</b>.",
+                        reply_markup=MediaMenuBuilder.get_settings_archive_part_menu(canonical),
+                        parse_mode="HTML",
+                    )
+
             elif data == "settings_slideshow_menu":
                 # Slideshow preference. Stored under the key the bulk picker
                 # writes, so the panel and the bulk menu cannot disagree.
@@ -9372,14 +9993,13 @@ class EnhancedMediaHandler:
             return
 
         # The file's own pick wins; otherwise the bitrate from /usersettings, so
-        # the preference the user set is what the picker opens on.
-        current = _sanitize_audio_bitrate(
-            current_file.get("audio_bitrate") or _user_audio_bitrate(update.effective_user.id)
-        )
+        # the preference the user set is what the picker opens on - and the menu
+        # states the value in force and which of the two it is.
+        current = _effective_audio_bitrate(current_file, update.effective_user.id)
         await self.safe_edit(
             query,
             "🎵 **Extract Audio (MP3)**\n"
-            f"Current quality: **{current}**\n"
+            f"Bitrate in force: **{current}** ({_audio_bitrate_source(current_file)})\n"
             f"{current} keeps the file small and still sounds good.",
             reply_markup=MediaMenuBuilder.get_mp3_quality_menu(current),
         )
@@ -9409,10 +10029,7 @@ class EnhancedMediaHandler:
                 "🎚️ Choose the target bitrate for this audio:",
                 reply_markup=MediaMenuBuilder.get_bitrate_menu(
                     "audio",
-                    _sanitize_audio_bitrate(
-                        current_file.get("audio_bitrate") or _user_audio_bitrate(update.effective_user.id),
-                        default="",
-                    ),
+                    _effective_audio_bitrate(current_file, update.effective_user.id),
                 ),
             )
             return
@@ -9723,9 +10340,7 @@ class EnhancedMediaHandler:
             await notify("❌ No video file found.")
             return
 
-        audio_bitrate = _sanitize_audio_bitrate(
-            bitrate or current_file.get("audio_bitrate") or _user_audio_bitrate(user_id)
-        )
+        audio_bitrate = _effective_audio_bitrate(current_file, user_id, override=bitrate)
         current_file["audio_bitrate"] = audio_bitrate
         # The bitrate is a setting as much as an argument: keep it, so the next
         # conversion without a quality of its own uses it and the quality picker
@@ -10912,9 +11527,25 @@ class EnhancedMediaHandler:
         # the table does not know is refused here - the old fallback handed the
         # worker ``-c:a copy``, which writes a file whose contents do not match its
         # extension.
-        from tasks.conversion_tasks import audio_format_ffmpeg_args
+        #
+        # ── The bitrate this button encodes with ──
+        # It is the user's own setting - the one /usersettings stores and every
+        # bitrate picker writes - rather than a constant of this button. Pressing
+        # 64k in the settings menu and then Convert Format has to encode at 64k,
+        # and it has to be the same 64k the already-exists check below compares
+        # against, or the check and the encoder would be reading two different
+        # numbers. The file's own pick still wins when it has one.
+        audio_bitrate = _effective_audio_bitrate(current_file, update.effective_user.id)
+        current_file["audio_bitrate"] = audio_bitrate
+        session["current_file"] = current_file
 
-        _pipeline_args = audio_format_ffmpeg_args(format_type, _DEFAULT_AUDIO_BITRATE)
+        from tasks.conversion_tasks import (
+            AUDIO_FORMAT_PROBE_CODECS,
+            audio_format_ffmpeg_args,
+            audio_format_takes_bitrate,
+        )
+
+        _pipeline_args = audio_format_ffmpeg_args(format_type, audio_bitrate)
         if _pipeline_args is None:
             await self.safe_edit(
                 query,
@@ -10929,20 +11560,29 @@ class EnhancedMediaHandler:
 
         await self.safe_edit(query, f"🔄 Converting to {format_type.upper()}...")
 
-        # ── Compare → validate → already exists (MP3 targets only) ──
-        # Convert Format asks for a codec *and* the bitrate that goes with it -
-        # MP3 is encoded at ``_DEFAULT_AUDIO_BITRATE``, the one this branch would
-        # pass to ffmpeg - so a source that already is an MP3 at that bitrate has
-        # nothing to encode, the same no-op Adjust Bitrate refuses to spend a
-        # fetch on. The other targets are codec changes: the gate speaks about
-        # MP3 only, so they are left alone entirely.
-        if format_type == "mp3":
+        # ── Compare → validate → already exists ──
+        # Three questions, all answered before anything is fetched: what bitrate
+        # the source carries (read from the stored object's header first - the S3
+        # ranged GET the gate is built around - then a local copy, and only then
+        # Telegram), which codec it carries, and which container it is in. A
+        # request has nothing to produce only when all three already match: an MP3
+        # the user has, at the bitrate they chose in the settings menu, is the very
+        # file this branch would write back, so it is answered instead of fetched
+        # and re-encoded. The targets whose encoder takes no bitrate (WAV, FLAC)
+        # are left alone - there is no bitrate to compare, and a lossless re-encode
+        # is not a duplicate this can prove.
+        _probe_codec = AUDIO_FORMAT_PROBE_CODECS.get(format_type)
+        if _probe_codec and audio_format_takes_bitrate(format_type):
             _existing = await _already_at_bitrate(
-                current_file, _DEFAULT_AUDIO_BITRATE, user_id=update.effective_user.id
+                current_file,
+                audio_bitrate,
+                user_id=update.effective_user.id,
+                target_codec=_probe_codec,
+                target_format=format_type,
             )
             if _existing:
                 session["current_file"] = current_file
-                await self.safe_edit(query, _already_at_bitrate_text(_DEFAULT_AUDIO_BITRATE))
+                await self.safe_edit(query, _already_at_bitrate_text(audio_bitrate))
                 return
 
         current_file, _ = await self._ensure_local_media(update, context, session, current_file, query=query)
@@ -10997,12 +11637,13 @@ class EnhancedMediaHandler:
                 await self.safe_edit(query, f"❌ Failed to convert to {format_type}: the source is not available.")
             return
 
-        # The bitrate is stated rather than left to the quality default: the
-        # gate above answers "already at this bitrate" with ``_DEFAULT_AUDIO_BITRATE``,
-        # and the queued job for a larger source encodes with the same constant -
-        # so a small file and a large one have to come out at that same bitrate.
+        # The bitrate is stated rather than left to the quality default: the gate
+        # above answers "already at this bitrate" with the value the settings menu
+        # chose, and the queued job for a larger source was built from that same
+        # value - so a small file and a large one come out at one bitrate, and all
+        # three readings of the user's setting agree.
         success = await self.converter.convert_audio_format(
-            local_input, output_path, format_type, bitrate=_DEFAULT_AUDIO_BITRATE
+            local_input, output_path, format_type, bitrate=audio_bitrate
         )
 
         if success and os.path.exists(output_path):
@@ -11311,9 +11952,7 @@ class EnhancedMediaHandler:
         with contextlib.suppress(OSError):
             os.makedirs(output_base, exist_ok=True)
         output_path = os.path.join(output_base, f"{current_file['id']}_normalized.mp3")
-        audio_bitrate = _sanitize_audio_bitrate(
-            current_file.get("audio_bitrate") or _user_audio_bitrate(update.effective_user.id)
-        )
+        audio_bitrate = _effective_audio_bitrate(current_file, update.effective_user.id)
 
         # Use loudnorm filter for normalization
         cmd = [
@@ -11526,48 +12165,299 @@ class EnhancedMediaHandler:
             await self.safe_edit(query, "❌ Failed to analyze media.")
 
     async def create_archive(self, update: Update, context: ContextTypes.DEFAULT_TYPE, session: dict):
-        """Create archive of processed files."""
+        """Collect the batch, state what would be packed, and ask first.
+
+        The button packs what the *batch* staged, the way Apply Bulk reads it,
+        instead of sweeping every ``{user_id}_*`` file out of the output
+        directory: that sweep archived whatever the account had ever produced -
+        leftovers included - and gave the user no idea what was inside until the
+        ZIP arrived.
+
+        Nothing is packed here. The selection is parked on the session and a
+        summary is shown, so the confirm that follows packs exactly what was
+        listed even if the batch changes in between.
+        """
         if not await self._require_callback(update):
             return
         query = update.callback_query
-
-        # Get all files in output directory for this user
         user_id = update.effective_user.id
+        session = session or self.user_sessions.setdefault(user_id, {})
+
+        source = session.get("bulk_list") or session.get("merge_list") or []
+        selection = _archive_selection(source)
+        if not selection and session.get("current_file"):
+            # Older sessions may have only the loaded file; the batch is preferred
+            # but a single loaded media is still something to pack.
+            selection = _archive_selection([session.get("current_file")])
+
+        if not selection:
+            await self.safe_edit(
+                query,
+                "❌ No files to archive.\n"
+                "Send the media first — it is collected automatically — then press "
+                "📦 Create Archive to pack this batch.",
+            )
+            return
+
+        session["archive_pending"] = selection
+        # Which list the batch came from, so the confirm can consume exactly the
+        # one it packed rather than whichever happens to be non-empty.
+        session["archive_pending_source"] = "bulk_list" if session.get("bulk_list") else "merge_list"
+        session.pop("archive_name", None)
+        with contextlib.suppress(Exception):
+            self._persist_session(user_id)
+
+        # The name is asked for first: the summary that follows is what the user
+        # confirms, and it states the name the archive will be delivered under.
+        # Arming the flag replaces any other pending prompt, so two "send me a
+        # value" flows can never both claim the user's next message.
+        for key in list(context.user_data.keys()):
+            if key.startswith("awaiting_"):
+                del context.user_data[key]
+        context.user_data["awaiting_archive_name"] = True
+        await self._show_archive_name_prompt(session, user_id=user_id, query=query)
+
+    async def _show_archive_name_prompt(self, session: dict, *, user_id=None, query=None, message=None) -> None:
+        """(Re)render the name prompt, with the current part-size setting.
+
+        Shared by the button that starts the flow and the 📐 shortcut beside it,
+        so a part size chosen here returns to this same prompt instead of jumping
+        past the name to a summary the user never chose.
+        """
+        selection = session.get("archive_pending")
+        if not selection:
+            text = "⌛ That archive request expired. Press 📦 Create Archive again."
+            if query is not None:
+                await self.safe_edit(query, text)
+            elif message is not None:
+                await message.reply_text(text)
+            return
+        text = _archive_name_prompt_text(
+            selection,
+            _archive_default_name(selection),
+            _user_archive_part(user_id),
+            cap_bytes=int(getattr(config, "ARCHIVE_SPLIT_MAX_BYTES", 0) or 0),
+        )
+        markup = MediaMenuBuilder.get_archive_name_menu()
+        if query is not None:
+            await self.safe_edit(query, text, reply_markup=markup, parse_mode="HTML")
+        elif message is not None:
+            await message.reply_text(text, reply_markup=markup, parse_mode="HTML")
+
+    async def _show_archive_summary(
+        self, session: dict, name: str, *, user_id=None, query=None, message=None
+    ) -> None:
+        """Render the confirm summary for a staged archive and its chosen name.
+
+        Shared by both ways to choose the name (typed, or the default button) so
+        the summary the user sees and the name the job is queued with cannot
+        drift apart. A staged selection that is gone answers with what to do
+        instead of rendering an empty summary.
+        """
+        selection = session.get("archive_pending")
+        if not selection:
+            text = "⌛ That archive request expired. Press 📦 Create Archive again."
+            if query is not None:
+                await self.safe_edit(query, text)
+            elif message is not None:
+                await message.reply_text(text)
+            return
+        text = _archive_summary_text(
+            selection,
+            name,
+            _user_archive_part(user_id),
+            cap_bytes=int(getattr(config, "ARCHIVE_SPLIT_MAX_BYTES", 0) or 0),
+        )
+        if query is not None:
+            await self.safe_edit(
+                query, text, reply_markup=MediaMenuBuilder.get_archive_confirm_menu(), parse_mode="HTML"
+            )
+        elif message is not None:
+            await message.reply_text(
+                text, reply_markup=MediaMenuBuilder.get_archive_confirm_menu(), parse_mode="HTML"
+            )
+
+    async def _archive_use_default_name(self, update: Update, context: ContextTypes.DEFAULT_TYPE, session: dict) -> None:
+        """Accept the name derived from the batch and show the summary."""
+        if not await self._require_callback(update):
+            return
+        query = update.callback_query
+        user_id = update.effective_user.id
+        session = session or self.user_sessions.setdefault(user_id, {})
+        for key in list(context.user_data.keys()):
+            if key.startswith("awaiting_"):
+                del context.user_data[key]
+        name = _archive_default_name(session.get("archive_pending") or [])
+        session["archive_name"] = name
+        with contextlib.suppress(Exception):
+            self._persist_session(user_id)
+        await self._show_archive_summary(session, name, user_id=user_id, query=query)
+
+    async def _show_archive_part_menu(self, update: Update, context: ContextTypes.DEFAULT_TYPE, session: dict) -> None:
+        """Open the part-size picker without leaving the Create Archive flow."""
+        if not await self._require_callback(update):
+            return
+        query = update.callback_query
+        user_id = update.effective_user.id
+        session = session or self.user_sessions.setdefault(user_id, {})
+        current = _user_archive_part(user_id)
+        await self.safe_edit(
+            query,
+            "📐 <b>Archive Part Size</b>\n\n"
+            f"Current: <b>{archive_split.label(current)}</b>\n"
+            "<i>A ZIP larger than the part size is split into .001/.002 volumes; the "
+            "recipient downloads every part and opens the first.</i>",
+            reply_markup=MediaMenuBuilder.get_archive_part_menu(current),
+            parse_mode="HTML",
+        )
+
+    async def _archive_set_part(self, update: Update, context: ContextTypes.DEFAULT_TYPE, session: dict, value: str) -> None:
+        """Store a part size chosen from the archive flow and show the summary again.
+
+        The same setting /usersettings writes, so a size picked here and one picked
+        there are one preference; the only difference is where the flow returns to.
+        """
+        if not await self._require_callback(update):
+            return
+        query = update.callback_query
+        user_id = update.effective_user.id
+        session = session or self.user_sessions.setdefault(user_id, {})
+        if user_settings is None:
+            await self.safe_edit(query, "⚠️ Settings not available.")
+            return
+        if value == "custom":
+            for key in list(context.user_data.keys()):
+                if key.startswith("awaiting_"):
+                    del context.user_data[key]
+            context.user_data["awaiting_archive_part_size"] = True
+            await self.safe_edit(
+                query,
+                "✏️ Send the archive part size (e.g. `500MB`, `1.5GB`) or a number of "
+                "equal parts (e.g. `3`):",
+            )
+            return
+        canonical = archive_split.normalize(value)
+        user_settings.set_user_setting(user_id, "archive_part", canonical)
+        # Return to the stage the picker was opened from: a name not chosen yet
+        # means the name prompt, not a summary that would have defaulted it.
+        if session.get("archive_name"):
+            await self._show_archive_summary(session, session["archive_name"], user_id=user_id, query=query)
+        else:
+            await self._show_archive_name_prompt(session, user_id=user_id, query=query)
+
+    async def confirm_archive(self, update: Update, context: ContextTypes.DEFAULT_TYPE, session: dict):
+        """Pack the batch the summary listed, once the user has confirmed.
+
+        Every member is resolved the way Apply Bulk resolves one: a file already
+        on disk is used as it is, and anything else is fetched through the same
+        guard (Bot API, then the userbot / big-file pipeline for media over the
+        Bot API's 20 MB limit). A large member the pipeline streamed to storage
+        is handed to the worker as its object key, which is what lets the pack
+        pull it in one file at a time rather than the whole set at once.
+
+        A member that could not be read is named in the queued notice, never
+        silently dropped from an archive the user believes holds everything.
+        """
+        if not await self._require_callback(update):
+            return
+        query = update.callback_query
+        user_id = update.effective_user.id
+        session = session or self.user_sessions.setdefault(user_id, {})
+
+        selection = session.pop("archive_pending", None)
+        if not selection:
+            await self.safe_edit(query, "⌛ That archive request expired. Press 📦 Create Archive again.")
+            return
+
+        total = len(selection)
+        await self.safe_edit(query, f"📦 Collecting {total} file(s)...")
+
+        sources: list[dict] = []
+        unavailable: list[str] = []
+        for index, entry in enumerate(selection, start=1):
+            name = _bulk_display_name(entry)
+            try:
+                await self._ensure_bulk_file_downloaded(update, context, session, entry)
+            except Exception:
+                logger.debug("archive: could not make %s available locally", name)
+            # A fetch that queued a pipeline job is not a fetch: wait it out so
+            # the member actually has bytes (or an object key) before packing.
+            if entry.get("_bulk_pipeline_job_pending"):
+                with contextlib.suppress(Exception):
+                    await self._await_bulk_pipeline_job(entry, query=query, index=index, total=total)
+            path = entry.get("path")
+            if path and os.path.exists(path):
+                sources.append({"name": name, "path": path})
+                continue
+            key = entry.get("input_key")
+            if key:
+                sources.append({"name": name, "input_key": key})
+                continue
+            unavailable.append(name)
+
+        if not sources:
+            detail = f" ({len(unavailable)} could not be read)" if unavailable else ""
+            await self.safe_edit(query, f"❌ None of the batched files could be read{detail}.")
+            return
+
         output_dir = getattr(config, "OUTPUT_PATH", "storage/output") if config else "storage/output"
         with contextlib.suppress(OSError):
             os.makedirs(output_dir, exist_ok=True)
-        user_files = [f for f in os.listdir(output_dir) if f.startswith(str(user_id))]
-
-        if not user_files:
-            await self.safe_edit(query, "❌ No files to archive.")
-            return
-
-        await self.safe_edit(query, "📦 Creating archive...")
-
-        # enqueue create_archive job so worker handles packaging and progress
-        file_paths = [os.path.join(output_dir, f) for f in user_files]
         archive_path = os.path.join(output_dir, f"{user_id}_archive.zip")
+        # The name the user chose, or the first file's stem when a confirm arrives
+        # without one (an older session, or a prompt that was never answered).
+        chosen = str(session.pop("archive_name", "") or "").strip()
+        stem = chosen or (os.path.splitext(_bulk_display_name(sources[0]))[0] or "media")
+        # The split the user set, resolved to what the worker needs: a byte cap
+        # (``default`` uses the configured ceiling), a part count, or neither.
+        # The worker turns a count into a size once it knows the packed size.
+        _archive_split_plan = archive_split.plan(
+            _user_archive_part(user_id),
+            cap_bytes=int(getattr(config, "ARCHIVE_SPLIT_MAX_BYTES", 0) or 0),
+        )
         job_id = str(uuid.uuid4())
         job = {
             "job_id": job_id,
             "type": "create_archive",
-            "files": file_paths,
+            "files": sources,
             "output_path": archive_path,
-            # Name the delivered archive after the first selected file.
-            "original_filename": f"{os.path.splitext(os.path.basename(file_paths[0]))[0]}_archive.zip"
-            if file_paths
-            else os.path.basename(archive_path),
+            # Every other job states the account that owns it; this one used to
+            # omit it, which left the worker's per-user accounting without an
+            # owner for an archive (its rate-limit key and any user-scoped
+            # delivery naming would fall back to the chat, or to "global").
+            "user_id": user_id,
+            "original_filename": f"{stem}.zip",
+            # Delivered as one ZIP unless it outgrows a single Telegram send; the
+            # worker splits it into .001/.002 volumes once it knows the real size.
+            # 0 switches splitting off entirely.
+            "split_max_bytes": _archive_split_plan[0],
+            "split_parts": _archive_split_plan[1],
             "progress_channel": f"ffmpeg:progress:{job_id}",
             "chat_id": update.effective_chat.id if update and update.effective_chat else None,
         }
-
         try:
             job["request_id"] = getattr(update, "request_id", None)
         except Exception:
             job["request_id"] = None
         await enqueue_job(job)
+
+        # The batch is consumed by the archive it produced: emptying the list it
+        # came from is what "packed" means, and it stops the next Apply from
+        # happening on files the user has already archived.
+        source_key = session.pop("archive_pending_source", None)
+        if source_key in ("bulk_list", "merge_list"):
+            session[source_key] = []
+        with contextlib.suppress(Exception):
+            self._persist_session(user_id)
+
+        note = f"\n⚠️ {len(unavailable)} file(s) could not be read and were left out." if unavailable else ""
         kb = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data=f"cancel_job:{job_id}")]])
-        await self.safe_edit(query, f"⏳ Job queued: {job_id} — creating archive", reply_markup=kb)
+        await self.safe_edit(
+            query,
+            f"⏳ Job queued: {job_id} — packing {len(sources)} file(s) into {job['original_filename']}{note}\n"
+            "🗑️ Batch cleared.",
+            reply_markup=kb,
+        )
         with contextlib.suppress(RuntimeError):
             asyncio.create_task(self._watch_job_progress(query, job_id, bot=context.bot))
 
@@ -11714,6 +12604,7 @@ class EnhancedMediaHandler:
                     "awaiting_settings_quality",
                     "awaiting_settings_slideshow",
                     "awaiting_settings_bulk_bitrate",
+                    "awaiting_settings_archive_part",
                     "awaiting_settings_prefix",
                     "awaiting_settings_suffix",
                 )
@@ -11782,6 +12673,19 @@ class EnhancedMediaHandler:
                     f"✅ Batch extract bitrate set to {bitrate}.",
                     reply_markup=MediaMenuBuilder.get_settings_bulk_bitrate_menu(bitrate),
                 )
+        elif pending == "awaiting_settings_archive_part":
+            try:
+                canonical = archive_split.parse(text_value)
+            except ValueError as exc:
+                await update.message.reply_text(f"❌ {exc}.")
+            else:
+                user_settings.set_user_setting(user_id, "archive_part", canonical)
+                await update.message.reply_text(
+                    f"✅ Archive part size set to <b>{archive_split.label(canonical)}</b>.",
+                    reply_markup=MediaMenuBuilder.get_settings_archive_part_menu(canonical),
+                    parse_mode="HTML",
+                )
+
         else:
             which = "prefix" if pending.endswith("prefix") else "suffix"
             # "-" is the documented way to clear one without retyping the other.
@@ -11814,6 +12718,48 @@ class EnhancedMediaHandler:
 
         session = self.user_sessions[user_id]
         current_file = session.get("current_file")
+
+        # --- Create Archive name prompt ---
+        # The 📦 button stages the batch and asks for a name; this answers that
+        # question. An unusable name keeps the prompt open rather than dropping
+        # the staged request, so a mistyped name costs a retype and nothing else.
+        if context.user_data.get("awaiting_archive_name"):
+            name = _sanitize_archive_name(user_input)
+            if not name:
+                await update.message.reply_text(
+                    "❌ That name has no usable characters. Send a name like `myclips`, "
+                    "or press ✅ Use default name."
+                )
+                return ConversationHandler.END
+            context.user_data.pop("awaiting_archive_name", None)
+            session["archive_name"] = name
+            with contextlib.suppress(Exception):
+                self._persist_session(user_id)
+            await self._show_archive_summary(session, name, user_id=user_id, message=update.message)
+            return ConversationHandler.END
+
+        # --- Create Archive part size, typed from the summary's 📐 picker ---
+        # Stores the same preference /usersettings does, then shows the summary
+        # again so the new part size is confirmed where the choice was made.
+        if context.user_data.get("awaiting_archive_part_size"):
+            try:
+                canonical = archive_split.parse(user_input)
+            except ValueError as exc:
+                await update.message.reply_text(f"❌ {exc}.")
+                return ConversationHandler.END
+            context.user_data.pop("awaiting_archive_part_size", None)
+            if user_settings is not None:
+                user_settings.set_user_setting(user_id, "archive_part", canonical)
+            if session.get("archive_name"):
+                await self._show_archive_summary(
+                    session, session["archive_name"], user_id=user_id, message=update.message
+                )
+            else:
+                # The size was changed before the name was given: go back to the
+                # name prompt (re-arming it) rather than defaulting the name.
+                context.user_data["awaiting_archive_name"] = True
+                await self._show_archive_name_prompt(session, user_id=user_id, message=update.message)
+            return ConversationHandler.END
 
         # --- Dynamic trimmer flow (Trimmer 1 & 2) ---
         if context.user_data.get("awaiting_trimmer"):
@@ -12039,15 +12985,30 @@ class EnhancedMediaHandler:
                     del context.user_data[key]
 
         elif context.user_data.get("awaiting_rename"):
+            _new_name = str(user_input or "").strip()
             if not current_file:
                 await update.message.reply_text("❌ No file in session.")
+                for key in list(context.user_data.keys()):
+                    if key.startswith("awaiting_"):
+                        del context.user_data[key]
+            elif not _new_name:
+                # An empty answer would blank the name, and every delivery name is
+                # built from it - the file would go out under the opaque output
+                # path instead of the name the user chose. Ask again rather than
+                # accept it, keeping the prompt armed.
+                await update.message.reply_text("❌ The filename cannot be empty. Send a name (include the extension).")
             else:
-                # Only change stored name, do not move files on disk here
-                session["current_file"]["name"] = user_input
-                await update.message.reply_text(f"✅ Filename set to: {user_input}")
-            for key in list(context.user_data.keys()):
-                if key.startswith("awaiting_"):
-                    del context.user_data[key]
+                # Only change stored name, do not move files on disk here. The
+                # delivery name is rebuilt from this stem plus the output
+                # extension, so a renamed file keeps whatever the conversion
+                # produced while carrying the name the user chose.
+                session["current_file"]["name"] = _new_name
+                await update.message.reply_text(f"✅ Filename set to: {_new_name}")
+                with contextlib.suppress(Exception):
+                    self._persist_session(update.effective_user.id)
+                for key in list(context.user_data.keys()):
+                    if key.startswith("awaiting_"):
+                        del context.user_data[key]
 
         elif context.user_data.get("awaiting_split"):
             # The whole split - splitting and the one-at-a-time delivery of the

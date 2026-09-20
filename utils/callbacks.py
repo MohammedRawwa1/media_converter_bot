@@ -147,6 +147,19 @@ MERGE_AUDIO = "merge_audio"
 
 # Other utilities found in keyboards
 CREATE_ARCHIVE = "create_archive"
+# Create Archive is staged, not immediate: the button collects the batch and
+# shows what would be packed, and these two answer that prompt.
+ARCHIVE_CONFIRM = "archive_confirm"
+ARCHIVE_CANCEL = "archive_cancel"
+# Create Archive asks for a name before it shows the summary; this button accepts
+# the one derived from the batch instead of one the user types.
+ARCHIVE_NAME_DEFAULT = "archive_name_default"
+# The part-size picker reached from the Create Archive summary. It stores the
+# same per-user setting as /usersettings, but its Back returns to the summary
+# rather than the settings page - the flow the user pressed it from.
+ARCHIVE_PART_MENU = "archive_part_menu"
+ARCHIVE_PART_BACK = "archive_part_back"
+ARCHIVE_PART_PREFIX = "archive_set_part:"
 REPAIR_VIDEO = "repair_video"
 FADE_MENU = "fade_menu"
 FRAMERATE_MENU = "framerate_menu"
@@ -282,11 +295,13 @@ SETTINGS_QUALITY_MENU = "settings_quality_menu"
 SETTINGS_PRESET_MENU = "settings_preset_menu"
 SETTINGS_SLIDESHOW_MENU = "settings_slideshow_menu"
 SETTINGS_BULK_BITRATE_MENU = "settings_bulk_bitrate_menu"
+SETTINGS_ARCHIVE_PART_MENU = "settings_archive_part_menu"
 SETTINGS_BITRATE_PREFIX = "settings_set_bitrate:"
 SETTINGS_QUALITY_PREFIX = "settings_set_quality:"
 SETTINGS_PRESET_PREFIX = "settings_set_preset:"
 SETTINGS_SLIDESHOW_PREFIX = "settings_set_slideshow:"
 SETTINGS_BULK_BITRATE_PREFIX = "settings_set_bulk_bitrate:"
+SETTINGS_ARCHIVE_PART_PREFIX = "settings_set_archive_part:"
 SETTINGS_TOGGLE_PREFIX = "settings_toggle:"
 SETTINGS_TOOL_PREFIX = "settings_tool:"
 
@@ -349,6 +364,16 @@ def settings_slideshow_key(seconds) -> str:
 def settings_bulk_bitrate_key(val) -> str:
     """A settings trigger for one batch extraction bitrate."""
     return f"{SETTINGS_BULK_BITRATE_PREFIX}{val}"
+
+
+def settings_archive_part_key(val) -> str:
+    """A settings trigger for one archive part size (or the ``custom`` prompt)."""
+    return f"{SETTINGS_ARCHIVE_PART_PREFIX}{val}"
+
+
+def archive_part_key(val) -> str:
+    """An archive-flow trigger for one part size (or the ``custom`` prompt)."""
+    return f"{ARCHIVE_PART_PREFIX}{val}"
 
 
 def settings_upload_mode_key(mode: str) -> str:

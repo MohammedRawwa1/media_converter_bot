@@ -37,6 +37,7 @@ from tasks import (
     generate_sample,
     merge_audios,
     merge_videos,
+    split_archive_volumes,
     trim_media,
 )
 from utils import batch_pipeline, deferred_delivery, eventbus, file_utils, job_store
@@ -52,6 +53,89 @@ from utils.file_utils import safe_rmtree
 from utils.rate_limiter import telegram_edit_coalescer, telegram_flood_gate
 
 logger = logging.getLogger(__name__)
+
+
+async def _split_and_deliver_archive(job, output_path: str, progress_channel) -> list[str] | None:
+    """Split an oversized archive into volumes and send each one over MTProto.
+
+    Returns the volume paths when the archive was split and delivery was
+    attempted, or ``None`` when this is not a split delivery at all - no cap, no
+    chat to send to, the userbot is off, or the archive already fits one send -
+    in which case the caller lets the ordinary single-output delivery run
+    unchanged.
+
+    A multi-volume set only extracts when *every* part arrives, so the whole set
+    is sent here, in order, and a part that fails is logged rather than silently
+    dropped. The parts are a transport shape, not the result: they are removed
+    once offered to Telegram, and a repeat can be packed again from the batch.
+    """
+    try:
+        cap = int(job.get("split_max_bytes") or 0)
+    except (TypeError, ValueError):
+        cap = 0
+    try:
+        want_parts = int(job.get("split_parts") or 0)
+    except (TypeError, ValueError):
+        want_parts = 0
+    chat_id = job.get("chat_id")
+    if not chat_id or not getattr(config, "ENABLE_USERBOT", False):
+        return None
+    try:
+        size = os.path.getsize(output_path)
+    except OSError:
+        return None
+    if want_parts >= 2:
+        # The user asked for N equal parts; only the packed size can turn that
+        # into a per-volume byte size. A tiny archive still splits into two.
+        cap = max(1, -(-size // want_parts))
+    if cap <= 0 or (want_parts < 2 and size <= cap):
+        return None
+
+    archive_name = os.path.basename(str(job.get("original_filename") or os.path.basename(output_path)))
+    volumes = await split_archive_volumes(
+        output_path, archive_filename=archive_name, max_bytes=cap, remove_source=True
+    )
+    if len(volumes) <= 1:
+        return None
+
+    total = len(volumes)
+    failed: list[str] = []
+    for index, volume in enumerate(volumes, 1):
+        name = os.path.basename(volume)
+        try:
+            from utils.userbot_uploader import send_file_via_userbot
+
+            ok = await send_file_via_userbot(
+                chat_id,
+                volume,
+                caption=f"📦 {archive_name} (part {index}/{total})",
+                user_id=job.get("user_id"),
+                media_kind="document",
+                delivery_name=name,
+                # A volume is a byte slice, not playable media, so it is always a
+                # document - whatever /usersettings says about videos.
+                as_document=True,
+            )
+        except Exception:
+            logger.exception("archive: could not send volume %s", name)
+            ok = None
+        if not ok:
+            failed.append(name)
+        await publish_update(
+            progress_channel,
+            {
+                "job_id": job.get("job_id"),
+                "progress": int(index * 100 / total),
+                "message": f"sent part {index}/{total}" if ok else f"part {index}/{total} failed",
+            },
+        )
+
+    if failed:
+        logger.error("archive: %d of %d volume(s) failed to send: %s", len(failed), total, ", ".join(failed))
+    for volume in volumes:
+        with contextlib.suppress(OSError):
+            os.remove(volume)
+    return volumes
 
 # Every Bot this worker builds sends through the shared flood gate, so a window
 # earned here (or by the bot process) stops the write before it costs a 429.
@@ -2383,19 +2467,73 @@ async def handle_job(job: dict):
 
                     elif job_type in ("create_archive", "archive"):
                         await publish_update(
-                            progress_channel, {"job_id": job_id, "progress": 5, "message": "creating archive"}
+                            progress_channel, {"job_id": job_id, "progress": 5, "message": "collecting media"}
                         )
                         files = job.get("files") or []
-                        ok, msg = await create_archive(files, output_path)
+
+                        async def _fetch_archive_source(entry):
+                            """Download one stored source for the archive, or None.
+
+                            A member the handler could not leave on disk carries its
+                            object key instead. Fetching it here, right before it is
+                            written, keeps peak disk at one member rather than the
+                            whole set at once - the same one-file-at-a-time shape the
+                            batch runs in.
+                            """
+                            key = (entry or {}).get("input_key")
+                            if not key or get_storage_backend is None:
+                                return None
+                            try:
+                                backend = await get_storage_backend()
+                            except Exception:
+                                return None
+                            if backend is None:
+                                return None
+                            tmpdir = tempfile.mkdtemp(prefix="archive_src_")
+                            dest = os.path.join(tmpdir, os.path.basename(str(entry.get("name") or key)) or "source")
+                            try:
+                                await backend.download_file(key, dest)
+                            except Exception:
+                                logger.exception("archive: could not fetch source %s", key)
+                                return None
+                            return dest if os.path.exists(dest) else None
+
+                        async def _archive_progress(done, total, _pc=progress_channel, _jid=job_id):
+                            """Advance the bar per packed file instead of once at the end."""
+                            pct = int(done * 95 / total) + 5 if total else 95
+                            await publish_update(
+                                _pc, {"job_id": _jid, "progress": pct, "message": f"packing {done}/{total}"}
+                            )
+
+                        ok, msg = await create_archive(
+                            files, output_path, fetch=_fetch_archive_source, on_progress=_archive_progress
+                        )
                         success = ok
                         info = output_path if ok else msg
+                        if ok:
+                            # An archive too big for one Telegram send goes out as
+                            # numbered volumes from here, and the ordinary delivery
+                            # below is skipped for it (there is no single file left).
+                            # An archive that fits returns None and is delivered by
+                            # the ordinary path, unchanged.
+                            try:
+                                volumes = await _split_and_deliver_archive(job, output_path, progress_channel)
+                            except Exception:
+                                logger.exception("archive: splitting/delivering volumes failed")
+                                volumes = None
+                            if volumes:
+                                job["_archive_volumes_sent"] = True
+                                info = ", ".join(os.path.basename(v) for v in volumes)
                         await publish_update(
                             progress_channel,
                             {
                                 "job_id": job_id,
                                 "progress": 100 if ok else 0,
                                 "message": "done" if ok else "error",
-                                "output": output_path if ok else None,
+                                # A single archive ships as its own path; a split one
+                                # has no file at ``output_path`` any more, so what it
+                                # records is the volume set it actually delivered.
+                                "output": info if ok else None,
                             },
                         )
 
@@ -2447,8 +2585,16 @@ async def handle_job(job: dict):
                         music_path = job.get("music_path")
                         if music_path and not os.path.isfile(str(music_path)):
                             music_path = None
+                        # The batch's own quality travels with the job: a slideshow
+                        # asked for by a Compress or Optimize apply must not come
+                        # back encoded at the slideshow's defaults.
                         ok, msg = await create_slideshow(
-                            files, output_path, seconds_per_image=seconds, music_path=music_path
+                            files,
+                            output_path,
+                            seconds_per_image=seconds,
+                            music_path=music_path,
+                            crf=job.get("crf"),
+                            preset=job.get("preset"),
                         )
                         success = ok
                         info = output_path if ok else msg
@@ -2894,9 +3040,18 @@ async def handle_job(job: dict):
                         logger.warning(f"Failed to cleanup input file: {e}")
 
                     try:
-                        chat_id = job.get("chat_id")
+                        # A split archive has already gone out, one volume at a
+                        # time, from the packing branch above: its parts are files
+                        # of their own and the packed ZIP is gone, so the
+                        # single-output delivery below has nothing left to send.
+                        # It reads no chat and no file, and records itself as
+                        # delivered so no retry re-sends a set the user already has.
+                        _volumes_sent = bool(isinstance(job, dict) and job.get("_archive_volumes_sent"))
+                        if _volumes_sent:
+                            out = None
+                        chat_id = None if _volumes_sent else job.get("chat_id")
                         caption = job.get("caption")
-                        sent = False
+                        sent = _volumes_sent
                         # Set when a flood window forces this delivery to be
                         # retried later instead of finalized as failed.
                         _deferred_window = None

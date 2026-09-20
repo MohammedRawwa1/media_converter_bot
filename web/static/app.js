@@ -34,8 +34,33 @@ uploadForm.addEventListener('submit', async (e) => {
   if (data.job_token) {
     jobTokens[jobId] = data.job_token
   }
-  addJobCard(jobId, file.name, file.size)
+  // An archive upload becomes one job per media member (the parent job is only a
+  // receipt), so each member gets its own card and its own capability.
+  if (data.archive && Array.isArray(data.archive.members) && data.archive.members.length) {
+    addArchiveCard(data.archive, file.name)
+    data.archive.members.forEach((m) => {
+      if (m.job_token) jobTokens[m.job_id] = m.job_token
+      addJobCard(m.job_id, m.filename, 0)
+    })
+  } else {
+    addJobCard(jobId, file.name, file.size)
+  }
 })
+
+function addArchiveCard(archive, archiveFilename){
+  const div = document.createElement('div')
+  div.className = 'job'
+  const skipped = archive.skipped ? ` • ${archive.skipped} skipped` : ''
+  div.innerHTML = `
+    <div class="job-row">
+      <div>
+        <strong>📦 ${escapeHtml(archive.archive_name || archiveFilename)}</strong>
+        <div class="meta">Queued ${archive.count} file(s) from the archive${skipped}</div>
+      </div>
+    </div>
+  `
+  jobsDiv.prepend(div)
+}
 
 function addJobCard(jobId, filename, fileSizeBytes){
   const div = document.createElement('div')

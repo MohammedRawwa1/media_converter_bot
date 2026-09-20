@@ -106,21 +106,47 @@ def test_the_tags_travel_with_the_codec():
 def test_the_queued_job_and_the_in_process_converter_share_one_table():
     src = read_source("handlers.py")
 
-    assert "from tasks.conversion_tasks import audio_format_ffmpeg_args" in src
+    assert "from tasks.conversion_tasks import" in src
+    assert "audio_format_ffmpeg_args" in src
     # The second table, and the copy fallback that hid a target nobody knew.
     assert '"-c:a", "libmp3lame", "-b:a", _DEFAULT_AUDIO_BITRATE' not in src
     assert '["-c:a", "copy"]' not in src
 
 
 def test_a_small_file_and_a_large_one_are_encoded_at_the_same_bitrate():
-    """The gate answers "already 128k", so the encoder has to mean 128k too.
+    """The gate answers "already at this bitrate", so the encoder has to mean it too.
 
     The in-process converter mapped its quality default to 192k while the queued
-    job encoded with ``_DEFAULT_AUDIO_BITRATE`` - one button, two answers.
+    job encoded with another constant - one button, two answers. Both now read the
+    one bitrate the settings menu chose, so the check and the encode agree.
     """
     src = read_source("handlers.py")
 
-    assert "bitrate=_DEFAULT_AUDIO_BITRATE" in src
+    assert "bitrate=audio_bitrate" in src
+    assert "audio_format_ffmpeg_args(format_type, audio_bitrate)" in src
+
+
+def test_every_offered_target_has_a_codec_a_probe_reports_and_a_bitrate_answer():
+    """The "already in this format" check needs to know what a probe calls each target.
+
+    ``libmp3lame`` is what ffmpeg writes with and ``mp3`` is what ffprobe reads
+    back; ``libvorbis`` and ``vorbis`` are the same split. WAV and FLAC are named
+    too, but their encoders take no bitrate - which is what keeps the check off
+    the lossless targets.
+    """
+    for target in MENU_TARGETS:
+        assert target in conversion_tasks.AUDIO_FORMAT_PROBE_CODECS, target
+
+    assert conversion_tasks.AUDIO_FORMAT_PROBE_CODECS["mp3"] == "mp3"
+    assert conversion_tasks.AUDIO_FORMAT_PROBE_CODECS["ogg"] == "vorbis"
+    # m4a is AAC in an MP4 container, so both targets report one codec.
+    assert conversion_tasks.AUDIO_FORMAT_PROBE_CODECS["m4a"] == "aac"
+    assert conversion_tasks.AUDIO_FORMAT_PROBE_CODECS["aac"] == "aac"
+
+    for target in ("mp3", "aac", "m4a", "ogg", "opus"):
+        assert conversion_tasks.audio_format_takes_bitrate(target) is True, target
+    for target in ("wav", "flac"):
+        assert conversion_tasks.audio_format_takes_bitrate(target) is False, target
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -180,6 +206,10 @@ def _run_conversion(monkeypatch, tmp_path, *, output_bytes=OVER_LIMIT, enable_us
     handler._check_conversion_quota = _yes
     handler.safe_edit = _edit
     handler.converter = converter
+
+    # The bitrate now comes from /usersettings; pin it so the assertion below does
+    # not depend on a settings file some other test may have written.
+    monkeypatch.setattr(handlers_module, "_user_audio_bitrate", lambda _uid: "128k")
 
     monkeypatch.setattr(
         handlers_module,
