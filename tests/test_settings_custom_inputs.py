@@ -21,7 +21,7 @@ import unittest
 from types import MethodType, SimpleNamespace
 from unittest.mock import patch
 
-from source_helpers import called_methods, find_function, parse_source
+from source_helpers import called_methods, find_function, parse_source, read_source
 
 import handlers as handlers_module
 from handlers import EnhancedMediaHandler, _format_seconds_to_hhmmss
@@ -696,6 +696,121 @@ class RepeatFadeJobTests(unittest.TestCase):
         job = self.jobs[0]
         self.assertEqual(job["output_ext"], ".mkv")
         self.assertEqual(job["output_filename"], "clip_faded.mkv")
+
+
+class RepeatRemoveAudioJobTests(unittest.TestCase):
+    """🔉 Remove Audio / 🔇 Stream Remover on a cached video: the stored object.
+
+    Both buttons are the same trigger (``stream_remover`` is an alias of
+    ``remove_audio``), and neither may pull the video out of Telegram again: the
+    session's ``input_key`` is what the worker reads, and the keyed job
+    deliberately carries no ``source_chat_id``/``source_message_id`` - which are
+    exactly the fields that would make the worker prefer MTProto over the bucket.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.output_patch = patch.object(handlers_module, "config", SimpleNamespace(OUTPUT_PATH=self.tmp.name))
+        self.output_patch.start()
+        self.jobs = []
+
+        async def _record(job):
+            self.jobs.append(job)
+
+        self.enqueue_patch = patch.object(handlers_module, "enqueue_job", _record)
+        self.enqueue_patch.start()
+
+    def tearDown(self):
+        self.enqueue_patch.stop()
+        self.output_patch.stop()
+        self.tmp.cleanup()
+
+    def _press(self):
+        class NoLocalConverter:
+            async def remove_audio(self, input_path, output_path):
+                raise AssertionError("a repeat must not be stripped from a local copy")
+
+        replies, sent = [], {}
+        handler = _StubHandler(NoLocalConverter(), sent, replies)
+        for name in ("remove_audio", "_require_callback", "_enqueue_keyed_job", "_ensure_local_media", "_local_copy"):
+            setattr(handler, name, MethodType(getattr(Handler, name), handler))
+        session = {
+            "current_file": {
+                "id": "abc123",
+                "name": "clip.mp4",
+                "path": None,
+                "input_key": "inputs/lib/clip",
+                "type": "video",
+                "file_unique_id": "uid-1",
+                "size": 1234,
+                "_source_metadata": {},
+            }
+        }
+        asyncio.run(handler.remove_audio(_FakeCallbackUpdate(replies), _FakeContext(sent), session))
+        return replies
+
+    def test_the_repeat_is_queued_against_the_stored_object(self):
+        replies = self._press()
+
+        self.assertEqual(len(self.jobs), 1, "expected one keyed worker job")
+        job = self.jobs[0]
+        self.assertEqual(job["type"], "remove_audio")
+        self.assertEqual(job["input_key"], "inputs/lib/clip")
+        self.assertEqual(job["ffmpeg_args"], ["-an", "-c:v", "copy"])
+        # No Telegram provenance: the worker reads the bucket, not the media's
+        # original chat/message. This omission *is* the no-second-download gate.
+        self.assertNotIn("source_chat_id", job)
+        self.assertNotIn("source_message_id", job)
+        self.assertTrue(any("Queued remove audio" in text for text, _ in replies), replies)
+
+    def test_a_media_with_neither_copy_is_refused_rather_than_fetched(self):
+        class NoLocalConverter:
+            async def remove_audio(self, input_path, output_path):
+                raise AssertionError("there are no bytes to strip")
+
+        replies, sent = [], {}
+        handler = _StubHandler(NoLocalConverter(), sent, replies)
+        for name in ("remove_audio", "_require_callback", "_enqueue_keyed_job", "_ensure_local_media", "_local_copy"):
+            setattr(handler, name, MethodType(getattr(Handler, name), handler))
+        session = {"current_file": {"id": "abc123", "name": "clip.mp4", "type": "video"}}
+
+        asyncio.run(handler.remove_audio(_FakeCallbackUpdate(replies), _FakeContext(sent), session))
+
+        self.assertEqual(self.jobs, [])
+        self.assertTrue(any("no stored object" in text for text, _ in replies), replies)
+
+
+class MetadataEditorSourceTests(unittest.TestCase):
+    """📝 Metadata Editor reads the stored object; it never re-downloads the video.
+
+    Rewriting tags needs real bytes, so the one thing this button must not do is
+    fetch them out of Telegram again. It resolves through the shared
+    ``_resolve_local_source`` with ``require_stored_key_only``: the local copy
+    when one is still there, else the session's ``input_key`` or the key derived
+    from the media's own identity (a metadata-only HEAD), then a single bucket
+    read.
+    """
+
+    def test_the_metadata_branch_resolves_the_stored_object(self):
+        src = parse_source("handlers.py")
+        called = called_methods(find_function(src, "handle_custom_input"), "self")
+
+        self.assertIn("_resolve_local_source", called)
+        self.assertIn(
+            "await self._resolve_local_source(current_file, require_stored_key_only=True)",
+            read_source("handlers.py"),
+        )
+        # The Telegram fetch is the other road entirely, and it is not taken here.
+        self.assertNotIn("_ensure_current_file_downloaded", called)
+
+    def test_the_stored_key_is_read_before_anything_is_downloaded(self):
+        src = read_source("handlers.py")
+        resolve = src[src.index("async def _resolve_local_source(") : src.index("async def _adopt_rename_source(")]
+
+        # local copy → named/derived key (HEAD) → bucket read. No Telegram call.
+        self.assertLess(resolve.index("_local_copy(current_file)"), resolve.index("_download_stored_source"))
+        self.assertIn('stored_key = current_file.get("input_key") or await self._adopt_stored_source(', resolve)
+        self.assertNotIn("get_file", resolve)
 
 
 class FadeTaskTests(unittest.TestCase):

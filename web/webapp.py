@@ -693,6 +693,10 @@ def upload():
                                     inp_path,
                                     msg_date=m.get("registered_at") or m.get("created_at"),
                                     file_unique_id=m.get("file_unique_id"),
+                                    # The forward's own user: the web app fetches on
+                                    # behalf of whoever sent the media, through that
+                                    # user's session, not the deployment's.
+                                    user_id=m.get("user_id"),
                                 )
                             )
                         except Exception:
@@ -853,6 +857,8 @@ def upload():
                             inp_path,
                             msg_date=meta_obj.get("registered_at") or meta_obj.get("created_at"),
                             file_unique_id=meta_obj.get("file_unique_id"),
+                            # The forward's own user - see the note above.
+                            user_id=meta_obj.get("user_id"),
                         )
                     )
                 except Exception:

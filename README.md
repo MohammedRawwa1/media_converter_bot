@@ -283,6 +283,16 @@ the chat you pressed it in, so the copy carries the bot's own header instead of
 the `Forwarded from …` the media arrived with. It is one tap — there is no target
 chat to type.
 
+**📤 Forward Batch** (in `/bulkmenu`) is the same re-forward applied to the whole
+collected batch: every file you sent is re-sent once by the bot, so each copy
+carries the bot's header whatever kind it was — video, audio, photo or document.
+It goes through the one re-send the two single-media buttons share, so a file the
+bot already delivered is re-sent by its cached file_id and costs no upload and no
+bucket read. A batch forward does **not** consume the list — the batch is left
+exactly as it was for ▶️ Apply Bulk or another forward — and it reports once
+(`sent 5 of 5 file(s)`) instead of once per file, naming whichever entries could
+not be re-sent.
+
 Both are built to cost as little as the delivery allows:
 
 - the media's stored object is looked up first, with the same metadata-only
@@ -300,7 +310,7 @@ Both are built to cost as little as the delivery allows:
 
 ### Bulk Batches
 
-Every video, audio, document, or photo you send is collected into a batch automatically (deduped by file id, capped at 30). Sending an **album** collects it as a group and announces it once instead of once per file. Open `/bulkmenu`, toggle the actions and quality, then press **▶️ Apply Bulk** to run the whole batch; **🗑️ Clear List** drops it and the batch clears itself after a successful apply. Two or more queued photos are combined into a single **slideshow video** (3 s per photo, letterboxed onto a 1280x720 canvas); a lone photo is encoded with the selected video action, and audio-only actions skip it. The Apply summary lists every queued file next to the job id it became.
+Every video, audio, document, or photo you send is collected into a batch automatically (deduped by file id, capped at 30). Sending an **album** collects it as a group and announces it once instead of once per file. Open `/bulkmenu`, toggle the actions and quality, then press **▶️ Apply Bulk** to run the whole batch; **📤 Forward Batch** re-sends the whole batch as new copies from the bot without running anything on it, and **🗑️ Clear List** drops it (the batch also clears itself after a successful apply). Two or more queued photos are combined into a single **slideshow video** (3 s per photo, letterboxed onto a 1280x720 canvas); a lone photo is encoded with the selected video action, and audio-only actions skip it. The Apply summary lists every queued file next to the job id it became.
 
 #### Sequential, memory-safe processing
 
@@ -499,6 +509,17 @@ accepted inside it and reported everywhere else, so the suite is not a blind
 spot. Excluding it was how a HIGH-severity md5 `B324` in a test helper stayed
 invisible to every local run until the CI job went red on it.
 
+Two audits in `tests/test_callback_audit.py` cover the button surface as a whole,
+because a button is the one thing this bot cannot pre-check: every function
+reachable from a callback entry point (handlers.py's dispatch, `main.py`'s two
+`CallbackQueryHandler`s) is walked, and no read of `update.message` is allowed on
+that graph unless a guard in the same function established one exists — a press
+carries no such message, which is how 📤 Media Forwarder reported an internal
+error after it had already re-sent the media. The second audit matches every
+`callback_data` the keyboards offer against the triggers the handlers route
+(alias map, exact trigger or prefix), so a button that would silently do nothing
+fails in CI instead of in the chat.
+
 ---
 
 ## 🛠 Development
@@ -570,6 +591,24 @@ Session strings are persisted to **both** MongoDB and local JSON files, ensuring
 5. **File-based .session**: Telethon's native file persistence (backup)
 
 The session healthchecker (`SessionHealthChecker`) runs every hour, verifies sessions are alive, and automatically persists working sessions to both MongoDB and JSON.
+
+A lookup is **scoped to a user**: the userbot layer takes the acting user's id, so a
+user's own session is never served to another one (`user_id` omitted means the
+legacy env/global session, which is only what an unscoped tool asks for). Every
+runtime userbot call passes that id — a button's upload/download, a queued job's
+delivery (`job["user_id"]`) and a fetch of an already-stored forward. Because a
+large forward is fetched in *another process* (the web app or the fetcher service)
+that never sees the `Update`, the forward's metadata records its owner too
+(`user_id`), so the fetch still resolves that user's session rather than the
+deployment's global one.
+
+A user who has **not** logged in has no session of their own, and that is not a
+failure: every userbot entry point resolves the user through `operating_user_id`,
+which keeps the id when that user has a session and drops it (with a log line
+naming the fallback) when they do not — so a second account works out of the box
+on the deployment's session, and `/login` upgrades it to their own. An operation
+never switches session on doubt: if the check itself cannot run, the requested id
+is kept.
 
 ---
 

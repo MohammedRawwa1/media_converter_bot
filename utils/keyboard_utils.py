@@ -485,7 +485,15 @@ class MediaMenuBuilder:
                 InlineKeyboardButton("↩️ Back", callback_data=MENU_MAIN),
             ]
         )
-        buttons.append([InlineKeyboardButton("🗑️ Clear List", callback_data="bulk_clear")])
+        # Forwarding the batch costs nothing to add here: it is the same cover
+        # re-forward the single 📤 Media Forwarder makes, one tap per batch
+        # instead of one per file, and it does not consume the list.
+        buttons.append(
+            [
+                InlineKeyboardButton("📤 Forward Batch", callback_data="bulk_forward"),
+                InlineKeyboardButton("🗑️ Clear List", callback_data="bulk_clear"),
+            ]
+        )
         return InlineKeyboardMarkup(buttons)
 
     @staticmethod

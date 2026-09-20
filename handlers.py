@@ -2915,6 +2915,44 @@ class EnhancedMediaHandler:
         logger.debug("safe_edit: all %d retries exhausted", _max_retries)
         return None
 
+    async def _reply_to_press(
+        self,
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+        text: str,
+        **kwargs,
+    ) -> bool:
+        """Answer the press wherever it came from: a reply, else a fresh message.
+
+        A callback press carries no ``update.message`` - the message the button
+        was attached to lives on ``update.callback_query.message`` - so reading
+        ``update.message.reply_text`` there raised ``AttributeError`` and the
+        Media Forwarder reported an internal error *after* it had already re-sent
+        the media. A real message (the Caption Editor's typed answer, a command)
+        is still answered with a reply, which lands above the media it just
+        re-sent; a press posts a new message instead, which lands below that
+        media, so the forwarder's "Re-sent above" stays true either way.
+
+        Returns True when the note reached the chat.
+        """
+        message = getattr(update, "message", None)
+        if message is not None:
+            try:
+                await message.reply_text(text, **kwargs)
+                return True
+            except Exception:
+                logger.debug("handlers: could not reply to the message that carried the press")
+
+        chat_id = getattr(getattr(update, "effective_chat", None), "id", None)
+        if chat_id is None:
+            return False
+        try:
+            await context.bot.send_message(chat_id=chat_id, text=text, **kwargs)
+            return True
+        except Exception:
+            logger.debug("handlers: could not post the note in the chat")
+            return False
+
     async def _require_callback(self, update) -> bool:
         """Ensure the update contains a callback_query. Return True if present."""
         if getattr(update, "callback_query", None) is None:
@@ -3824,6 +3862,7 @@ class EnhancedMediaHandler:
         *,
         caption: str | None = None,
         success_note: str = "",
+        announce: bool = True,
     ) -> bool:
         """Send the loaded media again, captioned afresh, without re-encoding it.
 
@@ -3848,11 +3887,21 @@ class EnhancedMediaHandler:
            the cached token before uploading, so "1" and "2" together make a
            captioned re-forward of an already-delivered media free.
 
+        ``announce=False`` suppresses the notes this re-send makes about itself, so
+        a caller that re-sends several media - the batch forward - can report once
+        instead of once per file; the return value says the same thing either way.
+
         Returns True when the media was sent.
         """
         current_file = (session or {}).get("current_file") or {}
+
+        async def _say(note: str) -> None:
+            """The re-send's own note - or nothing when a batch is doing the talking."""
+            if announce:
+                await self._reply_to_press(update, context, note)
+
         if not current_file:
-            await update.message.reply_text("❌ No media loaded. Send a file first.")
+            await _say("❌ No media loaded. Send a file first.")
             return False
 
         user_id = update.effective_user.id if update.effective_user else None
@@ -3890,7 +3939,7 @@ class EnhancedMediaHandler:
             if _key:
                 local_path = await self._download_stored_source(current_file, _key)
         if not local_path and not _token:
-            await update.message.reply_text(
+            await _say(
                 "❌ The media has no local copy and no stored object to work from. "
                 "Send the file again and press the button once more."
             )
@@ -3924,11 +3973,9 @@ class EnhancedMediaHandler:
                 )
             if sent:
                 if success_note:
-                    await update.message.reply_text(success_note)
+                    await _say(success_note)
                 return True
-            await update.message.reply_text(
-                "❌ The media is too large for the Bot API and the userbot could not send it."
-            )
+            await _say("❌ The media is too large for the Bot API and the userbot could not send it.")
             return False
 
         # (4) The standard delivery helpers: each tries the cached file_id first
@@ -3987,14 +4034,93 @@ class EnhancedMediaHandler:
 
         if sent:
             if success_note:
-                await update.message.reply_text(success_note)
+                await _say(success_note)
         elif local_path:
-            await update.message.reply_text("❌ Could not re-send the media.")
+            await _say("❌ Could not re-send the media.")
         else:
-            await update.message.reply_text(
+            await _say(
                 "❌ Telegram would not re-use its stored copy and the media is not on "
                 "disk. Send the file again and press the button once more."
             )
+        return sent
+
+    async def forward_batch(
+        self,
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+        session: dict,
+    ) -> int:
+        """📤 the whole collected batch: every media re-sent by the bot itself.
+
+        The same cover re-forward the single 📤 Media Forwarder makes, applied to
+        the batch (``bulk_list``, else the merge list, else the loaded file), so
+        every copy arrives from the bot instead of carrying the ``Forwarded from
+        …`` the original came with. Each entry goes through
+        :meth:`_redeliver_current_media`, which is the one implementation of the
+        re-send: the cached file_id where Telegram has one, the local copy or the
+        stored object only when it does not - so a batch of media the bot already
+        delivered costs no bucket read and no upload.
+
+        Forwarding is not consumption: the batch is left exactly as it was, so
+        the same list can still be applied or forwarded again. The per-file notes
+        are suppressed and one summary is posted instead, because thirty files
+        must not put thirty messages in the chat and a batch that only half
+        arrived has to say so.
+
+        Returns the number of media sent.
+        """
+        user_id = getattr(update.effective_user, "id", None)
+        sess = session or self.user_sessions.get(user_id, {})
+
+        entries: list[dict] = []
+        for item in sess.get("bulk_list") or sess.get("merge_list") or []:
+            entry = _normalize_bulk_item(item)
+            if entry is not None and entry not in entries:
+                entries.append(entry)
+        if not entries and sess.get("current_file"):
+            entries = [sess["current_file"]]
+
+        if not entries:
+            await self._reply_to_press(
+                update,
+                context,
+                "❌ The batch is empty.\nSend the file(s) first - they are collected "
+                "automatically - then press 📤 Forward Batch.",
+            )
+            return 0
+
+        sent = 0
+        failed: list[str] = []
+        for entry in entries:
+            try:
+                ok = await self._redeliver_current_media(
+                    update,
+                    context,
+                    # A throwaway session: the re-send writes the stored key back
+                    # onto its own ``current_file``, and working through a batch
+                    # must never re-point the loaded file at whichever entry is
+                    # being sent.
+                    {"current_file": entry},
+                    announce=False,
+                )
+            except Exception:
+                # One unreadable entry must not take the rest of the batch with
+                # it: it is named in the summary and the loop carries on.
+                logger.exception("handlers: batch forward could not re-send %s", _bulk_display_name(entry))
+                ok = False
+            if ok:
+                sent += 1
+            else:
+                failed.append(_bulk_display_name(entry))
+
+        lines = [f"📤 Batch forward: sent {sent} of {len(entries)} file(s) as new copies from the bot."]
+        if failed:
+            shown = ", ".join(failed[:8])
+            if len(failed) > 8:
+                shown += f", … (+{len(failed) - 8} more)"
+            lines.append(f"❌ Not re-sent: {shown}")
+        await self._reply_to_press(update, context, "\n".join(lines))
+        logger.info("handlers: batch forward for user %s — %d/%d sent", user_id, sent, len(entries))
         return sent
 
     async def _handle_split_request(
@@ -6143,6 +6269,13 @@ class EnhancedMediaHandler:
                 "size": current_file.get("size"),
                 "type": current_file.get("type"),
                 "registered_at": utc_iso(),
+                # The user this forward belongs to, recorded here so the fetch that
+                # happens *elsewhere* (the web app, the fetcher service, the ingest
+                # tool) can resolve that user's own userbot session instead of the
+                # deployment's global one - the global session belongs to whoever
+                # seeded it, and a second user's media must not be fetched through
+                # it just because the fetch runs in another process.
+                "user_id": update.effective_user.id if update and update.effective_user else None,
             }
             fh = await save_forward_metadata(metadata)
             logger.info("Saved forward metadata id=%s for file_id=%s", fh, metadata.get("file_id"))
@@ -9649,6 +9782,24 @@ class EnhancedMediaHandler:
                     with contextlib.suppress(Exception):
                         (session or self.user_sessions.get(user_id, {})).pop("_bulk_apply_started_at", None)
                     await self.safe_edit(query, "⚠️ Failed to apply bulk actions.")
+
+            elif data == "bulk_forward":
+                # The batch's cover re-forward: every collected media is sent
+                # again by the bot itself, so the copies carry the bot's own
+                # header instead of the "Forwarded from …" the originals arrived
+                # with. One tap, the same one the single-media 📤 makes, and it
+                # does not consume the batch - the list is still there for an
+                # Apply (or another forward).
+                await self.safe_edit(query, "📤 Re-sending the batch from the bot…")
+                try:
+                    await self.forward_batch(update, context, session)
+                except Exception:
+                    logger.exception("bulk_forward failed")
+                    await self._reply_to_press(update, context, "❌ Could not forward the batch.")
+                else:
+                    # Leave the batch menu where the press found it; the copies
+                    # and the one summary are above it.
+                    await self.show_bulk_menu(update, context)
 
             elif data == "bulk_clear":
                 # Drop the collected batch without processing it.

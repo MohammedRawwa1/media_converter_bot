@@ -50,6 +50,17 @@ class _FakeMessage:
         return self
 
 
+class _FakeBot:
+    """Records the messages posted into the chat (no message was replied to)."""
+
+    def __init__(self):
+        self.sent = []
+
+    async def send_message(self, chat_id=None, text=None, **kwargs):
+        self.sent.append({"chat_id": chat_id, "text": text, **kwargs})
+        return self
+
+
 class _FakeQuery:
     def __init__(self, data=None):
         self.data = data
@@ -62,17 +73,19 @@ class _FakeQuery:
 
 
 class _FakeUpdate:
-    def __init__(self, user_id=42, chat_id=7, text=None, data=None):
+    def __init__(self, user_id=42, chat_id=7, text=None, data=None, has_message=True):
         self.callback_query = _FakeQuery(data)
         self.effective_user = _FakeUser(user_id)
         self.effective_chat = _FakeChat(chat_id)
-        self.message = _FakeMessage(text)
+        # A callback press carries no ``update.message`` - the reported internal
+        # error was reading it - so a press is faked the same way.
+        self.message = _FakeMessage(text) if has_message else None
 
 
 class _FakeContext:
     def __init__(self, bot=None):
         self.user_data = {}
-        self.bot = bot or mock.Mock()
+        self.bot = bot or _FakeBot()
 
 
 def _handler(edits=None):
@@ -403,6 +416,119 @@ class ForwarderTests(unittest.TestCase):
         self.assertNotIn("Send target chat id", src)
 
 
+class ReplyTargetTests(unittest.TestCase):
+    """``_reply_to_press``: a reply when there is a message, a post when there is not."""
+
+    def test_a_real_message_is_answered_with_a_reply(self):
+        handler = _handler()
+        update = _FakeUpdate(text="typed words")
+        asyncio.run(handler._reply_to_press(update, _FakeContext(), "hello"))
+        self.assertEqual(update.message.replies, ["hello"])
+
+    def test_a_press_is_answered_in_the_chat_instead(self):
+        handler = _handler()
+        bot = _FakeBot()
+        asyncio.run(handler._reply_to_press(_FakeUpdate(has_message=False), _FakeContext(bot), "hello"))
+        self.assertEqual(bot.sent, [{"chat_id": 7, "text": "hello"}])
+
+
+class ForwarderPressTests(unittest.TestCase):
+    """📤 pressed on a callback: the media is re-sent *and* the note still lands."""
+
+    def test_the_button_re_sends_without_an_update_message(self):
+        current = {"id": "f1", "type": "document", "name": "notes.pdf", "file_unique_id": "uid1"}
+        handler = _handler()
+        session = {"current_file": current}
+        handler.user_sessions = {42: session}
+        seen = _events(handler, cached_id="the-file-id")
+        bot = _FakeBot()
+        edits = []
+
+        async def _edit(_query, text, **_kwargs):
+            edits.append(text)
+            return True
+
+        handler.safe_edit = _edit
+        asyncio.run(handler.callback_handler(_FakeUpdate(data="media_forwarder", has_message=False), _FakeContext(bot)))
+
+        # Telegram's own copy, re-sent: no upload and no bucket read.
+        self.assertEqual(seen["sends"][0]["kind"], "document")
+        self.assertEqual(seen["downloaded"], [])
+        # The note arrives as a new message, because there was no message to reply
+        # to. Reading ``update.message`` here is what raised AttributeError.
+        self.assertTrue(any("from the bot" in note["text"] for note in bot.sent), bot.sent)
+        self.assertIn("Re-sending", edits[-1])
+
+
+class BatchForwardTests(unittest.TestCase):
+    """📤 Forward Batch: every collected media, one summary, batch left alone."""
+
+    @staticmethod
+    def _batch_handler(entries, results=None):
+        handler = _handler()
+        session = {"bulk_list": entries, "current_file": entries[0] if entries else {}}
+        handler.user_sessions = {42: session}
+        calls = []
+        outcomes = list(results or [])
+
+        async def _redeliver(_update, _context, sess, **kwargs):
+            calls.append({"entry": sess.get("current_file"), "kwargs": kwargs})
+            return outcomes.pop(0) if outcomes else True
+
+        handler._redeliver_current_media = _redeliver
+        return handler, session, calls
+
+    @staticmethod
+    def _forward(handler, session):
+        bot = _FakeBot()
+        asyncio.run(handler.forward_batch(_FakeUpdate(has_message=False), _FakeContext(bot), session))
+        return bot
+
+    def test_every_entry_is_re_sent_once_and_the_batch_is_left_alone(self):
+        entries = [
+            {"id": "a", "name": "clip.mp4", "type": "video"},
+            {"id": "b", "name": "song.mp3", "type": "audio"},
+        ]
+        handler, session, calls = self._batch_handler(entries)
+        bot = self._forward(handler, session)
+        self.assertEqual([call["entry"]["id"] for call in calls], ["a", "b"])
+        # No per-file chatter: the batch reports itself once.
+        self.assertTrue(all(call["kwargs"]["announce"] is False for call in calls))
+        self.assertEqual(len(bot.sent), 1)
+        self.assertIn("sent 2 of 2", bot.sent[0]["text"])
+        # Forwarding is not consumption - the list is still there to apply.
+        self.assertEqual([entry["id"] for entry in session["bulk_list"]], ["a", "b"])
+
+    def test_the_one_summary_names_what_could_not_be_re_sent(self):
+        entries = [{"id": "a", "name": "clip.mp4"}, {"id": "b", "name": "song.mp3"}]
+        handler, session, _ = self._batch_handler(entries, results=[True, False])
+        bot = self._forward(handler, session)
+        self.assertIn("sent 1 of 2", bot.sent[0]["text"])
+        self.assertIn("song.mp3", bot.sent[0]["text"])
+
+    def test_the_loaded_file_is_forwarded_when_the_batch_is_empty(self):
+        handler = _handler()
+        session = {"current_file": {"id": "solo", "name": "solo.mp4", "type": "video"}}
+        handler.user_sessions = {42: session}
+        calls = []
+
+        async def _redeliver(_update, _context, sess, **_kwargs):
+            calls.append(sess.get("current_file"))
+            return True
+
+        handler._redeliver_current_media = _redeliver
+        bot = self._forward(handler, session)
+        self.assertEqual([call["id"] for call in calls], ["solo"])
+        self.assertIn("sent 1 of 1", bot.sent[0]["text"])
+
+    def test_an_empty_batch_says_so_instead_of_sending_nothing(self):
+        handler = _handler()
+        session = {}
+        handler.user_sessions = {}
+        bot = self._forward(handler, session)
+        self.assertIn("batch is empty", bot.sent[0]["text"])
+
+
 class MenuTests(unittest.TestCase):
     def test_the_button_names_only_what_it_does(self):
         markup = MediaMenuBuilder.get_main_menu("video")
@@ -416,6 +542,11 @@ class MenuTests(unittest.TestCase):
         labels = [b.text for row in markup.inline_keyboard for b in row]
         self.assertIn("💬 Caption Editor", labels)
         self.assertIn("📤 Media Forwarder", labels)
+
+    def test_the_batch_menu_offers_the_batch_forward(self):
+        items = [b for row in MediaMenuBuilder.get_bulk_menu({}).inline_keyboard for b in row]
+        self.assertIn("📤 Forward Batch", [b.text for b in items])
+        self.assertIn("bulk_forward", [b.callback_data for b in items])
 
 
 class WiringTests(unittest.TestCase):
@@ -432,12 +563,24 @@ class WiringTests(unittest.TestCase):
         self.assertNotIn('session["current_file"]["caption"] = user_input', src)
         self.assertNotIn('"✅ Caption saved."', src)
 
-    def test_one_re_send_serves_both_buttons(self):
+    def test_one_re_send_serves_all_three_buttons(self):
         src = read_source("handlers.py")
         self.assertIn("_redeliver_current_media(", src)
         self.assertIn("success_note=_note", src)
-        # One re-send, not two implementations of it.
+        # The batch forward is the same re-send, once per collected entry.
+        self.assertIn('elif data == "bulk_forward":', src)
+        self.assertIn("await self.forward_batch(update, context, session)", src)
+        # One re-send, not three implementations of it.
         self.assertEqual(src.count("async def _redeliver_current_media("), 1)
+
+    def test_the_re_send_notes_never_read_update_message_directly(self):
+        # That read is the reported internal error: a callback press has no
+        # ``update.message``. The one helper answers both kinds of update.
+        src = read_source("handlers.py")
+        start = src.index("async def _redeliver_current_media(")
+        end = src.index("async def forward_batch(")
+        self.assertNotIn("update.message.reply_text", src[start:end])
+        self.assertIn("async def _reply_to_press(", src)
 
 
 if __name__ == "__main__":

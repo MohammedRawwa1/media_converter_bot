@@ -108,6 +108,12 @@ async def process_forward_hash(forward_hash: str):
             input_path,
             msg_date=meta.get("registered_at") or meta.get("created_at"),
             file_unique_id=meta.get("file_unique_id"),
+            # The forward's own user, not the deployment's session: the fetcher
+            # runs in a process of its own, and every user's media must be
+            # fetched through the session that user logged in with. An entry from
+            # before this field existed resolves None and keeps the old
+            # behaviour rather than failing.
+            user_id=meta.get("user_id"),
         )
         logger.info(
             "fetcher: userbot download for %s returned ok=%s exists=%s",

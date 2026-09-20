@@ -1198,7 +1198,12 @@ async def download_media_to_sink(
         get_db_model,
         get_telethon_session_string_for_user,
         get_userbot_credentials,
+        operating_user_id,
     )
+
+    # Streaming is still a user's transfer: their session when they have one,
+    # else the deployment's (see ``operating_user_id``).
+    user_id = await operating_user_id(user_id, get_db_model())
 
     chunk_size_kb = get_download_chunk_size_kb()
     try:
@@ -1325,7 +1330,12 @@ async def download_head_via_userbot(
         get_db_model,
         get_telethon_session_string_for_user,
         get_userbot_credentials,
+        operating_user_id,
     )
+
+    # Best-effort read, so it asks the same question as every other userbot path:
+    # a user with no session of their own is served by the deployment's.
+    user_id = await operating_user_id(user_id, get_db_model())
 
     try:
         api_id, api_hash = get_userbot_credentials()
@@ -2556,7 +2566,13 @@ async def download_forward_via_userbot(
         get_db_model,
         get_pyrogram_session_string_for_user,
         has_usable_telethon_session_async,
+        operating_user_id,
     )
+
+    # A user who never logged in has no session of their own; this fetch is then
+    # carried by the deployment's session instead of failing (see
+    # ``operating_user_id``).
+    user_id = await operating_user_id(user_id, get_db_model())
 
     pyrogram_session_configured = bool(
         await get_pyrogram_session_string_for_user(user_id=user_id, db_model=get_db_model())
@@ -2637,7 +2653,11 @@ async def download_bytes_via_userbot(
         get_pyrogram_session_string_for_user,
         has_usable_telethon_session,
         has_usable_telethon_session_async,
+        operating_user_id,
     )
+
+    # No session of the user's own: the deployment's session carries the read.
+    user_id = await operating_user_id(user_id, get_db_model())
 
     pyrogram_session_configured = bool(
         await get_pyrogram_session_string_for_user(user_id=user_id, db_model=get_db_model())

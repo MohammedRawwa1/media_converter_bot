@@ -1,7 +1,9 @@
+import ast
 import asyncio
 from unittest.mock import patch
 
 import pytest
+from source_helpers import find_function, parse_source
 
 from utils import telethon_session
 from utils.session_healthcheck import SessionHealthChecker
@@ -285,6 +287,77 @@ def test_restore_rehydrates_local_session_from_mongodb_even_when_json_exists(mon
 
     value, _ = asyncio.run(telethon_session._resolve_telethon_session_with_source(user_id=8, db_model=None))
     assert value == "mongo-new"
+
+
+def test_operating_user_id_keeps_a_user_who_has_their_own_session(monkeypatch):
+    """A user with a session of their own is the one an operation runs as."""
+
+    async def _pyrogram(user_id=None, db_model=None):
+        return "pyro-session" if user_id == 7 else None
+
+    async def _telethon(user_id=None, db_model=None):
+        return False
+
+    monkeypatch.setattr(telethon_session, "get_pyrogram_session_string_for_user", _pyrogram)
+    monkeypatch.setattr(telethon_session, "has_usable_telethon_session_async", _telethon)
+
+    assert asyncio.run(telethon_session.operating_user_id(7)) == 7
+    # An unscoped operation stays unscoped - there is nothing to fall back to.
+    assert asyncio.run(telethon_session.operating_user_id(None)) is None
+
+
+def test_operating_user_id_falls_back_for_a_user_without_one(monkeypatch):
+    """No session for the user is not a failure: the deployment's session serves.
+
+    This is what keeps a second account usable without `/login`: passing its id on
+    to a scoped lookup finds nothing, and the fetch or delivery used to die with
+    "session not configured" instead of running on the session that exists.
+    """
+
+    async def _missing(user_id=None, db_model=None):
+        return None
+
+    async def _no_telethon(user_id=None, db_model=None):
+        return False
+
+    monkeypatch.setattr(telethon_session, "get_pyrogram_session_string_for_user", _missing)
+    monkeypatch.setattr(telethon_session, "has_usable_telethon_session_async", _no_telethon)
+
+    # ``None`` is the unscoped lookup the userbot layer turns into the env/global
+    # session.
+    assert asyncio.run(telethon_session.operating_user_id(7)) is None
+
+
+def test_operating_user_id_keeps_the_user_when_the_check_cannot_run(monkeypatch):
+    """An unanswerable check must not widen who an operation runs as."""
+
+    async def _boom(user_id=None, db_model=None):
+        raise RuntimeError("redis down")
+
+    monkeypatch.setattr(telethon_session, "get_pyrogram_session_string_for_user", _boom)
+
+    assert asyncio.run(telethon_session.operating_user_id(7)) == 7
+
+
+def test_every_userbot_entry_point_scopes_the_user():
+    """Each userbot entry point resolves the user's session, or the deployment's.
+
+    Checked in the source because the entry points do their work over the network:
+    what matters here is that the id is passed through ``operating_user_id``
+    before any client is built, so no path can silently keep the deployment's
+    session for a user who has one of their own - or fail for a user who does not.
+    """
+
+    entry_points = [
+        (("utils", "userbot_downloader.py"), "download_forward_via_userbot"),
+        (("utils", "userbot_downloader.py"), "download_media_to_sink"),
+        (("utils", "userbot_downloader.py"), "download_head_via_userbot"),
+        (("utils", "userbot_downloader.py"), "download_bytes_via_userbot"),
+        (("utils", "userbot_uploader.py"), "send_file_via_userbot"),
+    ]
+    for parts, name in entry_points:
+        body = ast.unparse(find_function(parse_source(*parts), name))
+        assert "await operating_user_id(" in body, f"{'/'.join(parts)}::{name} does not scope its user"
 
 
 def test_session_healthchecker_invalidates_stale_pyrogram_json_before_fallback(monkeypatch, tmp_path):

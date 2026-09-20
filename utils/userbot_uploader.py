@@ -1630,7 +1630,13 @@ async def send_file_via_userbot(
             logger.warning("userbot: Pyrogram bot error (%s); trying Telethon fallback", e)
 
     # ── Priority 2: Telethon user account ──
-    from utils.telethon_session import get_db_model, has_usable_telethon_session_async
+    from utils.telethon_session import get_db_model, has_usable_telethon_session_async, operating_user_id
+
+    # The delivery belongs to a user, but a user who never logged in has no
+    # session of their own - and a result that cannot be delivered is worse than
+    # one delivered by the deployment's account, so that session carries it (see
+    # ``operating_user_id``).
+    user_id = await operating_user_id(user_id, get_db_model())
 
     if TelegramClient is not None and await has_usable_telethon_session_async(user_id=user_id, db_model=get_db_model()):
         try:

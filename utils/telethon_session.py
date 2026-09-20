@@ -732,6 +732,41 @@ async def get_pyrogram_session_string_for_user(
     return value
 
 
+async def operating_user_id(user_id: int | None, db_model: object | None = None) -> int | None:
+    """The user a userbot operation should be carried by, or ``None`` for the
+    deployment's own session.
+
+    A user who has logged in has a session of their own, and it is the one used:
+    their media travels over their account. A user who never did - a second
+    account added with ``/admin add``, say - has none, and a scoped lookup finds
+    nothing, so every userbot operation on their media would fail with "session
+    not configured" even though the deployment *does* have a session. That turns
+    "this user has not logged in" into "the feature is broken for this user".
+
+    So the id is dropped when the user has no session of their own and the
+    operation runs on the unscoped session (env var, then the global JSON file) -
+    the same account that served everybody before per-user resolution existed. The
+    log line names the fallback, so which account carried a transfer stays
+    answerable. When the check itself cannot run the requested id is kept: an
+    unanswerable question must not silently widen who an operation runs as.
+    """
+    if user_id is None:
+        return None
+    try:
+        if await get_pyrogram_session_string_for_user(user_id=user_id, db_model=db_model):
+            return user_id
+        if await has_usable_telethon_session_async(user_id=user_id, db_model=db_model):
+            return user_id
+    except Exception:
+        logger.debug("session: could not tell whether user %s has a session", user_id)
+        return user_id
+    logger.info(
+        "session: user %s has no session of their own; using the deployment's session",
+        user_id,
+    )
+    return None
+
+
 async def resolve_session_string(
     client_type: str,
     session_str: str | None = None,
