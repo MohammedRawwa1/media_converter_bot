@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import logging
 import os
+import uuid
 from dataclasses import dataclass
 from typing import Any
 
@@ -216,6 +217,174 @@ async def store_source(
     return SourceRef(mode=resolved, key=key, job_key=key, header_only=False, bytes=size)
 
 
+async def stored_library_source(backend: Any, file_unique_id: Any, *, expected_size: Any = None) -> str | None:
+    """The whole object already stored for this media's identity, if there is one.
+
+    A descriptor is a *record* of what a producer stored, and a record can be
+    missing: a path that stored the media never wrote one, both cache tiers can
+    lose one, and a descriptor written in a header-keeping mode holds no reusable
+    source at all. The key does not have that problem - it is derived from the
+    media's own ``file_unique_id`` (``utils/media_cache.media_library_key``), so
+    an object the last run stored under it is reachable without asking anyone.
+
+    Only a *whole* object is ever found this way: a probe header is stored beside
+    the source, never on it (see :func:`header_object_key`), so a key that answers
+    here is media and never a two-megabyte reference to some.
+
+    Stricter than the descriptor path on purpose. That one treats a backend it
+    cannot question as a hit, because a record already proves a producer wrote
+    the object and doubting it is what causes the re-download it exists to
+    prevent. There is no such proof behind a *derived* key, so this one wants a
+    positive answer: without it the caller downloads, which is exactly what it
+    would have done before (and never a request that trusts the wrong bytes).
+    """
+    if backend is None or not file_unique_id:
+        return None
+    key = source_library_key(file_unique_id)
+    if not key:
+        return None
+    try:
+        from utils.storage import stored_object_is_intact
+
+        if not await stored_object_is_intact(backend, key, expected_size=expected_size):
+            return None
+        # ``stored_object_is_intact`` is forgiving about a backend that cannot
+        # answer at all; the size it reported (when it reported one) is the part
+        # of its verdict that this path needs to stand on its own.
+        if expected_size:
+            stored_size = await backend.get_file_size(key)
+            if stored_size is not None and int(stored_size) != int(expected_size):
+                return None
+    except Exception:
+        logger.debug("source_store: could not check the stored object at %s", key)
+        return None
+    logger.info("source_store: the media itself is already stored at %s", key)
+    return key
+
+
+async def remember_fetched_source(
+    current_file: dict | None,
+    local_path: str | None,
+    *,
+    source_meta: dict | None = None,
+    telegram_fallback: bool = False,
+    log_prefix: str = "source_store",
+) -> str | None:
+    """Keep what a fetch just wrote to disk, and record where it now lives.
+
+    The fetches that reach Telegram on a media's behalf - the userbot/relay
+    download behind the bot's buttons, the auto-fetch that answers a large
+    forward - used to hand the pipe a local file and nothing else. That left the
+    media invisible to every reuse path: the *next* request for it downloaded the
+    same bytes down the same road, and a worker on another host had no object to
+    read, so it went back to Telegram too. One fetch of one media is enough once
+    the producer records it, so these paths write what the piped Bot API branch
+    writes: the object, then the descriptor that says where it is.
+
+    Best-effort, because the caller already has its bytes: no backend, a storage
+    backend that is down, ``PIPELINE_SOURCE_UPLOAD=local``, or a deployment whose
+    store is this very disk all mean "no object to write" rather than a failed
+    request - the local copy and its bytes are recorded either way, because that
+    is the tier such a deployment reuses from. Returns the job-usable key (None
+    when no object was stored).
+    """
+    file = current_file or {}
+    if not local_path or not os.path.exists(local_path):
+        return None
+    try:
+        size = int(os.path.getsize(local_path))
+    except OSError:
+        return None
+    if size <= 0:
+        return None
+
+    # Only a remote store is worth *uploading* to. A local backend already *is*
+    # this disk, so a copy of it would be the same bytes under another name - but
+    # the fetch is recorded either way: the disk copy and its bytes are the tiers
+    # a deployment with no object store reads, and the descriptor is what tells
+    # the next request they are there.
+    try:
+        import config as _config
+
+        _remote = _config.get_storage_backend_name() in ("s3", "r2")
+    except Exception:
+        _remote = False
+
+    uid = file.get("file_unique_id")
+    ext = os.path.splitext(str(file.get("name") or local_path))[1] or ".bin"
+    # One media is one object: the identity key when there is an identity, so a
+    # second route to the same media finds this copy instead of storing another.
+    key = source_library_key(uid) or f"inputs/{uuid.uuid4().hex}/source{ext}"
+
+    backend = None
+    if _remote:
+        try:
+            from utils.storage import get_storage_backend
+
+            if get_storage_backend is not None:
+                backend = await get_storage_backend()
+        except Exception:
+            backend = None
+
+    ref = SourceRef(mode=source_upload_mode())
+    if backend is not None:
+        try:
+            ref = await store_source(
+                backend,
+                local_path,
+                key=key,
+                telegram_fallback=telegram_fallback,
+                log_prefix=log_prefix,
+            )
+        except Exception:
+            logger.warning("%s: could not store the fetched source at %s", log_prefix, key)
+
+    if not uid:
+        # No identity to record against. The key still goes back to the request
+        # that is about to queue its job, which is the only reader it has.
+        return ref.job_key
+
+    if not ref.stored:
+        # Nothing new was stored. Whatever a previous producer recorded is a
+        # better answer than blanking the descriptor, so it is carried over.
+        previous = {}
+        try:
+            from utils import media_cache
+
+            previous = await media_cache.lookup(uid, expected_size=size) or {}
+        except Exception:
+            previous = {}
+        if previous.get("header_only"):
+            ref = SourceRef(mode=ref.mode, key=previous.get("header_key"), header_only=True)
+        elif previous.get("input_key"):
+            ref = SourceRef(mode=ref.mode, key=previous.get("input_key"), job_key=previous.get("input_key"))
+
+    payload = None
+    try:
+        from utils import media_cache
+
+        if size <= media_cache.bytes_cache_limit():
+            with open(local_path, "rb") as fh:
+                payload = fh.read()
+    except Exception:
+        payload = None
+
+    await record_source(
+        uid,
+        ref=ref,
+        size=size,
+        name=file.get("name"),
+        # Where this fetch put the bytes: the tier a repeat reads when the
+        # object is gone (or was never written), instead of downloading again.
+        local_path=local_path,
+        data=payload,
+        file_id=file.get("id"),
+        source_meta=source_meta,
+        storage="s3" if ref.stored else "local",
+    )
+    return ref.job_key
+
+
 async def record_source(
     file_unique_id: Any,
     *,
@@ -228,12 +397,23 @@ async def record_source(
     duration: Any = None,
     source_meta: dict | None = None,
     remember_bytes: bool = False,
+    storage: str = "s3",
 ) -> bool:
     """Remember where this media lives, in the one shape every reader expects.
 
     A probe header goes in ``header_key``/``header_only`` and never in
     ``input_key``: the descriptor is what the next request's validation gate
     reads, and a header in the source slot would hand a job the wrong bytes.
+
+    ``local_path`` goes in ``path`` - the reuse tier a request reads after the
+    stored key, and the only one a deployment with no object store has. A fetch
+    that left its bytes on disk and wrote no key used to be told twice: nothing
+    in the descriptor said where the first one had put the media, so the next
+    request downloaded it again over the same road.
+
+    ``storage`` names which of the two the descriptor is describing - ``s3`` for
+    a stored object, ``local`` when only the disk copy exists - so the record
+    does not claim an object that was never written.
     """
     if not file_unique_id:
         return False
@@ -249,7 +429,8 @@ async def record_source(
         kwargs: dict[str, Any] = {
             "size": size,
             "name": name,
-            "storage": "s3",
+            "storage": storage,
+            "path": local_path,
             "data": payload,
             "file_id": file_id,
             "duration": duration,

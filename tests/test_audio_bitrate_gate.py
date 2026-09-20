@@ -434,7 +434,7 @@ def test_adjusting_an_audio_bitrate_asks_before_it_downloads():
     assert "_already_at_bitrate(current_file, audio_bitrate" in body
     assert "_already_at_bitrate_text(audio_bitrate)" in body
     # The verdict comes before the fetch it exists to avoid.
-    assert body.index("_already_at_bitrate(current_file") < body.index("_ensure_current_file_downloaded")
+    assert body.index("_already_at_bitrate(current_file") < body.index("_ensure_local_media")
 
 
 def test_a_batch_answers_an_audio_file_that_is_already_at_the_bitrate():
@@ -466,7 +466,7 @@ def test_the_audio_format_converter_answers_an_mp3_that_is_already_one():
     assert 'if format_type == "mp3":' in body
     assert "_already_at_bitrate(current_file, _DEFAULT_AUDIO_BITRATE" in body
     # Before the fetch it exists to avoid, like every other wired site.
-    assert body.index("_already_at_bitrate(") < body.index("_ensure_current_file_downloaded")
+    assert body.index("_already_at_bitrate(") < body.index("_ensure_local_media")
     # Only the MP3 target: the other targets are codec changes, and the gate
     # speaks about MP3 alone.
     assert body.count("_already_at_bitrate(") == 1

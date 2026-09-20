@@ -2941,25 +2941,133 @@ class EnhancedMediaHandler:
             logger.debug("handlers: could not invalidate a refused %s file_id", media_type)
 
     # ── Video delivery helper: send_video with rich metadata ──────────────
-    async def _split_local_source(self, current_file: dict) -> str | None:
-        """A readable local copy of the loaded media, fetching the stored object if needed.
+    async def _adopt_stored_source(
+        self,
+        current_file: dict,
+        *,
+        entry: dict | None = None,
+        backend=None,
+        session: dict | None = None,
+        user_id: int | None = None,
+        persist: bool = True,
+    ) -> str | None:
+        """The whole object already stored for this media, or ``None``.
 
-        The split needs real bytes on disk. The file the user sent is usually still
-        there (``REUSE_LOCAL_INPUT`` keeps it), a cache repeat hands over its own
-        copy, and the one case left is a media that only lives in the bucket - which
-        is downloaded here rather than answering "send the file again".
+        The one stored-key derivation every button shares - the split, the
+        trims, the extracts, the optimizes, the bulk apply and the ingest pipe -
+        so a media that only lives in the bucket is found instead of being pulled
+        down Telegram again. Two ways to name that object, cheapest first:
+
+        1. the descriptor's ``input_key``, validated with a HEAD before it is
+           trusted (existence and stored size, both metadata-only);
+        2. the key derived from the media's own identity
+           (``utils/source_store.stored_library_source``): one media is one
+           ``.../source`` object under the name every producer derives for it, so
+           this tier covers a descriptor that never survived, and a deployment
+           storing only a probe header (``SOURCE_UPLOAD=header``) - the header is
+           a *reference* to the media, and the whole object stored beside it is
+           the stream a button can actually read.
+
+        On a hit the caller's ``current_file`` is updated - the key written back,
+        the probe verdict carried over - so the next request for this media
+        resolves the same way without another lookup. Never answers from a probe
+        header: a header is not a source.
         """
-        for key in ("path", "_local_input_path"):
-            candidate = current_file.get(key)
-            try:
-                if candidate and os.path.exists(candidate) and os.path.getsize(candidate) > 0:
-                    return candidate
-            except OSError:
-                continue
-
-        input_key = current_file.get("input_key")
-        if not input_key:
+        _uid = current_file.get("file_unique_id")
+        if not _uid:
             return None
+        # The size is the validation, not the requirement: an identity without one
+        # still names an object, and the HEAD answers what it can.
+        _expected = current_file.get("size")
+        if config.get_storage_backend_name() not in ("s3", "r2"):
+            return None
+
+        try:
+            from utils import media_cache as _media_cache
+            from utils.storage import get_storage_backend as _gsb
+            from utils.storage import stored_object_is_intact as _stored_object_is_intact
+        except Exception:
+            return None
+
+        if backend is None and _gsb is not None:
+            try:
+                backend = await _gsb()
+            except Exception:
+                backend = None
+        if backend is None:
+            return None
+
+        _entry = entry if entry is not None else {}
+        _stored_key = _entry.get("input_key")
+        if not _stored_key and entry is None:
+            try:
+                if _media_cache.cache_enabled():
+                    _entry = await _media_cache.lookup(_uid, expected_size=_expected) or {}
+                    _stored_key = _entry.get("input_key")
+            except Exception:
+                # A cache that cannot answer is a miss, not a reason to give up:
+                # the identity-derived key below needs no descriptor at all.
+                logger.debug("handlers: media cache lookup failed for %s; deriving the stored key", _uid)
+
+        if not _stored_key:
+            # No descriptor names this media. Derive the key from the media's own
+            # identity: a whole object may be there from a producer that stored
+            # it without a descriptor, or beside the probe header of a
+            # header-mode deployment.
+            try:
+                from utils.source_store import stored_library_source as _stored_library_source
+
+                _stored_key = await _stored_library_source(backend, _uid, expected_size=_expected)
+            except Exception:
+                logger.debug("handlers: could not derive the stored key for %s", _uid)
+                _stored_key = None
+            if not _stored_key:
+                return None
+            _stored_ok = True
+        else:
+            try:
+                # Existence *and* size, both from a HEAD: the cached object is
+                # validated before the descriptor is trusted, so a swept (or
+                # replaced) object is a miss rather than a job handed the wrong
+                # bytes. No bytes leave the bucket to find that out.
+                _stored_ok = await _stored_object_is_intact(
+                    backend, _stored_key, expected_size=current_file.get("size")
+                )
+            except Exception:
+                # Conservatively treat an unchecked key as valid, matching the
+                # stale-key guard in _ensure_current_file_downloaded.
+                _stored_ok = True
+        if not _stored_ok:
+            return None
+
+        current_file["input_key"] = _stored_key
+        current_file["path"] = None
+        # Carry the probe verdict captured at ingest across the reuse. Without it
+        # a repeat rebuilds the caption and the audio tags from nothing but the
+        # filename - the same loss the pipeline's own reuse path had to fix.
+        _merge_cached_source_meta(current_file, _entry)
+        if session is not None:
+            session["current_file"] = current_file
+        if persist and user_id is not None:
+            with contextlib.suppress(Exception):
+                self._persist_session(user_id)
+        logger.info(
+            "handlers: reused stored input_key=%s for user %s (file_unique_id=%s)",
+            _stored_key,
+            user_id or current_file.get("chat_id") or current_file.get("id"),
+            _uid,
+        )
+        return _stored_key
+
+    async def _download_stored_source(self, current_file: dict, stored_key: str) -> str | None:
+        """Pull a stored object onto local disk for an action that needs real bytes.
+
+        The buttons that cannot hand a key to a worker - the split, which runs
+        its own stream copy, and the ones that read the media here (screenshots,
+        the thumbnail grid, the analysis) - need a file. Downloading the object
+        is how a media that only lives in the bucket still gets its button: one
+        bucket read, no Telegram, and the ``path`` the descriptor now records.
+        """
         try:
             from utils.storage import get_storage_backend
 
@@ -2969,13 +3077,92 @@ class EnhancedMediaHandler:
             temp_dir = os.path.join(getattr(config, "TEMP_PATH", "storage/temp"))
             os.makedirs(temp_dir, exist_ok=True)
             ext = os.path.splitext(str(current_file.get("name") or ""))[1] or ".bin"
-            dest = os.path.join(temp_dir, f"split_src_{current_file.get('id') or uuid.uuid4().hex}{ext}")
-            if await backend.download_file(input_key, dest) and os.path.getsize(dest) > 0:
-                logger.info("handlers: split source fetched from storage (%s)", input_key)
+            dest = os.path.join(temp_dir, f"local_src_{current_file.get('id') or uuid.uuid4().hex}{ext}")
+            if await backend.download_file(stored_key, dest) and os.path.getsize(dest) > 0:
+                logger.info("handlers: fetched the stored source to %s (%s)", dest, stored_key)
                 return dest
         except Exception:
-            logger.exception("handlers: could not fetch the split source from storage")
+            logger.exception("handlers: could not fetch the stored source from storage")
         return None
+
+    def _local_copy(self, current_file: dict | None) -> str | None:
+        """The readable on-disk copy of this media, or None when there is not one.
+
+        The one reader for what every button used to spell out for itself, and
+        the answer is the same everywhere: ``path`` first, then the
+        ``_local_input_path`` hint a streamed ingest leaves behind - and only when
+        the file is really there and not empty. A session that only carries a
+        stored ``input_key`` has neither, which is the case every caller has to
+        handle: ``current_file["path"]`` is a KeyError, and a ``None`` only fails
+        later, inside ffmpeg.
+        """
+        file = current_file or {}
+        for key in ("path", "_local_input_path"):
+            candidate = file.get(key)
+            try:
+                if candidate and os.path.exists(candidate) and os.path.getsize(candidate) > 0:
+                    return candidate
+            except OSError:
+                continue
+        return None
+
+    async def _resolve_local_source(
+        self,
+        current_file: dict,
+        *,
+        user_id: int | None = None,
+        session: dict | None = None,
+        require_stored_key_only: bool = False,
+    ) -> str | None:
+        """Return a readable local copy of the loaded media, or None.
+
+        The actions that need real bytes on disk hit the same three cases:
+
+        1. a local copy the user just sent (``REUSE_LOCAL_INPUT``),
+        2. a stored whole object the session already names (``input_key``),
+        3. a stored whole object named by the media's own identity.
+
+        The third case is the one the callback layer used to miss. It is the same
+        derivation :meth:`_ensure_current_file_downloaded` makes, shared through
+        :meth:`_adopt_stored_source`, so the ingest path and the buttons can never
+        disagree about which stored object belongs to this media.
+
+        ``require_stored_key_only`` is used by the split helper and by the
+        buttons that read the media here (screenshots, the thumbnail grid, the
+        analysis): they need a real file on disk, not a key the caller would
+        download itself, so a media that lives in the bucket is downloaded here
+        and the local path is returned.
+        """
+        local_copy = self._local_copy(current_file)
+        if local_copy:
+            return local_copy
+
+        stored_key = current_file.get("input_key") or await self._adopt_stored_source(
+            current_file, session=session, user_id=user_id
+        )
+        if not stored_key:
+            return None
+        if not require_stored_key_only:
+            return stored_key
+        return await self._download_stored_source(current_file, stored_key)
+
+    async def _split_local_source(self, current_file: dict, session: dict | None = None) -> str | None:
+        """A readable local copy of the loaded media for the split button.
+
+        The split needs real bytes on disk. The file the user sent is usually still
+        there (``REUSE_LOCAL_INPUT`` keeps it), a cache repeat hands over its own
+        copy, and the one case left is a media that only lives in the bucket - which
+        is downloaded here rather than answering "send the file again".
+
+        This is the split button's local-probe path through the shared
+        :meth:`_resolve_local_source`; the split's need for a file on disk is the
+        only part of it that is special.
+        """
+        return await self._resolve_local_source(
+            current_file,
+            session=session,
+            require_stored_key_only=True,
+        )
 
     async def _deliver_split_parts(
         self,
@@ -3270,7 +3457,7 @@ class EnhancedMediaHandler:
         if not await self._check_conversion_quota(update, context):
             return
 
-        source_path = await self._split_local_source(current_file)
+        source_path = await self._split_local_source(current_file, session)
         fetch_error = ""
         if not source_path:
             # A media the user just sent is registered *lazily*: the upload was
@@ -3288,7 +3475,7 @@ class EnhancedMediaHandler:
                 fetch_error = str(exc) or exc.__class__.__name__
                 logger.exception("handlers: could not fetch the source to split")
             current_file = (session or {}).get("current_file") or current_file
-            source_path = await self._split_local_source(current_file)
+            source_path = await self._split_local_source(current_file, session)
             if fetching is not None:
                 with contextlib.suppress(Exception):
                     await fetching.delete()
@@ -4089,7 +4276,7 @@ class EnhancedMediaHandler:
             raise Exception("No file in session")
 
         # If already downloaded (local) or already streamed to S3, nothing to do
-        path = current_file.get("path")
+        path = self._local_copy(current_file)
         input_key = current_file.get("input_key")
         # ── Stale-key guard for pipeline-restored sessions: verify the S3 key
         #    actually exists before reusing it.  Only check when the key came from
@@ -4188,45 +4375,13 @@ class EnhancedMediaHandler:
                 _expected = current_file.get("size")
                 _entry = await _media_cache.lookup(_uid, expected_size=_expected)
 
-                # 1) Remote copy already in object storage — reuse the key.
-                _stored_key = (_entry or {}).get("input_key")
-                if _stored_key and config.get_storage_backend_name() in ("s3", "r2"):
-                    _key_ok = True
-                    try:
-                        from utils.storage import get_storage_backend as _gsb_check
-                        from utils.storage import stored_object_is_intact as _stored_object_is_intact
-
-                        _check_backend = await _gsb_check()
-                        if _check_backend is not None:
-                            # Existence *and* size, both from a HEAD: the cached
-                            # object is validated before the descriptor is
-                            # trusted, so a swept (or replaced) object is a miss
-                            # rather than a job handed the wrong bytes. No
-                            # bytes leave the bucket to find that out.
-                            _key_ok = await _stored_object_is_intact(
-                                _check_backend, _stored_key, expected_size=_expected
-                            )
-                    except Exception:
-                        # Conservatively treat an unchecked key as valid, matching
-                        # the stale-key guard elsewhere in this function.
-                        _key_ok = True
-                    if _key_ok:
-                        current_file["input_key"] = _stored_key
-                        current_file["path"] = None
-                        # Carry the probe verdict captured at ingest across the
-                        # reuse. Without it a repeat rebuilds the caption and the
-                        # audio tags from nothing but the filename - the same loss
-                        # the pipeline's own reuse path had to fix.
-                        _merge_cached_source_meta(current_file, _entry)
-                        session["current_file"] = current_file
-                        with contextlib.suppress(Exception):
-                            self._persist_session(user_id)
-                        logger.info(
-                            "media cache: reused stored input_key for user %s (file_unique_id=%s)",
-                            user_id,
-                            _uid,
-                        )
-                        return
+                # 1) Remote copy already in object storage — reuse the key. The
+                # derivation lives in :meth:`_adopt_stored_source` so this path,
+                # the piped branch below and every button name the same object for
+                # the same media: a repeat whose session only carries the media
+                # identity and size still finds it instead of downloading again.
+                if await self._adopt_stored_source(current_file, entry=_entry or {}, session=session, user_id=user_id):
+                    return
 
                 # 2) Local copy still on disk — reuse the file.
                 _stored_path = (_entry or {}).get("path")
@@ -4844,6 +4999,21 @@ class EnhancedMediaHandler:
                         # caption and player tag built after it falls back to the
                         # filename (see _probe_downloaded_source).
                         await _probe_downloaded_source(current_file, file_path)
+                        # Record where this fetch put the media. Nothing did: the
+                        # userbot road left a local file and no descriptor, so the
+                        # next request for the same media walked it again and a
+                        # worker on another host had nothing to read.
+                        try:
+                            from utils.source_store import remember_fetched_source
+
+                            await remember_fetched_source(
+                                current_file,
+                                file_path,
+                                source_meta=current_file.get("_source_metadata"),
+                                log_prefix="handlers:userbot",
+                            )
+                        except Exception:
+                            logger.debug("handlers: could not record the userbot fetch")
                         session["current_file"] = current_file
                         try:
                             self._persist_session(user_id)
@@ -4986,7 +5156,11 @@ class EnhancedMediaHandler:
             # ── Media cache: reuse a copy already in object storage so a repeat of
             #    the same media skips both the Telegram download and the upload.
             #    This is the piped (S3/R2) branch, which the local-disk cache
-            #    short-circuit earlier never reaches. ──
+            #    short-circuit earlier never reaches. The derivation is the shared
+            #    one (:meth:`_adopt_stored_source`), so no button and no pipeline
+            #    run names a different object for the same media - including the
+            #    identity-derived ``.../source`` key a header-mode deployment
+            #    stores the stream under. ──
             _cache_uid = current_file.get("file_unique_id")
             _library_key = None
             try:
@@ -4994,41 +5168,10 @@ class EnhancedMediaHandler:
 
                 if _cache_uid and _media_cache.cache_enabled():
                     _library_key = _media_cache.media_library_key(_cache_uid)
-                    _entry = await _media_cache.lookup(_cache_uid, expected_size=current_file.get("size"))
-                    _stored_key = (_entry or {}).get("input_key")
-                    if _stored_key:
-                        _stored_ok = True
-                        try:
-                            # Validate before trusting the descriptor: existence
-                            # plus the stored size, both metadata-only.
-                            from utils.storage import stored_object_is_intact as _stored_object_is_intact
-
-                            _stored_ok = await _stored_object_is_intact(
-                                _backend, _stored_key, expected_size=current_file.get("size")
-                            )
-                        except Exception:
-                            _stored_ok = True
-                        if _stored_ok:
-                            current_file["input_key"] = _stored_key
-                            current_file["path"] = None
-                            # The metadata captured when this media was ingested
-                            # belongs to *this* media, and it is what the caption
-                            # and the audio tags are built from. This path used to
-                            # blank it, so every repeat - the second style applied
-                            # to a file, and every batch file after the first -
-                            # delivered with the filename instead of the title and
-                            # performer the file actually carries.
-                            current_file.setdefault("_source_metadata", {})
-                            session["current_file"] = current_file
-                            with contextlib.suppress(Exception):
-                                self._persist_session(user_id)
-                            logger.info(
-                                "media cache: reused stored input_key=%s for user %s (file_unique_id=%s)",
-                                _stored_key,
-                                user_id,
-                                _cache_uid,
-                            )
-                            return
+                    if await self._adopt_stored_source(
+                        current_file, backend=_backend, session=session, user_id=user_id
+                    ):
+                        return
             except Exception:
                 logger.debug("handlers: remote media-cache lookup failed for %s", file_id)
 
@@ -5169,39 +5312,74 @@ class EnhancedMediaHandler:
             # its captions and player tags from.
             await _probe_downloaded_source(current_file, file_path)
 
-            # Remember the body so a repeat of this media skips the download.
-            # Only small media are stored in Redis; larger ones are covered by
-            # the shared library key on the big-file pipeline instead.
+            # Record what this fetch produced through the one shared writer:
+            # the on-disk location, the bytes when they are small enough for
+            # Redis, and - in a deployment that stores to S3/R2 - the object
+            # itself, under the key this media's identity derives. A repeat is
+            # then a disk or bucket read, wherever it is asked from.
             try:
-                from utils import media_cache as _media_cache
+                from utils.source_store import remember_fetched_source
 
-                _uid = current_file.get("file_unique_id")
-                if _uid:
-                    _size = os.path.getsize(file_path)
-                    _payload = None
-                    if _size <= _media_cache.bytes_cache_limit():
-                        with open(file_path, "rb") as _fh:
-                            _payload = _fh.read()
-                    await _media_cache.remember(
-                        _uid,
-                        size=_size,
-                        # Record the on-disk location too: it lets a repeat reuse
-                        # the file directly when it is too large for the bytes
-                        # tier, instead of re-fetching it from Telegram.
-                        path=file_path,
-                        name=current_file.get("name"),
-                        storage="local",
-                        data=_payload,
-                        file_id=current_file.get("id"),
-                    )
+                await remember_fetched_source(
+                    current_file,
+                    file_path,
+                    source_meta=current_file.get("_source_metadata"),
+                    log_prefix="handlers",
+                )
             except Exception:
-                logger.debug("handlers: failed to remember media in cache")
+                logger.debug("handlers: failed to remember the fetched media")
 
         session["current_file"] = current_file
         try:
             self._persist_session(user_id)
         except Exception:
             logger.debug("Could not persist session after download")
+
+    async def _ensure_local_media(
+        self,
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+        session: dict,
+        current_file: dict | None = None,
+        *,
+        query=None,
+        notify=None,
+    ) -> tuple[dict | None, Message | None]:
+        """Make the session's current media available locally, or say why it is not.
+
+        The guard every action button had written out for itself. The split, the
+        trims, the screenshots, the extracts, the optimizes, the formats, the
+        repairs, the resolutions, the archives and the analysis all repeated the
+        same few lines around the same fetch. This is those lines, once: a media
+        already on disk is left alone, and anything else goes through
+        :meth:`_ensure_current_file_downloaded`, which reuses a stored object
+        before it touches Telegram.
+
+        Returns ``(current_file, queued_notice)`` - the refreshed file from the
+        session, and the message a queued pipeline job was announced on (``None``
+        when the media was simply local). ``current_file`` is ``None`` when the
+        fetch failed, after the reason has been shown through ``notify`` (a
+        coroutine taking the text) or on ``query``'s message, so a caller writes
+        ``if current_file is None: return`` and carries on as before.
+        """
+        file = current_file if current_file is not None else (session or {}).get("current_file") or {}
+        # The one reader for "is there a usable local copy" - the same answer every
+        # caller uses, so a media the guard skips is exactly one _local_copy accepts.
+        if self._local_copy(file):
+            return file, None
+
+        try:
+            notice = await self._ensure_current_file_downloaded(update, context, session)
+        except Exception as exc:
+            text = f"❌ Failed to download file: {exc}"
+            if notify is not None:
+                await notify(text)
+            elif query is not None:
+                await self.safe_edit(query, text)
+            else:
+                logger.exception("handlers: could not make the media available locally")
+            return None, None
+        return (session or {}).get("current_file") or file, notice
 
     async def _handle_large_forward(
         self,
@@ -5363,6 +5541,20 @@ class EnhancedMediaHandler:
                             )
                             if ok and os.path.exists(input_path):
                                 fetched = True
+                                # This fetch is the media's only copy on this box:
+                                # record it, so the next request for it - and any
+                                # worker on another host - reads that copy instead
+                                # of walking this same road again.
+                                try:
+                                    from utils.source_store import remember_fetched_source
+
+                                    await remember_fetched_source(
+                                        current_file,
+                                        input_path,
+                                        log_prefix="handlers:auto-fetch",
+                                    )
+                                except Exception:
+                                    logger.debug("handlers: could not record the auto-fetch")
                         except asyncio.CancelledError:
                             # User cancelled — update message and do NOT re-raise (see _try_userbot_download)
                             if _dl_progress_msg:
@@ -5817,33 +6009,28 @@ class EnhancedMediaHandler:
         current_file["_pipeline_caption"] = _metadata_caption(current_file)
         session["current_file"] = current_file
 
-        # Ensure file is available locally (lazy-download)
-        if not current_file.get("path") or not os.path.exists(current_file.get("path") or ""):
-            try:
-                await self._ensure_current_file_downloaded(update, context, session)
-                current_file = session.get("current_file")
-                # If pipeline queued a job (big file), watch it and return.
-                # Don't create a duplicate local job or cancel the pipeline job.
-                if current_file and current_file.get("_pipeline_job_id"):
-                    _pipeline_job_id = current_file["_pipeline_job_id"]
-                    kb = InlineKeyboardMarkup(
-                        [[InlineKeyboardButton("❌ Cancel", callback_data=f"cancel_job:{_pipeline_job_id}")]]
-                    )
-                    await self.safe_edit(
-                        query,
-                        f"✅ Large file queued (Job: {_pipeline_job_id[:8]}...). I'll send the result when ready.",
-                        reply_markup=kb,
-                    )
-                    with contextlib.suppress(RuntimeError):
-                        asyncio.create_task(self._watch_job_progress(query, _pipeline_job_id, bot=context.bot))
-                    return
-            except Exception as e:
-                await self.safe_edit(query, f"❌ Failed to download file: {e}")
-                return
+        current_file, _ = await self._ensure_local_media(update, context, session, current_file, query=query)
+        if current_file is None:
+            return
+        # If pipeline queued a job (big file), watch it and return.
+        # Don't create a duplicate local job or cancel the pipeline job.
+        if current_file.get("_pipeline_job_id"):
+            _pipeline_job_id = current_file["_pipeline_job_id"]
+            kb = InlineKeyboardMarkup(
+                [[InlineKeyboardButton("❌ Cancel", callback_data=f"cancel_job:{_pipeline_job_id}")]]
+            )
+            await self.safe_edit(
+                query,
+                f"✅ Large file queued (Job: {_pipeline_job_id[:8]}...). I'll send the result when ready.",
+                reply_markup=kb,
+            )
+            with contextlib.suppress(RuntimeError):
+                asyncio.create_task(self._watch_job_progress(query, _pipeline_job_id, bot=context.bot))
+            return
 
         # Enqueue conversion job to Redis so a worker handles heavy lifting
         # (Only reached for small files downloaded via Bot API, not pipeline jobs)
-        input_path = current_file["path"] or current_file.get("_local_input_path")
+        input_path = self._local_copy(current_file)
         output_ext = f".{target_format}"
         output_dir = getattr(config, "OUTPUT_PATH", "storage/output") if config else "storage/output"
         with contextlib.suppress(OSError):
@@ -6044,7 +6231,16 @@ class EnhancedMediaHandler:
                     context.user_data.pop("awaiting_mp3_tags", None)
                     return
 
-                input_path = current_file.get("path")
+                # Writing tags requires the bytes: fetch the stored object when
+                # this session only carries its key, rather than concatenating a
+                # None into an output path.
+                input_path = self._local_copy(current_file) or await self._resolve_local_source(
+                    current_file, require_stored_key_only=True
+                )
+                if not input_path:
+                    await update.message.reply_text("❌ The media is not on this disk and has no stored copy to tag.")
+                    context.user_data.pop("awaiting_mp3_tags", None)
+                    return
                 output_path = input_path + ".tagged" + os.path.splitext(input_path)[1]
                 try:
                     ok = await self.converter.edit_metadata(input_path, output_path, tags)
@@ -6507,7 +6703,13 @@ class EnhancedMediaHandler:
                 await update.message.reply_text("❌ No video available in session to apply subtitles.")
                 return
 
-            video_path = current["path"]
+            # Burning or muxing needs the bytes: a session that only carries a
+            # stored key has no path, so read the object out of the bucket rather
+            # than handing ffmpeg a path that is not there.
+            video_path = await self._resolve_local_source(current, require_stored_key_only=True)
+            if not video_path:
+                await update.message.reply_text("❌ File not available on disk.")
+                return
             output_dir = getattr(config, "OUTPUT_PATH", "storage/output") if config else "storage/output"
             with contextlib.suppress(OSError):
                 os.makedirs(output_dir, exist_ok=True)
@@ -6720,16 +6922,12 @@ class EnhancedMediaHandler:
 
         # Lazy-download: a media-cache repeat has no local copy yet, and the
         # trim used to dead-end on those with "No file available to trim".
-        if not current_file.get("path") or not os.path.exists(current_file.get("path") or ""):
-            try:
-                await self._ensure_current_file_downloaded(update, context, session)
-                current_file = session.get("current_file") or current_file
-            except Exception as exc:
-                await notify(f"❌ Failed to download file: {exc}")
-                return
+        current_file, _ = await self._ensure_local_media(update, context, session, current_file, notify=notify)
+        if current_file is None:
+            return
 
         is_audio = current_file.get("type") == "audio"
-        ext = os.path.splitext(current_file.get("name") or current_file.get("path") or "")[1].lower()
+        ext = os.path.splitext(current_file.get("name") or self._local_copy(current_file) or "")[1].lower()
         supported = self.converter.supported_formats.get("audio" if is_audio else "video") or ()
         if ext not in supported:
             ext = ".mp3" if is_audio else ".mp4"
@@ -6748,7 +6946,7 @@ class EnhancedMediaHandler:
             else f"{_stem}_trimmed{ext}"
         )
 
-        local_input = current_file.get("path") or current_file.get("_local_input_path")
+        local_input = self._local_copy(current_file)
         if not (local_input and os.path.exists(local_input)):
             # ── No local copy: serve the repeat from the object it already lives
             #    in. ``input_key`` is the S3/MinIO object the first run streamed
@@ -6866,15 +7064,11 @@ class EnhancedMediaHandler:
 
         await self.safe_edit(query, "📈 Applying fade effect...", reply_markup=MediaMenuBuilder.get_back_button())
 
-        if not current_file.get("path") or not os.path.exists(current_file.get("path") or ""):
-            try:
-                await self._ensure_current_file_downloaded(update, context, session)
-                current_file = session.get("current_file") or current_file
-            except Exception as e:
-                await self.safe_edit(query, f"❌ Failed to download file: {e}")
-                return
+        current_file, _ = await self._ensure_local_media(update, context, session, current_file, query=query)
+        if current_file is None:
+            return
 
-        input_path = current_file.get("path") or current_file.get("_local_input_path")
+        input_path = self._local_copy(current_file)
         if not (input_path and os.path.exists(input_path)):
             # ── No local copy: apply the fade from the stored object. The worker
             #    probes the duration for a fade-out from the source it resolves,
@@ -7235,18 +7429,47 @@ class EnhancedMediaHandler:
                     await self.safe_edit(
                         query, "\u2699\ufe0f Custom optimization: compressing with CRF 23, preset medium, faststart..."
                     )
-                    if not current_file.get("path") or not os.path.exists(current_file.get("path") or ""):
-                        try:
-                            await self._ensure_current_file_downloaded(update, context, session)
-                            current_file = session.get("current_file")
-                        except Exception as e:
-                            await self.safe_edit(query, f"\u274c Failed to download file: {e}")
-                            return
-                    input_path = current_file["path"]
-                    ext = os.path.splitext(input_path)[1] or ".mp4"
+                    current_file, _ = await self._ensure_local_media(
+                        update, context, session, current_file, query=query
+                    )
+                    if current_file is None:
+                        return
                     output_dir = getattr(config, "OUTPUT_PATH", "storage/output") if config else "storage/output"
                     with contextlib.suppress(OSError):
                         os.makedirs(output_dir, exist_ok=True)
+                    input_path = self._local_copy(current_file)
+                    if input_path is None:
+                        # No local copy: the media is a stored object, so the worker
+                        # reads it there - the route the preset optimizer takes
+                        # (``_enqueue_keyed_job``) - instead of optimising from None.
+                        queued = await self._enqueue_keyed_job(
+                            update,
+                            context,
+                            current_file,
+                            output_path=os.path.join(output_dir, f"{current_file.get('id', 'unknown')}_optimized.mp4"),
+                            ffmpeg_args=[
+                                "-c:v",
+                                "libx264",
+                                "-preset",
+                                "medium",
+                                "-crf",
+                                "23",
+                                "-movflags",
+                                "+faststart",
+                                "-c:a",
+                                "aac",
+                            ],
+                            output_ext=".mp4",
+                            job_type="optimize_video",
+                            caption=_metadata_caption(current_file),
+                            query=query,
+                        )
+                        if not queued:
+                            await self.safe_edit(
+                                query, "❌ The media has no local copy and no stored object to optimise."
+                            )
+                        return
+                    ext = os.path.splitext(input_path)[1] or ".mp4"
                     output_path = os.path.join(output_dir, f"{current_file.get('id', 'unknown')}_optimized{ext}")
                     success = await self.converter.optimize_video(input_path, output_path, preset="medium", crf=23)
                     if success and os.path.exists(output_path):
@@ -8286,7 +8509,7 @@ class EnhancedMediaHandler:
                                     _bulk_name = _renamed
                             job = {
                                 "job_id": job_id,
-                                "input_path": f.get("path"),
+                                "input_path": self._local_copy(f),
                                 "input_key": f.get("input_key"),
                                 "output_path": out_path,
                                 "original_filename": _bulk_name,
@@ -9228,28 +9451,23 @@ class EnhancedMediaHandler:
         current_file["_pipeline_caption"] = _metadata_caption(current_file)
         session["current_file"] = current_file
 
-        # Ensure file is available locally (lazy-download)
-        if not current_file.get("path") or not os.path.exists(current_file.get("path") or ""):
-            try:
-                await self._ensure_current_file_downloaded(update, context, session)
-                current_file = session.get("current_file")
-                # If the pipeline queued a job (big file), watch it and return.
-                if current_file and current_file.get("_pipeline_job_id"):
-                    _pipeline_job_id = current_file["_pipeline_job_id"]
-                    kb = InlineKeyboardMarkup(
-                        [[InlineKeyboardButton("❌ Cancel", callback_data=f"cancel_job:{_pipeline_job_id}")]]
-                    )
-                    await self.safe_edit(
-                        query,
-                        f"✅ Large file queued (Job: {_pipeline_job_id[:8]}...). I'll send the video when ready.",
-                        reply_markup=kb,
-                    )
-                    with contextlib.suppress(RuntimeError):
-                        asyncio.create_task(self._watch_job_progress(query, _pipeline_job_id, bot=context.bot))
-                    return
-            except Exception as e:
-                await self.safe_edit(query, f"❌ Failed to download file: {e}")
-                return
+        current_file, _ = await self._ensure_local_media(update, context, session, current_file, query=query)
+        if current_file is None:
+            return
+        # If the pipeline queued a job (big file), watch it and return.
+        if current_file.get("_pipeline_job_id"):
+            _pipeline_job_id = current_file["_pipeline_job_id"]
+            kb = InlineKeyboardMarkup(
+                [[InlineKeyboardButton("❌ Cancel", callback_data=f"cancel_job:{_pipeline_job_id}")]]
+            )
+            await self.safe_edit(
+                query,
+                f"✅ Large file queued (Job: {_pipeline_job_id[:8]}...). I'll send the video when ready.",
+                reply_markup=kb,
+            )
+            with contextlib.suppress(RuntimeError):
+                asyncio.create_task(self._watch_job_progress(query, _pipeline_job_id, bot=context.bot))
+            return
 
         # Enqueue the job so a worker handles the encoding, progress and delivery
         output_dir = getattr(config, "OUTPUT_PATH", "storage/output") if config else "storage/output"
@@ -9259,7 +9477,7 @@ class EnhancedMediaHandler:
         job_id = str(uuid.uuid4())
         job = {
             "job_id": job_id,
-            "input_path": current_file["path"] or current_file.get("_local_input_path"),
+            "input_path": self._local_copy(current_file),
             "input_key": current_file.get("input_key"),
             "output_path": output_path,
             # Keeps the delivered filename derived from the original name.
@@ -9326,7 +9544,7 @@ class EnhancedMediaHandler:
         job_id = str(uuid.uuid4())
         job = {
             "job_id": job_id,
-            "input_path": current_file.get("path") or current_file.get("_local_input_path"),
+            "input_path": self._local_copy(current_file),
             "input_key": input_key,
             "output_path": output_path,
             "original_filename": current_file.get("name") or os.path.basename(output_path),
@@ -9415,9 +9633,9 @@ class EnhancedMediaHandler:
         own copy of the media, still pointed at by ``current_file`` for every
         other action, and a worker must not delete them out from under it.
         """
-        path = current_file.get("path") or current_file.get("_local_input_path")
+        path = self._local_copy(current_file)
         input_key = current_file.get("input_key")
-        if not (path and os.path.exists(path)) and not input_key:
+        if not path and not input_key:
             return False
         forward = current_file.get("forward") or {}
         source_chat = current_file.get("chat_id") or forward.get("chat_id")
@@ -9580,7 +9798,7 @@ class EnhancedMediaHandler:
 
             if AsyncFileLock:
                 # Defensive: ensure we have a concrete file path before attempting locks
-                path = current_file.get("path") or current_file.get("_local_input_path")
+                path = self._local_copy(current_file)
                 if not path:
                     await notify("❌ Local file missing. Try re-downloading or use the web uploader.")
                     return
@@ -9599,7 +9817,7 @@ class EnhancedMediaHandler:
             else:
                 # Fallback without locking
                 success = await self.converter.extract_audio_from_video(
-                    current_file.get("path") or current_file.get("_local_input_path"),
+                    self._local_copy(current_file),
                     output_path,
                     "mp3",
                     audio_bitrate,
@@ -9620,30 +9838,27 @@ class EnhancedMediaHandler:
         current_file["_pipeline_caption"] = caption
         session["current_file"] = current_file
 
-        # Ensure file downloaded before conversion (lazy-download)
-        if not current_file.get("path") or not os.path.exists(current_file.get("path") or ""):
-            try:
-                _pipeline_notice = await self._ensure_current_file_downloaded(update, context, session)
-                current_file = session.get("current_file")
-                # The pipeline queued the conversion itself: it owns the fetch,
-                # the encode and the delivery, so queueing a second job for the
-                # same file here would convert and send it twice.
-                if current_file and current_file.get("_pipeline_job_id"):
-                    _pipeline_job_id = current_file["_pipeline_job_id"]
-                    await self._watch_pipeline_job(
-                        update,
-                        context,
-                        _pipeline_job_id,
-                        f"✅ Large file queued (Job: {_pipeline_job_id[:8]}...). I'll send the MP3 when ready.",
-                        query=query,
-                        message=message,
-                        notice=_pipeline_notice,
-                        superseded=_ack,
-                    )
-                    return
-            except Exception as e:
-                await notify(f"❌ Failed to download file: {e}")
-                return
+        current_file, _pipeline_notice = await self._ensure_local_media(
+            update, context, session, current_file, notify=notify
+        )
+        if current_file is None:
+            return
+        # The pipeline queued the conversion itself: it owns the fetch,
+        # the encode and the delivery, so queueing a second job for the
+        # same file here would convert and send it twice.
+        if current_file.get("_pipeline_job_id"):
+            _pipeline_job_id = current_file["_pipeline_job_id"]
+            await self._watch_pipeline_job(
+                update,
+                context,
+                _pipeline_job_id,
+                f"✅ Large file queued (Job: {_pipeline_job_id[:8]}...). I'll send the MP3 when ready.",
+                query=query,
+                message=message,
+                notice=_pipeline_notice,
+                superseded=_ack,
+            )
+            return
 
         # ── Cancel any stale pipeline job so user's specific settings take effect ──
         if current_file and current_file.get("_pipeline_job_id"):
@@ -9652,7 +9867,7 @@ class EnhancedMediaHandler:
         # ── No local copy: the source is already in object storage (a repeat
         #    answered from the media cache). Queue the worker with the key so it
         #    reads the stored object instead of a None path. ──
-        local_input = current_file.get("path") or current_file.get("_local_input_path")
+        local_input = self._local_copy(current_file)
         if not (local_input and os.path.exists(local_input)):
             queued = await self._enqueue_keyed_job(
                 update,
@@ -9747,7 +9962,7 @@ class EnhancedMediaHandler:
                 "1080_to_720": ("1280", "720"),
             }
 
-            _local = current_file.get("path") or current_file.get("_local_input_path")
+            _local = self._local_copy(current_file)
             if crf in resolution_map:
                 width, height = resolution_map[crf]
                 success = await self.converter.change_resolution(_local, output_path, int(width), int(height))
@@ -9800,27 +10015,22 @@ class EnhancedMediaHandler:
         current_file["_pipeline_caption"] = _metadata_caption(current_file)
         session["current_file"] = current_file
 
-        # Ensure file downloaded before compression (lazy-download)
-        if not current_file.get("path") or not os.path.exists(current_file.get("path") or ""):
-            try:
-                await self._ensure_current_file_downloaded(update, context, session)
-                current_file = session.get("current_file")
-                if current_file and current_file.get("_pipeline_job_id"):
-                    _pipeline_job_id = current_file["_pipeline_job_id"]
-                    kb = InlineKeyboardMarkup(
-                        [[InlineKeyboardButton("❌ Cancel", callback_data=f"cancel_job:{_pipeline_job_id}")]]
-                    )
-                    await notify(
-                        f"✅ Large file queued (Job: {_pipeline_job_id[:8]}...). I'll send the compressed video when ready.",
-                        reply_markup=kb,
-                    )
-                    if query is not None:
-                        with contextlib.suppress(RuntimeError):
-                            asyncio.create_task(self._watch_job_progress(query, _pipeline_job_id, bot=context.bot))
-                    return
-            except Exception as e:
-                await notify(f"❌ Failed to download file: {e}")
-                return
+        current_file, _ = await self._ensure_local_media(update, context, session, current_file, notify=notify)
+        if current_file is None:
+            return
+        if current_file.get("_pipeline_job_id"):
+            _pipeline_job_id = current_file["_pipeline_job_id"]
+            kb = InlineKeyboardMarkup(
+                [[InlineKeyboardButton("❌ Cancel", callback_data=f"cancel_job:{_pipeline_job_id}")]]
+            )
+            await notify(
+                f"✅ Large file queued (Job: {_pipeline_job_id[:8]}...). I'll send the compressed video when ready.",
+                reply_markup=kb,
+            )
+            if query is not None:
+                with contextlib.suppress(RuntimeError):
+                    asyncio.create_task(self._watch_job_progress(query, _pipeline_job_id, bot=context.bot))
+            return
 
         # ── Cancel any stale pipeline job so user's specific settings take effect ──
         if current_file and current_file.get("_pipeline_job_id"):
@@ -9828,7 +10038,7 @@ class EnhancedMediaHandler:
 
         # ── No local copy: the source is already in object storage (a repeat
         #    answered from the media cache). Queue the worker with the key. ──
-        local_input = current_file.get("path") or current_file.get("_local_input_path")
+        local_input = self._local_copy(current_file)
         if not (local_input and os.path.exists(local_input)):
             queued = await self._enqueue_keyed_job(
                 update,
@@ -9961,20 +10171,36 @@ class EnhancedMediaHandler:
 
         await self.safe_edit(query, "🔉 Removing audio...")
 
-        # Ensure file downloaded (lazy-download)
-        if not current_file.get("path") or not os.path.exists(current_file.get("path") or ""):
-            try:
-                await self._ensure_current_file_downloaded(update, context, session)
-                current_file = session.get("current_file")
-            except Exception as e:
-                await self.safe_edit(query, f"❌ Failed to download file: {e}")
-                return
+        current_file, _ = await self._ensure_local_media(update, context, session, current_file, query=query)
+        if current_file is None:
+            return
 
         output_dir = getattr(config, "OUTPUT_PATH", "storage/output") if config else "storage/output"
         with contextlib.suppress(OSError):
             os.makedirs(output_dir, exist_ok=True)
         output_path = os.path.join(output_dir, f"{current_file['id']}_no_audio.mp4")
-        success = await self.converter.remove_audio(current_file["path"], output_path)
+
+        # No local copy: the source is a stored object, so the worker reads it
+        # there - the route the compressor and the repair already take. There is
+        # no path to hand ffmpeg, and no download to make one.
+        input_path = self._local_copy(current_file)
+        if input_path is None:
+            queued = await self._enqueue_keyed_job(
+                update,
+                context,
+                current_file,
+                output_path=output_path,
+                ffmpeg_args=["-an", "-c:v", "copy"],
+                output_ext=".mp4",
+                job_type="remove_audio",
+                caption=_metadata_caption(current_file),
+                query=query,
+            )
+            if not queued:
+                await self.safe_edit(query, "❌ The media has no local copy and no stored object to work from.")
+            return
+
+        success = await self.converter.remove_audio(input_path, output_path)
 
         if success and os.path.exists(output_path):
             await self._send_video_result(
@@ -10037,20 +10263,35 @@ class EnhancedMediaHandler:
         width, height = res_map[resolution]
         await self.safe_edit(query, f"📐 Changing resolution to {width}x{height}...")
 
-        # Ensure file downloaded (lazy-download)
-        if not current_file.get("path") or not os.path.exists(current_file.get("path") or ""):
-            try:
-                await self._ensure_current_file_downloaded(update, context, session)
-                current_file = session.get("current_file")
-            except Exception as e:
-                await self.safe_edit(query, f"❌ Failed to download file: {e}")
-                return
+        current_file, _ = await self._ensure_local_media(update, context, session, current_file, query=query)
+        if current_file is None:
+            return
 
         output_dir = getattr(config, "OUTPUT_PATH", "storage/output") if config else "storage/output"
         with contextlib.suppress(OSError):
             os.makedirs(output_dir, exist_ok=True)
         output_path = os.path.join(output_dir, f"{current_file['id']}_{width}x{height}.mp4")
-        success = await self.converter.change_resolution(current_file["path"], output_path, width, height)
+
+        # No local copy: the stored object is the source, so the worker scales it
+        # there instead of ffmpeg being handed a path this session does not have.
+        input_path = self._local_copy(current_file)
+        if input_path is None:
+            queued = await self._enqueue_keyed_job(
+                update,
+                context,
+                current_file,
+                output_path=output_path,
+                ffmpeg_args=["-filter:v", f"scale={width}:{height}", "-c:a", "copy"],
+                output_ext=".mp4",
+                job_type="change_resolution",
+                caption=_metadata_caption(current_file),
+                query=query,
+            )
+            if not queued:
+                await self.safe_edit(query, "❌ The media has no local copy and no stored object to work from.")
+            return
+
+        success = await self.converter.change_resolution(input_path, output_path, width, height)
 
         if success and os.path.exists(output_path):
             await self._send_video_result(
@@ -10131,28 +10372,23 @@ class EnhancedMediaHandler:
 
         await self.safe_edit(query, f"⚡ Optimizing for {preset}...")
 
-        # Ensure file downloaded (lazy-download)
-        if not current_file.get("path") or not os.path.exists(current_file.get("path") or ""):
-            try:
-                await self._ensure_current_file_downloaded(update, context, session)
-                current_file = session.get("current_file")
-                # If pipeline queued a job (big file), watch it and return.
-                if current_file and current_file.get("_pipeline_job_id"):
-                    _pipeline_job_id = current_file["_pipeline_job_id"]
-                    kb = InlineKeyboardMarkup(
-                        [[InlineKeyboardButton("❌ Cancel", callback_data=f"cancel_job:{_pipeline_job_id}")]]
-                    )
-                    await self.safe_edit(
-                        query,
-                        f"✅ Large file queued (Job: {_pipeline_job_id[:8]}...). I'll send the result when ready.",
-                        reply_markup=kb,
-                    )
-                    with contextlib.suppress(RuntimeError):
-                        asyncio.create_task(self._watch_job_progress(query, _pipeline_job_id, bot=context.bot))
-                    return
-            except Exception as e:
-                await self.safe_edit(query, f"❌ Failed to download file: {e}")
-                return
+        current_file, _ = await self._ensure_local_media(update, context, session, current_file, query=query)
+        if current_file is None:
+            return
+        # If pipeline queued a job (big file), watch it and return.
+        if current_file.get("_pipeline_job_id"):
+            _pipeline_job_id = current_file["_pipeline_job_id"]
+            kb = InlineKeyboardMarkup(
+                [[InlineKeyboardButton("❌ Cancel", callback_data=f"cancel_job:{_pipeline_job_id}")]]
+            )
+            await self.safe_edit(
+                query,
+                f"✅ Large file queued (Job: {_pipeline_job_id[:8]}...). I'll send the result when ready.",
+                reply_markup=kb,
+            )
+            with contextlib.suppress(RuntimeError):
+                asyncio.create_task(self._watch_job_progress(query, _pipeline_job_id, bot=context.bot))
+            return
 
         # ── Cancel any stale pipeline job so user's specific settings take effect ──
         # (Only reached for small files downloaded via Bot API)
@@ -10185,7 +10421,7 @@ class EnhancedMediaHandler:
             job_id = str(uuid.uuid4())
             job = {
                 "job_id": job_id,
-                "input_path": current_file["path"] or current_file.get("_local_input_path"),
+                "input_path": self._local_copy(current_file),
                 "input_key": current_file.get("input_key"),
                 "output_path": output_path,
                 # Keeps the delivered filename derived from the original name.
@@ -10221,8 +10457,15 @@ class EnhancedMediaHandler:
                 await self.safe_edit(query, f"✅ Optimization job queued (ID: {job_id}).")
             return
 
-        # Fallback: inline execution if no job queue available
-        success, _ = await self.converter.execute_ffmpeg(cmd, current_file["path"], output_path)
+        # Fallback: inline execution if no job queue available. There is no
+        # worker to read the stored object for this one, so the only source left
+        # is a local file - the session's own copy, or the stored object the
+        # shared resolver fetches (never ``current_file["path"]``, which is a
+        # KeyError or a None that only fails inside ffmpeg).
+        input_path = self._local_copy(current_file) or await self._resolve_local_source(
+            current_file, require_stored_key_only=True
+        )
+        success, _ = await self.converter.execute_ffmpeg(cmd, input_path, output_path)
 
         if success and os.path.exists(output_path):
             await self._send_video_result(
@@ -10260,28 +10503,23 @@ class EnhancedMediaHandler:
         session["current_file"] = current_file
 
         await self.safe_edit(query, "🔧 Attempting to repair video...")
-        # Ensure file downloaded (lazy-download)
-        if not current_file.get("path") or not os.path.exists(current_file.get("path") or ""):
-            try:
-                await self._ensure_current_file_downloaded(update, context, session)
-                current_file = session.get("current_file")
-                # If pipeline queued a job (big file), watch it and return.
-                if current_file and current_file.get("_pipeline_job_id"):
-                    _pipeline_job_id = current_file["_pipeline_job_id"]
-                    kb = InlineKeyboardMarkup(
-                        [[InlineKeyboardButton("❌ Cancel", callback_data=f"cancel_job:{_pipeline_job_id}")]]
-                    )
-                    await self.safe_edit(
-                        query,
-                        f"✅ Large file queued (Job: {_pipeline_job_id[:8]}...). I'll send the result when ready.",
-                        reply_markup=kb,
-                    )
-                    with contextlib.suppress(RuntimeError):
-                        asyncio.create_task(self._watch_job_progress(query, _pipeline_job_id, bot=context.bot))
-                    return
-            except Exception as e:
-                await self.safe_edit(query, f"❌ Failed to download file: {e}")
-                return
+        current_file, _ = await self._ensure_local_media(update, context, session, current_file, query=query)
+        if current_file is None:
+            return
+        # If pipeline queued a job (big file), watch it and return.
+        if current_file.get("_pipeline_job_id"):
+            _pipeline_job_id = current_file["_pipeline_job_id"]
+            kb = InlineKeyboardMarkup(
+                [[InlineKeyboardButton("❌ Cancel", callback_data=f"cancel_job:{_pipeline_job_id}")]]
+            )
+            await self.safe_edit(
+                query,
+                f"✅ Large file queued (Job: {_pipeline_job_id[:8]}...). I'll send the result when ready.",
+                reply_markup=kb,
+            )
+            with contextlib.suppress(RuntimeError):
+                asyncio.create_task(self._watch_job_progress(query, _pipeline_job_id, bot=context.bot))
+            return
 
         # ── Cancel any stale pipeline job so user's specific settings take effect ──
         # (Only reached for small files downloaded via Bot API)
@@ -10296,7 +10534,7 @@ class EnhancedMediaHandler:
         output_path = os.path.join(output_dir, f"{current_file['id']}_repaired.mp4")
         job = {
             "job_id": job_id,
-            "input_path": current_file["path"] or current_file.get("_local_input_path"),
+            "input_path": self._local_copy(current_file),
             "input_key": current_file.get("input_key"),
             "output_path": output_path,
             # Keeps the delivered filename derived from the original name.
@@ -10348,17 +10586,15 @@ class EnhancedMediaHandler:
         if not await self._check_conversion_quota(update, context):
             return
 
-        # Ensure file downloaded (lazy-download)
-        if not current_file.get("path") or not os.path.exists(current_file.get("path") or ""):
-            try:
-                await self._ensure_current_file_downloaded(update, context, session)
-                current_file = session.get("current_file")
-            except Exception as e:
-                await self.safe_edit(query, f"❌ Failed to download file: {e}")
-                return
+        current_file, _ = await self._ensure_local_media(update, context, session, current_file, query=query)
+        if current_file is None:
+            return
 
-        input_path = current_file.get("path")
-        if not input_path or not os.path.exists(input_path):
+        # A session that only carries a stored object has no local copy: read the
+        # object out of the bucket - one read, no Telegram - rather than refusing
+        # a media this deployment already holds (see _resolve_local_source).
+        input_path = await self._resolve_local_source(current_file, require_stored_key_only=True)
+        if not input_path:
             await self.safe_edit(query, "❌ File not available on disk.")
             return
 
@@ -10438,17 +10674,20 @@ class EnhancedMediaHandler:
             logger.info("ffmpeg-python not available for take_screenshot; falling back to CLI where possible")
             return
 
-        # Ensure file downloaded (lazy-download)
-        if not current_file.get("path") or not os.path.exists(current_file.get("path") or ""):
-            try:
-                await self._ensure_current_file_downloaded(update, context, session)
-                current_file = session.get("current_file")
-            except Exception as e:
-                await self.safe_edit(query, f"❌ Failed to download file: {e}")
-                return
+        current_file, _ = await self._ensure_local_media(update, context, session, current_file, query=query)
+        if current_file is None:
+            return
+
+        # The same rule as the single-shot screenshot: the frame has to be read
+        # from a real file, and a stored object is fetched here when the session
+        # has no local copy of it.
+        input_path = await self._resolve_local_source(current_file, require_stored_key_only=True)
+        if not input_path:
+            await self.safe_edit(query, "❌ File not available on disk.")
+            return
 
         try:
-            probe = ffmpeg_mod.probe(current_file["path"])
+            probe = ffmpeg_mod.probe(input_path)
             duration = float(probe["format"]["duration"])
         except Exception as e:
             logger.warning(f"ffmpeg.probe failed: {e}")
@@ -10502,7 +10741,7 @@ class EnhancedMediaHandler:
         with contextlib.suppress(OSError):
             os.makedirs(output_dir, exist_ok=True)
         output_path = os.path.join(output_dir, f"{current_file.get('id', 'unknown')}_screenshot.jpg")
-        success = await self.converter.take_screenshot_at_time(current_file["path"], output_path, time_str)
+        success = await self.converter.take_screenshot_at_time(input_path, output_path, time_str)
 
         if success and os.path.exists(output_path):
             with open(output_path, "rb") as photo_file:
@@ -10526,22 +10765,22 @@ class EnhancedMediaHandler:
             await self.safe_edit(query, "❌ No video file found.")
             return
 
-        # Ensure file downloaded (lazy-download)
-        if not current_file.get("path") or not os.path.exists(current_file.get("path") or ""):
-            try:
-                await self._ensure_current_file_downloaded(update, context, session)
-                current_file = session.get("current_file")
-            except Exception as e:
-                await self.safe_edit(query, f"❌ Failed to download file: {e}")
-                return
+        current_file, _ = await self._ensure_local_media(update, context, session, current_file, query=query)
+        if current_file is None:
+            return
 
         await self.safe_edit(query, "🖼️ Creating thumbnail grid...")
+
+        input_path = await self._resolve_local_source(current_file, require_stored_key_only=True)
+        if not input_path:
+            await self.safe_edit(query, "❌ File not available on disk.")
+            return
 
         output_dir = getattr(config, "OUTPUT_PATH", "storage/output") if config else "storage/output"
         with contextlib.suppress(OSError):
             os.makedirs(output_dir, exist_ok=True)
         output_path = os.path.join(output_dir, f"{current_file['id']}_grid.jpg")
-        success = await self.converter.extract_thumbnail_grid(current_file["path"], output_path, 3, 3)
+        success = await self.converter.extract_thumbnail_grid(input_path, output_path, 3, 3)
 
         if success and os.path.exists(output_path):
             with open(output_path, "rb") as photo_file:
@@ -10576,28 +10815,23 @@ class EnhancedMediaHandler:
         current_file["_pipeline_caption"] = _metadata_caption(current_file)
         session["current_file"] = current_file
 
-        # Ensure file downloaded (lazy-download)
-        if not current_file.get("path") or not os.path.exists(current_file.get("path") or ""):
-            try:
-                await self._ensure_current_file_downloaded(update, context, session)
-                current_file = session.get("current_file")
-                # If pipeline queued a job (big file), watch it and return.
-                if current_file and current_file.get("_pipeline_job_id"):
-                    _pipeline_job_id = current_file["_pipeline_job_id"]
-                    kb = InlineKeyboardMarkup(
-                        [[InlineKeyboardButton("❌ Cancel", callback_data=f"cancel_job:{_pipeline_job_id}")]]
-                    )
-                    await self.safe_edit(
-                        query,
-                        f"✅ Large file queued (Job: {_pipeline_job_id[:8]}...). I'll send the result when ready.",
-                        reply_markup=kb,
-                    )
-                    with contextlib.suppress(RuntimeError):
-                        asyncio.create_task(self._watch_job_progress(query, _pipeline_job_id, bot=context.bot))
-                    return
-            except Exception as e:
-                await self.safe_edit(query, f"❌ Failed to download file: {e}")
-                return
+        current_file, _ = await self._ensure_local_media(update, context, session, current_file, query=query)
+        if current_file is None:
+            return
+        # If pipeline queued a job (big file), watch it and return.
+        if current_file.get("_pipeline_job_id"):
+            _pipeline_job_id = current_file["_pipeline_job_id"]
+            kb = InlineKeyboardMarkup(
+                [[InlineKeyboardButton("❌ Cancel", callback_data=f"cancel_job:{_pipeline_job_id}")]]
+            )
+            await self.safe_edit(
+                query,
+                f"✅ Large file queued (Job: {_pipeline_job_id[:8]}...). I'll send the result when ready.",
+                reply_markup=kb,
+            )
+            with contextlib.suppress(RuntimeError):
+                asyncio.create_task(self._watch_job_progress(query, _pipeline_job_id, bot=context.bot))
+            return
 
         # ── Cancel any stale pipeline job so user's specific settings take effect ──
         # (Only reached for small files downloaded via Bot API)
@@ -10620,7 +10854,7 @@ class EnhancedMediaHandler:
         job = {
             "job_id": job_id,
             "type": "extract_streams",
-            "input_path": current_file["path"] or current_file.get("_local_input_path"),
+            "input_path": self._local_copy(current_file),
             "input_key": current_file.get("input_key"),
             "output_dir": out_dir,
             "archive_path": archive_path,
@@ -10711,35 +10945,30 @@ class EnhancedMediaHandler:
                 await self.safe_edit(query, _already_at_bitrate_text(_DEFAULT_AUDIO_BITRATE))
                 return
 
-        # Ensure file downloaded (lazy-download)
-        if not current_file.get("path") or not os.path.exists(current_file.get("path") or ""):
-            try:
-                await self._ensure_current_file_downloaded(update, context, session)
-                current_file = session.get("current_file")
-                # If pipeline queued a job (big file), watch it and return.
-                if current_file and current_file.get("_pipeline_job_id"):
-                    _pipeline_job_id = current_file["_pipeline_job_id"]
-                    kb = InlineKeyboardMarkup(
-                        [[InlineKeyboardButton("❌ Cancel", callback_data=f"cancel_job:{_pipeline_job_id}")]]
-                    )
-                    await self.safe_edit(
-                        query,
-                        f"✅ Large file queued (Job: {_pipeline_job_id[:8]}...). I'll send the result when ready.",
-                        reply_markup=kb,
-                    )
-                    with contextlib.suppress(RuntimeError):
-                        asyncio.create_task(self._watch_job_progress(query, _pipeline_job_id, bot=context.bot))
-                    return
-            except Exception as e:
-                await self.safe_edit(query, f"❌ Failed to download file: {e}")
-                return
+        current_file, _ = await self._ensure_local_media(update, context, session, current_file, query=query)
+        if current_file is None:
+            return
+        # If pipeline queued a job (big file), watch it and return.
+        if current_file.get("_pipeline_job_id"):
+            _pipeline_job_id = current_file["_pipeline_job_id"]
+            kb = InlineKeyboardMarkup(
+                [[InlineKeyboardButton("❌ Cancel", callback_data=f"cancel_job:{_pipeline_job_id}")]]
+            )
+            await self.safe_edit(
+                query,
+                f"✅ Large file queued (Job: {_pipeline_job_id[:8]}...). I'll send the result when ready.",
+                reply_markup=kb,
+            )
+            with contextlib.suppress(RuntimeError):
+                asyncio.create_task(self._watch_job_progress(query, _pipeline_job_id, bot=context.bot))
+            return
 
         # ── Cancel any stale pipeline job so user's specific settings take effect ──
         # (Only reached for small files downloaded via Bot API)
         if current_file and current_file.get("_pipeline_job_id"):
             await self._cancel_stale_pipeline_job(session, "convert_audio_format", update.effective_user.id)
 
-        local_input = current_file["path"] or current_file.get("_local_input_path")
+        local_input = self._local_copy(current_file)
         output_base = getattr(config, "OUTPUT_PATH", "storage/output") if config else "storage/output"
         with contextlib.suppress(OSError):
             os.makedirs(output_base, exist_ok=True)
@@ -10959,32 +11188,29 @@ class EnhancedMediaHandler:
         current_file["_pipeline_conversion_type"] = "format_audio"
         session["current_file"] = current_file
 
-        # Ensure file downloaded (lazy-download)
-        if not current_file.get("path") or not os.path.exists(current_file.get("path") or ""):
-            try:
-                _pipeline_notice = await self._ensure_current_file_downloaded(update, context, session)
-                current_file = session.get("current_file")
-                # The pipeline queued the conversion itself: it owns the fetch,
-                # the encode and the delivery, so queueing a second job for the
-                # same file here would convert and send it twice.
-                if current_file and current_file.get("_pipeline_job_id"):
-                    _pipeline_job_id = current_file["_pipeline_job_id"]
-                    await self._watch_pipeline_job(
-                        update,
-                        context,
-                        _pipeline_job_id,
-                        f"✅ Large file queued (Job: {_pipeline_job_id[:8]}...). I'll send the MP3 when ready.",
-                        query=query,
-                        message=message,
-                        notice=_pipeline_notice,
-                        superseded=_ack,
-                    )
-                    return
-            except Exception as e:
-                await notify(f"❌ Failed to download file: {e}")
-                return
+        current_file, _pipeline_notice = await self._ensure_local_media(
+            update, context, session, current_file, notify=notify
+        )
+        if current_file is None:
+            return
+        # The pipeline queued the conversion itself: it owns the fetch,
+        # the encode and the delivery, so queueing a second job for the
+        # same file here would convert and send it twice.
+        if current_file.get("_pipeline_job_id"):
+            _pipeline_job_id = current_file["_pipeline_job_id"]
+            await self._watch_pipeline_job(
+                update,
+                context,
+                _pipeline_job_id,
+                f"✅ Large file queued (Job: {_pipeline_job_id[:8]}...). I'll send the MP3 when ready.",
+                query=query,
+                message=message,
+                notice=_pipeline_notice,
+                superseded=_ack,
+            )
+            return
 
-        local_input = current_file.get("path") or current_file.get("_local_input_path")
+        local_input = self._local_copy(current_file)
         delivery_name = _audio_delivery_name(current_file.get("name"), current_file.get("id"))
         if not (local_input and os.path.exists(local_input)):
             if not await self._enqueue_worker_job(
@@ -11099,16 +11325,11 @@ class EnhancedMediaHandler:
             audio_bitrate,
         ]
 
-        # Ensure file downloaded (lazy-download)
-        if not current_file.get("path") or not os.path.exists(current_file.get("path") or ""):
-            try:
-                await self._ensure_current_file_downloaded(update, context, session)
-                current_file = session.get("current_file")
-            except Exception as e:
-                await self.safe_edit(query, f"❌ Failed to download file: {e}")
-                return
+        current_file, _ = await self._ensure_local_media(update, context, session, current_file, query=query)
+        if current_file is None:
+            return
 
-        local_input = current_file.get("path") or current_file.get("_local_input_path")
+        local_input = self._local_copy(current_file)
         if not (local_input and os.path.exists(local_input)):
             if not await self._enqueue_keyed_job(
                 update,
@@ -11163,20 +11384,38 @@ class EnhancedMediaHandler:
 
         await self.safe_edit(query, "📝 Extracting subtitles...")
 
-        # Ensure file downloaded (lazy-download)
-        if not current_file.get("path") or not os.path.exists(current_file.get("path") or ""):
-            try:
-                await self._ensure_current_file_downloaded(update, context, session)
-                current_file = session.get("current_file")
-            except Exception as e:
-                await self.safe_edit(query, f"❌ Failed to download file: {e}")
-                return
+        current_file, _ = await self._ensure_local_media(update, context, session, current_file, query=query)
+        if current_file is None:
+            return
 
         output_base = getattr(config, "OUTPUT_PATH", "storage/output") if config else "storage/output"
         with contextlib.suppress(OSError):
             os.makedirs(output_base, exist_ok=True)
         output_path = os.path.join(output_base, f"{current_file['id']}_subtitles.srt")
-        success = await self.converter.extract_subtitles(current_file["path"], output_path)
+
+        # No local copy: the stored object is the source. The worker maps the
+        # subtitle stream out of it and delivers the .srt as a document, so
+        # nothing has to pull the media back onto this disk to read it.
+        input_path = self._local_copy(current_file)
+        if input_path is None:
+            queued = await self._enqueue_keyed_job(
+                update,
+                context,
+                current_file,
+                output_path=output_path,
+                ffmpeg_args=["-map", "0:s:0", "-c:s", "srt"],
+                output_ext=".srt",
+                job_type="extract_subtitles",
+                caption=_metadata_caption(current_file),
+                query=query,
+            )
+            if not queued:
+                await self.safe_edit(
+                    query, "❌ The media has no local copy and no stored object to read subtitles from."
+                )
+            return
+
+        success = await self.converter.extract_subtitles(input_path, output_path)
 
         if success and os.path.exists(output_path):
             # The media's own name with the subtitle extension: the old
@@ -11224,17 +11463,20 @@ class EnhancedMediaHandler:
             logger.warning("ffmpeg-python not available for media analysis")
             return
 
-        # Ensure file downloaded (lazy-download)
-        if not current_file.get("path") or not os.path.exists(current_file.get("path") or ""):
-            try:
-                await self._ensure_current_file_downloaded(update, context, session)
-                current_file = session.get("current_file")
-            except Exception as e:
-                await self.safe_edit(query, f"❌ Failed to download file: {e}")
-                return
+        current_file, _ = await self._ensure_local_media(update, context, session, current_file, query=query)
+        if current_file is None:
+            return
+
+        # Analysis reads the media itself, so it needs a real file: a stored
+        # object is fetched for it when the session has no local copy (see
+        # _resolve_local_source) instead of failing on a null path.
+        input_path = await self._resolve_local_source(current_file, require_stored_key_only=True)
+        if not input_path:
+            await self.safe_edit(query, "❌ File not available on disk.")
+            return
 
         try:
-            probe = ffmpeg_mod.probe(current_file["path"])
+            probe = ffmpeg_mod.probe(input_path)
 
             # Format information
             format_info = probe.get("format", {})
@@ -11742,20 +11984,39 @@ class EnhancedMediaHandler:
                     with contextlib.suppress(OSError):
                         os.makedirs(output_base, exist_ok=True)
                     output_path = os.path.join(output_base, f"{current_file['id']}_{width}x{height}.mp4")
-                    success = await self.converter.change_resolution(current_file["path"], output_path, width, height)
-
-                    if success and os.path.exists(output_path):
-                        await self._send_video_result(
-                            context.bot,
-                            update.effective_chat.id,
-                            output_path,
+                    input_path = self._local_copy(current_file)
+                    if input_path is None:
+                        # No local copy: the worker scales the stored object (see
+                        # change_resolution), which is also what the button does.
+                        if not await self._enqueue_keyed_job(
+                            update,
+                            context,
+                            current_file,
+                            output_path=output_path,
+                            ffmpeg_args=["-filter:v", f"scale={width}:{height}", "-c:a", "copy"],
+                            output_ext=".mp4",
+                            job_type="change_resolution",
                             caption=_metadata_caption(current_file),
-                            delivery_name=_video_delivery_name(current_file, output_path),
-                            upload_mode=_user_upload_mode(update.effective_user.id),
-                        )
-                        os.remove(output_path)
+                            notify=update.message.reply_text,
+                        ):
+                            await update.message.reply_text(
+                                "❌ The media has no local copy and no stored object to work from."
+                            )
                     else:
-                        await update.message.reply_text("❌ Failed to change resolution.")
+                        success = await self.converter.change_resolution(input_path, output_path, width, height)
+
+                        if success and os.path.exists(output_path):
+                            await self._send_video_result(
+                                context.bot,
+                                update.effective_chat.id,
+                                output_path,
+                                caption=_metadata_caption(current_file),
+                                delivery_name=_video_delivery_name(current_file, output_path),
+                                upload_mode=_user_upload_mode(update.effective_user.id),
+                            )
+                            os.remove(output_path)
+                        else:
+                            await update.message.reply_text("❌ Failed to change resolution.")
                 except Exception:
                     logger.exception("Invalid resolution input while parsing WIDTHxHEIGHT")
                     await update.message.reply_text("❌ Invalid format. Use WIDTHxHEIGHT.")
@@ -11945,7 +12206,11 @@ class EnhancedMediaHandler:
             with contextlib.suppress(OSError):
                 os.makedirs(output_base, exist_ok=True)
             output_path = os.path.join(output_base, f"{current_file['id']}_screenshot.jpg")
-            success = await self.converter.take_screenshot_at_time(current_file["path"], output_path, user_input)
+            input_path = await self._resolve_local_source(current_file, require_stored_key_only=True)
+            if not input_path:
+                await update.message.reply_text("❌ File not available on disk.")
+                return
+            success = await self.converter.take_screenshot_at_time(input_path, output_path, user_input)
 
             if success and os.path.exists(output_path):
                 with open(output_path, "rb") as photo_file:
@@ -11970,8 +12235,12 @@ class EnhancedMediaHandler:
                 with contextlib.suppress(OSError):
                     os.makedirs(output_base, exist_ok=True)
 
+                input_path = await self._resolve_local_source(current_file, require_stored_key_only=True)
+                if not input_path:
+                    await update.message.reply_text("❌ File not available on disk.")
+                    return
                 screenshots = await self.converter.take_screenshot_grid(
-                    current_file["path"],
+                    input_path,
                     os.path.join(output_base, f"{current_file['id']}_grid"),
                     count,
                 )
@@ -12011,20 +12280,46 @@ class EnhancedMediaHandler:
                 with contextlib.suppress(OSError):
                     os.makedirs(output_base, exist_ok=True)
                 output_path = os.path.join(output_base, f"{current_file['id']}_fr_{int(fps)}.mp4")
-                success = await self.converter.change_framerate(current_file["path"], output_path, fps)
-
-                if success and os.path.exists(output_path):
-                    await self._send_video_result(
-                        context.bot,
-                        update.effective_chat.id,
-                        output_path,
+                # The media may only be a stored object (a repeat, or an ingest
+                # that streamed straight to storage): make it available the one
+                # shared way before deciding between an inline encode and a job.
+                current_file, _ = await self._ensure_local_media(
+                    update, context, session, current_file, notify=update.message.reply_text
+                )
+                if current_file is None:
+                    return
+                input_path = self._local_copy(current_file)
+                if input_path is None:
+                    # No local copy: the worker re-encodes the stored object.
+                    if not await self._enqueue_keyed_job(
+                        update,
+                        context,
+                        current_file,
+                        output_path=output_path,
+                        ffmpeg_args=["-r", str(fps), "-c:v", "libx264", "-c:a", "copy"],
+                        output_ext=".mp4",
+                        job_type="change_framerate",
                         caption=_metadata_caption(current_file),
-                        delivery_name=_video_delivery_name(current_file, output_path),
-                        upload_mode=_user_upload_mode(update.effective_user.id),
-                    )
-                    os.remove(output_path)
+                        notify=update.message.reply_text,
+                    ):
+                        await update.message.reply_text(
+                            "❌ The media has no local copy and no stored object to work from."
+                        )
                 else:
-                    await update.message.reply_text("❌ Failed to change framerate.")
+                    success = await self.converter.change_framerate(input_path, output_path, fps)
+
+                    if success and os.path.exists(output_path):
+                        await self._send_video_result(
+                            context.bot,
+                            update.effective_chat.id,
+                            output_path,
+                            caption=_metadata_caption(current_file),
+                            delivery_name=_video_delivery_name(current_file, output_path),
+                            upload_mode=_user_upload_mode(update.effective_user.id),
+                        )
+                        os.remove(output_path)
+                    else:
+                        await update.message.reply_text("❌ Failed to change framerate.")
             except Exception:
                 await update.message.reply_text("❌ Invalid FPS value. Use a number like 24 or 29.97.")
                 for key in list(context.user_data.keys()):
@@ -12078,20 +12373,44 @@ class EnhancedMediaHandler:
                     "+faststart",
                 ]
 
-                success, _ = await self.converter.execute_ffmpeg(cmd, current_file["path"], output_path)
-
-                if success and os.path.exists(output_path):
-                    await self._send_video_result(
-                        context.bot,
-                        update.effective_chat.id,
-                        output_path,
+                current_file, _ = await self._ensure_local_media(
+                    update, context, session, current_file, notify=update.message.reply_text
+                )
+                if current_file is None:
+                    return
+                input_path = self._local_copy(current_file)
+                if input_path is None:
+                    # No local copy: the worker runs exactly this command against
+                    # the stored object (the same route the optimizer takes).
+                    if not await self._enqueue_keyed_job(
+                        update,
+                        context,
+                        current_file,
+                        output_path=output_path,
+                        ffmpeg_args=list(cmd),
+                        output_ext=".mp4",
+                        job_type="optimize_video",
                         caption=_metadata_caption(current_file),
-                        delivery_name=_video_delivery_name(current_file, output_path),
-                        upload_mode=_user_upload_mode(update.effective_user.id),
-                    )
-                    os.remove(output_path)
+                        notify=update.message.reply_text,
+                    ):
+                        await update.message.reply_text(
+                            "❌ The media has no local copy and no stored object to optimize."
+                        )
                 else:
-                    await update.message.reply_text("❌ Optimization failed.")
+                    success, _ = await self.converter.execute_ffmpeg(cmd, input_path, output_path)
+
+                    if success and os.path.exists(output_path):
+                        await self._send_video_result(
+                            context.bot,
+                            update.effective_chat.id,
+                            output_path,
+                            caption=_metadata_caption(current_file),
+                            delivery_name=_video_delivery_name(current_file, output_path),
+                            upload_mode=_user_upload_mode(update.effective_user.id),
+                        )
+                        os.remove(output_path)
+                    else:
+                        await update.message.reply_text("❌ Optimization failed.")
             except Exception:
                 logger.exception("Invalid custom optimize input; expected preset,crf,bitrate")
                 await update.message.reply_text("❌ Invalid format. Use: preset,crf,bitrate")
@@ -12108,7 +12427,14 @@ class EnhancedMediaHandler:
                     os.makedirs(output_base, exist_ok=True)
                 output_path = os.path.join(output_base, f"{current_file['id']}_with_metadata.mp4")
 
-                success = await self.converter.edit_metadata(current_file["path"], output_path, metadata)
+                # Editing tags needs the bytes: fetch the stored object when the
+                # session only carries its key, rather than handing ffmpeg a path
+                # that is not there.
+                input_path = await self._resolve_local_source(current_file, require_stored_key_only=True)
+                if not input_path:
+                    await update.message.reply_text("❌ File not available on disk.")
+                    return
+                success = await self.converter.edit_metadata(input_path, output_path, metadata)
 
                 if success and os.path.exists(output_path):
                     await self._send_video_result(

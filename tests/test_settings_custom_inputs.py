@@ -148,9 +148,11 @@ def _stub(converter, sent, *, trim: bool = False, fade: bool = False, replies=No
         names = ("_apply_fade", "_enqueue_keyed_job", "_enqueue_worker_job")
     else:
         names = ("adjust_bitrate", "compress_video", "_enqueue_keyed_job", "_enqueue_worker_job")
-    for name in names:
+    for name in (*names, "_ensure_local_media", "_local_copy"):
         # Bind the real implementation to the stub: a plain function assigned to
-        # an instance does not become a bound method.
+        # an instance does not become a bound method. ``_ensure_local_media`` is
+        # the guard the real methods call, and it in turn calls this stub's own
+        # ``_ensure_current_file_downloaded``.
         setattr(handler, name, MethodType(getattr(Handler, name), handler))
     return handler
 

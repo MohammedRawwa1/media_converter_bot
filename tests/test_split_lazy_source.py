@@ -19,6 +19,7 @@ from unittest.mock import patch
 import handlers as handlers_module
 from handlers import EnhancedMediaHandler
 from tasks import conversion_tasks
+from utils import media_cache
 
 Handler = EnhancedMediaHandler
 
@@ -66,10 +67,16 @@ class _FakeContext:
 
 
 class _FakeBackend:
-    """Stands in for the storage backend: downloads write the object to disk."""
+    """Stands in for the storage backend: downloads write the object to disk.
 
-    def __init__(self, payload=b"stored source"):
+    ``objects`` is what the bucket holds - key to stored byte size - and it is what
+    the HEAD answers (``exists``/``get_file_size``) read, so a media the bucket does
+    not have is a real miss rather than an unanswered probe.
+    """
+
+    def __init__(self, payload=b"stored source", objects=None):
         self.payload = payload
+        self.objects: dict[str, int] = dict(objects or {})
         self.downloads: list[str] = []
 
     async def download_file(self, key, dest):
@@ -77,6 +84,12 @@ class _FakeBackend:
         with open(dest, "wb") as fh:
             fh.write(self.payload)
         return True
+
+    async def exists(self, key):
+        return key in self.objects
+
+    async def get_file_size(self, key):
+        return self.objects.get(key)
 
 
 class _SplitHandler:
@@ -349,7 +362,11 @@ class SplitLazySourceTests(unittest.TestCase):
         self.output_patch = patch.object(
             handlers_module,
             "config",
-            SimpleNamespace(OUTPUT_PATH=self.tmp.name, TEMP_PATH=os.path.join(self.tmp.name, "temp")),
+            SimpleNamespace(
+                OUTPUT_PATH=self.tmp.name,
+                TEMP_PATH=os.path.join(self.tmp.name, "temp"),
+                get_storage_backend_name=lambda: "s3",
+            ),
         )
         self.output_patch.start()
 
@@ -366,7 +383,14 @@ class SplitLazySourceTests(unittest.TestCase):
     def _handler(self, downloaded_path):
         handler = _SplitHandler(downloaded_path)
         for name in (
+            # ``_split_local_source`` resolves through the shared helpers, so the
+            # stub needs the whole chain bound - a plain function set as an
+            # instance attribute does not become a bound method.
             "_split_local_source",
+            "_resolve_local_source",
+            "_local_copy",
+            "_adopt_stored_source",
+            "_download_stored_source",
             "_handle_split_request",
             "_check_conversion_quota",
             "_split_source_duration",
@@ -470,6 +494,128 @@ class SplitLazySourceTests(unittest.TestCase):
             [os.path.basename(part) for part in handler.delivered],
             ["Album.001.mp3", "Album.002.mp3"],
         )
+
+    def test_a_repeat_split_derives_the_stored_key_from_the_cache_descriptor(self):
+        """A split of a media that has no input_key yet, but does have a file_unique_id
+        and size, should reuse the stored object from the media-cache descriptor rather
+        than re-fetching from Telegram.
+
+        This is the path the split button hit when the session only carried the media
+        identity and size: the first upload had stored the object and written a descriptor,
+        but the split's current_file still had no input_key, so it tried get_file and hit
+        "File is too big" on a large audio.
+        """
+        backend = _FakeBackend()
+        current_file = {
+            "id": "abc123",
+            "name": "Album.mp3",
+            "path": None,
+            "file_unique_id": "AgADCSIAAtbSIVE",
+            "size": 1000,
+            "type": "audio",
+        }
+        handler = self._handler(None)
+
+        async def _get_backend():
+            return backend
+
+        async def _lookup(uid, *, expected_size=None):
+            assert uid == "AgADCSIAAtbSIVE"
+            return {
+                "input_key": "inputs/library/abc/source",
+                "size": 1000,
+                "storage": "s3",
+            }
+
+        async def _intact(backend, key, *, expected_size=None):
+            self.assertEqual(key, "inputs/library/abc/source")
+            return True
+
+        with (
+            patch("utils.storage.get_storage_backend", _get_backend),
+            patch("utils.media_cache.lookup", _lookup),
+            patch("utils.storage.stored_object_is_intact", _intact),
+        ):
+            self._run(handler, current_file)
+
+        self.assertEqual(backend.downloads, ["inputs/library/abc/source"])
+        self.assertEqual(handler.fetches, 0, "the stored object was reused; Telegram must not be asked")
+        self.assertEqual(
+            [os.path.basename(part) for part in handler.delivered],
+            ["Album.001.mp3", "Album.002.mp3"],
+        )
+
+    def test_a_repeat_split_reads_the_object_behind_a_header_only_descriptor(self):
+        """A ``header``-mode descriptor keeps a probe header, not the media - but the
+        media itself sits beside it under the library key every producer derives from
+        the identity. That object is what the split needs, and it used to miss it and
+        go back to Telegram for a file the bucket already held.
+        """
+        library_key = media_cache.media_library_key("AgADCSIAAtbSIVE")
+        backend = _FakeBackend(objects={library_key: 1000})
+        current_file = {
+            "id": "abc123",
+            "name": "Album.mp3",
+            "path": None,
+            "file_unique_id": "AgADCSIAAtbSIVE",
+            "size": 1000,
+            "type": "audio",
+        }
+        handler = self._handler(None)
+
+        async def _get_backend():
+            return backend
+
+        async def _lookup(uid, *, expected_size=None):
+            return {
+                "header_key": "inputs/library/abc/header",
+                "header_only": True,
+                "size": 1000,
+                "storage": "s3",
+            }
+
+        with patch("utils.storage.get_storage_backend", _get_backend), patch("utils.media_cache.lookup", _lookup):
+            self._run(handler, current_file)
+
+        self.assertEqual(backend.downloads, [library_key])
+        self.assertEqual(handler.fetches, 0, "the whole object was in the bucket; Telegram must not be asked")
+        self.assertEqual(
+            [os.path.basename(part) for part in handler.delivered],
+            ["Album.001.mp3", "Album.002.mp3"],
+        )
+
+    def test_a_repeat_split_without_a_stored_key_still_requests_the_media(self):
+        """A header-only descriptor *and* no whole object in the bucket: the split must
+        not pretend the media is available - it has to fall back to a fresh download.
+        """
+        backend = _FakeBackend()
+        current_file = {
+            "id": "abc123",
+            "name": "Album.mp3",
+            "path": None,
+            "file_unique_id": "AgADCSIAAtbSIVE",
+            "size": 1000,
+            "type": "audio",
+        }
+        handler = self._handler(None)
+
+        async def _get_backend():
+            return backend
+
+        async def _lookup(uid, *, expected_size=None):
+            return {
+                "header_key": "inputs/library/abc/header",
+                "header_only": True,
+                "size": 1000,
+                "storage": "s3",
+            }
+
+        with patch("utils.storage.get_storage_backend", _get_backend), patch("utils.media_cache.lookup", _lookup):
+            self._run(handler, current_file)
+
+        # No stored source key to fetch, so the handler still schedules a fetch.
+        self.assertEqual(handler.fetches, 1)
+        self.assertIsNone(handler.delivered)
 
 
 if __name__ == "__main__":

@@ -529,8 +529,10 @@ def test_bot_api_path_reuses_every_tier():
     assert 'current_file["path"] = _stored_path' in src
     assert "_media_cache.get_bytes(_uid, expected_size=_expected)" in src
     # The local fallback records where the file is, not just its bytes, so a
-    # file too large for the byte tier can still be reused.
-    assert "path=file_path," in src
+    # file too large for the byte tier can still be reused - through the shared
+    # fetch recorder, whose descriptor keeps the disk copy as its second tier.
+    assert "await remember_fetched_source(" in src
+    assert '"path": local_path,' in read_source("utils", "source_store.py")
 
 
 def test_photo_path_uses_the_cache_too():
@@ -559,9 +561,12 @@ def test_remote_s3_streaming_path_uses_the_shared_library_key():
     assert "store_source(" in src and "_input_key = _ref.job_key" in src
     assert "record_source(" in src
     assert "_media_cache.remember(" in src
-    # The descriptor shape itself (``storage="s3"``, header vs whole) is written
-    # once, by the shared helper, rather than restated at every producer.
-    assert '"storage": "s3"' in read_source("utils", "source_store.py")
+    # The descriptor shape itself (header vs whole, and ``storage`` naming which
+    # of the two a record describes) is written once, by the shared helper,
+    # rather than restated at every producer.
+    store = read_source("utils", "source_store.py")
+    assert '"storage": storage,' in store
+    assert 'storage="s3" if ref.stored else "local"' in store
 
 
 def test_both_download_pipes_share_one_key_scheme():

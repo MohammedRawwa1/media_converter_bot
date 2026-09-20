@@ -61,7 +61,10 @@ def test_the_media_cache_reuse_path_keeps_source_metadata():
     src = read_source(*HANDLERS)
     # The wipe is what made every repeat arrive with a filename caption.
     assert 'current_file["_source_metadata"] = {}' not in src
-    assert 'current_file.setdefault("_source_metadata", {})' in src
+    # Every reuse path goes through the one shared adoption helper, which is
+    # where the descriptor's probe verdict is carried onto the file.
+    assert "async def _adopt_stored_source(" in src
+    assert "_merge_cached_source_meta(current_file, _entry)" in src
 
 
 def test_the_reuse_path_still_short_circuits_on_a_stored_key():

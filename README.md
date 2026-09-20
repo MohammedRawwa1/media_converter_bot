@@ -599,6 +599,30 @@ repeat (only the worker's own single read is left, plus the cached probe verdict
 so the caption keeps its duration/title), while never letting a two-megabyte
 header be mistaken for something to encode from.
 
+Every button resolves the media the same way. `handlers._adopt_stored_source` is the
+one derivation the split, the trims, the screenshots, the extracts, the formats, the
+optimizes, the repairs, the resolutions, the archives and the bulk apply share: the
+descriptor's `input_key` when it is there and validated, and otherwise the key the
+media's own identity derives (`source_store.stored_library_source`) — so an object
+stored by a producer that wrote no descriptor, or sitting beside the probe header of a
+`header`-mode deployment, is still found instead of being pulled over Telegram again.
+A probe header is never handed back as media: the header is a reference, and the
+`.../source` object beside it is the stream a button can actually read. A media that
+resolves to a key has it written back into the session, so the next button on it — and
+every action it triggers — skips even the lookup.
+
+A fetch records what it produced, too. The userbot/relay download behind the
+buttons and the auto-fetch that answers a large forward each used to leave a bare
+local file: nothing said where the media was, so the next request for it walked the
+same road again and a worker on another host had nothing to read. Both now go
+through `source_store.remember_fetched_source`, which writes the object under the same
+identity-derived key (when the deployment stores to S3/R2) *and* the descriptor -
+`input_key` for the object, `path` for the disk copy beside it, and the bytes when the
+media is small enough for Redis - plus the probe verdict, so a repeat is served from
+the bucket, the disk or Redis instead of Telegram. A deployment with no object store
+(a local backend, or `PIPELINE_SOURCE_UPLOAD=local`) records the disk copy and the
+bytes and writes no key, which is what its reuse reads.
+
 The descriptor is kept in two tiers. Redis holds the hot copy for latency, and
 the `media_registry` MongoDB collection holds the record: Redis is a cache, so
 it may be flushed, evicted, or be unreachable, and a bare Redis miss used to

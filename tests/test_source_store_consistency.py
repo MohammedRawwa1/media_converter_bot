@@ -29,6 +29,8 @@ from utils.source_store import (  # noqa: E402
     header_object_key,
     read_head_bytes,
     record_source,
+    remember_fetched_source,
+    source_library_key,
     source_upload_mode,
     store_source,
 )
@@ -385,6 +387,161 @@ def test_a_media_without_an_identity_is_not_remembered(monkeypatch):
         return await record_source(None, ref=SourceRef(mode="full", key="k"), size=1)
 
     assert _run(_check()) is False
+    assert calls == []
+
+
+def test_the_disk_copy_is_kept_beside_the_key(monkeypatch):
+    """``path`` is the reuse tier a stored key cannot replace: the local file."""
+    calls = _capture_remember(monkeypatch)
+
+    async def _check():
+        return await record_source(
+            "AgAD-uid",
+            ref=SourceRef(mode="full", key="inputs/library/abc/source", job_key="inputs/library/abc/source"),
+            size=900,
+            local_path="/storage/temp/src_7_abc.mp4",
+        )
+
+    _run(_check())
+    _uid, kwargs = calls[-1]
+    assert kwargs["input_key"] == "inputs/library/abc/source"
+    assert kwargs["path"] == "/storage/temp/src_7_abc.mp4"
+    assert kwargs["storage"] == "s3"
+
+
+# ──────────────────────────────────────────────────────────────────────
+# remember_fetched_source: a fetch leaves a record, not only a file
+# ──────────────────────────────────────────────────────────────────────
+
+
+def _fetch_plumbing(monkeypatch, *, mode="header", store_name="s3", backend=None, previous=None):
+    """What a fetch needs: a backend, a mode, and a captured descriptor."""
+    calls = _capture_remember(monkeypatch)
+    backed = backend if backend is not None else _FullBackend()
+
+    async def _backend():
+        return backed
+
+    import config as config_module
+    import utils.media_cache as media_cache
+    import utils.storage as storage
+
+    monkeypatch.setattr(config_module, "get_storage_backend_name", lambda: store_name)
+    monkeypatch.setattr(storage, "get_storage_backend", _backend)
+    monkeypatch.setenv("PIPELINE_SOURCE_UPLOAD", mode)
+
+    async def _lookup(*_args, **_kwargs):
+        return previous
+
+    monkeypatch.setattr(media_cache, "lookup", _lookup)
+    return calls, backed
+
+
+def test_a_fetched_media_is_stored_under_its_own_identity(tmp_path, monkeypatch):
+    """One media is one object: the key every producer derives for it."""
+    payload = b"m" * 900
+    path = tmp_path / "movie.mp4"
+    path.write_bytes(payload)
+    calls, backend = _fetch_plumbing(monkeypatch, mode="full")
+
+    key = _run(
+        remember_fetched_source(
+            {"file_unique_id": "AgAD-uid", "name": "movie.mp4", "id": "file-id-1"},
+            str(path),
+        )
+    )
+
+    assert key == source_library_key("AgAD-uid")
+    assert backend.file_uploads == [(key, len(payload))]
+    _uid, kwargs = calls[-1]
+    assert _uid == "AgAD-uid"
+    assert kwargs["input_key"] == key
+    # The disk copy travels with it, as the second tier a repeat can read.
+    assert kwargs["path"] == str(path)
+    assert kwargs["storage"] == "s3"
+    assert kwargs["size"] == len(payload)
+    assert kwargs["data"] == payload
+
+
+def test_a_header_mode_fetch_keeps_a_probe_reference(tmp_path, monkeypatch):
+    """A media still reachable in Telegram does not need a whole second copy."""
+    path = tmp_path / "movie.mp4"
+    path.write_bytes(b"m" * 900)
+    calls, backend = _fetch_plumbing(monkeypatch, mode="header")
+
+    key = _run(
+        remember_fetched_source(
+            {"file_unique_id": "AgAD-uid", "name": "movie.mp4"},
+            str(path),
+            telegram_fallback=True,
+        )
+    )
+
+    # A header is a reference, never a job's source.
+    assert key is None
+    _uid, kwargs = calls[-1]
+    assert kwargs["header_only"] is True
+    assert kwargs["header_key"] == header_object_key(source_library_key("AgAD-uid"))
+    assert not kwargs.get("input_key")
+    assert backend.file_uploads == []
+
+
+def test_a_fetch_with_nothing_to_store_still_records_the_disk_copy(tmp_path, monkeypatch):
+    """``local`` mode: no object, but the fetch is not forgotten either."""
+    path = tmp_path / "movie.mp4"
+    path.write_bytes(b"m" * 900)
+    calls, backend = _fetch_plumbing(monkeypatch, mode="local")
+
+    key = _run(remember_fetched_source({"file_unique_id": "AgAD-uid", "name": "movie.mp4"}, str(path)))
+
+    assert key is None
+    assert backend.file_uploads == [] and backend.bytes_uploads == []
+    _uid, kwargs = calls[-1]
+    assert kwargs.get("input_key") is None and not kwargs.get("header_key")
+    assert kwargs["path"] == str(path)
+    assert kwargs["storage"] == "local"
+
+
+def test_a_deployment_with_no_object_store_records_the_fetch_without_asking_for_one(tmp_path, monkeypatch):
+    """A local backend *is* this disk: nothing is uploaded, the copy is recorded."""
+    path = tmp_path / "movie.mp4"
+    path.write_bytes(b"m" * 900)
+    calls, _backend = _fetch_plumbing(monkeypatch, mode="full", store_name="local")
+
+    key = _run(remember_fetched_source({"file_unique_id": "AgAD-uid", "name": "movie.mp4"}, str(path)))
+
+    assert key is None
+    _uid, kwargs = calls[-1]
+    assert kwargs["path"] == str(path)
+    assert kwargs["storage"] == "local"
+    assert not kwargs.get("input_key")
+
+
+def test_a_fetch_that_stored_nothing_keeps_the_key_an_earlier_producer_wrote(tmp_path, monkeypatch):
+    """Blank the descriptor and the object a previous run stored becomes invisible."""
+    path = tmp_path / "movie.mp4"
+    path.write_bytes(b"m" * 900)
+    calls, _backend = _fetch_plumbing(
+        monkeypatch,
+        mode="local",
+        previous={"input_key": "inputs/library/old/source", "size": 900},
+    )
+
+    key = _run(remember_fetched_source({"file_unique_id": "AgAD-uid", "name": "movie.mp4"}, str(path)))
+
+    assert key == "inputs/library/old/source"
+    _uid, kwargs = calls[-1]
+    assert kwargs["input_key"] == "inputs/library/old/source"
+    assert kwargs["storage"] == "s3"
+
+
+def test_a_fetch_that_saved_nothing_new_says_so(tmp_path, monkeypatch):
+    """An unreadable path is not a fetch: no descriptor, no key."""
+    calls, _backend = _fetch_plumbing(monkeypatch, mode="full")
+
+    key = _run(remember_fetched_source({"file_unique_id": "AgAD-uid"}, str(tmp_path / "gone.mp4")))
+
+    assert key is None
     assert calls == []
 
 
