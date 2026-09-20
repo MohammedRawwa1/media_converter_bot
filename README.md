@@ -291,17 +291,49 @@ bot already delivered is re-sent by its cached file_id and costs no upload and n
 bucket read. A batch forward does **not** consume the list — the batch is left
 exactly as it was for ▶️ Apply Bulk or another forward — and it reports once
 (`sent 5 of 5 file(s)`) instead of once per file, naming whichever entries could
-not be re-sent.
+not be re-sent. It posts **one line** and edits it as it goes, so a thirty-file
+batch is watchable without costing thirty messages:
+
+```
+📤 Batch forward: 3/12 sent
+⏳ clip.mp4
+```
+
+That line carries a **⏹️ Stop forward** button and ends as the run's summary. The
+button ends the run before the next file — the file being fetched right now always
+finishes, because a half-fetched media is not a state anything can use — and the
+summary then says what went out and what is left (`⏹️ Batch forward stopped: sent 3
+of 12`, `• 9 file(s) are still in the batch — press 📤 Forward Batch to continue`),
+with the button taken away as the run ends. Stopping is not consuming: the batch is
+left exactly as it was, so the rest can be forwarded again or applied as it is.
+The per-file notes of the single-media re-send are suppressed (`announce=False`), so
+a batch of fresh uploads that each have to be fetched first still shows progress
+rather than minutes of silence.
 
 Both are built to cost as little as the delivery allows:
 
-- the media's stored object is looked up first, with the same metadata-only
+- a media Telegram already holds is re-sent by **Telegram's own `copyMessage`** of
+  the message this bot received: no bucket read, no download, no upload — no bytes
+  move at all — and the copy is a new message from the bot, which is what the bot's
+  own header means. The message copied is the one the bot received, not the channel
+  a forwarded file came from (which it may not be able to read). It is also the one
+  route with no Bot API size ceiling, and it carries the caption this delivery was
+  given, so 💬 works on a large media too. If the copy cannot be made — the source
+  message is gone, or the delivery needs a different presentation than the original
+  had (a video the user receives as a file) — the routes below take over;
+- the media's stored object is looked up next, with the same metadata-only
   `input_key` HEAD check every other button makes — no bytes leave the bucket to
   find out where the media already lives;
-- a media Telegram already holds is re-sent **by its cached file_id**, so a repeat
-  costs no bucket read and no upload at all;
+- when no copy can be made, the same bytes go out by the **cached file_id** a
+  previous delivery left, so a repeat still costs no bucket read and no upload;
 - failing that, a local copy is used, and only then is the stored object fetched
   once;
+- a media that has none of those — the file you *just* sent, whose bytes nothing
+  has needed yet — is **fetched once**, the step every other button already takes
+  (the splitter, the trims, the screenshots): its transfer, then the re-send. That
+  is what makes 📤 work on a fresh upload instead of answering "send the file
+  again", which is what the user had just done. 💬 and 📤 Forward Batch take the
+  same road, since all three are the one re-send;
 - a media over the Bot API ceiling takes the userbot/MTProto path — the same road
   a large split part takes — so a big file is delivered rather than reported as
   too large;

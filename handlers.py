@@ -149,6 +149,14 @@ logger = logging.getLogger(__name__)
 # Used by _try_userbot_download() progress callback and the cancel_dl: callback handler.
 _download_cancel_flags: dict[str, list] = {}
 
+# Registry for a running batch forward's stop flag: key="<chat_id>:<run token>" ->
+# [bool]. Same shape as the download flags above, and for the same reason: a
+# forward is a loop in *this* process (see forward_batch), not a job in a worker,
+# so stopping it is a flag its own loop reads. The key carries the run's own token
+# rather than just the chat, so two forwards started one after the other can never
+# stop each other.
+_batch_forward_cancel_flags: dict[str, list] = {}
+
 # How often the apply's message is refreshed with the stage of the file it is
 # currently working on. Above the single-file watcher's 2s floor (which exists to
 # stay clear of Telegram's edit rate) and coarse enough that a long conversion is
@@ -445,6 +453,12 @@ _BULK_SLIDESHOW_MAX = 30.0
 
 # Longest filename shown in the per-file Apply summary before it is elided.
 _BULK_NAME_MAX = 32
+
+# How often 📤 Forward Batch may edit its one progress line. A batch of media the
+# bot already holds goes through its entries in well under a second each, so an
+# edit per file would be a flood of its own; the line still always lands on the
+# summary, which is edited in unconditionally.
+_BATCH_FORWARD_EDIT_SECONDS = 1.0
 
 # Image extensions: a photo sent uncompressed arrives as a document, and these
 # are the ones ffmpeg can read back out of the slideshow pipeline.
@@ -1203,6 +1217,18 @@ def _batch_stop_markup(batch_id):
         return None
     try:
         return InlineKeyboardMarkup([[InlineKeyboardButton("⏹️ Stop batch", callback_data=f"batch_cancel:{batch_id}")]])
+    except Exception:
+        return None
+
+
+def _batch_forward_stop_markup(run_key):
+    """The one button a running batch forward needs, or None when there is no run."""
+    if not run_key:
+        return None
+    try:
+        return InlineKeyboardMarkup(
+            [[InlineKeyboardButton("⏹️ Stop forward", callback_data=f"batch_forward_cancel:{run_key}")]]
+        )
     except Exception:
         return None
 
@@ -2915,6 +2941,43 @@ class EnhancedMediaHandler:
         logger.debug("safe_edit: all %d retries exhausted", _max_retries)
         return None
 
+    async def _say_in_chat(
+        self,
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+        text: str,
+        **kwargs,
+    ):
+        """Send *text* in the chat this update came from; return what was sent.
+
+        The one implementation of "answer this update". A real message (a typed
+        answer, a command) is replied to, so the note lands under the user's own
+        message - above anything the handler re-sends. A callback press carries
+        no ``update.message``, so it is answered with a new message in the chat
+        instead, which lands below that result: reading ``update.message`` here
+        raised ``AttributeError`` and the Media Forwarder reported an internal
+        error *after* it had already re-sent the media.
+
+        Returns the sent message (so a caller can edit or delete it), or ``None``
+        when there was nowhere to send it. Callers that only care whether it
+        arrived use :meth:`_reply_to_press`.
+        """
+        message = getattr(update, "message", None)
+        if message is not None:
+            try:
+                return await message.reply_text(text, **kwargs)
+            except Exception:
+                logger.debug("handlers: could not reply to the message that carried the press")
+
+        chat_id = getattr(getattr(update, "effective_chat", None), "id", None)
+        if chat_id is None:
+            return None
+        try:
+            return await context.bot.send_message(chat_id=chat_id, text=text, **kwargs)
+        except Exception:
+            logger.debug("handlers: could not post the note in the chat")
+            return None
+
     async def _reply_to_press(
         self,
         update: Update,
@@ -2924,34 +2987,9 @@ class EnhancedMediaHandler:
     ) -> bool:
         """Answer the press wherever it came from: a reply, else a fresh message.
 
-        A callback press carries no ``update.message`` - the message the button
-        was attached to lives on ``update.callback_query.message`` - so reading
-        ``update.message.reply_text`` there raised ``AttributeError`` and the
-        Media Forwarder reported an internal error *after* it had already re-sent
-        the media. A real message (the Caption Editor's typed answer, a command)
-        is still answered with a reply, which lands above the media it just
-        re-sent; a press posts a new message instead, which lands below that
-        media, so the forwarder's "Re-sent above" stays true either way.
-
-        Returns True when the note reached the chat.
+        Returns True when the note reached the chat. See :meth:`_say_in_chat`.
         """
-        message = getattr(update, "message", None)
-        if message is not None:
-            try:
-                await message.reply_text(text, **kwargs)
-                return True
-            except Exception:
-                logger.debug("handlers: could not reply to the message that carried the press")
-
-        chat_id = getattr(getattr(update, "effective_chat", None), "id", None)
-        if chat_id is None:
-            return False
-        try:
-            await context.bot.send_message(chat_id=chat_id, text=text, **kwargs)
-            return True
-        except Exception:
-            logger.debug("handlers: could not post the note in the chat")
-            return False
+        return await self._say_in_chat(update, context, text, **kwargs) is not None
 
     async def _require_callback(self, update) -> bool:
         """Ensure the update contains a callback_query. Return True if present."""
@@ -3875,17 +3913,30 @@ class EnhancedMediaHandler:
            a HEAD, else the key derived from the media's own identity). That is
            the S3 check every other button makes, and it is metadata-only - no
            bytes leave the bucket to find out where the media already lives;
-        2. what the copy is made of: a file_id Telegram already holds (the very
-           same bytes, for nothing) or the bytes - a local copy the user just
-           sent, else the stored object fetched once (one bucket read, no
-           Telegram). A media with neither is named as such instead of being
-           reported as a failure;
-        3. a media over the Bot API's ceiling takes the userbot (MTProto) path -
+        2. the cheapest re-send there is: Telegram **copies** the message this bot
+           already holds (:meth:`_copy_source_message`). No bytes move at all - no
+           bucket read, no download, no upload - and the copy is a new message
+           from the bot, which is what "the bot's own header" means. It is what a
+           repeated re-forward of any media, of any size, costs;
+        3. copy not possible (the source message is gone, or the delivery is not
+           the media's own kind - a video the user asked to receive as a file)?
+           Then what the copy would have been made of: a file_id Telegram already
+           holds (the same bytes, for nothing), a local copy the user just sent,
+           or the stored object fetched once (one bucket read, no Telegram);
+        4. none of those? Then the media itself is fetched once, the step every
+           other button takes (:meth:`_ensure_current_file_downloaded`). A media
+           the user has just sent has nothing else to offer: registration is
+           lazy, so the upload was never downloaded, no delivery has cached a
+           file_id for it, and it is not in the bucket yet. This used to be
+           answered with "send the file again" - which the user had just done,
+           so the button looked broken on exactly the media it is most used on;
+        5. a media over the Bot API's ceiling takes the userbot (MTProto) path -
            the same road a large split part takes - so a big media is delivered
            rather than reported as too large;
-        4. the send itself goes through the standard delivery helpers, which try
-           the cached token before uploading, so "1" and "2" together make a
-           captioned re-forward of an already-delivered media free.
+        6. the send itself goes through the standard delivery helpers, which try
+           the cached token before uploading, so "1" to "3" together make a
+           captioned re-forward of an already-delivered media free - and "4"
+           makes one of a freshly sent media merely cost its own transfer.
 
         ``announce=False`` suppresses the notes this re-send makes about itself, so
         a caller that re-sends several media - the batch forward - can report once
@@ -3927,21 +3978,70 @@ class EnhancedMediaHandler:
         with contextlib.suppress(Exception):
             await self._adopt_stored_source(current_file, session=session, user_id=user_id)
 
-        # (2) What the re-send can be made of. A file_id Telegram already holds
-        # is a re-send of the very same bytes for nothing, so it is checked
-        # first; the bytes themselves are a local copy the user just sent, or the
-        # stored object the check above named, fetched once (one bucket read, no
-        # Telegram).
+        # (2) The cheapest re-send there is: a copy of the message this bot already
+        # holds, made by Telegram. Only when the copy would deliver the media the
+        # way this delivery has to - a video the user asked to receive as a file
+        # must not come back as a video.
+        _source_kind = str(current_file.get("type") or "document").lower()
+        if _source_kind == kind and await self._copy_source_message(
+            context, current_file, chat_id=chat_id, caption=text
+        ):
+            logger.info(
+                "handlers: re-sent %s by copying the message Telegram holds (no bytes moved)",
+                current_file.get("name"),
+            )
+            if success_note:
+                await _say(success_note)
+            return True
+
+        # (3) What the copy would have been made of.
         _token = await self._get_cached_file_id(kind, file_unique_id=_uid)
         local_path = self._local_copy(current_file)
         if not local_path:
             _key = current_file.get("input_key")
             if _key:
                 local_path = await self._download_stored_source(current_file, _key)
+        _fetch_error = ""
         if not local_path and not _token:
+            # Nothing to re-send *from* yet: a media the user just sent is
+            # registered lazily (the upload is not downloaded until an action
+            # needs the bytes), nothing has cached a file_id for it, and it is not
+            # in the bucket either. Fetch it - the same step every other button
+            # takes - instead of answering with "send the file again", which is
+            # what the user had just done. The fetch leaves either a local copy or
+            # the whole object in storage; both are re-read below.
+            _fetching = None
+            if announce:
+                with contextlib.suppress(Exception):
+                    _fetching = await self._say_in_chat(update, context, "⬇️ Fetching the media to re-send…")
+            try:
+                await self._ensure_current_file_downloaded(update, context, session)
+            except Exception as exc:
+                _fetch_error = str(exc) or exc.__class__.__name__
+                logger.exception("handlers: could not fetch the media to re-send")
+            if _fetching is not None:
+                with contextlib.suppress(Exception):
+                    await _fetching.delete()
+            current_file = (session or {}).get("current_file") or current_file
+            local_path = self._local_copy(current_file)
+            if not local_path:
+                _key = current_file.get("input_key")
+                if _key:
+                    local_path = await self._download_stored_source(current_file, _key)
+            if caption is None:
+                # The fetch records the ingest's probe verdict (title/performer),
+                # which is what the media's own caption is built from.
+                text = _metadata_caption(current_file)
+
+        if not local_path and not _token:
+            # The note is plain text, so the fetch's own reason reads as a sentence
+            # rather than as a code span Telegram would not render.
+            _detail = f"\n{_fetch_error}" if _fetch_error else ""
             await _say(
-                "❌ The media has no local copy and no stored object to work from. "
-                "Send the file again and press the button once more."
+                "❌ The media could not be fetched to re-send it - it is not on disk, "
+                "not in storage, and Telegram would not hand it over."
+                + _detail
+                + "\nSend the file again and press the button once more."
             )
             return False
 
@@ -4044,6 +4144,73 @@ class EnhancedMediaHandler:
             )
         return sent
 
+    async def _copy_source_message(
+        self,
+        context: ContextTypes.DEFAULT_TYPE,
+        current_file: dict,
+        *,
+        chat_id: int,
+        caption: str,
+    ) -> bool:
+        """Re-send the media by copying the message this bot already holds.
+
+        ``copyMessage`` is the cheapest cover re-forward there is: Telegram copies
+        the media it already has, so no bytes move at all - no bucket read, no
+        download, no upload - and the copy is a *new message from the bot*, which
+        is exactly what "the bot's own header" means (forwarding would keep the
+        original's "Forwarded from …"). The caption is replaced with the one this
+        delivery carries, which is what makes it the same re-send as the byte-moving
+        routes and not a second feature.
+
+        The message copied is the one **the bot itself received** - the same chat,
+        ``msg_id`` - because that is the copy it is guaranteed to be able to read.
+        A forwarded media also records where it was forwarded *from*
+        (``forward``), and that is what the download paths need, but a source
+        channel the bot is not in cannot be copied from: taking it would turn the
+        one free route into a failed call plus a download. The forward source is
+        used only when it is all that was recorded.
+
+        Also the only route with no size ceiling: the Bot API's upload limit does
+        not apply to a copy, so a media far over it can still be re-forwarded
+        without the userbot.
+
+        Returns True when the copy was sent. False - the source message is gone, was
+        never recorded, or the chat is not readable by this bot - sends the caller
+        on to the routes that move bytes, which is why nothing here is logged as a
+        failure the user has to read.
+        """
+        # The bot's own received message first: it is in a chat the bot is by
+        # definition able to read.
+        source_chat = current_file.get("chat_id") or current_file.get("forward_chat_id")
+        source_message = current_file.get("msg_id") or current_file.get("message_id")
+        if source_chat is None or source_message is None:
+            source_chat, source_message = _extract_large_file_source(current_file)
+        if source_chat is None or source_message is None:
+            # Nothing to copy *from*: a media restored from the cache without its
+            # message coordinates, say. Not an error - just a route this media
+            # cannot take.
+            logger.debug("handlers: no source message recorded to copy %s from", current_file.get("name"))
+            return False
+        try:
+            await context.bot.copy_message(
+                chat_id=chat_id,
+                from_chat_id=source_chat,
+                message_id=int(source_message),
+                caption=caption,
+            )
+        except Exception as error:
+            # The message may be deleted, or in a chat this bot cannot read. The
+            # bytes routes are the answer, so this is one line and no notice.
+            logger.info(
+                "handlers: could not copy %s/%s to re-send %s (%s); fetching instead",
+                source_chat,
+                source_message,
+                current_file.get("name"),
+                error,
+            )
+            return False
+        return True
+
     async def forward_batch(
         self,
         update: Update,
@@ -4062,10 +4229,22 @@ class EnhancedMediaHandler:
         delivered costs no bucket read and no upload.
 
         Forwarding is not consumption: the batch is left exactly as it was, so
-        the same list can still be applied or forwarded again. The per-file notes
-        are suppressed and one summary is posted instead, because thirty files
-        must not put thirty messages in the chat and a batch that only half
-        arrived has to say so.
+        the same list can still be applied or forwarded again.
+
+        One message carries the whole run: it is posted as the run's progress line
+        and *edited* as each file goes out (``3/12 — two.mp4``), ending as the
+        summary. The per-file notes of the single-media re-send are suppressed -
+        thirty files must not put thirty messages in the chat - but a batch whose
+        files each have to be fetched first would otherwise sit silent for minutes
+        with nothing to show for it, and a batch that only half arrived still has
+        to say which half.
+
+        That one line also carries a **⏹️ Stop forward** button. The run is a loop
+        here rather than a job in a worker, so stopping it is a flag the loop reads
+        between files: the file being fetched right now always finishes - a
+        half-fetched media is not a state anything can use - and nothing after it
+        starts. The batch itself is untouched, so the rest can be forwarded later or
+        applied as it is.
 
         Returns the number of media sent.
         """
@@ -4089,38 +4268,118 @@ class EnhancedMediaHandler:
             )
             return 0
 
+        total = len(entries)
+
+        # The run's own token, not just the chat: the Stop button carries it, so a
+        # press stops *this* run and never a second one started from the same chat.
+        run_key = f"{getattr(update.effective_chat, 'id', None)}:{uuid.uuid4().hex[:8]}"
+        cancel_flag: list = [False]
+        _batch_forward_cancel_flags[run_key] = cancel_flag
+        stop_markup = _batch_forward_stop_markup(run_key)
+
+        def _progress_text(done: int, current: str = "") -> str:
+            """The run's one line: what it has done, and what it is on now.
+
+            A media that has to be fetched first takes as long as its transfer,
+            so the line names the file being worked on and the file's own place in
+            the batch - the same shape the worker's per-batch bar uses.
+            """
+            head = f"📤 Batch forward: {done}/{total} sent"
+            return f"{head}\n⏳ {current}" if current else head
+
+        status = None
+        _last_edit = [0.0]
+
+        async def _refresh(done: int, current: str = "", *, force: bool = False) -> None:
+            """Edit the run's line, paced so a fast batch cannot flood the chat."""
+            if status is None:
+                return
+            now = time.monotonic()
+            if not force and (now - _last_edit[0]) < _BATCH_FORWARD_EDIT_SECONDS:
+                return
+            _last_edit[0] = now
+            with contextlib.suppress(Exception):
+                # The button rides every edit, so the run stays stoppable for as
+                # long as it is going on.
+                await status.edit_text(_progress_text(done, current), reply_markup=stop_markup)
+
         sent = 0
         failed: list[str] = []
-        for entry in entries:
-            try:
-                ok = await self._redeliver_current_media(
-                    update,
-                    context,
-                    # A throwaway session: the re-send writes the stored key back
-                    # onto its own ``current_file``, and working through a batch
-                    # must never re-point the loaded file at whichever entry is
-                    # being sent.
-                    {"current_file": entry},
-                    announce=False,
-                )
-            except Exception:
-                # One unreadable entry must not take the rest of the batch with
-                # it: it is named in the summary and the loop carries on.
-                logger.exception("handlers: batch forward could not re-send %s", _bulk_display_name(entry))
-                ok = False
-            if ok:
-                sent += 1
-            else:
-                failed.append(_bulk_display_name(entry))
+        try:
+            # Posted before the first file and edited for the rest of the run, so a
+            # batch costs one message and never goes quiet. A press has no message of
+            # its own, so this is a new message; a command's reply is edited instead.
+            status = await self._say_in_chat(
+                update,
+                context,
+                _progress_text(0, _bulk_display_name(entries[0])),
+                reply_markup=stop_markup,
+            )
 
-        lines = [f"📤 Batch forward: sent {sent} of {len(entries)} file(s) as new copies from the bot."]
-        if failed:
-            shown = ", ".join(failed[:8])
-            if len(failed) > 8:
-                shown += f", … (+{len(failed) - 8} more)"
-            lines.append(f"❌ Not re-sent: {shown}")
-        await self._reply_to_press(update, context, "\n".join(lines))
-        logger.info("handlers: batch forward for user %s — %d/%d sent", user_id, sent, len(entries))
+            for index, entry in enumerate(entries):
+                if cancel_flag[0]:
+                    # A press landed while the previous file was going out. The file
+                    # in progress finished (a half-fetched media is not a state
+                    # anything can use); nothing after it starts.
+                    break
+                current = _bulk_display_name(entry)
+                await _refresh(sent, current)
+                try:
+                    ok = await self._redeliver_current_media(
+                        update,
+                        context,
+                        # A throwaway session: the re-send writes the stored key back
+                        # onto its own ``current_file``, and working through a batch
+                        # must never re-point the loaded file at whichever entry is
+                        # being sent.
+                        {"current_file": entry},
+                        announce=False,
+                    )
+                except Exception:
+                    # One unreadable entry must not take the rest of the batch with
+                    # it: it is named in the summary and the loop carries on.
+                    logger.exception("handlers: batch forward could not re-send %s", current)
+                    ok = False
+                if ok:
+                    sent += 1
+                else:
+                    failed.append(current)
+                if index + 1 < total:
+                    await _refresh(sent, _bulk_display_name(entries[index + 1]))
+
+            stopped = cancel_flag[0]
+            if stopped:
+                lines = [f"⏹️ Batch forward stopped: sent {sent} of {total} file(s) before you stopped it."]
+                remaining = total - sent - len(failed)
+                if remaining > 0:
+                    # The rest were never attempted, so they are not failures: they
+                    # are still there, which is what the user wants to know.
+                    lines.append(f"• {remaining} file(s) are still in the batch — press 📤 Forward Batch to continue.")
+            else:
+                lines = [f"📤 Batch forward: sent {sent} of {total} file(s) as new copies from the bot."]
+            if failed:
+                shown = ", ".join(failed[:8])
+                if len(failed) > 8:
+                    shown += f", … (+{len(failed) - 8} more)"
+                lines.append(f"❌ Not re-sent: {shown}")
+            summary = "\n".join(lines)
+            if status is not None:
+                # The run's own line becomes the result: one message for the whole
+                # batch, from its first file to its last. ``reply_markup=None`` takes
+                # the Stop button away with the run - a finished forward has nothing
+                # left to stop.
+                with contextlib.suppress(Exception):
+                    await status.edit_text(summary, reply_markup=None)
+            else:
+                await self._reply_to_press(update, context, summary)
+        finally:
+            # Only this run's own entry: a later run's flag must survive this one.
+            # Unregistered for the whole run, not just the loop, so a failure before
+            # the first file cannot leave a flag nothing will ever read.
+            if _batch_forward_cancel_flags.get(run_key) is cancel_flag:
+                _batch_forward_cancel_flags.pop(run_key, None)
+
+        logger.info("handlers: batch forward for user %s — %d/%d sent", user_id, sent, total)
         return sent
 
     async def _handle_split_request(
@@ -10293,6 +10552,32 @@ class EnhancedMediaHandler:
                 except Exception:
                     logger.exception("Failed to cancel batch %s", batch_id)
                     await self.safe_edit(query, "⚠️ Failed to stop the batch.")
+
+            elif isinstance(data, str) and data.startswith("batch_forward_cancel:"):
+                # Stop button on a running batch forward. Unlike Apply Bulk, whose
+                # jobs run in a worker and are stopped through Redis, the forward is
+                # a loop in this process: the flag its loop reads between files is
+                # all it takes, and the file being fetched right now finishes first.
+                try:
+                    run_key = data.split(":", 1)[1]
+                except Exception:
+                    await self.safe_edit(query, "⚠️ Invalid stop request.")
+                    return
+
+                cancel_flag = _batch_forward_cancel_flags.get(run_key)
+                if cancel_flag is not None:
+                    cancel_flag[0] = True
+                    # The line keeps being refreshed while the current file goes
+                    # out, so this is the last word until the run's own summary.
+                    await self.safe_edit(query, "⏹️ Stopping after the file in progress…")
+                    with contextlib.suppress(BadRequest):
+                        await query.answer("Stopping after the current file")
+                else:
+                    # The run is over (or was never this one): say so rather than
+                    # leave a button that appears to do nothing.
+                    await self.safe_edit(query, "⏳ This forward already finished.")
+                    with contextlib.suppress(BadRequest):
+                        await query.answer("Already finished")
 
             elif isinstance(data, str) and data.startswith("cancel_dl:"):
                 # User pressed the Cancel button during a userbot download
