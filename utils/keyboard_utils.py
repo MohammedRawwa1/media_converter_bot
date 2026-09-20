@@ -184,17 +184,25 @@ class MediaMenuBuilder:
         # alias; handlers remap this alias to the canonical `convert_format_menu`.
         conv_cb = "video_converter"
 
-        split_label = "🔪 Videos Splitter" if is_video else "🔪 Split"
+        # One label for both kinds: the splitter takes an audio file and a video
+        # file through the same stream copy, so naming it after one of them hid
+        # the action from the other.
+        split_label = "🔪 Media Splitter"
 
         buttons: list[list[InlineKeyboardButton]] = [
             row("🖼️ Thumbnail Extractor", THUMBNAIL_EXTRACTOR, "🗑️ Delete Thumbnail", "delete_custom_thumb"),
-            row("✏️ Caption And Buttons Editor", CAPTION_EDITOR, "🔀 Batch Process", "batch_process"),
+            # The caption half only: the tool takes one line of text and re-sends
+            # the media with it, and there is no buttons half to speak of - the
+            # old label promised an editor that never existed.
+            row("💬 Caption Editor", CAPTION_EDITOR, "🔀 Batch Process", "batch_process"),
             row("📝 Metadata Editor", EDIT_METADATA, "📤 Media Forwarder", MEDIA_FORWARDER),
             row("🔇 Stream Remover", STREAM_REMOVER, "🎵 Stream Extractor", STREAM_EXTRACTOR),
             # Trim and merge act on the media that is actually loaded: an audio
             # file must not be sent to the video-only trimmer/merger.
+            # The trimmer handles audio and video alike, so the label is neutral;
+            # only the trigger differs (each opens its own kind's flow).
             row(
-                "✂️ Audio Trimmer" if file_type == "audio" else "✂️ Video Trimmer",
+                "✂️ Media Trimmer",
                 TRIM_AUDIO if file_type == "audio" else TRIM_VIDEO,
                 "➕ Audio Merger" if file_type == "audio" else "➕ Video Merger",
                 "merge_audio" if file_type == "audio" else MERGE_MENU,
@@ -204,7 +212,7 @@ class MediaMenuBuilder:
             row("🖼️ Screenshots", SCREENSHOTS_MENU, "🖼️ Manual Shots", MANUAL_SHOTS),
             row("🎵 Video To Audio", VIDEO_TO_AUDIO, "📉 Compress", COMPRESS_MENU),
             row("⚡ Video Optimizer", OPTIMIZE_MENU, "🔗 Subtitle Merger", SUBTITLE_MERGER),
-            row("✏️ Video Renamer", VIDEO_RENAMER, "🛈 Media Information", INFO),
+            row("✏️ Media Renamer", VIDEO_RENAMER, "🛈 Media Information", INFO),
             # The tool sub-menus. They live here rather than behind the settings
             # button: they all act on the loaded media, and /usersettings must
             # stay a preferences panel that never starts a conversion.
@@ -658,6 +666,9 @@ class MediaMenuBuilder:
             # where it read the loaded file's tags and rewrote them. It is an
             # action, so it belongs with the other audio actions.
             [InlineKeyboardButton("🏷️ Mp3 Tag Editor", callback_data=MP3_TAG_EDITOR)],
+            # Renaming is not a video action: an audio file's delivered name is
+            # exactly as worth setting, so the button is reachable from here too.
+            [InlineKeyboardButton("✏️ Media Renamer", callback_data=VIDEO_RENAMER)],
             [InlineKeyboardButton("↩️ Back", callback_data=MENU_MAIN)],
         ]
         return InlineKeyboardMarkup(buttons)

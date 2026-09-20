@@ -793,13 +793,87 @@ def _document_delivery_name(current_file: dict | None, path: str | None, default
     return os.path.basename(str(path or "")) or f"media{ext}"
 
 
-def _metadata_caption(current_file: dict | None, fallback: str | None = None) -> str:
-    """Build a metadata-derived caption from the captured source metadata.
+def _redelivery_name(current_file: dict | None, kind: str, local_path: str | None = None) -> str:
+    """The name a re-sent copy of the media carries.
 
-    Prefer title/performer tags when present, otherwise fall back to the
-    original media filename stem, then the supplied fallback string.
+    A cover re-forward and a captioned re-send both hand Telegram the media
+    again, and neither should rename it: the media's own name and extension are
+    used, and the local path only fills in what the name does not carry (a
+    download's extension, or a nameless media's basename).
     """
-    title, performer = _source_media_tags(current_file)
+    info = current_file or {}
+    own = os.path.basename(str(info.get("name") or ""))
+    stem, own_ext = os.path.splitext(own)
+    ext = own_ext or os.path.splitext(str(local_path or ""))[1]
+
+    if kind == "audio":
+        return _audio_delivery_name(info.get("name"), info.get("id"), extension=ext or ".mp3")
+    if kind == "video":
+        _stem = stem or _safe_media_stem(info.get("name"), fallback="")
+        if _stem:
+            return f"{_stem}{ext or '.mp4'}"
+        return os.path.basename(str(local_path or "")) or "video.mp4"
+    return _document_delivery_name(info, local_path, default_ext=ext or ".bin")
+
+
+def _caption_prompt_text(current_file: dict | None) -> str:
+    """The Caption Editor's prompt, showing the current caption in a code block.
+
+    The caption a delivery already carries is the best starting point, so it is
+    shown *exactly* - in the monospace block Telegram copies on tap - rather than
+    described, and the one-line reset is stated where the answer is typed: a
+    caption set by mistake has to be undoable from the prompt that set it.
+    """
+    current = _metadata_caption(current_file)
+    return (
+        "💬 <b>Caption Editor</b>\n\n"
+        "Send the caption this media should be delivered with. Current caption:\n"
+        f"<code>{html.escape(current)}</code>\n\n"
+        "The file is re-sent with the new caption, and every later delivery of it "
+        "carries the same words.\n"
+        "Send <code>-</code> to go back to the media's own caption."
+    )
+
+
+def _rename_prompt_text(current_file: dict | None) -> str:
+    """The renamer's prompt, showing the media's current name in a code block.
+
+    The name the reply replaces is usually close to what the user wants, so it is
+    shown *exactly* - in the monospace block Telegram copies on tap - rather than
+    described, so it can be pasted back and only the part that should change is
+    edited. The block carries the name only: the extension a delivery uses comes
+    from the output this action produces, not from what is typed here.
+    """
+    info = current_file or {}
+    raw = str(info.get("name") or info.get("path") or "").replace("\\", "/")
+    name = os.path.basename(raw) or "media"
+    return (
+        "✏️ <b>Media Renamer</b>\n\n"
+        "Send the new filename. Current name:\n"
+        f"<code>{html.escape(name)}</code>\n\n"
+        "Renaming changes the name only — the format stays whatever this action produces."
+    )
+
+
+def _metadata_caption(current_file: dict | None, fallback: str | None = None) -> str:
+    """Build the caption a delivery carries from the captured source metadata.
+
+    A caption the user set with the Caption Editor comes first: it is what they
+    asked to see on this media, and *every* delivery in this bot builds its
+    caption here, so one stored value carries it to the split parts, the bulk
+    apply and the worker's own sends alike. The edit is stored under
+    ``current_file["caption"]`` by the editor, which is the only writer of it.
+
+    Without one, the media's own title/performer tags are preferred, otherwise
+    the original media filename stem, then the supplied fallback string.
+    """
+    info = current_file or {}
+
+    _override = str(info.get("caption") or "").strip()
+    if _override:
+        return _override
+
+    title, performer = _source_media_tags(info)
 
     if title and performer:
         return f"{title} — {performer}"
@@ -811,7 +885,6 @@ def _metadata_caption(current_file: dict | None, fallback: str | None = None) ->
     if fallback:
         return fallback
 
-    info = current_file or {}
     name = info.get("name") or info.get("original_filename") or info.get("output_filename") or ""
     stem = os.path.splitext(os.path.basename(str(name)))[0].strip()
     if stem:
@@ -3444,6 +3517,29 @@ class EnhancedMediaHandler:
             return stored_key
         return await self._download_stored_source(current_file, stored_key)
 
+    async def _adopt_rename_source(
+        self, current_file: dict, *, session: dict | None = None, user_id=None
+    ) -> str | None:
+        """The one stored-source check the renamer makes, best-effort.
+
+        Renaming is metadata-only, so it must never fetch the media - but it can
+        record where the media already lives. The check is the same one every
+        other button shares (``_adopt_stored_source``): the descriptor's
+        ``input_key`` validated by a HEAD, else the key derived from the media's
+        own identity, which is how a probe-header deployment's ``.../source``
+        stream is found. On a hit the key is written back onto ``current_file``,
+        so the *next* action reuses the stored object instead of pulling the same
+        bytes down Telegram again - which is what keeps a renamed repeat from
+        repeating the download.
+
+        Any failure is a non-event: the session keeps exactly what it had.
+        """
+        try:
+            return await self._adopt_stored_source(current_file, session=session, user_id=user_id)
+        except Exception:
+            logger.debug("handlers: the stored-source check for the renamer could not run")
+            return None
+
     async def _split_local_source(self, current_file: dict, session: dict | None = None) -> str | None:
         """A readable local copy of the loaded media for the split button.
 
@@ -3582,12 +3678,16 @@ class EnhancedMediaHandler:
         *,
         user_id: int | None = None,
         as_document: bool = False,
+        media_kind: str | None = None,
     ) -> bool:
-        """Send a split part via userbot (MTProto) for files exceeding Bot API limits.
+        """Send one over-limit file via userbot (MTProto).
 
         This is the large-file delivery path for split parts: when a part exceeds
         BOT_API_MAX_MB, the Bot API cannot deliver it, so we use Pyrogram/Telethon
-        to send it directly via MTProto, which has no size limit.
+        to send it directly via MTProto, which has no size limit. It is also the
+        road a re-sent media takes when it is over the same ceiling, which is what
+        ``media_kind`` is for: the splitter's parts are video or audio, while a
+        re-send can be a document too.
 
         *user_id* is the requester's, so the send resolves the session the rest of
         the pipeline uses for them instead of whatever account is configured
@@ -3599,7 +3699,10 @@ class EnhancedMediaHandler:
         """
         from utils.userbot_uploader import send_file_via_userbot
 
-        _media_kind = "audio" if as_audio else "video"
+        # ``media_kind`` only ever forces audio (see userbot_uploader); a document
+        # is inferred from ``as_document`` and its extension, so the video default
+        # is what a split part keeps.
+        _media_kind = "audio" if as_audio else (media_kind or "video")
         _thumb_path = None
 
         # Probe metadata for video parts (audio doesn't need video metadata)
@@ -3712,6 +3815,187 @@ class EnhancedMediaHandler:
             logger.info("handlers: sent %s via userbot (msg_id=%s)", delivery_name, msg_id)
             return True
         return False
+
+    async def _redeliver_current_media(
+        self,
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+        session: dict,
+        *,
+        caption: str | None = None,
+        success_note: str = "",
+    ) -> bool:
+        """Send the loaded media again, captioned afresh, without re-encoding it.
+
+        This is the one re-send behind the Caption Editor and the Media Forwarder
+        (a cover re-forward: the bot sends the copy, so its header is the bot's),
+        and it is ordered to cost as little as the delivery allows:
+
+        1. the media's stored object is looked up first
+           (:meth:`_adopt_stored_source`: a descriptor ``input_key`` validated by
+           a HEAD, else the key derived from the media's own identity). That is
+           the S3 check every other button makes, and it is metadata-only - no
+           bytes leave the bucket to find out where the media already lives;
+        2. what the copy is made of: a file_id Telegram already holds (the very
+           same bytes, for nothing) or the bytes - a local copy the user just
+           sent, else the stored object fetched once (one bucket read, no
+           Telegram). A media with neither is named as such instead of being
+           reported as a failure;
+        3. a media over the Bot API's ceiling takes the userbot (MTProto) path -
+           the same road a large split part takes - so a big media is delivered
+           rather than reported as too large;
+        4. the send itself goes through the standard delivery helpers, which try
+           the cached token before uploading, so "1" and "2" together make a
+           captioned re-forward of an already-delivered media free.
+
+        Returns True when the media was sent.
+        """
+        current_file = (session or {}).get("current_file") or {}
+        if not current_file:
+            await update.message.reply_text("❌ No media loaded. Send a file first.")
+            return False
+
+        user_id = update.effective_user.id if update.effective_user else None
+        chat_id = update.effective_chat.id
+        _uid = current_file.get("file_unique_id")
+        kind = str(current_file.get("type") or "document").lower()
+        if kind not in ("video", "audio", "photo", "document"):
+            kind = "document"
+        text = caption if caption is not None else _metadata_caption(current_file)
+
+        # The user's own upload preference turns a video result into a file (the
+        # same bytes, in the document view - see /usersettings). It is applied by
+        # choosing the delivery helper here rather than by asking the video helper
+        # for it, because that branch reports no file_id and so cannot tell a
+        # delivered copy from a failed one.
+        if kind == "video" and _user_upload_mode(user_id) == _UPLOAD_MODE_FILE:
+            kind = "document"
+
+        # (1) The one stored-source check: it records the object this media
+        # already has, so step (3) can read it instead of pulling the media down
+        # Telegram again. Best-effort - a bucket that cannot answer changes
+        # nothing about the re-send.
+        with contextlib.suppress(Exception):
+            await self._adopt_stored_source(current_file, session=session, user_id=user_id)
+
+        # (2) What the re-send can be made of. A file_id Telegram already holds
+        # is a re-send of the very same bytes for nothing, so it is checked
+        # first; the bytes themselves are a local copy the user just sent, or the
+        # stored object the check above named, fetched once (one bucket read, no
+        # Telegram).
+        _token = await self._get_cached_file_id(kind, file_unique_id=_uid)
+        local_path = self._local_copy(current_file)
+        if not local_path:
+            _key = current_file.get("input_key")
+            if _key:
+                local_path = await self._download_stored_source(current_file, _key)
+        if not local_path and not _token:
+            await update.message.reply_text(
+                "❌ The media has no local copy and no stored object to work from. "
+                "Send the file again and press the button once more."
+            )
+            return False
+
+        _name = _redelivery_name(current_file, kind, local_path)
+        _size = 0
+        with contextlib.suppress(OSError):
+            _size = os.path.getsize(local_path) if local_path else 0
+
+        # (3) Over the Bot API's ceiling the userbot carries it, caption and all.
+        # Only reachable with the bytes in hand: a token Telegram still holds is a
+        # Bot API token by construction.
+        if local_path and _size > config.BOT_API_MAX_BYTES and getattr(config, "ENABLE_USERBOT", False):
+            if kind == "audio":
+                sent = await self._send_audio_via_userbot(
+                    chat_id, local_path, text, _name, current_file, user_id=user_id
+                )
+            else:
+                sent = await self._send_part_via_userbot(
+                    chat_id,
+                    local_path,
+                    text,
+                    _name,
+                    False,
+                    current_file,
+                    _name,
+                    user_id=user_id,
+                    as_document=(kind == "document"),
+                    media_kind="document" if kind == "document" else None,
+                )
+            if sent:
+                if success_note:
+                    await update.message.reply_text(success_note)
+                return True
+            await update.message.reply_text(
+                "❌ The media is too large for the Bot API and the userbot could not send it."
+            )
+            return False
+
+        # (4) The standard delivery helpers: each tries the cached file_id first
+        # (so a stored token costs no upload at all), falls back to the bytes when
+        # Telegram refuses it, names the copy after the media and states an audio
+        # file's own length. They are handed an empty path only when Telegram's own
+        # copy is all there is - a refused token then has nothing to fall back on,
+        # which the failure says plainly rather than closing over.
+        try:
+            if kind == "video":
+                sent = bool(
+                    await self._send_video_result(
+                        context.bot,
+                        chat_id,
+                        local_path or "",
+                        caption=text,
+                        delivery_name=_name,
+                        file_unique_id=_uid,
+                    )
+                )
+            elif kind == "audio":
+                # The media's own length, stated: Telegram will not derive it for
+                # a long clip (see _audio_delivery_duration).
+                _duration = await _audio_delivery_duration(local_path)
+                sent = bool(
+                    await self._send_audio_result(
+                        context.bot,
+                        chat_id,
+                        local_path or "",
+                        caption=text,
+                        filename=_name,
+                        file_unique_id=_uid,
+                        **_audio_tag_kwargs(current_file, _name, _duration),
+                    )
+                )
+            elif kind == "photo":
+                sent = bool(
+                    await self._send_photo_result(
+                        context.bot, chat_id, local_path or "", caption=text, file_unique_id=_uid
+                    )
+                )
+            else:
+                sent = bool(
+                    await self._send_document_result(
+                        context.bot,
+                        chat_id,
+                        local_path or "",
+                        caption=text,
+                        filename=_name,
+                        file_unique_id=_uid,
+                    )
+                )
+        except Exception:
+            logger.exception("handlers: re-sending the media failed")
+            sent = False
+
+        if sent:
+            if success_note:
+                await update.message.reply_text(success_note)
+        elif local_path:
+            await update.message.reply_text("❌ Could not re-send the media.")
+        else:
+            await update.message.reply_text(
+                "❌ Telegram would not re-use its stored copy and the media is not on "
+                "disk. Send the file again and press the button once more."
+            )
+        return sent
 
     async def _handle_split_request(
         self,
@@ -8206,7 +8490,7 @@ class EnhancedMediaHandler:
                 if current_file.get("type") != "audio":
                     await self.safe_edit(
                         query,
-                        "❌ That file is a video. Use ✂️ Video Trimmer instead.",
+                        "❌ That file is a video. Use ✂️ Media Trimmer instead.",
                     )
                     return
                 # Clear previous prompts *before* arming this one, otherwise the
@@ -8218,12 +8502,16 @@ class EnhancedMediaHandler:
                 await self.safe_edit(query, "✂️ **Trim Audio**\nSend start time (HH:MM:SS):")
 
             elif data == "caption_editor":
-                # Ask user to send a new caption for the current file
+                # Ask for the one caption this media should be delivered with.
+                # The current caption is shown in a copyable block, like the
+                # renamer shows the current name: the answer is usually a small
+                # edit of it, and the media is re-sent with it the moment it is
+                # typed (see the awaiting_caption branch of handle_custom_input).
                 current_file = session.get("current_file")
                 if not current_file:
                     await self.safe_edit(query, "❌ No file found to caption.")
                     return
-                await self.safe_edit(query, "✏️ Send the new caption text:")
+                await self.safe_edit(query, _caption_prompt_text(current_file), parse_mode="HTML")
                 for key in list(context.user_data.keys()):
                     if key.startswith("awaiting_"):
                         del context.user_data[key]
@@ -8234,7 +8522,12 @@ class EnhancedMediaHandler:
                 if not current_file:
                     await self.safe_edit(query, "❌ No file found to rename.")
                     return
-                await self.safe_edit(query, "✏️ Send new filename (include extension):")
+                # One storage check before the prompt. Renaming touches no bytes,
+                # but recording where the media already lives is what stops the
+                # *next* action downloading the same file again (see
+                # _adopt_rename_source).
+                await self._adopt_rename_source(current_file, session=session, user_id=user_id)
+                await self.safe_edit(query, _rename_prompt_text(current_file), parse_mode="HTML")
                 for key in list(context.user_data.keys()):
                     if key.startswith("awaiting_"):
                         del context.user_data[key]
@@ -8261,15 +8554,24 @@ class EnhancedMediaHandler:
                 context.user_data["awaiting_split"] = True
 
             elif data == "media_forwarder":
+                # A cover re-forward: the bot sends the media itself, so the copy
+                # carries the bot's own header instead of whatever the original
+                # was forwarded from. It goes to this chat - one tap, no target to
+                # type - and a media that only lives in the bucket is fetched for
+                # it like any other result (_redeliver_current_media), which is
+                # what the old version could not do: it demanded a local path and
+                # gave up with "❌ Source file not available on disk".
                 current_file = session.get("current_file")
                 if not current_file:
                     await self.safe_edit(query, "❌ No file to forward.")
                     return
-                await self.safe_edit(query, "➡️ Send target chat id or @username to forward the file to:")
-                for key in list(context.user_data.keys()):
-                    if key.startswith("awaiting_"):
-                        del context.user_data[key]
-                context.user_data["awaiting_forward_to"] = True
+                await self.safe_edit(query, "📤 Re-sending the media from this chat…")
+                await self._redeliver_current_media(
+                    update,
+                    context,
+                    session,
+                    success_note="✅ Re-sent above — as a new copy, from the bot.",
+                )
 
             elif data == "merge_audios_menu":
                 await self.safe_edit(
@@ -12969,12 +13271,38 @@ class EnhancedMediaHandler:
                     del context.user_data[key]
 
         elif context.user_data.get("awaiting_caption"):
-            # Store caption in session and confirm
+            # The Caption Editor's answer. Both halves matter: the caption is
+            # stored on the file, where every later delivery of this media reads
+            # it (``_metadata_caption``), and the media is re-sent with it right
+            # away - the proof is the copy arriving with the new words on it.
+            # The old code wrote a field no delivery ever read and answered
+            # "saved": the caption looked accepted and appeared nowhere.
+            _typed_caption = str(user_input or "").strip()
             if not current_file:
                 await update.message.reply_text("❌ No file in session.")
+            elif not _typed_caption:
+                # An empty answer would deliver the media with no caption at all.
+                # Ask again rather than accept it, keeping the prompt armed.
+                await update.message.reply_text(
+                    "❌ The caption cannot be empty. Send the text it should carry, "
+                    "or - to go back to the media's own caption."
+                )
+                return ConversationHandler.END
             else:
-                session["current_file"]["caption"] = user_input
-                await update.message.reply_text("✅ Caption saved.")
+                if _typed_caption == "-":
+                    # The way back: a caption set by mistake must be undoable
+                    # from the prompt that set it.
+                    current_file.pop("caption", None)
+                    current_file.pop("_pipeline_caption", None)
+                    _note = "♻️ Back to the media's own caption."
+                else:
+                    current_file["caption"] = _typed_caption
+                    current_file["_pipeline_caption"] = _typed_caption
+                    _note = "✅ Caption set — the copy above carries it."
+                session["current_file"] = current_file
+                with contextlib.suppress(Exception):
+                    self._persist_session(update.effective_user.id)
+                await self._redeliver_current_media(update, context, session, success_note=_note)
             for key in list(context.user_data.keys()):
                 if key.startswith("awaiting_"):
                     del context.user_data[key]
@@ -13009,112 +13337,6 @@ class EnhancedMediaHandler:
             # The whole split - splitting and the one-at-a-time delivery of the
             # parts - lives in one place, for video and audio alike.
             await self._handle_split_request(update, context, session, user_input)
-            for key in list(context.user_data.keys()):
-                if key.startswith("awaiting_"):
-                    del context.user_data[key]
-
-        elif context.user_data.get("awaiting_forward_to"):
-            if not current_file:
-                await update.message.reply_text("❌ No file to forward.")
-            else:
-                target = user_input.strip()
-                path = current_file.get("path")
-                if not path or not os.path.exists(path):
-                    await update.message.reply_text("❌ Source file not available on disk.")
-                else:
-                    # Resolve & validate target chat (username or id)
-                    try:
-                        # Normalize username (allow with or without @)
-                        if target.startswith("@"):
-                            lookup = target
-                        else:
-                            # try integer id first
-                            try:
-                                lookup = int(target)
-                            except Exception:
-                                lookup = target
-
-                        # This will raise if bot cannot access the chat or it's invalid
-                        dest_chat = await context.bot.get_chat(lookup)
-                    except Exception as e:
-                        logger.warning("Invalid forward target or inaccessible chat: %s", e)
-                        await update.message.reply_text(
-                            "❌ Invalid target or bot cannot access that chat/user. "
-                            "Provide a numeric chat id or ensure the user has started the bot (use @username)."
-                        )
-                        for key in list(context.user_data.keys()):
-                            if key.startswith("awaiting_"):
-                                del context.user_data[key]
-                        return
-
-                    # Try sending with validation and robust error handling
-                    try:
-                        # Choose send method; document is a safer fallback for large files
-                        caption = current_file.get("caption", "") or _metadata_caption(current_file)
-                        # A forwarded file has to arrive under the name the user
-                        # sent it with: without these the forwarded copy is named
-                        # after the local temp path this session happens to use.
-                        _forward_name = _document_delivery_name(current_file, path)
-                        _forward_audio = _audio_delivery_name(
-                            current_file.get("name"),
-                            current_file.get("id"),
-                            extension=os.path.splitext(str(path or ""))[1] or ".mp3",
-                        )
-
-                        if current_file.get("type") == "video":
-                            # Prefer send_video; fallback to send_document on failure
-                            try:
-                                await self._send_video_result(
-                                    context.bot,
-                                    dest_chat.id,
-                                    path,
-                                    caption=caption,
-                                    delivery_name=_forward_name,
-                                )
-                            except Exception:
-                                logger.exception("send_video failed, trying send_document as fallback")
-                                with open(path, "rb") as f:
-                                    await context.bot.send_document(
-                                        chat_id=dest_chat.id, document=f, caption=caption, filename=_forward_name
-                                    )
-
-                        elif current_file.get("type") == "audio":
-                            try:
-                                # The forwarded file's own length: Telegram will
-                                # not derive it for a long clip, and the copy
-                                # would land in the target chat as 00:00
-                                # (see _audio_delivery_duration).
-                                _forward_duration = await _audio_delivery_duration(path)
-                                with open(path, "rb") as f:
-                                    await context.bot.send_audio(
-                                        chat_id=dest_chat.id,
-                                        audio=f,
-                                        caption=caption,
-                                        filename=_forward_audio,
-                                        **_audio_tag_kwargs(current_file, _forward_audio, _forward_duration),
-                                    )
-                            except Exception:
-                                logger.exception("send_audio failed, trying send_document as fallback")
-                                with open(path, "rb") as f:
-                                    await context.bot.send_document(
-                                        chat_id=dest_chat.id, document=f, caption=caption, filename=_forward_audio
-                                    )
-
-                        else:
-                            with open(path, "rb") as f:
-                                await context.bot.send_document(
-                                    chat_id=dest_chat.id, document=f, caption=caption, filename=_forward_name
-                                )
-
-                        await update.message.reply_text("✅ Forwarded file successfully.")
-                    except Exception as e:
-                        logger.exception("Failed to forward file to %s: %s", getattr(dest_chat, "id", lookup), e)
-                        await update.message.reply_text(f"❌ Failed to forward: {e}")
-
-            # Clear awaiting flag regardless of outcome to avoid stuck state.
-            # (This used to be a `for … else` whose `else` always ran, so every
-            # successful forward was followed by a bogus
-            # "❌ Invalid format. Use WIDTHxHEIGHT." reply.)
             for key in list(context.user_data.keys()):
                 if key.startswith("awaiting_"):
                     del context.user_data[key]

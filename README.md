@@ -264,6 +264,40 @@ own sake. The split parameter handling lives in one module
 (`utils/archive_split.py`), which parses, validates and labels the value for the
 panel, the archive picker, the summary and the queued job alike.
 
+#### 💬 Caption Editor and 📤 Media Forwarder
+
+Both buttons hand the **same media back with different words on it**, and both go
+through one re-send, so neither re-encodes anything — the format you have is the
+format you get.
+
+**💬 Caption Editor** sets the caption this media is delivered with. The current
+caption is shown in a block Telegram copies on tap, and what you send becomes the
+caption for *every* later delivery of that file — the re-sends here, a split's
+parts, the worker's own send — because every delivery in the bot builds its
+caption from the one place the edit is stored. Send `-` to go back to the caption
+the media's own tags build. The media is re-sent with the new caption the moment
+you send it, which is the proof that it took.
+
+**📤 Media Forwarder** is a cover re-forward: the bot sends the copy itself, into
+the chat you pressed it in, so the copy carries the bot's own header instead of
+the `Forwarded from …` the media arrived with. It is one tap — there is no target
+chat to type.
+
+Both are built to cost as little as the delivery allows:
+
+- the media's stored object is looked up first, with the same metadata-only
+  `input_key` HEAD check every other button makes — no bytes leave the bucket to
+  find out where the media already lives;
+- a media Telegram already holds is re-sent **by its cached file_id**, so a repeat
+  costs no bucket read and no upload at all;
+- failing that, a local copy is used, and only then is the stored object fetched
+  once;
+- a media over the Bot API ceiling takes the userbot/MTProto path — the same road
+  a large split part takes — so a big file is delivered rather than reported as
+  too large;
+- the copy keeps the media's own name and extension, and an audio copy states its
+  own length (Telegram will not derive it for a long clip).
+
 ### Bulk Batches
 
 Every video, audio, document, or photo you send is collected into a batch automatically (deduped by file id, capped at 30). Sending an **album** collects it as a group and announces it once instead of once per file. Open `/bulkmenu`, toggle the actions and quality, then press **▶️ Apply Bulk** to run the whole batch; **🗑️ Clear List** drops it and the batch clears itself after a successful apply. Two or more queued photos are combined into a single **slideshow video** (3 s per photo, letterboxed onto a 1280x720 canvas); a lone photo is encoded with the selected video action, and audio-only actions skip it. The Apply summary lists every queued file next to the job id it became.
