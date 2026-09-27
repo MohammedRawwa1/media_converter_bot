@@ -408,6 +408,87 @@ def test_sweep_survives_an_unreachable_redis(monkeypatch):
     assert summary == {"batches": [], "keys": 0, "messages": [], "kept": 0, "tombstones": 0}
 
 
+# ── finished batches: the traces a completed Apply leaves ───────────────
+
+
+def test_sweep_finished_retires_a_batch_that_counted_everything(monkeypatch):
+    """The reported annoyance: a completed batch left its keys in Redis for the
+    30-day state TTL, so ``scripts/cleanup_stale_redis.py`` had to be run by hand.
+
+    Every member reported, so nothing is left to stop - the sweep takes the whole
+    batch down, marker and all, and drops its resume record with it.
+    """
+    r = FakeRedis()
+    _seed_batch(r, "batch-a", members=["j1", "j2"], statuses={"j1": FINISHED, "j2": FINISHED}, total=2, done=2)
+    _use(monkeypatch, r)
+
+    summary = asyncio.run(batch_pipeline.sweep_finished_batches(r))
+
+    assert summary["batches"] == ["batch-a"]
+    assert summary["messages"] == [(1, 2)]
+    assert summary["keys"] > 0
+    for key in batch_pipeline.batch_state_keys("batch-a"):
+        assert key not in r.strings
+        assert key not in r.sets
+    assert "batch-a" not in r.sets[batch_pipeline.ACTIVE_BATCHES_KEY]
+    # Nothing was left to stop, so no marker is written for a later run to find.
+    assert r.strings.get(batch_pipeline.batch_cancel_key("batch-a")) is None
+    # The resume record must not keep pointing at a batch that no longer exists.
+    assert r.sets.get("ffmpeg:batch:resume:42") == set()
+
+
+def test_sweep_finished_leaves_a_batch_with_work_left(monkeypatch):
+    # ``:done`` short of ``:total`` is the apply still feeding the batch one file
+    # at a time, so it must survive - only the manual sweep may take it down.
+    r = FakeRedis()
+    _seed_batch(r, "batch-a", members=["j1"], statuses={"j1": FINISHED}, total=3, done=1)
+    _use(monkeypatch, r)
+
+    summary = asyncio.run(batch_pipeline.sweep_finished_batches(r))
+
+    assert summary["batches"] == []
+    assert batch_pipeline.batch_total_key("batch-a") in r.strings
+
+
+def test_sweep_finished_keeps_a_running_member(monkeypatch):
+    r = FakeRedis()
+    _seed_batch(r, "batch-a", members=["j1"], statuses={"j1": RUNNING}, total=1, done=1)
+    _use(monkeypatch, r)
+
+    assert asyncio.run(batch_pipeline.sweep_finished_batches(r))["batches"] == []
+
+
+def test_retire_finished_batch_drops_the_state_without_a_marker(monkeypatch):
+    r = FakeRedis()
+    _seed_batch(r, "batch-a", members=["j1"], statuses={"j1": FINISHED}, total=1, done=1)
+    _use(monkeypatch, r)
+
+    purged = asyncio.run(batch_pipeline.retire_finished_batch(r, batch_id="batch-a"))
+
+    assert purged["keys"] > 0
+    assert r.strings.get(batch_pipeline.batch_cancel_key("batch-a")) is None
+    assert asyncio.run(batch_pipeline.retire_finished_batch(r, batch_id=None))["keys"] == 0
+
+
+def test_batch_counters_finished_reads_the_counters(monkeypatch):
+    r = FakeRedis()
+    _seed_batch(r, "batch-a", members=[], total=2, done=2)
+    _use(monkeypatch, r)
+    assert asyncio.run(batch_pipeline.batch_counters_finished(r, batch_id="batch-a")) is True
+
+    half = FakeRedis()
+    _seed_batch(half, "batch-b", members=[], total=2, done=1)
+    assert asyncio.run(batch_pipeline.batch_counters_finished(half, batch_id="batch-b")) is False
+    assert asyncio.run(batch_pipeline.batch_counters_finished(r, batch_id=None)) is False
+
+
+def test_the_finished_sweep_is_much_shorter_than_the_live_state_ttl():
+    # The live batch state has to survive an hours-long Apply; the traces of one
+    # that is over do not, and that is the whole point of the separate TTL.
+    assert batch_pipeline.BATCH_STALE_TTL_SECONDS < batch_pipeline.BATCH_STATE_TTL_SECONDS
+    assert batch_pipeline.BATCH_STALE_TTL_SECONDS <= 300
+
+
 # ── ghosted old batches ─────────────────────────────────────────────────
 
 

@@ -16,6 +16,14 @@ try:
 except Exception:
     LIBRARY_KEY_PREFIX = "inputs/library/"
 
+# How long a finished batch's leftover state may sit in Redis before the sweep
+# takes it down. Read from the module that owns the value, so the sweep and the
+# apply that retires its own batch cannot drift apart.
+try:
+    from utils.batch_pipeline import BATCH_STALE_TTL_SECONDS as _BATCH_STALE_TTL_SECONDS
+except Exception:  # pragma: no cover - the module is always present in-tree
+    _BATCH_STALE_TTL_SECONDS = int(os.getenv("BATCH_STALE_TTL_SECONDS", "60"))
+
 logger = logging.getLogger(__name__)
 
 # Directory placeholders that must never be treated as stale data.
@@ -51,18 +59,28 @@ class CleanupManager:
         self.redis_cleanup_interval = int(os.getenv("REDIS_CLEANUP_INTERVAL", str(30 * 60)))
         # Stale Redis job hash max age (24 hours)
         self.redis_job_max_age = int(os.getenv("REDIS_JOB_MAX_AGE", str(24 * 3600)))
+        # How often finished batches are swept out of Redis. A finished Apply
+        # retires its own batch; this is the backstop for one it never got to,
+        # and it is what a manual scripts/cleanup_stale_redis.py run used to do.
+        self.batch_stale_ttl = max(1, int(os.getenv("BATCH_STALE_TTL_SECONDS", str(_BATCH_STALE_TTL_SECONDS))))
         self.is_running = False
         self._redis_cleanup_task = None
+        self._batch_sweep_task = None
 
     async def start(self):
         """Start periodic cleanup tasks (hourly file cleanup + 30-min Redis cleanup)."""
         self.is_running = True
         # Start the Redis cleanup loop as a separate background task
         self._redis_cleanup_task = asyncio.create_task(self._redis_cleanup_loop())
+        # The finished-batch sweep runs on its own short clock, so the traces a
+        # finished Apply leaves are gone in about a minute rather than after the
+        # 30-day state TTL (or a manual cleanup script).
+        self._batch_sweep_task = asyncio.create_task(self._batch_sweep_loop())
         logger.info(
-            "Cleanup manager started (file cleanup every %ds, Redis cleanup every %ds)",
+            "Cleanup manager started (file cleanup every %ds, Redis cleanup every %ds, batch sweep every %ds)",
             self.cleanup_interval,
             self.redis_cleanup_interval,
+            self.batch_stale_ttl,
         )
 
         while self.is_running:
@@ -78,6 +96,8 @@ class CleanupManager:
         self.is_running = False
         if self._redis_cleanup_task and not self._redis_cleanup_task.done():
             self._redis_cleanup_task.cancel()
+        if self._batch_sweep_task and not self._batch_sweep_task.done():
+            self._batch_sweep_task.cancel()
         logger.info("Cleanup manager stopped")
 
     async def cleanup_all(self) -> dict:
@@ -90,6 +110,7 @@ class CleanupManager:
             "redis_jobs": await self.cleanup_stale_redis_jobs(),
             "redis_dedup_keys": await self.cleanup_stale_dedup_keys(),
             "redis_lock_keys": await self.cleanup_stale_locks(),
+            "finished_batches": await self.cleanup_finished_batches(),
             "empty_dirs": await self.cleanup_empty_directories(),
             "rate_limit_buckets": self.cleanup_rate_limit_buckets(),
             "web_job_store": self.cleanup_web_job_store(),
@@ -609,6 +630,41 @@ class CleanupManager:
             except Exception as e:
                 logger.error("Redis cleanup loop error: %s", e)
             await asyncio.sleep(self.redis_cleanup_interval)
+
+    async def cleanup_finished_batches(self) -> int:
+        """Retire batches whose members have all reported but whose keys linger.
+
+        The bot's own answer to running ``scripts/cleanup_stale_redis.py`` by hand
+        for the traces a finished Apply leaves behind. Safe by construction: only a
+        batch whose ``:done`` counter has reached its ``:total`` is touched, so a
+        batch that is still being fed one file at a time is never torn down.
+
+        Returns the number of batches retired.
+        """
+        try:
+            from utils.batch_pipeline import sweep_finished_batches
+        except Exception:
+            logger.debug("finished-batch sweep unavailable")
+            return 0
+        try:
+            summary = await sweep_finished_batches()
+            return len(summary.get("batches") or [])
+        except Exception as e:
+            logger.debug("finished-batch sweep failed: %s", e)
+            return 0
+
+    async def _batch_sweep_loop(self):
+        """Sweep finished batches on their own short clock (BATCH_STALE_TTL_SECONDS)."""
+        # A short delay before the first run, so startup is not the busiest moment.
+        await asyncio.sleep(min(30, self.batch_stale_ttl))
+        while self.is_running:
+            try:
+                retired = await self.cleanup_finished_batches()
+                if retired > 0:
+                    logger.info("Batch sweep: retired %d finished batch(es)", retired)
+            except Exception as e:
+                logger.error("Batch sweep loop error: %s", e)
+            await asyncio.sleep(self.batch_stale_ttl)
 
     async def startup_temp_cleanup(self, max_age: int = 1800) -> int:
         """Clean stale temp files on startup (default: files older than 30 minutes).

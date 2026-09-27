@@ -672,6 +672,23 @@ async def read_active_batches(redis) -> list[dict]:
 # exists. Members are the real signal; this only covers that window.
 BATCH_PURGE_GRACE_SECONDS = max(0, _env_number("BATCH_PURGE_GRACE_SECONDS", 900))
 
+# How long a batch that has *finished* may leave its state behind, and how often
+# the bot sweeps for one.
+#
+# A batch's counters, membership set, message location and place in the aggregate
+# view are written to outlive a live batch - BATCH_STATE_TTL_SECONDS is 30 days,
+# because a long Apply legitimately runs for hours. None of it is needed once
+# every member has reported, though, and leaving it behind is exactly what
+# ``scripts/cleanup_stale_redis.py`` used to find: the same handful of long-dead
+# batches came back on every run, and a stale resume record among them made the
+# *next* Apply answer "nothing left to do" until the script was run by hand. The
+# apply now retires its own batch the moment it is over, and this is how long the
+# automatic sweep waits before retiring one the apply never got to.
+#
+# Deliberately NOT applied to a batch that is still running: those keys have to
+# survive however long the batch really takes (see BATCH_STATE_TTL_SECONDS).
+BATCH_STALE_TTL_SECONDS = max(1, _env_number("BATCH_STALE_TTL_SECONDS", 60))
+
 # The tombstone written when a batch is taken down. Kept, not deleted: a worker
 # that is still finishing one of its members asks about it before it edits or
 # reposts the progress message, so a batch that is over cannot put its bar back.
@@ -914,6 +931,109 @@ def _counters_say_finished(done, total) -> bool:
     except (TypeError, ValueError):
         return False
     return expected > 0 and finished >= expected
+
+
+async def batch_counters_finished(redis=None, *, batch_id) -> bool:
+    """Whether a batch's own counters say every member it queued has reported.
+
+    The question a caller asks before retiring a batch: ``:total`` was published
+    and ``:done`` reached it, so there is nothing left to run and nothing left to
+    resume. A missing or unreadable counter answers no, which keeps the batch.
+    """
+    if not batch_id:
+        return False
+    own = redis is None
+    try:
+        if own:
+            from utils.job_queue import get_redis
+
+            redis = await get_redis()
+        done = await redis.get(batch_progress_key(batch_id))
+        total = await redis.get(batch_total_key(batch_id))
+        return _counters_say_finished(done, total)
+    except Exception:
+        logger.debug("batch_pipeline: could not read the counters for %s", batch_id)
+        return False
+    finally:
+        if own and redis is not None:
+            with contextlib.suppress(Exception):
+                await redis.close()
+
+
+async def retire_finished_batch(redis=None, *, batch_id) -> dict:
+    """Take down a batch that is over, leaving no state and no marker.
+
+    Used the moment an apply knows its batch accounted for every member, and by
+    :func:`sweep_finished_batches` for one it did not get to. Nothing is left to
+    stop, so no tombstone is written: the counters, the membership set, the
+    finished-entries record and the message location all go, along with the
+    batch's place in the aggregate view and in every user's resume set. This is
+    what keeps a completed Apply from leaving a 30-day trace behind - the state a
+    manual ``scripts/cleanup_stale_redis.py`` run used to clear by hand.
+    """
+    result: dict = {"batch_id": str(batch_id or ""), "keys": 0, "message": None}
+    if not batch_id:
+        return result
+    own = redis is None
+    try:
+        if own:
+            from utils.job_queue import get_redis
+
+            redis = await get_redis()
+        result = await purge_batch(redis, batch_id=batch_id, fence=False)
+        # The resume record points at a batch whose state is now gone; leaving it
+        # is what made a later Apply treat this run's files as already finished.
+        await _forget_resume_membership(redis, batch_id)
+        return result
+    except Exception:
+        logger.debug("batch_pipeline: could not retire batch %s", batch_id)
+        return result
+    finally:
+        if own and redis is not None:
+            with contextlib.suppress(Exception):
+                await redis.close()
+
+
+async def sweep_finished_batches(redis=None) -> dict:
+    """Retire every batch whose own counters say it is over.
+
+    The automatic counterpart to running ``scripts/cleanup_stale_redis.py`` by
+    hand for the traces a finished Apply leaves. Restricted to batches that are
+    **provably finished** - ``:total`` was published and ``:done`` reached it - so
+    it can never tear down a batch that is still being fed one file at a time: an
+    in-flight apply queues a file, waits it out, then fetches the next, so between
+    two files the only members Redis knows are the ones already reported. A batch
+    with work left is deliberately left to ``/cancelall``, which is the only place
+    that can know a stopped batch should not resume.
+
+    Returns ``{batches, keys, messages, tombstones}``.
+    """
+    summary: dict = {"batches": [], "keys": 0, "messages": [], "tombstones": 0}
+    own = redis is None
+    try:
+        if own:
+            from utils.job_queue import get_redis
+
+            redis = await get_redis()
+        for batch_id in sorted(await _known_batch_ids(redis)):
+            if await _batch_is_live(redis, batch_id):
+                continue
+            if not await batch_counters_finished(redis, batch_id=batch_id):
+                continue
+            purged = await retire_finished_batch(redis, batch_id=batch_id)
+            summary["batches"].append(batch_id)
+            summary["keys"] += purged.get("keys", 0)
+            if purged.get("message"):
+                summary["messages"].append(purged["message"])
+        summary["tombstones"] = await purge_stale_tombstones(redis)
+        return summary
+    except Exception:
+        logger.debug("batch_pipeline: finished-batch sweep failed")
+        return summary
+    finally:
+        if own and redis is not None:
+            with contextlib.suppress(Exception):
+                await redis.close()
 
 
 async def _batch_needs_tombstone(redis, batch_id, cancelled_job_ids=None) -> bool:

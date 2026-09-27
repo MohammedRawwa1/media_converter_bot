@@ -206,6 +206,26 @@ def _events(handler, **overrides):
     return seen
 
 
+class OriginalCaptionTests(unittest.TestCase):
+    """A forward carries the media's *own* caption, never one the bot built."""
+
+    def test_it_reads_the_recording_made_at_ingest(self):
+        self.assertEqual(handlers._original_caption({"original_caption": "  Chapter 3  "}), "Chapter 3")
+
+    def test_a_missing_or_blank_recording_is_no_caption_at_all(self):
+        # None is the meaningful value: the copy route omits the caption for it
+        # (preserving the source's) and the byte routes send the media bare.
+        self.assertIsNone(handlers._original_caption({}))
+        self.assertIsNone(handlers._original_caption({"original_caption": "   "}))
+        self.assertIsNone(handlers._original_caption(None))
+
+    def test_the_ingest_records_the_words_the_media_arrived_with(self):
+        src = read_source("handlers.py")
+        # Video, audio, document and photo entries all keep what they were sent
+        # with, so a forward of any of them can send it as it is.
+        self.assertGreaterEqual(src.count('"original_caption": _message_caption(update.message)'), 4)
+
+
 class CaptionOverrideTests(unittest.TestCase):
     """One stored caption is what every delivery of that media carries."""
 
@@ -634,6 +654,8 @@ class ForwarderTests(unittest.TestCase):
         context = _FakeContext()
         asyncio.run(handler.callback_handler(_FakeUpdate(data="media_forwarder"), context))
         self.assertIn("from the bot", redelivered[0]["success_note"])
+        # It asks for the media as it is: its own caption, and none invented.
+        self.assertIs(redelivered[0]["keep_caption"], True)
         # Nothing is armed: no prompt, no target to type.
         self.assertFalse(any(k.startswith("awaiting_") for k in context.user_data))
         self.assertEqual(len(redelivered), 1)
@@ -680,6 +702,29 @@ class CopyRouteTests(unittest.TestCase):
             bot.copies,
             [{"chat_id": 7, "from_chat_id": 7, "message_id": 4678, "caption": "the caption"}],
         )
+
+    def test_no_caption_omits_the_field_so_telegram_keeps_the_sources_own(self):
+        """A plain forward adds no words, and must not clear the ones that exist.
+
+        The Bot API preserves a message's caption only when the field is absent,
+        so an empty string is not the same thing as omitting it - that is why
+        ``_original_caption`` answers ``None`` and this route drops the keyword.
+        """
+        current = {"id": "f1", "name": "clip.mp4", "chat_id": 7, "msg_id": 4678}
+        handler = _handler()
+        bot = mock.AsyncMock()
+        ok = asyncio.run(handler._copy_source_message(_FakeContext(bot), current, chat_id=7, caption=None))
+
+        self.assertTrue(ok)
+        self.assertNotIn("caption", bot.copy_message.call_args.kwargs)
+
+    def test_a_caption_that_is_given_is_still_passed_along(self):
+        current = {"id": "f1", "name": "clip.mp4", "chat_id": 7, "msg_id": 4678}
+        handler = _handler()
+        bot = mock.AsyncMock()
+        asyncio.run(handler._copy_source_message(_FakeContext(bot), current, chat_id=7, caption="typed words"))
+
+        self.assertEqual(bot.copy_message.call_args.kwargs["caption"], "typed words")
 
     def test_it_copies_the_message_the_bot_received_not_the_forward_source(self):
         """A forwarded media records where it came from; that is not what to copy.
@@ -728,6 +773,76 @@ class CopyRouteTests(unittest.TestCase):
         self.assertEqual(bot.copies, [])
 
 
+class ForwardAsIsTests(unittest.TestCase):
+    """📤 forwards the media as it is: its own caption, never the bot's.
+
+    A file the user sent bare used to come back stamped with a caption the bot
+    built from the media's name - a filename, and an object-storage key once it
+    had round-tripped through the bucket - which is not something the media ever
+    carried. ``keep_caption`` is what the forwarders ask for instead.
+    """
+
+    def _forward(self, current, **overrides):
+        handler = _handler()
+        seen = _events(handler, **overrides)
+        asyncio.run(
+            handler._redeliver_current_media(
+                _FakeUpdate(), _FakeContext(), {"current_file": current}, keep_caption=True
+            )
+        )
+        return seen
+
+    def test_a_media_that_arrived_bare_is_forwarded_bare(self):
+        current = {"id": "f1", "type": "document", "name": "inputs/f1/source.bin", "file_unique_id": "u1"}
+        seen = self._forward(current, cached_id="the-file-id")
+
+        self.assertEqual(seen["sends"][0]["kind"], "document")
+        # No caption was invented from the name, and none from the metadata tags.
+        self.assertIsNone(seen["sends"][0]["kwargs"]["caption"])
+
+    def test_the_medias_own_words_are_what_the_forward_carries(self):
+        current = {
+            "id": "f1",
+            "type": "document",
+            "name": "notes.pdf",
+            "file_unique_id": "u1",
+            "original_caption": "Chapter 3",
+        }
+        seen = self._forward(current, cached_id="the-file-id")
+        self.assertEqual(seen["sends"][0]["kwargs"]["caption"], "Chapter 3")
+
+    def test_a_caption_the_user_set_is_not_forced_onto_a_forward(self):
+        # The editor's caption belongs to deliveries; a forward keeps the media's
+        # own words (here, none) rather than the editor's.
+        current = {
+            "id": "f1",
+            "type": "document",
+            "name": "notes.pdf",
+            "file_unique_id": "u1",
+            "caption": "Buy now",
+        }
+        seen = self._forward(current, cached_id="the-file-id")
+        self.assertIsNone(seen["sends"][0]["kwargs"]["caption"])
+
+    def test_a_forwarded_media_is_never_captioned_from_its_metadata_tags(self):
+        current = {
+            "id": "f1",
+            "type": "document",
+            "name": "notes.pdf",
+            "file_unique_id": "u1",
+            "_source_metadata": {"title": "My Song", "performer": "Some Artist"},
+        }
+        seen = self._forward(current, cached_id="the-file-id")
+        self.assertIsNone(seen["sends"][0]["kwargs"]["caption"])
+
+    def test_the_copy_route_is_asked_to_keep_the_source_caption(self):
+        # ``caption=None`` is what makes the copy preserve the message's own
+        # words (see CopyRouteTests); a forward must reach the copy that way.
+        current = {"id": "f1", "type": "video", "name": "clip.mp4", "chat_id": 7, "msg_id": 4678}
+        seen = self._forward(current, copy_result=True)
+        self.assertEqual(seen["copied"], [{"file": "f1", "chat_id": 7, "caption": None}])
+
+
 class ForwarderPressTests(unittest.TestCase):
     """📤 pressed on a callback: the media is re-sent *and* the note still lands."""
 
@@ -750,6 +865,8 @@ class ForwarderPressTests(unittest.TestCase):
         # Telegram's own copy, re-sent: no upload and no bucket read.
         self.assertEqual(seen["sends"][0]["kind"], "document")
         self.assertEqual(seen["downloaded"], [])
+        # Forwarded as it is: the bot's metadata caption is never applied.
+        self.assertIsNone(seen["sends"][0]["kwargs"]["caption"])
         # The note arrives as a new message, because there was no message to reply
         # to. Reading ``update.message`` here is what raised AttributeError.
         self.assertTrue(any("from the bot" in note["text"] for note in bot.sent), bot.sent)
@@ -1104,6 +1221,12 @@ class WiringTests(unittest.TestCase):
         self.assertIn("await self.forward_batch(update, context, session)", src)
         # One re-send, not three implementations of it.
         self.assertEqual(src.count("async def _redeliver_current_media("), 1)
+
+    def test_both_forwarders_ask_for_the_media_as_it_is(self):
+        # The single 📤 and 📤 Forward Batch both forward rather than caption.
+        src = read_source("handlers.py")
+        self.assertGreaterEqual(src.count("keep_caption=True,"), 2)
+        self.assertIn("def _original_caption(", src)
 
     def test_the_re_send_notes_never_read_update_message_directly(self):
         # That read is the reported internal error: a callback press has no

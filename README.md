@@ -266,9 +266,9 @@ panel, the archive picker, the summary and the queued job alike.
 
 #### 💬 Caption Editor and 📤 Media Forwarder
 
-Both buttons hand the **same media back with different words on it**, and both go
-through one re-send, so neither re-encodes anything — the format you have is the
-format you get.
+Both buttons hand the **same media back**, and both go through one re-send, so
+neither re-encodes anything — the format you have is the format you get. The
+difference is the words: the editor changes them, the forwarder leaves them alone.
 
 **💬 Caption Editor** sets the caption this media is delivered with. The current
 caption is shown in a block Telegram copies on tap, and what you send becomes the
@@ -281,12 +281,17 @@ you send it, which is the proof that it took.
 **📤 Media Forwarder** is a cover re-forward: the bot sends the copy itself, into
 the chat you pressed it in, so the copy carries the bot's own header instead of
 the `Forwarded from …` the media arrived with. It is one tap — there is no target
-chat to type.
+chat to type. It forwards the media **as it is**: the copy keeps the caption the
+file arrived with, and a file that arrived with no caption comes back with none —
+never with the caption a *delivery* of that file would carry (its title/performer
+tags, or its filename). Forwarding is not captioning.
 
 **📤 Forward Batch** (in `/bulkmenu`) is the same re-forward applied to the whole
 collected batch: every file you sent is re-sent once by the bot, so each copy
 carries the bot's header whatever kind it was — video, audio, photo or document.
-It goes through the one re-send the two single-media buttons share, so a file the
+Like the single button, each entry is forwarded **as it is**: its own caption,
+and none at all when it arrived bare. It goes through the one re-send the two
+single-media buttons share, so a file the
 bot already delivered is re-sent by its cached file_id and costs no upload and no
 bucket read. A batch forward does **not** consume the list — the batch is left
 exactly as it was for ▶️ Apply Bulk or another forward — and it reports once
@@ -363,6 +368,8 @@ Feeding the batch is serial too, and every wait in it is bounded. The apply fetc
 
 Cancelling takes the whole batch with it. Stopping one batch writes a tombstone (`ffmpeg:batch:<id>:cancelled`) *before* it removes anything, because a worker that is still finishing a member asks about that marker before it edits or reposts the progress message — without it, the bar the user just stopped comes back. `/cancelall` does the same for every batch in one run: after it has flagged every queued, delayed and in-flight job, no batch has a live member left, so it takes each of them down — counters, membership and resume records, plus their place in the active set and their progress bars in the chat. That is what used to need `scripts/cleanup_stale_redis.py` run by hand; the script is now a preview/offline tool and says so.
 
+A **finished** batch does not wait for a cancel, either. The apply retires its own batch the moment its counters show every member reported - no tombstone, since nothing is left to stop - and a background sweep retires any batch it missed on a `BATCH_STALE_TTL_SECONDS` clock (default `60`s). The live state keeps the long `BATCH_STATE_TTL_SECONDS` because an hours-long apply needs it; only the traces of a batch that is over are short-lived. Before this, those counters, the batch's place in the aggregate view and its resume record sat in Redis for 30 days, and a stale resume record made the *next* Apply answer "nothing left to do" until the cleanup script was run by hand.
+
 The tombstone is written only while it has something to stop. A batch whose members have all reported is over — no worker is still finishing one, and no apply is still feeding it — so it is taken down without a marker, and a batch that *was* mid-flight keeps one until its last member can no longer be running (the marker is what the worker and the feeding apply both read; see `_batch_needs_tombstone`). Markers left from a cancel that raced a running member age out on their own, and a worker reporting for a batch that has been taken down (a redelivery, say) writes nothing back: the batch's state and its place in the view are both gone, and re-creating its counter would put the batch back for the next `/cancelall` to clear all over again.
 
 A file that the pipeline already queued is counted toward the batch by the **worker** that runs that job, not by the apply — the apply only counts the job when it carries no tag of this batch (one the user already had in flight). Counting both ways used to finish the batch at half its files and take its progress message down while work was still queued.
@@ -424,6 +431,7 @@ For Railway's 1 GB box the shipped `.env.example` is tuned to: `MAX_CONCURRENT_F
 | `MEDIA_CACHE_BYTES_MAX_MB` | `32` | Largest media body kept verbatim in Redis (larger files reuse the storage key) |
 | `MEDIA_REGISTRY_ENABLED` | `1` | Mirror every media descriptor into the durable MongoDB tier, so a Redis flush or restart cannot send a media back to Telegram for a second download |
 | `MEDIA_REGISTRY_TTL_SECONDS` | `2592000` | How long a descriptor stays in the MongoDB media registry (30 days) |
+| `BATCH_STALE_TTL_SECONDS` | `60` | How long a **finished** batch's leftover state (counters, membership, message location, resume record) may sit in Redis, and how often the bot sweeps for one. A live batch keeps the long `BATCH_STATE_TTL_SECONDS`; this only governs the traces of a batch that is over |
 | `PRESENCE_TTL_SECONDS` | `300` | How long a user counts as "online" after their last interaction |
 | `REUSE_LOCAL_INPUT` | `1` | Keep the source on disk after uploading it, so a worker in the same container reads it instead of downloading it back out of S3 (one full copy of the media of egress saved per job) |
 | `PIPELINE_SOURCE_UPLOAD` | `header` | What **every** producer of a source stores for it — the big-file pipeline, the Bot API download behind the bot's buttons, the fetcher and the web uploader all go through one helper (`utils/source_store.py`): `header` keeps only its first `PIPELINE_HEADER_BYTES` as a probe reference, `full` stores the whole file after the download finishes, `stream` writes the whole file **while** it downloads (storage is the source of truth, no local copy), `local` stores nothing. In `header`/`local` the media is read over Telegram, so a large video costs no bucket egress at all. Code default is `header`; `stream` is what makes a **repeat** of a media cost no Telegram traffic at all (one shared object per media, served from the bucket once validated). A producer that has no Telegram copy to fall back on (a Bot API file id, a web upload) always stores the media itself, because a probe header and no reachable copy is not a smaller source — it is a lost one |

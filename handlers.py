@@ -907,6 +907,31 @@ def _metadata_caption(current_file: dict | None, fallback: str | None = None) ->
     return "media"
 
 
+def _message_caption(message) -> str:
+    """The caption (or text) an incoming message carried, as a plain string.
+
+    Recorded at ingest so a media's *own* words survive a re-send that has to move
+    bytes: the copy route can keep them for free by not sending a caption, but an
+    upload can only carry the words the bot wrote down when it first read the
+    message. Empty when the message had none.
+    """
+    return str(getattr(message, "caption", None) or getattr(message, "text", None) or "")
+
+
+def _original_caption(current_file: dict | None) -> str | None:
+    """The caption the media itself arrived with - or ``None`` when it had none.
+
+    What the 📤 forwarders send with: the media as it is, never a caption the bot
+    built from the file's tags or its own name (which is a filename at best, and an
+    object-storage key at worst - neither of which the media ever carried).
+    ``None`` is a meaningful value here, not a missing one: it is what the copy
+    route omits so Telegram preserves the source's caption, and what the byte
+    routes pass to send the media bare rather than guessed-at.
+    """
+    text = str((current_file or {}).get("original_caption") or "").strip()
+    return text or None
+
+
 def _session_lists_defaulted(data) -> dict | None:
     """A persisted session with the list fields every caller indexes present.
 
@@ -3899,6 +3924,7 @@ class EnhancedMediaHandler:
         session: dict,
         *,
         caption: str | None = None,
+        keep_caption: bool = False,
         success_note: str = "",
         announce: bool = True,
     ) -> bool:
@@ -3938,6 +3964,16 @@ class EnhancedMediaHandler:
            captioned re-forward of an already-delivered media free - and "4"
            makes one of a freshly sent media merely cost its own transfer.
 
+        ``keep_caption=True`` turns the re-send into a plain forward: the media
+        goes out with the caption *it* arrived with - recorded at ingest
+        (:func:`_original_caption`) - and with no caption at all when it arrived
+        bare. The bot's own caption is never built on this path, so a filename or
+        an object-storage key can never be presented as words the media carried.
+        This is what 📤 Media Forwarder and 📤 Forward Batch ask for: forwarding is
+        not captioning. The copy route keeps the original words for free by
+        omitting the caption (Telegram preserves it); the byte-moving routes carry
+        the recorded words, or none.
+
         ``announce=False`` suppresses the notes this re-send makes about itself, so
         a caller that re-sends several media - the batch forward - can report once
         instead of once per file; the return value says the same thing either way.
@@ -3961,7 +3997,13 @@ class EnhancedMediaHandler:
         kind = str(current_file.get("type") or "document").lower()
         if kind not in ("video", "audio", "photo", "document"):
             kind = "document"
-        text = caption if caption is not None else _metadata_caption(current_file)
+        if keep_caption:
+            # Forward, don't caption: the media's own words, or none at all when it
+            # arrived bare. _original_caption answers None rather than "" so the
+            # copy route knows to leave the source's caption alone.
+            text = _original_caption(current_file)
+        else:
+            text = caption if caption is not None else _metadata_caption(current_file)
 
         # The user's own upload preference turns a video result into a file (the
         # same bytes, in the document view - see /usersettings). It is applied by
@@ -4028,7 +4070,7 @@ class EnhancedMediaHandler:
                 _key = current_file.get("input_key")
                 if _key:
                     local_path = await self._download_stored_source(current_file, _key)
-            if caption is None:
+            if caption is None and not keep_caption:
                 # The fetch records the ingest's probe verdict (title/performer),
                 # which is what the media's own caption is built from.
                 text = _metadata_caption(current_file)
@@ -4150,7 +4192,7 @@ class EnhancedMediaHandler:
         current_file: dict,
         *,
         chat_id: int,
-        caption: str,
+        caption: str | None = None,
     ) -> bool:
         """Re-send the media by copying the message this bot already holds.
 
@@ -4158,7 +4200,10 @@ class EnhancedMediaHandler:
         the media it already has, so no bytes move at all - no bucket read, no
         download, no upload - and the copy is a *new message from the bot*, which
         is exactly what "the bot's own header" means (forwarding would keep the
-        original's "Forwarded from …"). The caption is replaced with the one this
+        original's "Forwarded from …"). A caption is set only when the caller
+        passes one; ``None`` omits the field, and Telegram then keeps the caption
+        the source message already has - which is how a plain forward sends the
+        media as it is. Otherwise the caption is replaced with the one this
         delivery carries, which is what makes it the same re-send as the byte-moving
         routes and not a second feature.
 
@@ -4192,12 +4237,17 @@ class EnhancedMediaHandler:
             logger.debug("handlers: no source message recorded to copy %s from", current_file.get("name"))
             return False
         try:
-            await context.bot.copy_message(
-                chat_id=chat_id,
-                from_chat_id=source_chat,
-                message_id=int(source_message),
-                caption=caption,
-            )
+            _copy_kwargs = {
+                "chat_id": chat_id,
+                "from_chat_id": source_chat,
+                "message_id": int(source_message),
+            }
+            # No caption means "keep the one the media already has": Telegram
+            # preserves it when the field is absent, so a forward that adds no
+            # words also keeps the words the media arrived with.
+            if caption is not None:
+                _copy_kwargs["caption"] = caption
+            await context.bot.copy_message(**_copy_kwargs)
         except Exception as error:
             # The message may be deleted, or in a chat this bot cannot read. The
             # bytes routes are the answer, so this is one line and no notice.
@@ -4227,6 +4277,10 @@ class EnhancedMediaHandler:
         re-send: the cached file_id where Telegram has one, the local copy or the
         stored object only when it does not - so a batch of media the bot already
         delivered costs no bucket read and no upload.
+
+        Like the single button, each entry is forwarded **as it is**: the caption
+        it arrived with, and none at all when it arrived bare (``keep_caption``),
+        so a batch forward never stamps the bot's own caption onto the files.
 
         Forwarding is not consumption: the batch is left exactly as it was, so
         the same list can still be applied or forwarded again.
@@ -4333,6 +4387,7 @@ class EnhancedMediaHandler:
                         # must never re-point the loaded file at whichever entry is
                         # being sent.
                         {"current_file": entry},
+                        keep_caption=True,
                         announce=False,
                     )
                 except Exception:
@@ -7481,6 +7536,7 @@ class EnhancedMediaHandler:
                         "path": photo_path,
                         "type": "photo",
                         "size": getattr(file_obj, "file_size", None),
+                        "original_caption": _message_caption(update.message),
                     }
                     _register_bulk_file(session, _photo_entry)
 
@@ -7675,6 +7731,9 @@ class EnhancedMediaHandler:
             "msg_id": getattr(update.message, "message_id", None),
             "msg_date": msg_date,
             "file_unique_id": file_unique_id,
+            # The words the media arrived with, so a forward can keep them
+            # instead of inventing a caption from the filename (_original_caption).
+            "original_caption": _message_caption(update.message),
         }
 
         logger.info(
@@ -7782,6 +7841,9 @@ class EnhancedMediaHandler:
             "msg_id": getattr(update.message, "message_id", None),
             "msg_date": msg_date,
             "file_unique_id": file_unique_id,
+            # The words the media arrived with, so a forward can keep them
+            # instead of inventing a caption from the filename (_original_caption).
+            "original_caption": _message_caption(update.message),
         }
 
         # Collect every sent file so "Apply Bulk" can run on the whole batch.
@@ -7975,6 +8037,9 @@ class EnhancedMediaHandler:
             "msg_id": getattr(update.message, "message_id", None),
             "msg_date": msg_date,
             "file_unique_id": file_unique_id,
+            # The words the media arrived with, so a forward can keep them
+            # instead of inventing a caption from the filename (_original_caption).
+            "original_caption": _message_caption(update.message),
         }
 
         # Collect every sent file so "Apply Bulk" can run on the whole batch.
@@ -8953,6 +9018,11 @@ class EnhancedMediaHandler:
                 # it like any other result (_redeliver_current_media), which is
                 # what the old version could not do: it demanded a local path and
                 # gave up with "❌ Source file not available on disk".
+                #
+                # ``keep_caption`` sends the media as it is: it keeps the caption
+                # it arrived with and adds none when it had none, instead of
+                # stamping the bot's own metadata caption (a filename, or an
+                # object-storage key) onto a file the user sent bare.
                 current_file = session.get("current_file")
                 if not current_file:
                     await self.safe_edit(query, "❌ No file to forward.")
@@ -8962,6 +9032,7 @@ class EnhancedMediaHandler:
                     update,
                     context,
                     session,
+                    keep_caption=True,
                     success_note="✅ Re-sent above — as a new copy, from the bot.",
                 )
 
@@ -9922,16 +9993,35 @@ class EnhancedMediaHandler:
                                 from utils.batch_pipeline import unregister_active_batch
 
                                 await unregister_active_batch(batch_id=_batch_id)
-                        # A run that finished keeps no resume record: its collection
-                        # is cleared, so there is nothing left to skip. A stopped or
-                        # stalled run keeps its record deliberately - the finished
-                        # files are still in the collection, and pressing Apply again
-                        # should continue from where it stopped rather than convert
-                        # them a second time.
-                        # A batch with work still queued is not over: its resume
-                        # record must survive (those files were never finished)
-                        # and the rest of it is released when that work arrives.
-                        if not (stopped or stalled or pending):
+                        # A batch that accounted for every member it queued is
+                        # over: it has nothing left to resume, and its counters
+                        # have nothing left to outlive. Retire it here rather than
+                        # let a 30-day trace sit in Redis - the state a manual
+                        # ``scripts/cleanup_stale_redis.py`` run used to clear, and
+                        # the reason a later Apply could answer "nothing left to
+                        # do" when a stale resume record outlived its batch.
+                        _batch_finished = enqueued == 0
+                        if _batch_id and not _batch_finished:
+                            try:
+                                from utils.batch_pipeline import batch_counters_finished
+
+                                _batch_finished = await batch_counters_finished(batch_id=_batch_id)
+                            except Exception:
+                                _batch_finished = False
+                        if _batch_finished:
+                            with contextlib.suppress(Exception):
+                                from utils.batch_pipeline import retire_finished_batch
+
+                                await retire_finished_batch(batch_id=_batch_id)
+                        # A run that finished - even one the watchdog gave up on
+                        # after every job had already reported - keeps no resume
+                        # record: its collection is cleared, so there is nothing
+                        # left to skip. A run that genuinely still has work queued
+                        # or still to count keeps its record deliberately: those
+                        # files were never finished, and pressing Apply again should
+                        # continue from where it stopped rather than convert the
+                        # finished ones a second time.
+                        if _batch_finished or not (stopped or stalled or pending):
                             with contextlib.suppress(Exception):
                                 from utils.batch_pipeline import close_batch_resume
 

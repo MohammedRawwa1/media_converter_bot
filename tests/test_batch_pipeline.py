@@ -1514,7 +1514,11 @@ class BulkPipelineWatchTests(unittest.IsolatedAsyncioTestCase):
         # up while the job it describes is still running, and its resume record
         # survives (those entries are not finished).
         self.assertIn("if not pending:", apply_body)
-        self.assertIn("if not (stopped or stalled or pending):", apply_body)
+        # The resume record survives unless the batch accounted for *every* member
+        # it queued - `_batch_finished` is read from the counters, so a batch whose
+        # work is still outstanding keeps it, and a finished one drops it.
+        self.assertIn("if _batch_finished or not (stopped or stalled or pending):", apply_body)
+        self.assertIn("batch_counters_finished(batch_id=_batch_id)", apply_body)
 
     def test_a_finished_member_is_not_left_reading_queued(self):
         """The queueing line is a placeholder, not the file's last word.
