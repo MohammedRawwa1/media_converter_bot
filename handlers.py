@@ -6491,16 +6491,35 @@ class EnhancedMediaHandler:
             # id, so this path has no second way to reach the media. In ``header``
             # mode the whole object is therefore stored rather than a probe header
             # that nothing could turn back into a source.
+            from utils.source_store import SourceRef as _SourceRef
             from utils.source_store import record_source as _record_source
+            from utils.source_store import source_upload_mode as _source_upload_mode
             from utils.source_store import store_source as _store_source
 
-            _ref = await _store_source(
-                _backend,
-                _temp_path,
-                key=_library_key or f"inputs/{_job_id}/source{ext}",
-                telegram_fallback=False,
-                log_prefix="handlers",
-            )
+            # ── The store is a cache, never the fetch ──
+            # The bytes are already on this disk, so a bucket that refuses the
+            # write - a read-only key, a policy that denies PutObject, an outage -
+            # must not become "❌ Failed to download file". Everything that works
+            # from the local copy (the subtitle burn, a screenshot, an in-process
+            # trim) keeps working, and the worker prefers ``_local_input_path``
+            # over ``input_key`` anyway. The userbot and the local-disk branches
+            # already treat their store as best-effort (see
+            # ``remember_fetched_source``); this branch was the one that failed the
+            # whole request over an upload it did not need to succeed.
+            _ref = _SourceRef(mode=_source_upload_mode())
+            try:
+                _ref = await _store_source(
+                    _backend,
+                    _temp_path,
+                    key=_library_key or f"inputs/{_job_id}/source{ext}",
+                    telegram_fallback=False,
+                    log_prefix="handlers",
+                )
+            except Exception as _store_exc:
+                logger.warning(
+                    "handlers: could not store the fetched source (%s); keeping the local copy",
+                    _store_exc,
+                )
             _input_key = _ref.job_key
 
             # Record where this media now lives (and its bytes when small enough
@@ -6534,6 +6553,10 @@ class EnhancedMediaHandler:
                         # answered from the cache still describes the media (the
                         # caption's duration/codecs, the audio tags).
                         source_meta=_source_meta or None,
+                        # Which of the two this record describes: with the upload
+                        # refused, the descriptor must not claim an object that
+                        # was never written.
+                        storage="s3" if _ref.stored else "local",
                     )
             except Exception:
                 logger.debug("handlers: failed to remember remote media in cache")

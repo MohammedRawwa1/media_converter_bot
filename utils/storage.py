@@ -440,6 +440,10 @@ class S3UploadSink(UploadSink):
                 logger.debug("s3 sink: part %d uploaded (%dMB)", part_number, len(data) // (1024 * 1024))
         except BaseException as exc:  # noqa: BLE001 - recorded and re-raised at close
             self._error = exc
+            # A refusal is the state the fuse exists for: open it here too so the
+            # `create_multipart_upload` path (which does not go through _retry)
+            # closes the fuse as well.
+            note_storage_write_failure(exc)
             logger.warning("s3 sink: part %d failed for %s: %s", part_number, self.key, exc)
         finally:
             self._inflight = max(0, self._inflight - len(data))
@@ -454,7 +458,8 @@ class S3UploadSink(UploadSink):
                 return await call()
             except Exception as exc:  # noqa: PERF203 - the retry loop is the point
                 last = exc
-                if attempt == retries:
+                # A refused write cannot be improved by retrying it.
+                if attempt == retries or note_storage_write_failure(exc):
                     break
                 backoff = min(max_backoff, backoff_base * (2 ** (attempt - 1)))
                 logger.warning(
@@ -550,6 +555,13 @@ class AsyncStorageBackend(ABC):
     #: Whether :meth:`download_file_with_progress` can continue a partial
     #: transfer from ``resume_from`` instead of starting over.
     supports_resume_download: bool = False
+    #: Whether :meth:`list_versions` / :meth:`delete_versions` can address the
+    #: individual versions of an object. A bucket that keeps versions holds bytes
+    #: a plain delete cannot free - the delete only writes a marker, and every
+    #: superseded copy keeps counting against the plan. A backend that cannot
+    #: answer (a local filesystem has no versions) leaves this False, and the
+    #: sweeper falls back to the plain ``delete_keys`` it always used.
+    supports_object_versions: bool = False
     #: Whether :meth:`iter_range` can stream a byte window of an object, which is
     #: what lets a caller answer an HTTP Range request from the bucket itself.
     supports_range_streaming: bool = False
@@ -644,6 +656,29 @@ class AsyncStorageBackend(ABC):
         `delete()` in a loop.  Returns 0 when no keys are provided.
         """
 
+    async def list_versions(self, prefix: str = "") -> list[dict[str, Any]]:
+        """Every version and delete marker under *prefix*.
+
+        Each entry is a dict with:
+            - "key": the object key
+            - "version_id": the version's id (``"null"`` on an unversioned bucket)
+            - "is_latest": whether it is the version a plain GET would return
+            - "is_delete_marker": whether it hides the object instead of being it
+            - "last_modified": a float UNIX timestamp (seconds since epoch)
+            - "size": the version's size in bytes (0 for a delete marker)
+
+        Only meaningful when :attr:`supports_object_versions` is true.
+        """
+        raise NotImplementedError("object versions are not supported by this backend")
+
+    async def delete_versions(self, versions: list[tuple[str, str]]) -> int:
+        """Delete specific ``(key, version_id)`` pairs, returning how many went.
+
+        This is what frees bytes on a versioned bucket, where :meth:`delete_keys`
+        only writes a delete marker and leaves every earlier version in place.
+        """
+        raise NotImplementedError("object versions are not supported by this backend")
+
     async def usage(self, *, max_objects: int = 5000, group_depth: int = 1) -> dict[str, Any]:
         """Count objects and total bytes held by the backend.
 
@@ -706,6 +741,145 @@ def _env_int(name: str, default: int) -> int:
         return int(float(str(os.getenv(name) or "").strip()))
     except (TypeError, ValueError):
         return default
+
+
+# ── The write fuse ──────────────────────────────────────────────────────────
+#
+# Storage can stop accepting writes for reasons no caller here can fix: the plan
+# is full, the access key lost its write permission, the bucket was suspended.
+# That is a *state*, not a flake, so the retry loops around it cannot help - they
+# just make every fetch pay three refused PutObjects plus backoff before the
+# request that asked for the source gives up (and the traceback for a planned
+# refusal reads like a crash).
+#
+# The fuse turns that state into one flag. The first writer that is refused opens
+# it, every writer after that fails immediately with
+# :class:`StorageWriteUnavailableError`, and the producers that already hold the
+# bytes fall back to their local copy instead of retrying. It closes by itself
+# after ``STORAGE_WRITE_FUSE_SECONDS`` (``0`` disables it and always tries), so a
+# bucket somebody empties starts accepting writes again with no restart.
+
+#: What a refusal looks like. S3 answers a full plan or a key without write
+#: permission with 403 ``AccessDenied`` (iDrive e2 included); some providers
+#: answer ``QuotaExceeded`` or ``StorageFull`` instead.
+_WRITE_REFUSAL_TOKENS = (
+    "accessdenied",
+    "access denied",
+    "quota",
+    "storage full",
+    "insufficient storage",
+    "no space left",
+    "403",
+)
+
+_storage_fuse_until = 0.0
+_storage_fuse_reason = ""
+_storage_fuse_logged = False
+
+
+class StorageWriteUnavailableError(RuntimeError):
+    """Storage is refusing writes; a caller with local bytes should use them."""
+
+
+def storage_write_fuse_seconds() -> int:
+    """How long a refusal keeps writers off storage (``0`` disables the fuse)."""
+    return max(0, _env_int("STORAGE_WRITE_FUSE_SECONDS", 900))
+
+
+def storage_write_refused(exc: BaseException) -> bool:
+    """True when *exc* is storage refusing a write rather than failing at one."""
+    text = f"{type(exc).__name__}: {exc}".lower()
+    return any(token in text for token in _WRITE_REFUSAL_TOKENS)
+
+
+def note_storage_write_failure(exc: BaseException) -> bool:
+    """Open the fuse when *exc* is a refusal. Returns whether it is now open."""
+    global _storage_fuse_until, _storage_fuse_reason, _storage_fuse_logged
+    if not storage_write_refused(exc):
+        return storage_writes_fused()
+    seconds = storage_write_fuse_seconds()
+    if seconds <= 0:
+        # The operator asked for no fuse: keep trying on every write.
+        return False
+    _storage_fuse_until = time.monotonic() + seconds
+    _storage_fuse_reason = str(exc)
+    if not _storage_fuse_logged:
+        _storage_fuse_logged = True
+        logger.error(
+            "storage: writes are refused (%s) - source storage stays off for %ss and the bot works "
+            "from the copies it already has. Free space, or grant the key write access, and writes "
+            "resume on their own",
+            exc,
+            seconds,
+        )
+    return True
+
+
+def storage_writes_fused() -> bool:
+    """True while storage is known to be refusing writes."""
+    global _storage_fuse_logged
+    if not _storage_fuse_until:
+        return False
+    if time.monotonic() >= _storage_fuse_until:
+        if _storage_fuse_logged:
+            _storage_fuse_logged = False
+            logger.info("storage: write fuse closed - writes are being tried again")
+        return False
+    return True
+
+
+def storage_fuse_reason() -> str:
+    """Why the fuse is open, or an empty string when it is closed."""
+    return _storage_fuse_reason if storage_writes_fused() else ""
+
+
+def reset_storage_write_fuse() -> None:
+    """Close the fuse without waiting it out (tests, and a manual retry)."""
+    global _storage_fuse_until, _storage_fuse_reason, _storage_fuse_logged
+    _storage_fuse_until = 0.0
+    _storage_fuse_reason = ""
+    _storage_fuse_logged = False
+
+
+def _require_storage_writable(what: str) -> None:
+    """Raise :class:`StorageWriteUnavailableError` while the fuse is open."""
+    if storage_writes_fused():
+        raise StorageWriteUnavailableError(
+            f"{what}: storage is not accepting writes ({storage_fuse_reason() or 'refused'})"
+        )
+
+
+def _version_rows(page: dict[str, Any]) -> list[dict[str, Any]]:
+    """The versions and delete markers held by one ``list_object_versions`` page.
+
+    A delete marker is a version too - it hides the object rather than being one -
+    so it is reported with its own flag instead of being dropped, or a sweep could
+    never remove the markers a plain delete leaves behind.
+    """
+    rows: list[dict[str, Any]] = []
+    for obj in page.get("Versions", []):
+        rows.append(
+            {
+                "key": obj["Key"],
+                "version_id": obj.get("VersionId"),
+                "is_latest": bool(obj.get("IsLatest")),
+                "is_delete_marker": False,
+                "last_modified": obj["LastModified"].timestamp(),
+                "size": int(obj.get("Size") or 0),
+            }
+        )
+    for marker in page.get("DeleteMarkers", []):
+        rows.append(
+            {
+                "key": marker["Key"],
+                "version_id": marker.get("VersionId"),
+                "is_latest": bool(marker.get("IsLatest")),
+                "is_delete_marker": True,
+                "last_modified": marker["LastModified"].timestamp(),
+                "size": 0,
+            }
+        )
+    return rows
 
 
 def _usage_group(key: str, depth: int) -> str:
@@ -1126,6 +1300,10 @@ class _PerLoopS3Session:
 
 
 class S3AsyncBackend(AsyncStorageBackend):
+    #: S3 - and every S3-compatible store, iDrive e2 included - keeps object
+    #: versions, so the sweeper can remove what a plain delete leaves behind.
+    supports_object_versions = True
+
     def __init__(
         self,
         bucket: str | None = None,
@@ -1213,6 +1391,10 @@ class S3AsyncBackend(AsyncStorageBackend):
         if "http://" in str(self.bucket) or "https://" in str(self.bucket):
             raise ValueError(f"S3_BUCKET must be a bucket name, not a URL: {self.bucket}")
 
+        # A refused write is not worth attempting: the fuse is what keeps a full
+        # plan from costing every fetch three PutObjects and a traceback.
+        _require_storage_writable(f"upload_file {dest_key}")
+
         # Retry/backoff parameters
         retries = int(os.getenv("S3_OP_RETRIES", "3"))
         backoff_base = float(os.getenv("S3_OP_BACKOFF_BASE", "1"))
@@ -1256,6 +1438,13 @@ class S3AsyncBackend(AsyncStorageBackend):
                 return dest_key
 
             except Exception as e:
+                # A refusal (the plan is full, the key cannot write) is a state,
+                # not a flake: retrying multiplies the cost of every request and
+                # cannot change the answer. One warning, the fuse open, and the
+                # caller falls back to whatever copy it already holds.
+                if note_storage_write_failure(e):
+                    logger.warning("S3 upload refused for key=%s: %s", dest_key, e)
+                    raise
                 logger.warning(
                     "S3 upload failed (attempt %s/%s): %s",
                     attempt,
@@ -1285,6 +1474,7 @@ class S3AsyncBackend(AsyncStorageBackend):
             raise ValueError("key must not be empty")
         if not self.bucket:
             raise ValueError(f"Invalid S3 bucket name: {self.bucket}")
+        _require_storage_writable(f"open_upload_sink {key}")
         return S3UploadSink(
             self,
             key,
@@ -1313,6 +1503,8 @@ class S3AsyncBackend(AsyncStorageBackend):
         src_path = os.path.abspath(src_path)
         if not os.path.exists(src_path):
             raise ValueError(f"File not found: {src_path}")
+
+        _require_storage_writable(f"upload_file_streaming {dest_key}")
 
         # Async path (aioboto3)
         if self._use_aioboto3:
@@ -1346,6 +1538,8 @@ class S3AsyncBackend(AsyncStorageBackend):
         if "http://" in str(self.bucket) or "https://" in str(self.bucket):
             raise ValueError(f"S3_BUCKET must be a bucket name, not a URL: {self.bucket}")
 
+        _require_storage_writable(f"upload_bytes {dest_key}")
+
         retries = int(os.getenv("S3_OP_RETRIES", "3"))
         backoff_base = float(os.getenv("S3_OP_BACKOFF_BASE", "1"))
         max_backoff = float(os.getenv("S3_OP_BACKOFF_MAX", "60"))
@@ -1373,6 +1567,9 @@ class S3AsyncBackend(AsyncStorageBackend):
                 await asyncio.to_thread(_sync)
                 return dest_key
             except Exception as e:
+                if note_storage_write_failure(e):
+                    logger.warning("S3 bytes upload refused for key=%s: %s", dest_key, e)
+                    raise
                 logger.warning("S3 bytes upload failed (attempt %s/%s): %s", attempt, retries, e)
                 if attempt == retries:
                     logger.exception("S3 bytes upload failed permanently for key=%s", dest_key)
@@ -1998,6 +2195,86 @@ class S3AsyncBackend(AsyncStorageBackend):
                 deleted += await asyncio.to_thread(_sync_delete)
 
         logger.info("S3 bulk delete: requested=%d succeeded=%d/%d", len(keys), deleted, len(keys))
+        return deleted
+
+    async def list_versions(self, prefix: str = "") -> list[dict[str, Any]]:
+        """Every version (and delete marker) under *prefix*, with pagination.
+
+        ``list_objects_v2`` - what :meth:`list_keys` uses - reports each key once,
+        as it is *now*: the superseded versions that still hold the bucket's bytes
+        are invisible to it. This is the listing that can see them.
+        """
+        versions: list[dict[str, Any]] = []
+        kwargs: dict[str, Any] = {"Bucket": self.bucket, "Prefix": prefix}
+
+        if self._use_aioboto3:
+            async with self._session.client("s3", **self._client_kwargs()) as client:
+                paginator = client.get_paginator("list_object_versions")
+                async for page in paginator.paginate(**kwargs):
+                    versions.extend(_version_rows(page))
+            return versions
+
+        if boto3 is None:
+            raise RuntimeError("boto3 is required for S3 operations when aioboto3 is not installed")
+
+        def _sync_versions() -> list[dict[str, Any]]:
+            client = boto3.client("s3", **self._client_kwargs())
+            rows: list[dict[str, Any]] = []
+            for page in client.get_paginator("list_object_versions").paginate(**kwargs):
+                rows.extend(_version_rows(page))
+            return rows
+
+        return await asyncio.to_thread(_sync_versions)
+
+    async def delete_versions(self, versions: list[tuple[str, str]]) -> int:
+        """Delete ``(key, version_id)`` pairs in batches of 1000.
+
+        The version id is what makes the delete address the *bytes* instead of
+        the object's name: without it S3 writes a delete marker and keeps them.
+        Returns the count of versions successfully removed.
+        """
+        if not versions:
+            return 0
+
+        deleted = 0
+        batch_size = 1000
+
+        for i in range(0, len(versions), batch_size):
+            batch = versions[i : i + batch_size]
+            delete_dict = {"Objects": [{"Key": key, "VersionId": version_id} for key, version_id in batch]}
+
+            if self._use_aioboto3:
+                async with self._session.client("s3", **self._client_kwargs()) as client:
+                    resp = await client.delete_objects(Bucket=self.bucket, Delete=delete_dict)
+                    _batch_deleted = len(resp.get("Deleted", []))
+                    _errors = resp.get("Errors", [])
+                    if _errors:
+                        logger.warning(
+                            "S3 version delete: %d errors in batch: %s",
+                            len(_errors),
+                            _errors[:3],
+                        )
+                    deleted += _batch_deleted
+            else:
+                if boto3 is None:
+                    raise RuntimeError("boto3 is required for S3 operations when aioboto3 is not installed")
+
+                def _sync_delete_versions(delete_dict=delete_dict):
+                    client = boto3.client("s3", **self._client_kwargs())
+                    resp = client.delete_objects(Bucket=self.bucket, Delete=delete_dict)
+                    _batch_del = len(resp.get("Deleted", []))
+                    _errs = resp.get("Errors", [])
+                    if _errs:
+                        logger.warning(
+                            "S3 version delete: %d errors in batch: %s",
+                            len(_errs),
+                            _errs[:3],
+                        )
+                    return _batch_del
+
+                deleted += await asyncio.to_thread(_sync_delete_versions)
+
+        logger.info("S3 version delete: requested=%d succeeded=%d/%d", len(versions), deleted, len(versions))
         return deleted
 
 

@@ -64,6 +64,20 @@ def _env_positive_int(name: str, default: int) -> int:
     return value if value > 0 else default
 
 
+def _storage_fuse_reason() -> str:
+    """Why storage is refusing writes, or "" while it is accepting them.
+
+    Read through a lazy import: ``utils.storage`` pulls in boto3 and the whole
+    backend stack, and this module is imported by paths that never touch it.
+    """
+    try:
+        from utils.storage import storage_fuse_reason
+
+        return storage_fuse_reason()
+    except Exception:
+        return ""
+
+
 def source_upload_mode() -> str:
     """The configured mode, read at call time so a deployment can flip it live.
 
@@ -167,11 +181,26 @@ async def store_source(
     ``source_chat_id``/``source_message_id``). Only then can ``header`` mode store
     a probe header; without it the whole object is stored, because nothing else
     could supply the bytes.
+
+    A backend that is refusing writes is answered with "nothing was stored"
+    without attempting the upload: every caller of this helper holds the bytes on
+    disk, and the bucket copy is a cache the job can live without (the mode only
+    ever decides *whether a copy is kept in the bucket*, never whether the
+    request may proceed). See the write fuse in ``utils/storage``.
     """
     resolved = mode or source_upload_mode()
     if backend is None or not local_path or not key or stores_nothing(resolved):
         # Nothing is stored: no backend, no bytes to store, or ``local`` mode
         # where the job is fed from this very disk.
+        return SourceRef(mode=resolved)
+
+    _fused = _storage_fuse_reason()
+    if _fused:
+        # Storage already told somebody it is not accepting writes. Trying anyway
+        # would cost a refused PutObject - plus its retries - on every source the
+        # bot touches, to store a copy nothing needs. The fuse closes by itself,
+        # so this is a pause rather than a change of mode.
+        logger.info("%s: not storing %s - storage is refusing writes (%s)", log_prefix, key, _fused)
         return SourceRef(mode=resolved)
 
     if resolved == "header":

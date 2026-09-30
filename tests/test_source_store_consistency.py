@@ -21,7 +21,7 @@ import pytest
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
-from source_helpers import parse_source, read_source, source_text  # noqa: E402
+from source_helpers import find_function, flatten, parse_source, read_source, source_text  # noqa: E402
 
 from utils.source_store import (  # noqa: E402
     DEFAULT_HEADER_BYTES,
@@ -587,6 +587,50 @@ def test_the_producer_and_the_worker_agree_on_the_flag():
             f"{'/'.join(parts)} must mark the job from what the helper stored, not from the configured mode"
         )
     assert flagged >= 3, "the producers that can hand over a header have to say so on the job"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# A refused store is not a failed fetch
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def test_the_bot_api_fetch_treats_a_refused_store_as_a_miss_not_a_failure():
+    """The bucket refusing PutObject must not turn a local fetch into an error.
+
+    A bucket can refuse the write for reasons the bot cannot fix: a read-only
+    key, a policy that denies ``PutObject``, an outage. By then the bytes are
+    already on this disk, which is everything the request actually asked for -
+    the subtitle burn, a screenshot, an in-process trim all read them from
+    there, and the worker prefers ``_local_input_path`` over ``input_key``. The
+    other producers already treat their store as best-effort
+    (``remember_fetched_source``); the Bot API branch was the one that awaited it
+    bare, so a denied upload surfaced as "❌ Failed to download file".
+    """
+    body = find_function(parse_source("handlers.py"), "_ensure_current_file_downloaded")
+
+    store_calls = [
+        node
+        for node in ast.walk(body)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "_store_source"
+    ]
+    assert len(store_calls) == 1, "the fetched source is stored exactly once"
+    store_call = store_calls[0]
+
+    guarded = [
+        node
+        for node in ast.walk(body)
+        if isinstance(node, ast.Try) and any(store_call in ast.walk(statement) for statement in node.body)
+    ]
+    assert guarded, "the store must be awaited inside a try, not bare"
+    assert any(
+        isinstance(handler.type, ast.Name) and handler.type.id == "Exception" for handler in guarded[0].handlers
+    ), "a refused store has to be caught, not raised"
+
+    # The fallback still describes the media: the descriptor is recorded with the
+    # local copy and never claims an object that was not written.
+    text = flatten(ast.unparse(body))
+    assert 'storage="s3" if _ref.stored else "local"' in text
+    assert "_input_key = _ref.job_key" in text, "a job is still told whatever there is to tell"
 
 
 # ─────────────────────────────────────────────────────────────────────────────

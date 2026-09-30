@@ -30,6 +30,23 @@ logger = logging.getLogger(__name__)
 _PLACEHOLDER_FILES = frozenset({"README.md", ".gitkeep", ".gitignore"})
 
 
+def _env_ttl(name: str) -> int | None:
+    """A seconds TTL from the environment, or ``None`` when it says nothing.
+
+    ``0`` is a real answer - "no grace period at all" - so it is kept apart from
+    unset rather than being read as one: only an empty value falls back to the
+    caller's default.
+    """
+    raw = (os.getenv(name) or "").strip()
+    if not raw:
+        return None
+    try:
+        return max(0, int(float(raw)))
+    except (TypeError, ValueError):
+        logger.warning("cleanup: %s=%r is not a number; ignoring it", name, raw)
+        return None
+
+
 class CleanupManager:
     """Manages cleanup of temporary files and old data."""
 
@@ -55,6 +72,13 @@ class CleanupManager:
         # egress is a multiple of what is stored. The sweep still bounds the
         # bucket, so it stays a cache rather than a permanent archive.
         self.s3_library_ttl = int(os.getenv("S3_LIBRARY_TTL", str(30 * 24 * 3600)))
+        # How long a *superseded* version of an object may stay. Every S3 bucket
+        # keeps versions, and a plain delete on one only writes a marker: the
+        # bytes stay and keep counting against the plan, which is how a bucket
+        # holding seven objects filled an account. Unset keeps the prefix's own
+        # TTL, the same window S3's NoncurrentVersionExpiration would use; ``0``
+        # drops a superseded version the moment a sweep sees it.
+        self.s3_noncurrent_ttl = _env_ttl("S3_NONCURRENT_TTL_SECONDS")
         # Redis job hash cleanup interval (30 minutes)
         self.redis_cleanup_interval = int(os.getenv("REDIS_CLEANUP_INTERVAL", str(30 * 60)))
         # Stale Redis job hash max age (24 hours)
@@ -312,8 +336,6 @@ class CleanupManager:
                 return 0
 
             objects = await backend.list_keys(prefix)
-            if not objects:
-                return 0
 
             now = time.time()
             to_delete = [
@@ -322,22 +344,106 @@ class CleanupManager:
                 if (now - obj["last_modified"]) > max_age_seconds and not obj["key"].startswith(tuple(exclude_prefixes))
             ]
 
-            if not to_delete:
-                return 0
+            deleted = 0
+            if to_delete:
+                deleted = await backend.delete_keys(to_delete)
+                logger.info(
+                    "S3 cleanup: prefix=%s deleted=%d/%d candidates=%d (TTL=%ds)",
+                    prefix,
+                    deleted,
+                    len(to_delete),
+                    len(objects),
+                    max_age_seconds,
+                )
 
-            deleted = await backend.delete_keys(to_delete)
-            logger.info(
-                "S3 cleanup: prefix=%s deleted=%d/%d candidates=%d (TTL=%ds)",
+            # What the delete above left behind when the bucket keeps versions.
+            # It runs even when nothing expired this time: the residue of earlier
+            # sweeps is invisible to the listing above and is exactly what fills
+            # a plan up.
+            purged = await self._purge_version_residue(
+                backend,
                 prefix,
-                deleted,
-                len(to_delete),
-                len(objects),
                 max_age_seconds,
+                exclude_prefixes,
+                expired=set(to_delete),
             )
-            return deleted
+            return deleted + purged
         except Exception as e:
             logger.error("S3 cleanup failed for prefix=%s: %s", prefix, e)
             return 0
+
+    async def _purge_version_residue(
+        self,
+        backend,
+        prefix: str,
+        max_age_seconds: int,
+        exclude_prefixes: tuple[str, ...],
+        *,
+        expired: set[str],
+    ) -> int:
+        """Remove the versions and delete markers a plain delete leaves behind.
+
+        A versioned bucket - and every S3 bucket is one unless somebody turned it
+        off - answers a plain delete with a *delete marker*: the object is hidden,
+        the bytes stay, and the marker becomes the key's newest version, so the
+        next sweep sees a fresh object and leaves the whole history alone. Seven
+        live objects plus twenty-three invisible versions is a full plan and a
+        bucket that refuses every write, while every sweep reports success.
+
+        Three kinds of entry go, none of them visible to ``list_keys``:
+
+        * whatever is left of a key this sweep just expired - markers included,
+          which is what makes the expiry stick instead of adding a tombstone;
+        * a superseded version older than the prefix's own TTL: nobody reads it
+          (every reader resolves the newest version) and it only costs space;
+        * a delete marker that has outlived its TTL. A marker is not an object, it
+          is the tombstone of one, and nothing ever removed it.
+
+        Backends without :attr:`supports_object_versions` (a local filesystem, a
+        test double) are left exactly as they were.
+        """
+        if not getattr(backend, "supports_object_versions", False):
+            return 0
+        try:
+            versions = await backend.list_versions(prefix)
+        except NotImplementedError:
+            return 0
+        if not versions:
+            return 0
+
+        max_age = int(self.s3_noncurrent_ttl) if self.s3_noncurrent_ttl is not None else int(max_age_seconds)
+        excluded = tuple(exclude_prefixes)
+        now = time.time()
+        doomed: list[tuple[str, str]] = []
+        for row in versions:
+            key = row.get("key")
+            version_id = row.get("version_id")
+            if not key or not version_id or (excluded and key.startswith(excluded)):
+                continue
+            if key in expired:
+                # The TTL expired this key: every copy of it goes, whatever the
+                # listing says about which one is current.
+                doomed.append((key, version_id))
+                continue
+            age = now - float(row.get("last_modified") or 0)
+            stale = max_age <= 0 or age > max_age
+            if not stale:
+                continue
+            if row.get("is_delete_marker") or (not row.get("is_latest") and version_id != "null"):
+                doomed.append((key, version_id))
+
+        if not doomed:
+            return 0
+
+        purged = await backend.delete_versions(doomed)
+        logger.info(
+            "S3 cleanup: prefix=%s purged=%d/%d version(s) and marker(s) (superseded TTL=%ds)",
+            prefix,
+            purged,
+            len(doomed),
+            max_age,
+        )
+        return purged
 
     # ─────────────────────────────────────────────────────────────────────
     # Redis job hash cleanup
