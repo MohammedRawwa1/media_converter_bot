@@ -399,7 +399,15 @@ async def _stored_source_available(input_key: str | None) -> bool:
         return False
 
 
-async def _fetch_source_url_to_path(url: str, dest_path: str, *, timeout: int = 60) -> bool:
+async def _fetch_source_url_to_path(
+    url: str,
+    dest_path: str,
+    *,
+    timeout: int = 60,
+    job_id: str | None = None,
+    progress_channel: str | None = None,
+    note: str | None = None,
+) -> bool:
     """Fetch a job's ``source_url`` onto disk - the one way this worker does it.
 
     A URL source is needed in two places: when the job is picked up, and again
@@ -415,7 +423,17 @@ async def _fetch_source_url_to_path(url: str, dest_path: str, *, timeout: int = 
 
     The bytes land in a sibling ``.part`` file and are only swapped in once the
     whole body is there, so an interrupted fetch cannot leave a truncated file
-    that ffmpeg would happily encode as if it were the source.
+    that ffmpeg would happily encode as if it were the source. That partial is
+    kept between attempts (and between this function's two callers) and the next
+    attempt asks for the rest with a Range GET, so an interrupted transfer - a
+    large presigned S3 link from the web uploader, say - resumes instead of
+    starting from zero. The worker's partial-fetch sweep bounds how long one can
+    linger.
+
+    When *job_id* is given the transfer reports into ``ffmpeg:job:<job_id>`` the
+    same way the storage fetch does, so a URL-sourced file shows real movement -
+    and the point a resumed attempt picked up - in the progress and batch lines
+    instead of sitting on whatever the apply last wrote.
     """
     from utils.url_validation import _validate_url_safe
 
@@ -427,26 +445,108 @@ async def _fetch_source_url_to_path(url: str, dest_path: str, *, timeout: int = 
         return False
 
     part_path = f"{dest_path}.part"
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url, timeout=aiohttp.ClientTimeout(total=timeout), allow_redirects=False) as resp:
-                if resp.status != 200:
-                    logger.warning("source_url fetch returned %s for %s", resp.status, url)
-                    return False
-                with open(part_path, "wb") as fh:
-                    async for chunk in resp.content.iter_chunked(1024 * 64):
-                        fh.write(chunk)
-        if os.path.exists(part_path) and os.path.getsize(part_path) > 0:
-            os.replace(part_path, dest_path)
-            return True
-        return False
-    except Exception:
-        logger.exception("source_url fetch failed for %s", url)
-        return False
-    finally:
+    retries = max(1, int(os.environ.get("DOWNLOAD_RETRIES", "3")))
+    backoff_base = float(os.environ.get("DOWNLOAD_BACKOFF_BASE", "1"))
+    last_error = ""
+    base_note = note or "fetching the source url"
+    known_total = 0
+    _last_pct = [-1]
+    _last_update = [0.0]
+
+    async def _report_progress(done: int, total: int, stage_note: str) -> None:
+        """Throttled write of the transfer's position, like the storage fetch's."""
+        if not job_id or total <= 0:
+            return
+        pct = min(int(done * 100 / total), 99)
+        now = time.time()
+        if pct == _last_pct[0] or (now - _last_update[0]) < _FETCH_PROGRESS_INTERVAL:
+            return
+        _last_pct[0] = pct
+        _last_update[0] = now
+        await _set_job_state(job_id, "processing", stage_note, progress=pct, channel=progress_channel)
+
+    for attempt in range(1, retries + 1):
+        # Bytes already on disk from an earlier attempt: ask for the remainder
+        # rather than the whole body, the same way the storage fetch resumes.
+        resume_from = 0
         with contextlib.suppress(OSError):
-            if os.path.exists(part_path):
-                os.remove(part_path)
+            resume_from = os.path.getsize(part_path) if os.path.exists(part_path) else 0
+        headers = {"Range": f"bytes={resume_from}-"} if resume_from > 0 else {}
+        # Name the point a resumed attempt continues from, on the same line the
+        # batch shows: a fetch that opens at 62% has to read as a resume.
+        stage_note = base_note
+        if resume_from > 0 and known_total > 0:
+            resume_pct = min(int(resume_from * 100 / known_total), 99)
+            stage_note = f"{base_note} (resuming from {resume_pct}%)"
+            if job_id:
+                await _set_job_state(job_id, "processing", stage_note, progress=0, channel=progress_channel)
+        total = 0
+        streamed = False
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(
+                    url,
+                    timeout=aiohttp.ClientTimeout(total=timeout),
+                    allow_redirects=False,
+                    headers=headers,
+                ) as resp:
+                    if resp.status == 416 and resume_from > 0:
+                        # The partial is already as long as the body (or longer):
+                        # continuing from there is not a valid range, so start over.
+                        with contextlib.suppress(OSError):
+                            os.remove(part_path)
+                        last_error = "HTTP 416"
+                    elif resp.status != 200 and not (resp.status == 206 and resume_from > 0):
+                        if resp.status >= 500:
+                            # Worth another attempt: the body was never sent.
+                            last_error = f"HTTP {resp.status}"
+                            logger.warning("source_url fetch returned %s for %s; will retry", resp.status, url)
+                        else:
+                            # A 4xx/redirect is not transient; retrying cannot help.
+                            logger.warning("source_url fetch returned %s for %s", resp.status, url)
+                            return False
+                    else:
+                        # A server that ignored the Range answers 200 with the
+                        # whole body: appending would duplicate the prefix.
+                        if resp.status == 200 and resume_from > 0:
+                            resume_from = 0
+                        content_range = str(resp.headers.get("Content-Range") or "")
+                        if "/" in content_range and content_range.rsplit("/", 1)[1].strip().isdigit():
+                            total = int(content_range.rsplit("/", 1)[1].strip())
+                        else:
+                            with contextlib.suppress(ValueError):
+                                total = resume_from + int(resp.headers.get("Content-Length") or 0)
+                        if total > resume_from:
+                            # A real total: what a later attempt resumes against.
+                            known_total = total
+                        written = resume_from
+                        os.makedirs(os.path.dirname(part_path) or ".", exist_ok=True)
+                        with open(part_path, "ab" if resume_from > 0 else "wb") as fh:
+                            async for chunk in resp.content.iter_chunked(1024 * 64):
+                                fh.write(chunk)
+                                written += len(chunk)
+                                await _report_progress(written, total, stage_note)
+                        streamed = True
+            if streamed:
+                if os.path.exists(part_path) and os.path.getsize(part_path) > 0:
+                    size = os.path.getsize(part_path)
+                    if total and size < total:
+                        # The body ended early (a cut connection): keep what arrived
+                        # and let the next attempt continue from there.
+                        last_error = f"incomplete body ({size}/{total} bytes)"
+                        logger.warning("source_url fetch was short (%d/%d bytes) for %s", size, total, url)
+                    else:
+                        os.replace(part_path, dest_path)
+                        return True
+                else:
+                    last_error = "no bytes"
+        except Exception as e:
+            last_error = str(e)
+            logger.debug("source_url fetch attempt %d/%d failed for %s: %s", attempt, retries, url, e)
+        if attempt < retries:
+            await asyncio.sleep(backoff_base * (2 ** (attempt - 1)))
+    logger.warning("source_url fetch failed for %s after %d attempt(s): %s", url, retries, last_error)
+    return False
 
 
 async def _check_upload_cancelled(job_id: str) -> bool:
@@ -631,6 +731,49 @@ def _make_upload_progress_callback(job_id: str, progress_channel: str):
             raise
         except Exception:
             logger.debug("ffmpeg worker: in _progress()")
+
+    return _progress
+
+
+# Storage-fetch progress pacing: the streaming callback fires once per chunk, so
+# a multi-GB egress would otherwise write the job hash thousands of times.
+_FETCH_PROGRESS_INTERVAL: float = 1.5
+
+
+def _make_fetch_progress_callback(job_id: str, progress_channel: str, note: str):
+    """Throttled sync callback for a storage download's progress.
+
+    Boto3 reports from the worker thread it runs in and aioboto3 from the event
+    loop, so every update is scheduled back onto the captured loop instead of
+    awaited in place (the same reasoning as ``_make_upload_progress_callback``).
+    ``progress`` is capped at 99 so a finished fetch does not paint 100% and
+    then drop to 0 when the encode stage takes over.
+    """
+    _last_pct = [-1]
+    _last_update = [0.0]
+    try:
+        _loop = asyncio.get_running_loop()
+    except RuntimeError:  # built outside a loop; updates are then dropped
+        _loop = None
+
+    def _progress(done_bytes: int, total_bytes: int) -> None:
+        try:
+            if not total_bytes or total_bytes <= 0:
+                return
+            pct = min(int(done_bytes * 100 / total_bytes), 99)
+            now = time.time()
+            if pct == _last_pct[0] or (now - _last_update[0]) < _FETCH_PROGRESS_INTERVAL:
+                return
+            _last_pct[0] = pct
+            _last_update[0] = now
+            loop = _loop
+            if loop is None or loop.is_closed():
+                return
+            asyncio.run_coroutine_threadsafe(
+                _set_job_state(job_id, "processing", note, progress=pct, channel=progress_channel), loop
+            )
+        except Exception:
+            logger.debug("ffmpeg worker: storage fetch progress update failed")
 
     return _progress
 
@@ -895,6 +1038,17 @@ _DEFERRED_MESSAGE = (
 _DEFERRED_SWEEP_SECONDS = float(os.getenv("DEFERRED_DELIVERY_SWEEP_SECONDS", "30"))
 _DEFERRED_RETRY_BACKOFF_SECONDS = float(os.getenv("DEFERRED_DELIVERY_RETRY_BACKOFF_SECONDS", "120"))
 _DEFERRED_SWEEP_LIMIT = int(os.getenv("DEFERRED_DELIVERY_SWEEP_LIMIT", "5"))
+
+# The ``.part`` a resumable fetch keeps so an interrupted transfer can continue
+# is the one thing nothing else sweeps: without a bound, a worker that keeps
+# failing mid-fetch leaves a partial per media until the disk fills. A partial
+# older than the TTL is past any resume window (and the one case that could
+# splice two objects), so it is dropped; the newest files within the byte budget
+# are the ones still worth resuming.
+_PARTIAL_FETCH_TTL_SECONDS = float(os.getenv("PARTIAL_FETCH_TTL_SECONDS", str(6 * 3600)))
+_PARTIAL_FETCH_MAX_FILES = int(os.getenv("PARTIAL_FETCH_MAX_FILES", "8"))
+_PARTIAL_FETCH_MAX_BYTES = int(os.getenv("PARTIAL_FETCH_MAX_MB", "4096")) * 1024 * 1024
+_PARTIAL_FETCH_SWEEP_SECONDS = float(os.getenv("PARTIAL_FETCH_SWEEP_SECONDS", str(1800)))
 
 
 def _deliver_as_document(job) -> bool:
@@ -1267,6 +1421,53 @@ async def _deferred_delivery_sweeper(stop_event: asyncio.Event | None = None) ->
             logger.exception("deferred delivery sweep failed")
         try:
             await asyncio.sleep(_DEFERRED_SWEEP_SECONDS)
+        except asyncio.CancelledError:
+            raise
+
+
+async def _partial_fetch_sweeper(stop_event: asyncio.Event | None = None) -> None:
+    """Background task: bound the disk the resumable fetch partials may hold.
+
+    Every failed or interrupted storage fetch leaves a ``.part`` behind on
+    purpose, so the next attempt resumes instead of pulling the whole object
+    again - but nothing else ever removed them. One pass on startup, before the
+    first fetch, plus a pass on a slow clock, keeps a worker that keeps failing
+    mid-fetch from filling its disk with prefixes.
+    """
+    # TEMP_PATH holds the storage fetch's and the URL fetch's partials; INPUT_PATH
+    # can hold one for a URL job whose destination came from there.
+    roots = []
+    for candidate in (getattr(config, "TEMP_PATH", "storage/temp"), getattr(config, "INPUT_PATH", "storage/input")):
+        root = os.path.join(candidate)
+        if root not in roots:
+            roots.append(root)
+    while True:
+        try:
+            removed = 0
+            freed = 0
+            for root in roots:
+                _removed, _freed = await asyncio.to_thread(
+                    file_utils.prune_partial_files,
+                    root,
+                    ttl_seconds=_PARTIAL_FETCH_TTL_SECONDS,
+                    max_files=_PARTIAL_FETCH_MAX_FILES,
+                    max_bytes=_PARTIAL_FETCH_MAX_BYTES,
+                )
+                removed += _removed
+                freed += _freed
+            if removed:
+                logger.info(
+                    "partial fetch sweep: removed %d file(s) (%d MB) from %s",
+                    removed,
+                    freed // (1024 * 1024),
+                    ", ".join(roots),
+                )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("partial fetch sweep failed")
+        try:
+            await asyncio.sleep(_PARTIAL_FETCH_SWEEP_SECONDS)
         except asyncio.CancelledError:
             raise
 
@@ -2001,12 +2202,52 @@ async def handle_job(job: dict):
         # file is the cache later jobs read, and half a video would be processed
         # as if it were the whole thing.
         _part_path = f"{temp_input_path}.part"
-        with contextlib.suppress(Exception):
-            if os.path.exists(_part_path):
-                os.remove(_part_path)
+        # The managed transfer can only say "started" and "done", which is what
+        # left the batch message frozen at "Fetching source from storage" for
+        # the whole download. A backend that advertises streaming gets the
+        # callback instead; the flag is explicit so a test double with
+        # auto-created attributes is never taken for one.
+        _streams_fetch = getattr(backend, "supports_download_progress", False) is True
+        _resumes_fetch = getattr(backend, "supports_resume_download", False) is True
+        if _resumes_fetch:
+            # Keep a partial left by an interrupted attempt so this one continues
+            # from it. A partial at or past the object's size is stale (or already
+            # whole), and is dropped rather than resumed into a 416.
+            with contextlib.suppress(OSError):
+                if source_bytes > 0 and os.path.exists(_part_path) and os.path.getsize(_part_path) >= source_bytes:
+                    os.remove(_part_path)
+        else:
+            with contextlib.suppress(Exception):
+                if os.path.exists(_part_path):
+                    os.remove(_part_path)
         for attempt in range(1, download_retries + 1):
+            # Bytes already on disk from an earlier attempt of this job - or from
+            # a job that died mid-fetch - so the transfer continues from there
+            # instead of pulling the whole object again.
+            _resume_from = 0
+            if _resumes_fetch:
+                with contextlib.suppress(OSError):
+                    _resume_from = os.path.getsize(_part_path) if os.path.exists(_part_path) else 0
+            # Name the point a resumed attempt continues from, on the same line
+            # the batch shows: a fetch that starts at 62% has to read as a
+            # resume, not as a bar that was already there. ``progress=0`` leaves
+            # the wording to carry the line until the first bytes land.
+            _attempt_note = _fetch_note
+            if _resume_from > 0 and source_bytes > 0:
+                _resume_pct = min(int(_resume_from * 100 / source_bytes), 99)
+                _attempt_note = f"fetching source from storage (resuming from {_resume_pct}%)"
+                await _set_job_state(job_id, "processing", _attempt_note, progress=0, channel=progress_channel)
+            _attempt_progress = _make_fetch_progress_callback(job_id, progress_channel, _attempt_note)
             try:
-                await asyncio.wait_for(backend.download_file(input_key, _part_path), timeout=download_timeout)
+                if _streams_fetch:
+                    await asyncio.wait_for(
+                        backend.download_file_with_progress(
+                            input_key, _part_path, _attempt_progress, resume_from=_resume_from
+                        ),
+                        timeout=download_timeout,
+                    )
+                else:
+                    await asyncio.wait_for(backend.download_file(input_key, _part_path), timeout=download_timeout)
                 # confirm file exists and has data
                 if os.path.exists(_part_path) and (os.path.getsize(_part_path) > 0):
                     os.replace(_part_path, temp_input_path)
@@ -2026,7 +2267,9 @@ async def handle_job(job: dict):
                 )
             except Exception as e:
                 last_exc = e
-            if not download_success:
+            if not download_success and not _resumes_fetch:
+                # A backend that cannot resume would only overwrite the partial
+                # anyway, so it is dropped here.
                 with contextlib.suppress(Exception):
                     os.remove(_part_path)
             # backoff before next attempt
@@ -2104,7 +2347,13 @@ async def handle_job(job: dict):
         # One URL fetch, shared with the mid-run re-download below. It re-validates
         # the URL itself, so a forged job in the queue cannot reach an internal
         # address through here either.
-        if await _fetch_source_url_to_path(source_url, temp_input):
+        if await _fetch_source_url_to_path(
+            source_url,
+            temp_input,
+            job_id=job_id,
+            progress_channel=progress_channel,
+            note="fetching the source url",
+        ):
             if not job.get("input_path"):
                 job["input_path"] = temp_input
             input_path = job.get("input_path")
@@ -3962,7 +4211,13 @@ async def handle_job(job: dict):
                                 if not tried and job.get("source_url"):
                                     try:
                                         tried = True
-                                        ok = await _fetch_source_url_to_path(job.get("source_url"), input_path)
+                                        ok = await _fetch_source_url_to_path(
+                                            job.get("source_url"),
+                                            input_path,
+                                            job_id=job_id,
+                                            progress_channel=progress_channel,
+                                            note="fetching the source url",
+                                        )
                                     except Exception:
                                         ok = False
 
@@ -4922,6 +5177,16 @@ async def worker_loop(stop_event: asyncio.Event | None = None, *, allow_restart:
         deferred_task = None
         logger.debug("ffmpeg worker: deferred delivery sweeper not started")
 
+    # Keep the resumable fetch partials bounded. Started before any job runs, so
+    # the startup pass has already retired stale prefixes by the time the first
+    # fetch looks for one to resume from.
+    partial_sweep_task = None
+    try:
+        partial_sweep_task = asyncio.create_task(_partial_fetch_sweeper(stop_event))
+    except Exception:
+        partial_sweep_task = None
+        logger.debug("ffmpeg worker: partial fetch sweeper not started")
+
     # Optional RabbitMQ consumer. Enabled by EVENTBUS_QUEUE_BACKEND=rabbitmq with
     # a non-zero rollout; the Redis loop below keeps running either way, because
     # during a rollout both queues hold jobs.
@@ -4979,6 +5244,13 @@ async def worker_loop(stop_event: asyncio.Event | None = None, *, allow_restart:
                     await deferred_task
         except Exception:
             logger.debug("ffmpeg worker: ensure the deferred delivery sweeper is cancelled")
+        try:
+            if partial_sweep_task:
+                partial_sweep_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await partial_sweep_task
+        except Exception:
+            logger.debug("ffmpeg worker: ensure the partial fetch sweeper is cancelled")
         # Stop the broker consumer and close both adapters so an in-flight
         # message is redelivered instead of being acked by a dying process.
         try:

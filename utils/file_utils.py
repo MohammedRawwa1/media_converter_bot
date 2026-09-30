@@ -8,6 +8,7 @@ import logging
 import os
 import shutil
 import tempfile
+import time
 from datetime import UTC
 
 # Optional async file operations
@@ -371,6 +372,85 @@ def safe_rmtree(path: str) -> None:
     if resolved in protected:
         raise RuntimeError(f"safe_rmtree: refusing to delete system directory {resolved!r}")
     shutil.rmtree(resolved, ignore_errors=True)
+
+
+# Suffix of a fetch that is kept on purpose so an interrupted transfer can
+# resume from it. Only names ending in one of these are ever pruned by
+# :func:`prune_partial_files` - a finished media never carries it.
+PARTIAL_FETCH_SUFFIXES = (".part",)
+
+
+def prune_partial_files(
+    root: str,
+    *,
+    ttl_seconds: float,
+    max_files: int,
+    max_bytes: int,
+    suffixes: tuple[str, ...] = PARTIAL_FETCH_SUFFIXES,
+) -> tuple[int, int]:
+    """Bound the disk that deliberately-kept partial fetches can hold.
+
+    A ``.part`` file survives a failed or interrupted download so the next
+    attempt can resume instead of pulling the whole object again. Without this
+    it was the only thing nothing cleaned: a worker that kept failing mid-fetch
+    would leave one partial per media until the disk filled. Two limits keep it
+    bounded:
+
+    * every partial older than *ttl_seconds* is dropped - beyond the resume
+      window it is worth nothing, and a stale prefix is the one case where
+      continuing could splice two different objects together;
+    * of what is newer, only the newest *max_files* are kept, and only while
+      they fit within *max_bytes* - oldest first, since those are the least
+      likely to still be resumed.
+
+    Returns ``(files_removed, bytes_freed)``. Best-effort: an entry that cannot
+    be stat'ed or removed is skipped, symlinks are not followed, and a walk that
+    fails leaves whatever it already pruned in place.
+    """
+    if not root or not os.path.isdir(root):
+        return 0, 0
+    now = time.time()
+    removed = 0
+    freed = 0
+    candidates: list[tuple[float, int, str]] = []  # (mtime, size, path)
+    try:
+        for dirpath, _dirnames, filenames in os.walk(root, followlinks=False):
+            for name in filenames:
+                if not name.endswith(suffixes):
+                    continue
+                path = os.path.join(dirpath, name)
+                try:
+                    st = os.stat(path)
+                except OSError:
+                    continue
+                if (now - st.st_mtime) > ttl_seconds:
+                    try:
+                        os.remove(path)
+                        removed += 1
+                        freed += st.st_size
+                    except OSError:
+                        logger.debug("prune_partial_files: could not remove %s", path)
+                    continue
+                candidates.append((st.st_mtime, st.st_size, path))
+    except OSError:
+        logger.debug("prune_partial_files: walk of %s failed", root)
+        return removed, freed
+
+    candidates.sort()
+    kept = len(candidates)
+    total = sum(size for _mtime, size, _path in candidates)
+    for _mtime, size, path in candidates:
+        if kept <= max_files and total <= max_bytes:
+            break
+        try:
+            os.remove(path)
+            removed += 1
+            freed += size
+            kept -= 1
+            total -= size
+        except OSError:
+            logger.debug("prune_partial_files: could not remove %s", path)
+    return removed, freed
 
 
 # Media/container extensions allowed when building on-disk paths from

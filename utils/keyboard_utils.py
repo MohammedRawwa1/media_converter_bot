@@ -441,6 +441,10 @@ class MediaMenuBuilder:
             ("Remove Audio", "bulk_remove_audio"),
             ("Rename Files", "bulk_rename"),
             ("Optimize", "bulk_optimize"),
+            # Burns a subtitle into every queued video. Turning it on asks for the
+            # .srt files first; Apply Bulk then runs them one video at a time
+            # instead of the worker-job plan the other toggles share.
+            ("Batch Subtitles", "bulk_subtitles"),
         ]
 
         buttons = []
@@ -477,6 +481,10 @@ class MediaMenuBuilder:
         buttons.append(
             [InlineKeyboardButton(f"🎞️ Slideshow: {slideshow:g}s per photo", callback_data=BULK_SLIDESHOW_MENU)]
         )
+
+        # Batch subtitles: its own flow, because it needs the .srt files before it
+        # can run - the button asks for them, then merges one video at a time.
+        buttons.append([InlineKeyboardButton("📝 Batch Subtitles", callback_data="bulk_subtitles")])
 
         # actions: apply, clear the collected batch, and back
         buttons.append(
@@ -589,6 +597,31 @@ class MediaMenuBuilder:
         return InlineKeyboardMarkup(buttons)
 
     @staticmethod
+    def get_merge_options_menu() -> InlineKeyboardMarkup:
+        """The merge variants: a plain merge plus merge-and-trim/compress/convert.
+
+        The merge itself is one stream copy, so the follow-up work (a cut, a
+        re-encode, a container change) runs as a second pass on the merged file.
+        Offering them together is what makes the button useful instead of a dead
+        end that only repeats "start merge".
+        """
+        # Each button carries its own one-line hint, so the encode it runs is on
+        # the button itself rather than something the user has to guess.
+        buttons = [
+            [
+                InlineKeyboardButton("🔀 Merge\nstream copy — no re-encode", callback_data=MERGE_VIDEOS_START),
+                InlineKeyboardButton("✂️ Merge + Trim\nmerge, then cut", callback_data="merge_trim"),
+            ],
+            [
+                InlineKeyboardButton("📉 Merge + Compress\nH.264 CRF 23 · veryfast", callback_data="merge_compress"),
+                InlineKeyboardButton("🔄 Merge + Convert\nremux to your format", callback_data="merge_convert"),
+            ],
+            [InlineKeyboardButton("➕ Add Files", callback_data=MERGE_MENU)],
+            [InlineKeyboardButton("↩️ Back", callback_data=MENU_MAIN)],
+        ]
+        return InlineKeyboardMarkup(buttons)
+
+    @staticmethod
     def get_optimize_menu(current: str = None) -> InlineKeyboardMarkup:
         """Get optimization presets menu, marking the user's stored preset."""
         default = current if current in BULK_PRESET_CHOICES else None
@@ -641,7 +674,10 @@ class MediaMenuBuilder:
             ],
             [
                 InlineKeyboardButton("✂️ Trim", callback_data=TRIM_VIDEO),
-                InlineKeyboardButton("🔀 Merge", callback_data=MERGE_VIDEOS_START),
+                # Opens the merge variants: a plain merge, and the merge-and-X
+                # combinations. Pressing it used to run a merge straight away,
+                # which could only ever answer "need at least 2 videos".
+                InlineKeyboardButton("🔀 Merge", callback_data="merge_options"),
             ],
             [
                 InlineKeyboardButton("🎧 Remove Audio", callback_data=REMOVE_AUDIO),

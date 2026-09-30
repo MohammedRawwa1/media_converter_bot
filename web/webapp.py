@@ -1,7 +1,9 @@
 import asyncio
+import contextlib
 import json
 import logging
 import os
+import queue
 import re
 import shutil
 import subprocess
@@ -11,7 +13,7 @@ import traceback
 import uuid
 
 import redis as redis_sync
-from flask import Flask, jsonify, request, send_file, send_from_directory
+from flask import Flask, Response, jsonify, request, send_file, send_from_directory
 from flask_cors import CORS
 
 import config
@@ -151,9 +153,7 @@ except Exception:
     get_redis = None
     aioredis_available = False
 
-import contextlib
-
-from flask import Response, stream_with_context
+from flask import stream_with_context
 
 from utils import file_utils
 
@@ -1569,6 +1569,147 @@ def status(job_id):
     return jsonify({"job_id": job_id, "progress": 0.0, "message": "queued", "status": "queued"})
 
 
+# ── Streaming an output out of the bucket ───────────────────────────────────
+#
+# The download endpoint used to redirect to a presigned URL, which only works
+# when presigning does; and a directly-served object went out as one whole-body
+# response, so a dropped connection restarted the transfer from zero. Serving
+# the window the client asked for, as a 206, is what lets a large download resume.
+_STREAM_QUEUE_DEPTH = 8
+_STREAM_CHUNK_BYTES = 256 * 1024
+
+_RANGE_RE = re.compile(r"^\s*bytes\s*=\s*(\d*)\s*-\s*(\d*)\s*$", re.IGNORECASE)
+
+
+def _resolve_http_range(header, size):
+    """A Range header as ``(start, end)``, ``"unsatisfiable"``, or ``None``.
+
+    Only a single byte range is handled. Anything else - multiple ranges, a
+    malformed value, an unknown object size - returns ``None`` so the whole body
+    is sent, which every client understands.
+    """
+    if not header or not size or size <= 0:
+        return None
+    match = _RANGE_RE.match(str(header))
+    if not match:
+        return None
+    first, last = match.group(1), match.group(2)
+    if not first and not last:
+        return None
+    if not first:
+        # A suffix range: the final N bytes.
+        length = int(last)
+        if length <= 0:
+            return "unsatisfiable"
+        return (max(0, size - length), size - 1)
+    start = int(first)
+    if start >= size:
+        return "unsatisfiable"
+    end = int(last) if last else size - 1
+    if end < start:
+        return "unsatisfiable"
+    return (start, min(end, size - 1))
+
+
+def _storage_range_chunks(backend, key, start, end):
+    """A sync byte generator over an async backend's ranged stream.
+
+    Flask's response body is synchronous while the storage backend is not, so the
+    reader runs on its own event loop in a daemon thread and hands chunks over a
+    small bounded queue. That bound is the back-pressure: a fast bucket cannot
+    pull the whole video into memory behind a slow client. ``cancelled`` is what
+    stops the reader when the client goes away.
+    """
+    chunks: queue.Queue = queue.Queue(maxsize=_STREAM_QUEUE_DEPTH)
+    cancelled = threading.Event()
+    finished = object()
+    errors: list[str] = []
+
+    async def _pump():
+        try:
+            async for chunk in backend.iter_range(key, start=start, end=end, chunk_size=_STREAM_CHUNK_BYTES):
+                while not cancelled.is_set():
+                    try:
+                        chunks.put_nowait(chunk)
+                        break
+                    except queue.Full:
+                        await asyncio.sleep(0.05)
+                else:
+                    return
+        except Exception as exc:
+            errors.append(str(exc))
+        finally:
+            while True:
+                try:
+                    chunks.put(finished, timeout=0.5)
+                    break
+                except queue.Full:
+                    if cancelled.is_set():
+                        break
+
+    def _run():
+        loop = asyncio.new_event_loop()
+        try:
+            asyncio.set_event_loop(loop)
+            loop.run_until_complete(_pump())
+        except Exception:
+            logger.debug("web download: storage stream pump failed")
+        finally:
+            with contextlib.suppress(Exception):
+                loop.close()
+
+    reader = threading.Thread(target=_run, daemon=True, name="web-storage-stream")
+    reader.start()
+    try:
+        while True:
+            item = chunks.get()
+            if item is finished:
+                break
+            yield item
+    finally:
+        cancelled.set()
+        reader.join(timeout=1.0)
+    if errors:
+        logger.debug("web download: storage stream ended early: %s", errors[0])
+
+
+def _serve_storage_object(backend, key, *, filename=None, mimetype=None):
+    """Stream a storage object through the app, honouring a Range request.
+
+    Answers 206 with ``Content-Range`` for a satisfiable range, 416 with
+    ``bytes */size`` for one that is not, and 200 with the whole object when there
+    is no (or no supported) Range header. ``Accept-Ranges: bytes`` is always set,
+    which is what tells a resuming client the endpoint supports this.
+    """
+    size = None
+    try:
+        size = _run_async(backend.get_file_size(key))
+    except Exception:
+        size = None
+    headers = {"Accept-Ranges": "bytes"}
+    if filename:
+        safe_name = os.path.basename(str(filename)).replace('"', "")
+        headers["Content-Disposition"] = f'attachment; filename="{safe_name}"'
+    resolved = _resolve_http_range(request.headers.get("Range"), size)
+    if resolved == "unsatisfiable":
+        headers["Content-Range"] = f"bytes */{size}"
+        return Response(status=416, headers=headers)
+    if resolved is None:
+        start, end, status = 0, (size - 1 if size else None), 200
+    else:
+        start, end = resolved
+        status = 206
+        headers["Content-Range"] = f"bytes {start}-{end}/{size}"
+    if size:
+        headers["Content-Length"] = str((end - start + 1) if end is not None else size)
+    return Response(
+        _storage_range_chunks(backend, key, start, end),
+        status=status,
+        headers=headers,
+        mimetype=mimetype or "application/octet-stream",
+    )
+
+
 @app.route("/download/<job_id>", methods=["GET"])
 def download(job_id):
 
@@ -1600,43 +1741,51 @@ def download(job_id):
         job_hash = None
 
     if job_hash:
-        # If a presigned URL exists return a redirect to it
-        try:
-            url = job_hash.get("output_get_url")
-            if url:
-                from flask import redirect
-
-                return redirect(url)
-        except Exception:
-            logger.debug("webapp: failed to redirect to presigned URL for %s", job_id)
-
-        # If output is a local path we can send it directly
+        # A local output is the cheapest to serve and its Range support is
+        # Werkzeug's, so it goes first.
         try:
             output_val = job_hash.get("output")
             if output_val and os.path.exists(output_val) and _is_within_output_dir(output_val):
                 output_path = output_val
                 filename = job_hash.get("output_filename") or os.path.basename(output_path)
                 try:
-                    return send_file(output_path, as_attachment=True, download_name=filename)
+                    return send_file(output_path, as_attachment=True, download_name=filename, conditional=True)
                 except TypeError:
                     return send_file(output_path, as_attachment=True, attachment_filename=filename)
         except Exception:
             logger.debug("webapp: failed to send local output file for %s", job_id)
 
-        # If storage key present, attempt to generate presigned GET and redirect
+        # A stored output is streamed through the app with Range support, so a
+        # dropped download resumes from where it stopped - and it does not depend
+        # on presigning being available.
         try:
             output_key = job_hash.get("output_key")
             if output_key and get_storage_backend_sync is not None:
                 backend = get_storage_backend_sync()
-                try:
-                    url = _run_async(backend.generate_presigned_get(output_key))
-                    from flask import redirect
-
-                    return redirect(url)
-                except Exception:
-                    logger.debug("webapp: presigned GET redirect failed for %s", job_id)
+                if getattr(backend, "supports_range_streaming", False) is True:
+                    filename = job_hash.get("output_filename") or f"{job_id}.mp4"
+                    return _serve_storage_object(backend, output_key, filename=filename)
         except Exception:
-            logger.debug("webapp: failed to process output_key redirect for %s", job_id)
+            logger.exception("webapp: streaming output for %s failed", job_id)
+
+        # Fallback for a backend that cannot stream a range: hand off to a fresh
+        # presigned GET, then to the one stored at upload time. A presigned URL
+        # supports Range at the bucket, so resume still works here.
+        try:
+            url = None
+            output_key = job_hash.get("output_key")
+            if output_key and get_storage_backend_sync is not None:
+                try:
+                    url = _run_async(get_storage_backend_sync().generate_presigned_get(output_key))
+                except Exception:
+                    url = None
+            url = url or job_hash.get("output_get_url")
+            if url:
+                from flask import redirect
+
+                return redirect(url)
+        except Exception:
+            logger.debug("webapp: presigned GET redirect failed for %s", job_id)
 
     # Check in-memory JOB_STORE for output path
     try:
@@ -1651,7 +1800,10 @@ def download(job_id):
     ):
         try:
             return send_file(
-                local.get("output"), as_attachment=True, download_name=os.path.basename(local.get("output"))
+                local.get("output"),
+                as_attachment=True,
+                download_name=os.path.basename(local.get("output")),
+                conditional=True,
             )
         except TypeError:
             return send_file(
@@ -1662,7 +1814,7 @@ def download(job_id):
     out_path = os.path.join(OUTPUT_DIR, f"{job_id}.mp4")
     if os.path.exists(out_path):
         try:
-            return send_file(out_path, as_attachment=True, download_name=os.path.basename(out_path))
+            return send_file(out_path, as_attachment=True, download_name=os.path.basename(out_path), conditional=True)
         except TypeError:
             return send_file(out_path, as_attachment=True, attachment_filename=os.path.basename(out_path))
 

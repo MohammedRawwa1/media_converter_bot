@@ -542,6 +542,43 @@ class AsyncStorageBackend(ABC):
         """
         return False
 
+    #: Whether :meth:`download_file_with_progress` streams and reports real
+    #: movement. Kept as an explicit flag (rather than probing for the method)
+    #: so a test double with auto-created attributes is never mistaken for a
+    #: backend that can render progress.
+    supports_download_progress: bool = False
+    #: Whether :meth:`download_file_with_progress` can continue a partial
+    #: transfer from ``resume_from`` instead of starting over.
+    supports_resume_download: bool = False
+    #: Whether :meth:`iter_range` can stream a byte window of an object, which is
+    #: what lets a caller answer an HTTP Range request from the bucket itself.
+    supports_range_streaming: bool = False
+
+    async def download_file_with_progress(
+        self, key: str, dest_path: str, progress_callback=None, *, resume_from: int = 0
+    ) -> bool:
+        """Download ``key`` to ``dest_path``, optionally reporting progress.
+
+        ``progress_callback`` is ``callable(done_bytes, total_bytes)`` and is
+        display-only; it may be invoked from another thread, so it must be
+        cheap. The default is exactly :meth:`download_file` followed by a
+        single 100% report - a backend that cannot stream does not have to
+        reimplement anything, and callers use :attr:`supports_download_progress`
+        to know whether the numbers mean anything in between.
+
+        ``resume_from`` is ignored here: a whole-object transfer has no offset
+        to continue from, so the default starts over.
+        """
+        ok = await self.download_file(key, dest_path)
+        if ok and progress_callback is not None:
+            try:
+                size = os.path.getsize(dest_path)
+            except OSError:
+                size = 0
+            with contextlib.suppress(Exception):
+                progress_callback(size, size)
+        return ok
+
     @abstractmethod
     async def generate_presigned_post(self, key: str, expires: int | None = None) -> dict[str, Any]:
         """Return a dict with presigned POST upload info (url/fields) or raise when unsupported."""
@@ -1379,6 +1416,214 @@ class S3AsyncBackend(AsyncStorageBackend):
                 # Use deterministic jitter (based on attempt number) to avoid S311 insecure-random warning
                 _jitter = (attempt * 9973) % 1000 / 1000  # deterministic fractional jitter
                 await asyncio.sleep(backoff + _jitter)
+
+    supports_download_progress = True
+    supports_resume_download = True
+    supports_range_streaming = True
+
+    async def iter_range(self, key: str, *, start: int = 0, end: int | None = None, chunk_size: int = 262144):
+        """Yield bytes ``[start..end]`` of *key*, ``end=None`` meaning to the end.
+
+        The streaming counterpart of :meth:`download_range`: a caller that has to
+        serve an object over HTTP (a web download with a Range request) needs the
+        bytes as they arrive rather than a whole file on disk first.
+        """
+        if not self._use_aioboto3 and boto3 is None:
+            raise RuntimeError("boto3 is required for S3 operations when aioboto3 is not installed")
+        start = max(0, int(start or 0))
+        chunk_size = max(64 * 1024, int(chunk_size or 0))
+        if end is not None:
+            range_header = f"bytes={start}-{int(end)}"
+        else:
+            range_header = f"bytes={start}-" if start else None
+
+        if self._use_aioboto3:
+            async with self._session.client("s3", **self._client_kwargs()) as client:
+                kwargs: dict[str, Any] = {"Bucket": self.bucket, "Key": key}
+                if range_header:
+                    kwargs["Range"] = range_header
+                resp = await client.get_object(**kwargs)
+                body = resp["Body"]
+                while True:
+                    chunk = await body.read(chunk_size)
+                    if not chunk:
+                        break
+                    yield chunk
+                    # Yield so a long stream does not monopolise the loop.
+                    await asyncio.sleep(0)
+            return
+
+        def _open():
+            client = boto3.client("s3", **self._client_kwargs())
+            kwargs: dict[str, Any] = {"Bucket": self.bucket, "Key": key}
+            if range_header:
+                kwargs["Range"] = range_header
+            return client.get_object(**kwargs)
+
+        resp = await asyncio.to_thread(_open)
+        body = resp["Body"]
+        while True:
+            # One read per thread hop, so a client that disconnects stops the
+            # reader at a chunk boundary instead of leaving a thread mid-body.
+            chunk = await asyncio.to_thread(body.read, chunk_size)
+            if not chunk:
+                break
+            yield chunk
+
+    @staticmethod
+    def _range_kwargs(key: str, bucket: str, offset: int) -> dict[str, Any]:
+        """``get_object`` kwargs for [*offset*..end] (a plain GET at offset 0)."""
+        kwargs: dict[str, Any] = {"Bucket": bucket, "Key": key}
+        if offset > 0:
+            kwargs["Range"] = f"bytes={offset}-"
+        return kwargs
+
+    @staticmethod
+    def _response_total(resp: dict, offset: int) -> int:
+        """The whole object's size from a (possibly ranged) response.
+
+        A 206 carries ``Content-Range: bytes <start>-<end>/<total>``, which is
+        the authoritative total for a resumed transfer; a plain response only
+        gives this response's length, so the offset has to be added back.
+        """
+        content_range = str(resp.get("ContentRange") or "")
+        if "/" in content_range:
+            tail = content_range.rsplit("/", 1)[1].strip()
+            if tail.isdigit():
+                return int(tail)
+        return offset + int(resp.get("ContentLength") or 0)
+
+    async def _stream_body_async(self, key, dest_path, offset, chunk_size, report) -> int:
+        """aioboto3: read the body natively, appending from *offset*."""
+        async with self._session.client("s3", **self._client_kwargs()) as client:
+            resp = await client.get_object(**self._range_kwargs(key, self.bucket, offset))
+            status = (resp.get("ResponseMetadata") or {}).get("HTTPStatusCode")
+            if offset > 0 and status not in (None, 206):
+                # The backend ignored the Range and sent the whole object:
+                # appending it would duplicate the prefix, so start over.
+                offset = 0
+            total = self._response_total(resp, offset)
+            done = offset
+            with open(dest_path, "ab" if offset > 0 else "wb") as fh:
+                while True:
+                    chunk = await resp["Body"].read(chunk_size)
+                    if not chunk:
+                        break
+                    fh.write(chunk)
+                    done += len(chunk)
+                    report(done, total)
+                    # Yield so a long stream does not monopolise the loop.
+                    await asyncio.sleep(0)
+        return done
+
+    async def _stream_body_sync(self, key, dest_path, offset, chunk_size, report) -> int:
+        """boto3 fallback: the same stream, one thread hop per chunk.
+
+        Deliberately not a single long ``to_thread`` around the whole read loop:
+        a timed-out attempt would leave that thread still appending to the file
+        that a resumed attempt then continues from. One read per hop means a
+        cancelled attempt stops at a chunk boundary with a coherent prefix.
+        """
+
+        def _open():
+            client = boto3.client("s3", **self._client_kwargs())
+            return client.get_object(**self._range_kwargs(key, self.bucket, offset))
+
+        resp = await asyncio.to_thread(_open)
+        status = (resp.get("ResponseMetadata") or {}).get("HTTPStatusCode")
+        if offset > 0 and status not in (None, 206):
+            offset = 0
+        total = self._response_total(resp, offset)
+        body = resp["Body"]
+        done = offset
+        with open(dest_path, "ab" if offset > 0 else "wb") as fh:
+            while True:
+                chunk = await asyncio.to_thread(body.read, chunk_size)
+                if not chunk:
+                    break
+                fh.write(chunk)
+                done += len(chunk)
+                report(done, total)
+        return done
+
+    async def download_file_with_progress(
+        self, key: str, dest_path: str, progress_callback=None, *, resume_from: int = 0
+    ) -> bool:
+        """Stream ``key`` into ``dest_path``, reporting progress per chunk.
+
+        :meth:`download_file` hands the transfer to boto3's managed downloader,
+        which offers no hook between "0 bytes" and "done" - so a multi-GB
+        source sat at 0% in the batch progress message for as long as its bytes
+        were arriving. Reading the object body here costs the one GET it always
+        did, but lets the caller render real movement.
+
+        ``resume_from`` is the number of bytes already on disk. When positive,
+        the object is requested with a Range GET and the remaining bytes are
+        appended, so an interrupted transfer continues from where it stopped
+        instead of pulling the whole object again. A partial at or past the
+        object's size is stale, so it starts over rather than sending a Range
+        the bucket would refuse with a 416.
+
+        ``progress_callback`` is ``callable(done_bytes, total_bytes)``, with
+        ``done`` measured from the start of the object so the percentage is
+        right on a resumed transfer too. It runs on the event loop under
+        aioboto3 and on a worker thread under boto3, so it must be cheap and
+        thread-safe (the worker coalesces it).
+        """
+        chunk_size = max(64 * 1024, _env_int("S3_DOWNLOAD_CHUNK_KB", 512) * 1024)
+        retries = int(os.getenv("S3_OP_RETRIES", "3"))
+        backoff_base = float(os.getenv("S3_OP_BACKOFF_BASE", "1"))
+        max_backoff = float(os.getenv("S3_OP_BACKOFF_MAX", "60"))
+        os.makedirs(os.path.dirname(dest_path) or ".", exist_ok=True)
+        if not self._use_aioboto3 and boto3 is None:
+            raise RuntimeError("boto3 is required for S3 operations when aioboto3 is not installed")
+
+        def _report(done: int, total: int) -> None:
+            if progress_callback is None:
+                return
+            try:
+                progress_callback(done, total)
+            except Exception:
+                logger.debug("S3 download progress callback failed for key %s", key)
+
+        def _on_disk() -> int:
+            try:
+                return os.path.getsize(dest_path) if os.path.exists(dest_path) else 0
+            except OSError:
+                return 0
+
+        offset = max(0, int(resume_from or 0))
+        if offset > 0:
+            try:
+                known = await self.get_file_size(key)
+            except Exception:
+                known = None
+            if known is not None and offset >= known:
+                offset = 0
+
+        for attempt in range(1, retries + 1):
+            try:
+                if self._use_aioboto3:
+                    await self._stream_body_async(key, dest_path, offset, chunk_size, _report)
+                else:
+                    await self._stream_body_sync(key, dest_path, offset, chunk_size, _report)
+                await self._record_download_egress(dest_path)
+                _final = _on_disk()
+                _report(_final, _final)
+                return True
+            except Exception as e:
+                # Whatever landed is a coherent prefix, so the next attempt
+                # continues from it instead of re-pulling the whole object.
+                offset = _on_disk()
+                logger.warning("S3 streaming download attempt %s/%s failed for key %s: %s", attempt, retries, key, e)
+                if attempt == retries:
+                    logger.exception("S3 streaming download failed after %s attempts for key %s", retries, key)
+                    raise
+                backoff = min(max_backoff, backoff_base * (2 ** (attempt - 1)))
+                # Use deterministic jitter (based on attempt number) to avoid S311 insecure-random warning
+                _jitter = (attempt * 9973) % 1000 / 1000
+                await asyncio.sleep(backoff + _jitter)
+        return False
 
     async def download_range(self, key: str, dest_path: str, end: int = 2_097_151) -> bool:
         """Download only bytes 0–*end* of *key* (a Range GET).

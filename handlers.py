@@ -807,6 +807,52 @@ def _document_delivery_name(current_file: dict | None, path: str | None, default
     return os.path.basename(str(path or "")) or f"media{ext}"
 
 
+#: How large an uploaded subtitle file may be. A text track of a few megabytes
+#: covers hours of dialogue; anything past this is not a subtitle file and ffmpeg
+#: would only choke on it.
+_MAX_SUBTITLE_BYTES = 10 * 1024 * 1024
+
+
+def _validate_subtitle_file(path: str, ext: str) -> tuple[bool, str]:
+    """Check that ``path`` really holds a usable subtitle file for ``ext``.
+
+    Telegram hands over a document's extension, and an extension is a claim rather
+    than a fact: a renamed video, an empty file and a stray note all arrive as
+    ``.srt`` and all make ffmpeg fail *after* the download. This reads what was
+    actually downloaded - size, decoding, and the structural marker each format
+    must carry - so the user is told what is wrong instead of getting a generic
+    merge failure. Returns ``(ok, reason)``.
+    """
+    try:
+        size = os.path.getsize(path)
+    except OSError:
+        return False, "the file could not be read"
+    if size <= 0:
+        return False, "the file is empty"
+    if size > _MAX_SUBTITLE_BYTES:
+        return False, f"the file is too large for a subtitle ({size // (1024 * 1024)} MB)"
+
+    try:
+        with open(path, "rb") as fh:
+            raw = fh.read(_MAX_SUBTITLE_BYTES)
+    except OSError:
+        return False, "the file could not be read"
+
+    text = raw.decode("utf-8-sig", errors="ignore")
+    if not text.strip():
+        return False, "the file has no readable text"
+
+    if ext == ".vtt":
+        ok = text.lstrip().startswith("WEBVTT")
+    elif ext in (".ass", ".ssa"):
+        ok = "[Script Info]" in text or "Dialogue:" in text
+    else:  # .srt
+        ok = "-->" in text
+    if not ok:
+        return False, f"the file is not a valid {ext.lstrip('.').upper()} subtitle"
+    return True, ""
+
+
 def _redelivery_name(current_file: dict | None, kind: str, local_path: str | None = None) -> str:
     """The name a re-sent copy of the media carries.
 
@@ -1281,8 +1327,17 @@ def _batch_member_stage(info: dict | None) -> tuple[str, str]:
     if "waiting" in low:
         return "⏳", message or "waiting for the worker"
     if "fetch" in low or "download" in low or "storag" in low:
+        # A resumed transfer says where it picked up, so a line that opens at
+        # 62% reads as a resume rather than as a bar that was already there.
+        origin = ""
+        if "resuming from" in low:
+            origin = message.rsplit("resuming from", 1)[1].strip().split("%", 1)[0].strip()
         if progress not in ("", "0", "0.0"):
+            if origin:
+                return "⬇️", f"Fetching source from storage — {progress}% (resumed from {origin}%)"
             return "⬇️", f"Fetching source from storage — {progress}%"
+        if origin:
+            return "⬇️", f"Fetching source from storage — resuming from {origin}%"
         return "⬇️", "Fetching source from storage"
     if status == "queued":
         return "⏳", "queued"
@@ -6065,6 +6120,7 @@ class EnhancedMediaHandler:
             async def _try_userbot_download(chat_id, message_id, reason):
                 if not enable_userbot or not chat_id or not message_id:
                     return False
+                _dl_batch_cancel_task = None
                 try:
                     from utils.userbot_downloader import download_forward_via_userbot
 
@@ -6082,22 +6138,69 @@ class EnhancedMediaHandler:
                     _cancel_key = f"{chat_id}:{message_id}"
                     _cancel_flag = [False]  # thread-safe via list mutation
                     _download_cancel_flags[_cancel_key] = _cancel_flag
+                    # In a batch the apply owns exactly one message, so this fetch
+                    # renders the same shape as every other stage of the file (id,
+                    # index, Stop) instead of replacing it with a bare
+                    # "Downloading: N%" line that hid the batch id and its button.
+                    _dl_batch_id = current_file.get("_pipeline_batch_id")
+                    _dl_batch_cancelled = [False]
                     try:
                         # Prefer editing the callback query message for continuity
                         _cq = getattr(update, "callback_query", None)
                         _kb_cancel = InlineKeyboardMarkup(
                             [[InlineKeyboardButton("❌ Cancel", callback_data=f"cancel_dl:{_cancel_key}")]]
                         )
+                        _dl_markup = _batch_stop_markup(_dl_batch_id) if _dl_batch_id else _kb_cancel
+                        _dl_start_text = (
+                            _batch_member_text(
+                                _dl_batch_id,
+                                current_file.get("_pipeline_file_index"),
+                                current_file.get("_pipeline_file_total"),
+                                current_file.get("name"),
+                                {"status": "fetching", "message": "downloading the source", "progress": 0},
+                            )
+                            if _dl_batch_id
+                            else "⬇️ Starting download..."
+                        )
                         if _cq:
                             _dl_progress_msg = _cq.message
-                            await _dl_progress_msg.edit_text("⬇️ Starting download...", reply_markup=_kb_cancel)
+                            await _dl_progress_msg.edit_text(_dl_start_text, reply_markup=_dl_markup)
                         else:
                             _dl_progress_msg = await update.effective_message.reply_text(
-                                "⬇️ Starting download...", reply_markup=_kb_cancel
+                                _dl_start_text, reply_markup=_dl_markup
                             )
                         _dl_loop = asyncio.get_running_loop()
                     except Exception:
                         pass
+
+                    async def _watch_userbot_batch_cancel():
+                        """Abort this fetch when the batch's own Stop is pressed.
+
+                        Stop flags the batch in Redis, not this download's local
+                        flag, so without this the transfer ran to completion
+                        before the apply noticed the batch was over.
+                        """
+                        try:
+                            from utils.batch_pipeline import is_batch_cancelled
+                            from utils.job_queue import get_redis as _bc_redis
+
+                            while not _dl_batch_cancelled[0]:
+                                _bc = await _bc_redis()
+                                try:
+                                    if await is_batch_cancelled(batch_id=_dl_batch_id):
+                                        _dl_batch_cancelled[0] = True
+                                        return
+                                finally:
+                                    with contextlib.suppress(Exception):
+                                        await _bc.close()
+                                await asyncio.sleep(0.5)
+                        except asyncio.CancelledError:
+                            raise
+                        except Exception:
+                            logger.debug("bulk: userbot download cancel watcher stopped")
+
+                    if _dl_batch_id:
+                        _dl_batch_cancel_task = asyncio.create_task(_watch_userbot_batch_cancel())
 
                     _dl_last_pct = [-1]
                     _dl_last_time = [0.0]
@@ -6105,14 +6208,15 @@ class EnhancedMediaHandler:
                     def _dl_progress_cb(sent, total):
                         """Sync callback called by Pyrogram/Telethon download_media.
 
-                        Raises an exception when the user presses the Cancel button
-                        so the download aborts and propagates up.
+                        Raises an exception when the user presses Cancel - or, in a
+                        batch, the Stop button - so the download aborts and
+                        propagates up.
                         """
                         if not _dl_progress_msg or not _dl_loop or total <= 0:
                             return
                         try:
-                            # Check if user pressed Cancel
-                            if _cancel_flag[0]:
+                            # Check if user pressed Cancel, or stopped the batch
+                            if _cancel_flag[0] or _dl_batch_cancelled[0]:
                                 raise asyncio.CancelledError("Download cancelled by user")
                             pct = min(int(sent * 100 / total), 100)
                             now = time.time()
@@ -6122,9 +6226,18 @@ class EnhancedMediaHandler:
                             _dl_last_time[0] = now
                             mb_sent = sent // (1024 * 1024)
                             mb_total = total // (1024 * 1024)
-                            text = f"⬇️ Downloading: {pct}% ({mb_sent}MB / {mb_total}MB)"
+                            if _dl_batch_id:
+                                text = _batch_member_text(
+                                    _dl_batch_id,
+                                    current_file.get("_pipeline_file_index"),
+                                    current_file.get("_pipeline_file_total"),
+                                    current_file.get("name"),
+                                    {"status": "fetching", "message": "downloading the source", "progress": pct},
+                                )
+                            else:
+                                text = f"⬇️ Downloading: {pct}% ({mb_sent}MB / {mb_total}MB)"
                             asyncio.run_coroutine_threadsafe(
-                                _dl_progress_msg.edit_text(text, reply_markup=_kb_cancel),
+                                _dl_progress_msg.edit_text(text, reply_markup=_dl_markup),
                                 _dl_loop,
                             )
                         except asyncio.CancelledError:
@@ -6210,6 +6323,10 @@ class EnhancedMediaHandler:
                 except Exception:
                     logger.exception("Userbot download fallback failed (%s) for %s/%s", reason, chat_id, message_id)
                 finally:
+                    if _dl_batch_cancel_task is not None:
+                        _dl_batch_cancel_task.cancel()
+                        with contextlib.suppress(asyncio.CancelledError):
+                            await _dl_batch_cancel_task
                     _download_cancel_flags.pop(_cancel_key, None)
                 return False
 
@@ -7868,6 +7985,437 @@ class EnhancedMediaHandler:
             reply_markup=MediaMenuBuilder.get_main_menu("audio"),
         )
 
+    async def _apply_subtitle_file(
+        self,
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+        session: dict,
+        document,
+        file_ext: str,
+        *,
+        burn: bool,
+    ) -> None:
+        """Attach a subtitle file to the session's video, the way every button does.
+
+        Media registration is lazy, so a video the user has *just* sent has no
+        local copy and nothing in storage yet. This path used to resolve the
+        media directly and answer "File not available on disk." for exactly that
+        case - the file the user had just sent. It now asks the shared guard for
+        the bytes (``_ensure_local_media``), the same step the trimmer, the
+        splitter and every other action takes: a stored object is reused before
+        Telegram is touched, and a fresh upload is fetched through whichever pipe
+        can carry it (the Bot API for a small media, the userbot/pipeline for a
+        large one, one ranged read when it already lives in the bucket).
+
+        The subtitle bytes are then validated (an extension is only a claim), and
+        the merge hardcodes the text into the picture - one MP4 with the subtitles
+        in it, the same result the ``🔥 Burn Subtitles`` button produces, because
+        both buttons exist to end with a single self-contained video.
+
+        The result is delivered through the same helpers as its sibling buttons -
+        cached token first, the user's upload preference, and the userbot for
+        anything over the Bot API's ceiling - instead of a bare ``send_document``
+        that left a large result undeliverable.
+        """
+        message = getattr(update, "message", None)
+        user_id = update.effective_user.id if update.effective_user else None
+
+        async def notify(text: str, **kwargs) -> None:
+            if message is not None:
+                await message.reply_text(text, **kwargs)
+            else:
+                await context.bot.send_message(update.effective_chat.id, text, **kwargs)
+
+        current = session.get("current_file")
+        if not current or current.get("type") != "video":
+            await notify("❌ No video available in session to apply subtitles.")
+            return
+
+        if not await self._check_conversion_quota(update, context):
+            return
+
+        # Make sure the video's bytes are reachable *before* the subtitle is
+        # pulled down, so a media that cannot be fetched does not leave a stray
+        # subtitle on disk. A stored object is reused; otherwise the same fetch
+        # every other button performs.
+        current, _ = await self._ensure_local_media(update, context, session, current, notify=notify)
+        if current is None:
+            return
+        if not (self._local_copy(current) or current.get("input_key")):
+            await notify("❌ File not available on disk.")
+            return
+
+        await notify("📥 Downloading subtitle file...")
+        file = await context.bot.get_file(document.file_id)
+        input_dir = getattr(config, "INPUT_PATH", "storage/input") if config else "storage/input"
+        with contextlib.suppress(OSError):
+            os.makedirs(input_dir, exist_ok=True)
+        subtitle_path = os.path.join(input_dir, f"{user_id}_{document.file_id}{file_ext}")
+        await file.download_to_drive(subtitle_path)
+
+        try:
+            # Never hand ffmpeg a file that only *claims* to be a subtitle: the
+            # extension arrives from Telegram, so the bytes are checked before
+            # the merge. A bad file keeps the prompt armed, so a resend costs one
+            # message rather than restarting the whole flow.
+            subtitle_ok, reason = _validate_subtitle_file(subtitle_path, file_ext)
+            if not subtitle_ok:
+                context.user_data["awaiting_burn_subtitle" if burn else "awaiting_subtitle_file"] = True
+                await notify(
+                    f"❌ That file is not a usable subtitle: {reason}.\n"
+                    f"Send a valid {file_ext} subtitle file and I'll try again."
+                )
+                return
+
+            ok, reason = await self._burn_subtitle_into_current(
+                update, context, session, current, subtitle_path, notify=notify
+            )
+            if ok:
+                await notify("✅ Subtitles applied.")
+            else:
+                await notify(f"❌ Failed to apply subtitles ({reason}). See logs for details.")
+        finally:
+            with contextlib.suppress(OSError):
+                os.remove(subtitle_path)
+
+    async def _burn_subtitle_into_current(
+        self,
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+        session: dict,
+        current: dict,
+        subtitle_path: str,
+        *,
+        notify,
+    ) -> tuple[bool, str]:
+        """Merge ``subtitle_path`` into the session's video and deliver one MP4.
+
+        The shared half of both subtitle flows - the single-file buttons and the
+        batch run - so a batch cannot merge differently from a one-off. It makes
+        the video's bytes available through the same guard every button uses, runs
+        the burn, and delivers the result the way its sibling buttons do (cached
+        token, the user's upload preference, the userbot over the Bot API's
+        ceiling). Returns ``(ok, reason)``.
+        """
+        user_id = update.effective_user.id if update.effective_user else None
+
+        current, _ = await self._ensure_local_media(update, context, session, current, notify=notify)
+        if current is None:
+            return False, "the video could not be fetched"
+        video_path = await self._resolve_local_source(
+            current, session=session, user_id=user_id, require_stored_key_only=True
+        )
+        if not video_path:
+            return False, "file not available on disk"
+
+        output_dir = getattr(config, "OUTPUT_PATH", "storage/output") if config else "storage/output"
+        with contextlib.suppress(OSError):
+            os.makedirs(output_dir, exist_ok=True)
+        # The subtitles are merged *into* the frames, so the delivery is always
+        # one MP4: the video is re-encoded to H.264/AAC and there is no subtitle
+        # stream left to select, whatever container the source arrived in.
+        out_stem = os.path.splitext(os.path.basename(video_path))[0] or str(current.get("id") or "video")
+        out_path = os.path.join(output_dir, f"{user_id}_subtitled_{out_stem}.mp4")
+
+        try:
+            await notify("🔧 Merging subtitles into the video (this may take a while)...")
+            ok = await self.converter.burn_subtitles(video_path, subtitle_path, out_path)
+            if not (ok and os.path.exists(out_path)):
+                return False, "the merge failed"
+
+            caption = _metadata_caption(current)
+            delivery_name = _video_delivery_name(current, out_path)
+            upload_mode = _user_upload_mode(user_id)
+            size = 0
+            with contextlib.suppress(OSError):
+                size = os.path.getsize(out_path)
+            sent = False
+            # An output over the Bot API's ceiling takes the userbot (MTProto)
+            # road - the same one an over-limit split part takes.
+            if size > config.BOT_API_MAX_BYTES and getattr(config, "ENABLE_USERBOT", False):
+                sent = await self._send_part_via_userbot(
+                    update.effective_chat.id,
+                    out_path,
+                    caption,
+                    delivery_name,
+                    False,
+                    current,
+                    delivery_name,
+                    user_id=user_id,
+                    as_document=(upload_mode == _UPLOAD_MODE_FILE),
+                )
+            if not sent:
+                sent = bool(
+                    await self._send_video_result(
+                        context.bot,
+                        update.effective_chat.id,
+                        out_path,
+                        caption=caption,
+                        delivery_name=delivery_name,
+                        upload_mode=upload_mode,
+                    )
+                )
+            return (True, "") if sent else (False, "the file could not be delivered")
+        finally:
+            with contextlib.suppress(OSError):
+                os.remove(out_path)
+
+    @staticmethod
+    def _batch_videos(sess: dict | None) -> list[dict]:
+        """The video entries collected for the next batch, deduped and normalised."""
+        source = (sess or {}).get("bulk_list") or (sess or {}).get("merge_list") or []
+        videos: list[dict] = []
+        seen: set = set()
+        for item in source:
+            entry = _normalize_bulk_item(item)
+            if entry is None:
+                continue
+            key = _bulk_item_key(entry)
+            if key in seen:
+                continue
+            if entry.get("type") != "video":
+                continue
+            seen.add(key)
+            videos.append(entry)
+        return videos
+
+    @staticmethod
+    def _match_batch_subtitle(video: dict, subtitles: list[dict], used: set) -> dict | None:
+        """Pick the subtitle for one video: same filename first, else send order.
+
+        The name is the honest pairing (a batch of ``clip.mp4``/``clip.srt`` is
+        how these files arrive together), and the remaining subtitles are handed
+        out in the order they were sent so a batch whose names do not line up is
+        still processed instead of refused.
+        """
+        vstem = os.path.splitext(os.path.basename(str((video or {}).get("name") or "")))[0].strip().lower()
+        if vstem:
+            for sub in subtitles:
+                if sub.get("file_id") in used:
+                    continue
+                sstem = os.path.splitext(os.path.basename(str(sub.get("name") or "")))[0].strip().lower()
+                if sstem == vstem:
+                    return sub
+        for sub in subtitles:
+            if sub.get("file_id") not in used:
+                return sub
+        return None
+
+    @staticmethod
+    def _batch_subtitle_markup() -> InlineKeyboardMarkup:
+        """The two buttons the collector offers: start the merge, or go back."""
+        return InlineKeyboardMarkup(
+            [
+                [InlineKeyboardButton("▶️ Start Merge", callback_data="bulk_subtitles_start")],
+                [InlineKeyboardButton("↩️ Back to Batch", callback_data="bulk_menu")],
+            ]
+        )
+
+    async def _start_batch_subtitles(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE, session, query, user_id
+    ) -> None:
+        """Open the batch subtitle flow: ask for every .srt first, then merge."""
+        sess = session or self.user_sessions.get(user_id, {})
+        videos = self._batch_videos(sess)
+        if not videos:
+            await self.safe_edit(
+                query,
+                "❌ No videos collected yet.\nSend the videos first — they are collected "
+                "automatically — then press 📝 Batch Subtitles.",
+            )
+            return
+
+        # One subtitle flow at a time, and a fresh list for this run. Files from a
+        # previous attempt are removed rather than left on disk.
+        for key in list(context.user_data.keys()):
+            if key.startswith("awaiting_"):
+                del context.user_data[key]
+        for entry in sess.get("subtitle_files") or []:
+            path = entry.get("path") if isinstance(entry, dict) else None
+            if path:
+                with contextlib.suppress(OSError):
+                    os.remove(path)
+        sess["subtitle_files"] = []
+        context.user_data["awaiting_bulk_subtitles"] = True
+        with contextlib.suppress(Exception):
+            self._persist_session(user_id)
+
+        await self.safe_edit(
+            query,
+            f"📝 <b>Batch Subtitles</b>\n\n"
+            f"{len(videos)} video(s) queued. Send or forward the subtitle files "
+            f"(.srt, .ass, .vtt) — one per video. Each is matched to a video by "
+            f"name first, otherwise in the order you send them.\n\n"
+            f"Press ▶️ Start Merge when they are all in.",
+            reply_markup=self._batch_subtitle_markup(),
+            parse_mode="HTML",
+        )
+
+    async def _collect_batch_subtitle(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE, session: dict, document, file_ext: str
+    ) -> None:
+        """Receive one subtitle for the pending batch run, validated before it waits."""
+        message = update.message
+        user_id = update.effective_user.id if update.effective_user else None
+        await message.reply_text("📥 Receiving subtitle file...")
+
+        input_dir = getattr(config, "INPUT_PATH", "storage/input") if config else "storage/input"
+        with contextlib.suppress(OSError):
+            os.makedirs(input_dir, exist_ok=True)
+        subtitle_path = os.path.join(input_dir, f"{user_id}_{document.file_id}{file_ext}")
+        file = await context.bot.get_file(document.file_id)
+        await file.download_to_drive(subtitle_path)
+
+        ok, reason = _validate_subtitle_file(subtitle_path, file_ext)
+        if not ok:
+            with contextlib.suppress(OSError):
+                os.remove(subtitle_path)
+            await message.reply_text(
+                f"❌ That file is not a usable subtitle: {reason}.\n"
+                f"Send a valid {file_ext} file and I'll keep collecting.",
+                reply_markup=self._batch_subtitle_markup(),
+            )
+            return
+
+        entries = session.setdefault("subtitle_files", [])
+        if any(isinstance(e, dict) and e.get("file_id") == document.file_id for e in entries):
+            with contextlib.suppress(OSError):
+                os.remove(subtitle_path)
+            await message.reply_text("ℹ️ That subtitle is already queued.", reply_markup=self._batch_subtitle_markup())
+            return
+        if len(entries) >= _BULK_LIST_LIMIT:
+            with contextlib.suppress(OSError):
+                os.remove(subtitle_path)
+            await message.reply_text(
+                f"⚠️ The subtitle list is full ({_BULK_LIST_LIMIT}). Press ▶️ Start Merge to run what is queued.",
+                reply_markup=self._batch_subtitle_markup(),
+            )
+            return
+
+        _name = (document.file_name or f"subtitle{file_ext}").strip()
+        entries.append(
+            {
+                "file_id": document.file_id,
+                "name": _name,
+                "path": subtitle_path,
+                "ext": file_ext,
+                "size": getattr(document, "file_size", None),
+            }
+        )
+        with contextlib.suppress(Exception):
+            self._persist_session(user_id)
+
+        await message.reply_text(
+            f"✅ Subtitle {len(entries)} received: {_name}\n"
+            f"Send the rest, then press ▶️ Start Merge ({len(self._batch_videos(session))} video(s) queued).",
+            reply_markup=self._batch_subtitle_markup(),
+        )
+
+    async def _run_batch_subtitles(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE, session, query, user_id
+    ) -> None:
+        """Merge the queued subtitles into the batch, one video at a time.
+
+        The run is strictly sequential on purpose: one fetch, one burn, one
+        delivery at a time, with a single progress message that becomes the
+        summary - the same shape every other batch has. Each video's merge goes
+        through :meth:`_burn_subtitle_into_current`, so the fetch/validate/burn/
+        deliver rules are the single-file ones.
+        """
+        sess = session or self.user_sessions.get(user_id, {})
+        videos = self._batch_videos(sess)
+        subtitles = [e for e in (sess.get("subtitle_files") or []) if isinstance(e, dict) and e.get("file_id")]
+        if not videos:
+            await self.safe_edit(query, "❌ No videos collected. Send the videos first, then retry.")
+            return
+        if not subtitles:
+            await self.safe_edit(query, "❌ No subtitle files received yet. Send the .srt/.ass/.vtt files first.")
+            return
+
+        context.user_data.pop("awaiting_bulk_subtitles", None)
+
+        try:
+            _started = float(sess.get("_bulk_subtitles_started_at") or 0)
+        except (TypeError, ValueError):
+            _started = 0
+        if _started and (time.time() - _started) < _BULK_APPLY_GUARD_SECONDS:
+            await self.safe_edit(query, "⏳ A subtitle merge is already running for your account.")
+            return
+        sess["_bulk_subtitles_started_at"] = time.time()
+
+        if not await self._check_conversion_quota(update, context):
+            sess.pop("_bulk_subtitles_started_at", None)
+            return
+
+        total = len(videos)
+        used: set = set()
+        results: list[tuple[str, str]] = []
+        merged = failed = unmatched = 0
+
+        for index, video in enumerate(videos, start=1):
+            label = _bulk_display_name(video)
+            sub = self._match_batch_subtitle(video, subtitles, used)
+            if sub is None:
+                unmatched += 1
+                results.append((label, "⏭️ no matching subtitle"))
+                continue
+            used.add(sub["file_id"])
+            sub_path = sub.get("path")
+            if not sub_path or not os.path.exists(sub_path):
+                failed += 1
+                results.append((label, "❌ subtitle file missing"))
+                continue
+
+            sess["current_file"] = video
+
+            async def notify(text: str, _index=index, _label=label, **kwargs) -> None:
+                with contextlib.suppress(Exception):
+                    await self.safe_edit(
+                        query,
+                        f"📝 <b>Batch Subtitles</b> — {_index}/{total}\n🎬 {_label}\n{text}",
+                        parse_mode="HTML",
+                    )
+
+            try:
+                ok, reason = await self._burn_subtitle_into_current(
+                    update, context, sess, video, sub_path, notify=notify
+                )
+            except Exception as exc:
+                logger.exception("batch subtitles: merge failed for %s", label)
+                ok, reason = False, _bulk_failure_reason(exc)
+            if ok:
+                merged += 1
+                results.append((label, "✅ merged"))
+            else:
+                failed += 1
+                results.append((label, f"❌ {reason}"))
+
+        # The progress message becomes the summary, exactly like Apply Bulk.
+        head = f"📝 <b>Batch Subtitles</b> — {merged}/{total} merged"
+        if unmatched:
+            head += f"\n⚠️ {unmatched} video(s) had no matching subtitle."
+        if failed:
+            head += f"\n❗ {failed} video(s) failed."
+        if results:
+            _lines = [f"• {name} → {status}" for name, status in results[:_BULK_SUMMARY_MAX_LINES]]
+            if len(results) > _BULK_SUMMARY_MAX_LINES:
+                _lines.append(f"… +{len(results) - _BULK_SUMMARY_MAX_LINES} more")
+            head += "\n\n🗂 Per-file:\n" + "\n".join(_lines)
+        with contextlib.suppress(Exception):
+            await self.safe_edit(query, head, reply_markup=None, parse_mode="HTML")
+
+        # The run consumed both lists, the way a successful Apply Bulk clears its
+        # own; the local subtitle files go with them.
+        for entry in subtitles:
+            with contextlib.suppress(OSError):
+                os.remove(entry.get("path") or "")
+        sess["bulk_list"] = []
+        sess.pop("merge_list", None)
+        sess.pop("subtitle_files", None)
+        sess.pop("_bulk_subtitles_started_at", None)
+        with contextlib.suppress(Exception):
+            self._persist_session(user_id)
+
     async def handle_document(self, update: Update, context: ContextTypes.DEFAULT_TYPE, session: dict):
         """Handle document files (could be video/audio)."""
         document = update.message.document
@@ -7880,57 +8428,16 @@ class EnhancedMediaHandler:
         # If the user was asked to send a subtitle file, handle specially
         awaiting_sub = context.user_data.pop("awaiting_subtitle_file", False)
         awaiting_burn = context.user_data.pop("awaiting_burn_subtitle", False)
+        # The batch collector stays armed across several uploads, so it is read
+        # rather than popped: every subtitle sent joins the same run.
+        awaiting_bulk_sub = context.user_data.get("awaiting_bulk_subtitles", False)
 
         subtitle_exts = {".srt", ".ass", ".vtt"}
-        if (awaiting_sub or awaiting_burn) and file_ext in subtitle_exts:
-            await update.message.reply_text("📥 Downloading subtitle file...")
-            file = await context.bot.get_file(document.file_id)
-            input_dir = getattr(config, "INPUT_PATH", "storage/input") if config else "storage/input"
-            with contextlib.suppress(OSError):
-                os.makedirs(input_dir, exist_ok=True)
-            subtitle_path = os.path.join(input_dir, f"{user_id}_{document.file_id}{file_ext}")
-            await file.download_to_drive(subtitle_path)
-
-            # Ensure we have a current video for burning/adding
-            current = session.get("current_file")
-            if not current or current.get("type") != "video":
-                await update.message.reply_text("❌ No video available in session to apply subtitles.")
+        if (awaiting_sub or awaiting_burn or awaiting_bulk_sub) and file_ext in subtitle_exts:
+            if awaiting_bulk_sub and not (awaiting_sub or awaiting_burn):
+                await self._collect_batch_subtitle(update, context, session, document, file_ext)
                 return
-
-            # Burning or muxing needs the bytes: a session that only carries a
-            # stored key has no path, so read the object out of the bucket rather
-            # than handing ffmpeg a path that is not there.
-            video_path = await self._resolve_local_source(current, require_stored_key_only=True)
-            if not video_path:
-                await update.message.reply_text("❌ File not available on disk.")
-                return
-            output_dir = getattr(config, "OUTPUT_PATH", "storage/output") if config else "storage/output"
-            with contextlib.suppress(OSError):
-                os.makedirs(output_dir, exist_ok=True)
-            out_path = os.path.join(output_dir, f"{user_id}_subtitled_{os.path.basename(video_path)}")
-
-            if awaiting_burn:
-                await update.message.reply_text("🔧 Burning subtitles into video (this may take a while)...")
-                ok = await self.converter.burn_subtitles(video_path, subtitle_path, out_path)
-            else:
-                await update.message.reply_text("🔧 Adding subtitles as a separate stream (soft subtitles)...")
-                ok = await self.converter.add_subtitles(video_path, subtitle_path, out_path)
-
-            if ok and os.path.exists(out_path):
-                await update.message.reply_text("✅ Subtitles applied. Sending file...")
-                try:
-                    with open(out_path, "rb") as doc_file:
-                        # Named after the media, not after the output path.
-                        await context.bot.send_document(
-                            chat_id=update.effective_chat.id,
-                            document=doc_file,
-                            filename=_document_delivery_name(current, out_path),
-                        )
-                except Exception:
-                    await update.message.reply_text("⚠️ Failed to send file; try downloading from the server.")
-            else:
-                await update.message.reply_text("❌ Failed to apply subtitles. See logs for details.")
-
+            await self._apply_subtitle_file(update, context, session, document, file_ext, burn=awaiting_burn)
             return
 
         # A .zip is not a media file. Rather than reject it as an unknown
@@ -8594,6 +9101,47 @@ class EnhancedMediaHandler:
             elif data == "merge_videos_start":
                 await self.merge_videos(update, context, session)
 
+            elif data == "merge_options":
+                # The variants of the merge, so the button leads somewhere rather
+                # than reporting "need at least 2 videos" on a list that may not
+                # even exist yet.
+                await self.safe_edit(
+                    query,
+                    "🔀 <b>Merge Videos</b>\n\n"
+                    "Collect the videos with ➕ Add Files (or the ➕ Video Merger panel), "
+                    "then pick how the merged file should finish:",
+                    reply_markup=MediaMenuBuilder.get_merge_options_menu(),
+                    parse_mode="HTML",
+                )
+
+            elif data == "merge_trim":
+                for key in list(context.user_data.keys()):
+                    if key.startswith("awaiting_"):
+                        del context.user_data[key]
+                context.user_data["awaiting_merge_trim"] = True
+                await self.safe_edit(
+                    query,
+                    "✂️ <b>Merge + Trim</b>\n\n"
+                    "Send the start and end time for the merged video, "
+                    "e.g. <code>00:10 00:40</code> (or <code>00:10-00:40</code>).",
+                    parse_mode="HTML",
+                )
+
+            elif data == "merge_compress":
+                await self.merge_videos(update, context, session, post="compress")
+
+            elif data == "merge_convert":
+                for key in list(context.user_data.keys()):
+                    if key.startswith("awaiting_"):
+                        del context.user_data[key]
+                context.user_data["awaiting_merge_convert"] = True
+                await self.safe_edit(
+                    query,
+                    "🔄 <b>Merge + Convert</b>\n\nSend the target video format "
+                    "(e.g. <code>mkv</code>, <code>mov</code>, <code>avi</code>).",
+                    parse_mode="HTML",
+                )
+
             elif data == "remove_audio":
                 await self.remove_audio(update, context, session)
 
@@ -8812,13 +9360,21 @@ class EnhancedMediaHandler:
 
             # Merge list interactions
             elif data == "merge_add":
-                # Add the current file to the merge list
+                # Add the current file to the merge list.
+                #
+                # The media is registered lazily, so a freshly sent video has no
+                # local copy and nothing in storage yet: the shared guard fetches
+                # it (or reads a stored object) instead of answering "File not
+                # available to add" for the file the user had just sent.
                 current_file = session.get("current_file")
                 if not current_file:
                     await self.safe_edit(query, "❌ No current file to add. Send a file first.")
                     return
-                path = current_file.get("path")
-                if not path or not os.path.exists(path):
+                current_file, _ = await self._ensure_local_media(update, context, session, current_file, query=query)
+                if current_file is None:
+                    return
+                path = await self._resolve_local_source(current_file, require_stored_key_only=True)
+                if not path:
                     await self.safe_edit(query, "❌ File not available to add.")
                     return
                 # Ensure merge_list stores file paths
@@ -9128,6 +9684,26 @@ class EnhancedMediaHandler:
                     new = not bool(_read_bulk_settings(user_id, sess).get(key))
                     _write_bulk_setting(user_id, sess, key, new)
 
+                    if key == "bulk_subtitles" and new:
+                        # Switching the batch subtitle action on needs the files:
+                        # arm the same collector the dedicated button uses and ask
+                        # for them now, so Apply Bulk has subtitles to merge.
+                        for _k in list(context.user_data.keys()):
+                            if _k.startswith("awaiting_"):
+                                del context.user_data[_k]
+                        sess.setdefault("subtitle_files", [])
+                        context.user_data["awaiting_bulk_subtitles"] = True
+                        await self.safe_edit(
+                            query,
+                            "📝 <b>Batch Subtitles: On</b>\n\n"
+                            "Send or forward the subtitle files (.srt, .ass, .vtt) — one per "
+                            "video — then press ▶️ Apply Bulk. They are matched by name first, "
+                            "else in the order you send them.",
+                            reply_markup=self._batch_subtitle_markup(),
+                            parse_mode="HTML",
+                        )
+                        return
+
                     await self.safe_edit(query, f"✅ {key.replace('_', ' ').title()}: {'On' if new else 'Off'}")
                     # re-render the bulk menu to show updated status
                     await self.show_bulk_menu(update, context)
@@ -9259,6 +9835,16 @@ class EnhancedMediaHandler:
                     await self.safe_edit(query, f"✅ Bulk optimize preset set to {preset}.")
                     await self.show_bulk_menu(update, context)
 
+            elif data == "bulk_subtitles":
+                # Batch subtitle entry point: ask for every .srt first, then merge
+                # them into the queued videos one at a time (see
+                # _start_batch_subtitles / _run_batch_subtitles).
+                await self._start_batch_subtitles(update, context, session, query, user_id)
+
+            elif data == "bulk_subtitles_start":
+                # The collector's ▶️ Start Merge: run the batch now.
+                await self._run_batch_subtitles(update, context, session, query, user_id)
+
             elif data == "bulk_apply":
                 # Apply bulk actions to the files collected for this batch. Sent
                 # files land in bulk_list automatically; older sessions may still
@@ -9345,6 +9931,24 @@ class EnhancedMediaHandler:
                     # ones could not fit into the single pass, so nothing is
                     # silently ignored.
                     _bulk_settings = _read_bulk_settings(user_id, sess)
+
+                    if _bulk_settings.get("bulk_subtitles"):
+                        # Batch Subtitles is a mode of its own: it needs the .srt
+                        # files collected first and burns each video one at a time
+                        # in this process (see _run_batch_subtitles), so it does not
+                        # go through the worker-job plan the other toggles share.
+                        with contextlib.suppress(Exception):
+                            sess.pop("_bulk_apply_started_at", None)
+                        if not (sess.get("subtitle_files") or []):
+                            await self.safe_edit(
+                                query,
+                                "📝 <b>Batch Subtitles is on</b>, but no .srt files were received.\n"
+                                "Press 📝 Batch Subtitles to send them, then Apply Bulk again.",
+                                parse_mode="HTML",
+                            )
+                            return
+                        await self._run_batch_subtitles(update, context, sess, query, user_id)
+                        return
 
                     _plan = _resolve_bulk_plan(_bulk_settings)
                     _bulk_args = _plan["ffmpeg_args"]
@@ -11500,8 +12104,23 @@ class EnhancedMediaHandler:
 
         await self._run_with_concurrency_limit(user_id, "compression", do_compression())
 
-    async def merge_videos(self, update: Update, context: ContextTypes.DEFAULT_TYPE, session: dict):
-        """Merge multiple videos."""
+    async def merge_videos(
+        self,
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+        session: dict,
+        *,
+        post: str | None = None,
+        trim: tuple | None = None,
+        target_format: str | None = None,
+    ):
+        """Merge the collected videos, optionally trimming/compressing/converting.
+
+        ``post`` is the 🔀 Merge menu's variant: ``"trim"`` (with ``trim=(start,
+        end)``), ``"compress"`` or ``"convert"`` (with ``target_format``). The
+        follow-up is a second, single pass over the merged file, so the sources
+        are still read once.
+        """
         if not await self._require_callback(update):
             return
         query = update.callback_query
@@ -11509,39 +12128,136 @@ class EnhancedMediaHandler:
         if not await self._check_conversion_quota(update, context):
             return
 
-        if "merge_list" not in session or len(session["merge_list"]) < 2:
-            await self.safe_edit(
-                query,
-                "❌ Need at least 2 videos to merge.\nSend video files first, then click 'Start Merge'.",
-            )
+        async def notify(text: str, **kwargs) -> None:
+            await self.safe_edit(query, text, **kwargs)
+
+        await self._merge_videos_core(
+            update, context, session, notify=notify, post=post, trim=trim, target_format=target_format
+        )
+
+    async def _merge_videos_core(
+        self,
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+        session: dict,
+        *,
+        notify,
+        post: str | None = None,
+        trim: tuple | None = None,
+        target_format: str | None = None,
+    ) -> None:
+        """The merge itself, shared by the button and by the typed follow-ups.
+
+        ``notify`` is how the caller reports progress (an edit for a button, a
+        reply for a typed answer), so the two entries cannot diverge. Nothing here
+        requires a callback query, which is what lets a Merge + Trim/Convert typed
+        answer run the same code. The caller owns the quota check.
+        """
+        merge_list = session.get("merge_list") or []
+        if len(merge_list) < 2:
+            await notify("❌ Need at least 2 videos to merge.\nSend video files first, then press Merge.")
             return
 
-        await self.safe_edit(query, f"🔀 Merging {len(session['merge_list'])} videos...")
+        await notify(f"🔀 Merging {len(merge_list)} videos...")
 
         output_dir = getattr(config, "OUTPUT_PATH", "storage/output") if config else "storage/output"
         with contextlib.suppress(OSError):
             os.makedirs(output_dir, exist_ok=True)
-        output_path = os.path.join(output_dir, f"merged_{int(datetime.now(UTC).timestamp())}.mp4")
-        success = await self.converter.merge_videos(session["merge_list"], output_path)
-        if success and os.path.exists(output_path):
+        stamp = int(datetime.now(UTC).timestamp())
+        merged_path = os.path.join(output_dir, f"merged_{stamp}.mp4")
+        success = await self.converter.merge_videos(merge_list, merged_path)
+        merged_ok = bool(success and os.path.exists(merged_path))
+        final_path: str | None = merged_path if merged_ok else None
+
+        # The merge-and-X variants: one extra pass on the merged file. A failed
+        # follow-up must not throw the merge away - the merged file is itself a
+        # complete video - so it is kept below and handed to the session, and the
+        # user retries only the cut/re-encode/remux.
+        if final_path and post:
+            try:
+                if post == "trim" and trim:
+                    _candidate = os.path.join(output_dir, f"merged_trimmed_{stamp}.mp4")
+                    _ok = await self.converter.trim_video(merged_path, _candidate, trim[0], trim[1])
+                    final_path = _candidate if _ok else None
+                elif post == "compress":
+                    _candidate = os.path.join(output_dir, f"merged_compressed_{stamp}.mp4")
+                    _ok, _ = await self.converter.execute_ffmpeg(
+                        [
+                            "-c:v",
+                            "libx264",
+                            "-preset",
+                            "veryfast",
+                            "-crf",
+                            "23",
+                            "-c:a",
+                            "aac",
+                            "-b:a",
+                            "128k",
+                            "-movflags",
+                            "+faststart",
+                        ],
+                        merged_path,
+                        _candidate,
+                    )
+                    final_path = _candidate if _ok else None
+                elif post == "convert" and target_format:
+                    _candidate = os.path.join(output_dir, f"merged_{stamp}.{target_format}")
+                    _ok = await self.converter.convert_video_format(merged_path, _candidate, target_format)
+                    final_path = _candidate if _ok else None
+            except Exception:
+                logger.exception("merge: the %s follow-up failed", post)
+                final_path = None
+
+        if final_path and os.path.exists(final_path):
             _session_file = session.get("current_file")
             await self._send_video_result(
                 context.bot,
                 update.effective_chat.id,
-                output_path,
+                final_path,
                 caption=_metadata_caption(_session_file),
-                delivery_name=_video_delivery_name(_session_file, output_path),
+                delivery_name=_video_delivery_name(_session_file, final_path),
                 upload_mode=_user_upload_mode(getattr(update.effective_user, "id", None)),
             )
-
-            # Cleanup
-            os.remove(output_path)
-            for file_path in session["merge_list"]:
-                if os.path.exists(file_path):
+            # Cleanup: the intermediate when a follow-up produced it, the merged
+            # file itself otherwise, and the sources either way.
+            for _produced in {merged_path, final_path}:
+                with contextlib.suppress(OSError):
+                    os.remove(_produced)
+            for file_path in merge_list:
+                with contextlib.suppress(OSError):
                     os.remove(file_path)
             session["merge_list"] = []
+        elif merged_ok and post:
+            # The merge worked; only the follow-up failed. Keep the merged file
+            # (do not delete it) and hand it to the session as the current media,
+            # so a retry of just the cut/re-encode/remux costs no second merge.
+            _merged_name = f"merged_{stamp}.mp4"
+            _merged_entry = {
+                "path": merged_path,
+                "type": "video",
+                "id": f"merged_{stamp}",
+                "name": _merged_name,
+                "size": os.path.getsize(merged_path) if os.path.exists(merged_path) else None,
+            }
+            session["current_file"] = _merged_entry
+            _register_bulk_file(session, _merged_entry)
+            for file_path in merge_list:
+                with contextlib.suppress(OSError):
+                    os.remove(file_path)
+            session["merge_list"] = []
+            _hint = {
+                "trim": "✂️ Media Trimmer",
+                "compress": "📉 Compress",
+                "convert": "🔄 Convert Format",
+            }.get(post or "", "the matching tool")
+            await notify(
+                f"⚠️ The merge succeeded, but the {post} step failed.\n"
+                f"The merged video is kept as the current file — open {_hint} to retry it."
+            )
         else:
-            await self.safe_edit(query, "❌ Merge failed.")
+            with contextlib.suppress(OSError):
+                os.remove(merged_path)
+            await notify("❌ Merge failed.")
 
     async def merge_audios(self, update: Update, context: ContextTypes.DEFAULT_TYPE, session: dict):
         """Merge multiple audio files."""
@@ -12946,25 +13662,29 @@ class EnhancedMediaHandler:
             format_info = probe.get("format", {})
             streams = probe.get("streams", [])
 
-            info_text = "📊 **Full Media Analysis**\n\n"
-            info_text += f"📁 **File:** {current_file['name']}\n"
-            info_text += f"📦 **Size:** {format_info.get('size', 0) // 1024 // 1024} MB\n"
-            info_text += f"🎞️ **Format:** {format_info.get('format_name', 'N/A')}\n"
-            info_text += f"⏱️ **Duration:** {float(format_info.get('duration', 0)):.2f}s\n"
+            # HTML, and every value that comes from the file is escaped: the
+            # headings used ``**`` and no parse_mode, so the user read the literal
+            # asterisks - and a filename with ``<`` or ``&`` would have broken the
+            # message entirely.
+            info_text = "📊 <b>Full Media Analysis</b>\n\n"
+            info_text += f"📁 <b>File:</b> {html.escape(str(current_file['name']))}\n"
+            info_text += f"📦 <b>Size:</b> {format_info.get('size', 0) // 1024 // 1024} MB\n"
+            info_text += f"🎞️ <b>Format:</b> {html.escape(str(format_info.get('format_name', 'N/A')))}\n"
+            info_text += f"⏱️ <b>Duration:</b> {float(format_info.get('duration', 0)):.2f}s\n"
             bitrate_kbps = int(format_info.get("bit_rate", 0)) // 1000
-            info_text += f"📈 **Bitrate:** {bitrate_kbps} kbps\n\n"
+            info_text += f"📈 <b>Bitrate:</b> {bitrate_kbps} kbps\n\n"
 
             # Streams information
-            info_text += f"🎬 **Streams ({len(streams)}):**\n"
+            info_text += f"🎬 <b>Streams ({len(streams)}):</b>\n"
 
             for i, stream in enumerate(streams):
                 codec_type = stream.get("codec_type", "unknown")
-                info_text += f"\n**Stream {i + 1} ({codec_type}):**\n"
+                info_text += f"\n<b>Stream {i + 1} ({html.escape(str(codec_type))}):</b>\n"
 
                 if codec_type == "video":
-                    info_text += f"  Codec: {stream.get('codec_name', 'N/A')}\n"
+                    info_text += f"  Codec: {html.escape(str(stream.get('codec_name', 'N/A')))}\n"
                     info_text += f"  Resolution: {stream.get('width', 'N/A')}x{stream.get('height', 'N/A')}\n"
-                    num, den = stream.get("avg_frame_rate", "0/1").split("/")
+                    num, den = str(stream.get("avg_frame_rate", "0/1")).split("/")
                     fps = float(num) / float(den) if float(den) != 0 else 0
                     info_text += f"  FPS: {fps:.2f}\n"
                     sb = stream.get("bit_rate")
@@ -12972,7 +13692,7 @@ class EnhancedMediaHandler:
                     info_text += f"  Bitrate: {sb_kbps}\n"
 
                 elif codec_type == "audio":
-                    info_text += f"  Codec: {stream.get('codec_name', 'N/A')}\n"
+                    info_text += f"  Codec: {html.escape(str(stream.get('codec_name', 'N/A')))}\n"
                     info_text += f"  Channels: {stream.get('channels', 'N/A')}\n"
                     info_text += f"  Sample Rate: {stream.get('sample_rate', 'N/A')} Hz\n"
                     sb = stream.get("bit_rate")
@@ -12980,10 +13700,11 @@ class EnhancedMediaHandler:
                     info_text += f"  Bitrate: {sb_kbps}\n"
 
                 elif codec_type == "subtitle":
-                    info_text += f"  Codec: {stream.get('codec_name', 'N/A')}\n"
-                    info_text += f"  Language: {stream.get('tags', {}).get('language', 'N/A')}\n"
+                    info_text += f"  Codec: {html.escape(str(stream.get('codec_name', 'N/A')))}\n"
+                    _lang = html.escape(str(stream.get("tags", {}).get("language", "N/A")))
+                    info_text += f"  Language: {_lang}\n"
 
-            await self.safe_edit(query, info_text[:4000])  # Telegram message limit
+            await self.safe_edit(query, info_text[:4000], parse_mode="HTML")  # Telegram message limit
 
         except Exception as e:
             logger.error(f"Error analyzing media: {e}")
@@ -13910,6 +14631,15 @@ class EnhancedMediaHandler:
             with contextlib.suppress(OSError):
                 os.makedirs(output_base, exist_ok=True)
             output_path = os.path.join(output_base, f"{current_file['id']}_screenshot.jpg")
+            # The same rope every other action takes: a lazily-registered upload
+            # is fetched (or read from storage) before the frame is grabbed, so a
+            # screenshot of a file the user just sent does not answer "File not
+            # available on disk."
+            current_file, _ = await self._ensure_local_media(
+                update, context, session, current_file, notify=update.message.reply_text
+            )
+            if current_file is None:
+                return
             input_path = await self._resolve_local_source(current_file, require_stored_key_only=True)
             if not input_path:
                 await update.message.reply_text("❌ File not available on disk.")
@@ -13939,6 +14669,13 @@ class EnhancedMediaHandler:
                 with contextlib.suppress(OSError):
                     os.makedirs(output_base, exist_ok=True)
 
+                # Same shared fetch as the single-screenshot branch: the grid of a
+                # freshly sent media must not be refused for want of a download.
+                current_file, _ = await self._ensure_local_media(
+                    update, context, session, current_file, notify=update.message.reply_text
+                )
+                if current_file is None:
+                    return
                 input_path = await self._resolve_local_source(current_file, require_stored_key_only=True)
                 if not input_path:
                     await update.message.reply_text("❌ File not available on disk.")
@@ -14122,6 +14859,51 @@ class EnhancedMediaHandler:
                     if key.startswith("awaiting_"):
                         del context.user_data[key]
 
+        elif context.user_data.get("awaiting_merge_trim"):
+            # Merge + Trim: the typed answer is the start and end for the merged
+            # file. A bad answer keeps the prompt armed rather than dropping it.
+            raw = str(user_input).replace("-", " ").replace(",", " ").split()
+            try:
+                if len(raw) < 2:
+                    raise ValueError("send both a start and an end time")
+                start_s = _parse_time_to_seconds(raw[0])
+                end_s = _parse_time_to_seconds(raw[1])
+            except ValueError as exc:
+                await update.message.reply_text(f"❌ {exc}.\nSend e.g. 00:10 00:40")
+                return ConversationHandler.END
+            if end_s <= start_s:
+                await update.message.reply_text("❌ The end must be after the start. Send e.g. 00:10 00:40")
+                return ConversationHandler.END
+            if not await self._check_conversion_quota(update, context):
+                return ConversationHandler.END
+            await self._merge_videos_core(
+                update,
+                context,
+                session,
+                notify=update.message.reply_text,
+                post="trim",
+                trim=(_format_seconds_to_hhmmss(start_s), _format_seconds_to_hhmmss(end_s)),
+            )
+
+        elif context.user_data.get("awaiting_merge_convert"):
+            # Merge + Convert: the typed answer is the target video container.
+            target = str(user_input).strip().lower().lstrip(".")
+            supported = self.converter.supported_formats.get("video") or ()
+            if f".{target}" not in supported:
+                _choices = ", ".join(sorted(str(ext).lstrip(".") for ext in supported))
+                await update.message.reply_text(f"❌ Unsupported format: {target}.\nSupported: {_choices}")
+                return ConversationHandler.END
+            if not await self._check_conversion_quota(update, context):
+                return ConversationHandler.END
+            await self._merge_videos_core(
+                update,
+                context,
+                session,
+                notify=update.message.reply_text,
+                post="convert",
+                target_format=target,
+            )
+
         elif context.user_data.get("awaiting_metadata"):
             # Handle metadata JSON
             try:
@@ -14131,9 +14913,18 @@ class EnhancedMediaHandler:
                     os.makedirs(output_base, exist_ok=True)
                 output_path = os.path.join(output_base, f"{current_file['id']}_with_metadata.mp4")
 
-                # Editing tags needs the bytes: fetch the stored object when the
-                # session only carries its key, rather than handing ffmpeg a path
-                # that is not there.
+                # Editing tags needs the bytes. A lazily-registered upload has no
+                # local copy and nothing in storage yet, so the media is fetched
+                # through the shared guard first (a stored object is reused, else
+                # the same pipe every other button uses); the stored key alone is
+                # then read out of the bucket. Without the guard a metadata edit of
+                # a file the user had just sent answered "File not available on
+                # disk."
+                current_file, _ = await self._ensure_local_media(
+                    update, context, session, current_file, notify=update.message.reply_text
+                )
+                if current_file is None:
+                    return
                 input_path = await self._resolve_local_source(current_file, require_stored_key_only=True)
                 if not input_path:
                     await update.message.reply_text("❌ File not available on disk.")

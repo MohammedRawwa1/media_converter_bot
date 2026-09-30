@@ -242,12 +242,45 @@ class ExtendedMediaConverter:
     async def burn_subtitles(self, input_path: str, subtitle_path: str, output_path: str) -> bool:
         """Hardcode (burn) subtitles into the video using ffmpeg subtitles filter.
 
-        Note: This requires ffmpeg built with libass or the subtitles filter available.
+        The result is a single MP4 with the subtitles painted into the frames, so
+        any player shows them because there is no subtitle stream left to select.
+        The audio is re-encoded (not copied) because the MP4 muxer will not carry
+        some source codecs, and ``+faststart`` moves the index to the front so the
+        file streams while it downloads.
+
+        The encoder settings are the deployment's own memory-constrained defaults
+        (see ``utils.ffmpeg_runner``): ``veryfast`` x264 keeps RAM down on a small
+        host, and the optional ``FFMPEG_MAXRATE``/``FFMPEG_BUFSIZE`` caps stop CRF
+        from inflating the file size, which matters on a metered plan.
+
+        Note: This requires ffmpeg built with libass or the subtitles filter
+        available. The filter parses its own argument, so a Windows drive colon or
+        an apostrophe in the path is escaped before it is handed over - otherwise
+        ffmpeg reads the path as filter syntax and the burn fails ("No option name
+        near ...").
         """
         try:
-            # Use vf subtitles filter; need to ensure subtitle_path is an absolute path
-            abs_sub = os.path.abspath(subtitle_path)
-            cmd = ["-vf", f"subtitles={abs_sub}", "-c:v", "libx264", "-c:a", "copy"]
+            abs_sub = os.path.abspath(subtitle_path).replace("\\", "/")
+            filter_path = abs_sub.replace(":", "\\:").replace("'", "\\'")
+            cmd = [
+                "-vf",
+                f"subtitles=filename='{filter_path}'",
+                "-c:v",
+                "libx264",
+                "-preset",
+                "veryfast",
+                "-crf",
+                "23",
+                "-c:a",
+                "aac",
+                "-b:a",
+                "128k",
+                "-movflags",
+                "+faststart",
+            ]
+            maxrate = os.getenv("FFMPEG_MAXRATE", "2M")
+            if maxrate.strip().lower() not in ("0", "unlimited", "none", ""):
+                cmd.extend(["-maxrate", maxrate, "-bufsize", os.getenv("FFMPEG_BUFSIZE", "4M")])
             return (await self.execute_ffmpeg(cmd, input_path, output_path))[0]
         except Exception as e:
             logger.error(f"burn_subtitles error: {e}")
@@ -264,21 +297,44 @@ class ExtendedMediaConverter:
         return success
 
     async def add_subtitles(self, video_path: str, subtitle_path: str, output_path: str) -> bool:
-        """Add subtitles to video."""
+        """Mux a subtitle file into the video as a soft (selectable) track.
+
+        The subtitle codec is fixed by the output container - ``mov_text`` is the
+        MP4/MOV answer, ``srt`` the Matroska one - so the same call works whether
+        the media arrived as ``.mp4`` or ``.mkv``; asking for ``mov_text`` in an
+        MKV is how the merge silently produced nothing. The streams are mapped
+        explicitly (video and audio from the media, the subtitle from its own
+        file) so a source with several tracks cannot make ffmpeg pick the wrong
+        one, and the ``?`` on the audio keeps a silent video working.
+        """
+        ext = os.path.splitext(output_path)[1].lower()
+        sub_codec = "mov_text" if ext in (".mp4", ".m4v", ".mov") else "srt"
         cmd = [
             "-i",
             video_path,
             "-i",
             subtitle_path,
+            "-map",
+            "0:v:0",
+            "-map",
+            "0:a?",
+            "-map",
+            "1:0",
             "-c:v",
             "copy",
             "-c:a",
             "copy",
             "-c:s",
-            "mov_text",
+            sub_codec,
             "-metadata:s:s:0",
             "language=eng",
+            "-disposition:s:0",
+            "default",
         ]
+        if sub_codec == "mov_text":
+            # MP4/MOV only: put the index in front so the file streams while it
+            # downloads. The matroska muxer has no ``movflags``.
+            cmd.extend(["-movflags", "+faststart"])
         return (await self.execute_ffmpeg(cmd, None, output_path))[0]
 
     async def extract_streams(self, input_path: str, output_dir: str) -> dict[str, str]:
