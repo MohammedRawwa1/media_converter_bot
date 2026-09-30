@@ -4817,13 +4817,15 @@ class EnhancedMediaHandler:
                     if _thumb_path:
                         try:
                             with open(_thumb_path, "rb") as _tf:
-                                _send_kwargs["thumb"] = _tf
+                                _send_kwargs["thumbnail"] = _tf
                                 _msg = await bot.send_video(**_send_kwargs)
                         except Exception:
-                            # The thumb may be what Telegram objected to, not the
-                            # token: retry without it and keep the retry's message
-                            # (this used to drop the result, leaving _msg unbound).
-                            _send_kwargs.pop("thumb", None)
+                            # The thumbnail may be what Telegram objected to, not
+                            # the token: retry without it and keep the retry's
+                            # message (this used to drop the result, leaving _msg
+                            # unbound). The handle is closed by now, so the kwarg
+                            # has to go too or the retry re-sends a dead file.
+                            _send_kwargs.pop("thumbnail", None)
                             _msg = await bot.send_video(**_send_kwargs)
                     else:
                         _msg = await bot.send_video(**_send_kwargs)
@@ -4860,9 +4862,12 @@ class EnhancedMediaHandler:
                 if _thumb_path:
                     try:
                         with open(_thumb_path, "rb") as _tf:
-                            _send_kwargs["thumb"] = _tf
+                            _send_kwargs["thumbnail"] = _tf
                             _msg = await bot.send_video(**_send_kwargs)
                     except Exception:
+                        # The handle is closed by now, so drop the kwarg rather
+                        # than retry the send with a dead file object.
+                        _send_kwargs.pop("thumbnail", None)
                         _msg = await bot.send_video(**_send_kwargs)
                 else:
                     _msg = await bot.send_video(**_send_kwargs)

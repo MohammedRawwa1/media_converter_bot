@@ -137,8 +137,11 @@ def test_the_video_metadata_is_probed_not_invented():
     src = read_source("handlers.py")
     assert "from utils.ffmpeg_runner import probe_video_for_delivery" in src
     # The probe's little thumbnail is attached to the send, so the video shows
-    # frames rather than a black box before it is played.
-    assert '"thumb"' in src
+    # frames rather than a black box before it is played. The kwarg must be
+    # ``thumbnail``: ``send_video`` rejects ``thumb`` (Pyrogram's spelling),
+    # which is a TypeError before the request is even made.
+    assert '_send_kwargs["thumbnail"] = _tf' in src
+    assert '_send_kwargs["thumb"]' not in src
     assert "_vid_duration" in src and "_vid_width" in src and "_vid_height" in src
 
 
