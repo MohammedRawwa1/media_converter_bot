@@ -1460,7 +1460,11 @@ def check_dependencies(repo: Repo, profile: dict, suppressions: list[dict]) -> l
                 )
                 continue
             spec = raw.split(";")[0].strip()
-            if re.search(r"[<>]=?|==", spec) and not re.search(r"<", spec):
+            # Only a *lower bound* with no upper bound is unpinned. An exact
+            # pin (`==x.y.z`) is the tightest possible bound, so it must not be
+            # flagged here; the `|==` alternative used to do exactly that and
+            # reported every `==` pin as "Dependency without an upper bound".
+            if re.search(r"[<>]=?", spec) and not re.search(r"<", spec):
                 if suppressed("DEP-UNPINNED", req_rel, suppressions):
                     continue
                 unpinned_hits += 1
