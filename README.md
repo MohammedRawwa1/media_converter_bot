@@ -434,6 +434,7 @@ For Railway's 1 GB box the shipped `.env.example` is tuned to: `MAX_CONCURRENT_F
 | `BATCH_STALE_TTL_SECONDS` | `60` | How long a **finished** batch's leftover state (counters, membership, message location, resume record) may sit in Redis, and how often the bot sweeps for one. A live batch keeps the long `BATCH_STATE_TTL_SECONDS`; this only governs the traces of a batch that is over |
 | `PRESENCE_TTL_SECONDS` | `300` | How long a user counts as "online" after their last interaction |
 | `REUSE_LOCAL_INPUT` | `1` | Keep the source on disk after uploading it, so a worker in the same container reads it instead of downloading it back out of S3 (one full copy of the media of egress saved per job) |
+| `STORAGE_WRITE_FUSE_SECONDS` | `900` | After storage refuses a write — a full plan or a key without write permission both answer `403 AccessDenied` — the bot stops asking for this many seconds and serves every source from the copy already on disk, instead of paying a refused upload plus its retries on each request. The fuse closes on its own, so freeing space is enough to resume storing; `0` disables it and always tries |
 | `PIPELINE_SOURCE_UPLOAD` | `header` | What **every** producer of a source stores for it — the big-file pipeline, the Bot API download behind the bot's buttons, the fetcher and the web uploader all go through one helper (`utils/source_store.py`): `header` keeps only its first `PIPELINE_HEADER_BYTES` as a probe reference, `full` stores the whole file after the download finishes, `stream` writes the whole file **while** it downloads (storage is the source of truth, no local copy), `local` stores nothing. In `header`/`local` the media is read over Telegram, so a large video costs no bucket egress at all. Code default is `header`; `stream` is what makes a **repeat** of a media cost no Telegram traffic at all (one shared object per media, served from the bucket once validated). A producer that has no Telegram copy to fall back on (a Bot API file id, a web upload) always stores the media itself, because a probe header and no reachable copy is not a smaller source — it is a lost one |
 | `PIPELINE_PROMOTE_ON_REPEAT` | `1` | On the second request for a media in `header` mode, store its whole object at the shared library key instead of only refreshing the probe header. First-time media keep costing 2 MB; media that come back stop being read over Telegram for every job. `0` restores pure header behaviour |
 | `PIPELINE_HEADER_BYTES` | `2097152` | How much of a source the `header` object carries (2 MB covers MP4 `moov`, MKV `SegmentInfo` and AVI `RIFF` headers). In `stream` mode it is also how much of the stream is tapped for the ffprobe that fills the job's `source_*` metadata |
@@ -453,11 +454,22 @@ For Railway's 1 GB box the shipped `.env.example` is tuned to: `MAX_CONCURRENT_F
 | `PRESIGN_EXPIRES` | Presigned URL expiry in seconds (default `3600`) |
 | `S3_OUTPUTS_TTL` | How long a delivered result stays in the bucket before the hourly sweep removes it (default `86400`; `S3_INPUT_TTL`/`S3_UPLOADS_TTL`/`S3_FORWARDS_TTL` behave the same for their prefixes) |
 | `S3_LIBRARY_TTL` | How long the shared one-object-per-media library (`inputs/library/`) is kept (default `2592000`, 30 days). Exempt from `S3_INPUT_TTL`, so repeats of the same media keep hitting the same object |
+| `S3_NONCURRENT_TTL_SECONDS` | How long a **superseded** version of an object may stay (default: the prefix's own TTL). A versioned bucket — which is every S3 bucket unless somebody turned versioning off — answers a plain delete with a *delete marker*: the key leaves the listing, the bytes stay, and the marker becomes the key's newest version. The hourly sweep therefore also deletes noncurrent versions and stale markers, with a `VersionId`, which is what actually frees the space. `0` drops a superseded version as soon as a sweep sees it |
 | `EGRESS_FREE_MULTIPLIER` | Free egress the provider grants, as a multiple of stored bytes (default `3`, which is IDrive e2's policy) |
 | `EGRESS_WATCH_PERCENT` | Ratio of the allowance at which the dashboard flags it and the admin is alerted (default `80`) |
 | `EGRESS_WARN_STEP_GB` | Log a warning every time this much egress accumulates in a billing cycle (default `50`) |
 | `EGRESS_CHECK_INTERVAL` | Seconds between egress checks by the watchdog (default `900`) |
 | `EGRESS_ALERT_MIN_INTERVAL` | Floor between two Telegram alerts, so a flapping ratio stays quiet (default `3600`) |
+
+**Versioning is not free.** The store esteems itself a cache: every prefix has a
+TTL and the hourly sweep removes what passed it. On a bucket that keeps versions
+that delete is not a delete — S3 writes a delete marker, the object and every
+earlier copy of it stay, and because the marker becomes the key's newest version
+the next sweep sees a fresh object and spares the whole history. Seven live
+objects plus twenty-three invisible versions filled an account and made every
+write answer `403 AccessDenied` while each sweep logged success. The sweep now
+deletes noncurrent versions and stale markers too (`S3_NONCURRENT_TTL_SECONDS`),
+so a versioned bucket is bounded the way an unversioned one is.
 
 A result is only copied into the bucket when something remote will read it: a
 job with no `chat_id` (the web uploader collects through a URL) or when

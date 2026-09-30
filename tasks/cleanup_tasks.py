@@ -324,6 +324,12 @@ class CleanupManager:
         Objects under any of *exclude_prefixes* are skipped: a caller sweeping a
         broad prefix (``inputs/``) must not remove a nested prefix that has its
         own lifecycle (``inputs/library/``).
+
+        On a bucket that keeps versions the delete is only half the job - it writes
+        a marker and the bytes stay - so the sweep ends by purging what a plain
+        delete leaves behind (:meth:`_purge_version_residue`). The count it returns
+        is what the sweep actually took out of the bucket: expired keys *and* the
+        versions and markers that went with them.
         """
         try:
             from utils.storage import get_storage_backend
