@@ -5,6 +5,7 @@ import html
 import json
 import logging
 import os
+import re
 import shutil
 import time
 from datetime import UTC, datetime
@@ -934,6 +935,13 @@ def _metadata_caption(current_file: dict | None, fallback: str | None = None) ->
         return _override
 
     title, performer = _source_media_tags(info)
+    # A tag (or the name below) can itself be a machine token - a file id or a
+    # hash a source stamped onto the media. It is not words to caption a
+    # delivery with, so it is treated as absent and the next source is used.
+    if _is_opaque_caption(title):
+        title = ""
+    if _is_opaque_caption(performer):
+        performer = ""
 
     if title and performer:
         return f"{title} — {performer}"
@@ -947,7 +955,7 @@ def _metadata_caption(current_file: dict | None, fallback: str | None = None) ->
 
     name = info.get("name") or info.get("original_filename") or info.get("output_filename") or ""
     stem = os.path.splitext(os.path.basename(str(name)))[0].strip()
-    if stem:
+    if stem and not _is_opaque_caption(stem):
         return stem
 
     return "media"
@@ -964,6 +972,39 @@ def _message_caption(message) -> str:
     return str(getattr(message, "caption", None) or getattr(message, "text", None) or "")
 
 
+#: A caption this long, with no spaces and nothing but token characters, is
+#: machine output rather than words a person wrote - a Telegram file reference,
+#: a storage/job hash, a base64 blob. Some sources caption a file with its own
+#: reference; forwarding must not present that as the media's caption.
+_OPAQUE_CAPTION_MIN = 32
+_OPAQUE_CAPTION_CHARS = re.compile(r"^[A-Za-z0-9_\-=+/]+$")
+
+
+def _is_opaque_caption(text: str | None) -> bool:
+    """Whether *text* is one opaque machine token rather than a caption.
+
+    A forward carries the words the media arrived with, and some sources caption
+    a file with its own reference - a Telegram file id, a hex hash, a base64
+    blob. Those are not captions and must not be shown as one.
+
+    The test is deliberately narrow: a single word, at least
+    :data:`_OPAQUE_CAPTION_MIN` characters, no whitespace, nothing but token
+    characters, and carrying both a letter and a digit (so a long ordinary word
+    is never mistaken for a token). A URL (it has dots and slashes), a title, a
+    sentence and an emoji caption all fail it and are left alone.
+    """
+    if not text:
+        return False
+    token = str(text).strip().strip(" :")
+    if len(token) < _OPAQUE_CAPTION_MIN:
+        return False
+    if any(ch.isspace() for ch in token):
+        return False
+    if not _OPAQUE_CAPTION_CHARS.match(token):
+        return False
+    return any(ch.isdigit() for ch in token) and any(ch.isalpha() for ch in token)
+
+
 def _original_caption(current_file: dict | None) -> str | None:
     """The caption the media itself arrived with - or ``None`` when it had none.
 
@@ -973,8 +1014,15 @@ def _original_caption(current_file: dict | None) -> str | None:
     ``None`` is a meaningful value here, not a missing one: it is what the copy
     route omits so Telegram preserves the source's caption, and what the byte
     routes pass to send the media bare rather than guessed-at.
+
+    A recording that is one opaque machine token (:func:`_is_opaque_caption`) -
+    a source that captioned the file with its own reference or hash - is dropped
+    too: it is not words the media carried, so the forward sends the media bare
+    instead of stamping a random hash under it.
     """
     text = str((current_file or {}).get("original_caption") or "").strip()
+    if _is_opaque_caption(text):
+        return None
     return text or None
 
 
@@ -4057,6 +4105,13 @@ class EnhancedMediaHandler:
             # arrived bare. _original_caption answers None rather than "" so the
             # copy route knows to leave the source's caption alone.
             text = _original_caption(current_file)
+            if text is None and _is_opaque_caption((current_file or {}).get("original_caption")):
+                # The media arrived captioned with a machine token - its own file
+                # reference, or a hash a source stamped on it. A forward must not
+                # carry that, and the copy route *preserves* the source's caption
+                # when the field is omitted - so the caption is set to empty,
+                # which clears it instead of leaving the token under the media.
+                text = ""
         else:
             text = caption if caption is not None else _metadata_caption(current_file)
 
@@ -10317,7 +10372,7 @@ class EnhancedMediaHandler:
                                 _bulk_fallback_caption = (
                                     f"✅ Audio extracted ({_plan['extract_bitrate']})"
                                     if _bulk_ext == ".mp3"
-                                    else f"Bulk conversion finished for {f.get('name') or f.get('id')}"
+                                    else f"Bulk conversion finished for {_safe_media_stem(f.get('name'))}"
                                 )
                                 # A file that carries tags keeps its metadriven
                                 # caption in a batch too - the same one the

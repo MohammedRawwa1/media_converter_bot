@@ -1238,5 +1238,79 @@ class WiringTests(unittest.TestCase):
         self.assertIn("async def _reply_to_press(", src)
 
 
+class OpaqueCaptionTests(unittest.TestCase):
+    """A machine token is not a caption: a forward sends the media bare.
+
+    Some sources caption a file with its own reference or a hash, and the
+    forwarder is the only button that carries the media's *own* words - so it
+    was the only route showing an opaque token under the delivered media.
+    """
+
+    # The exact reference the user reported seeing under a forwarded media.
+    OPAQUE = "AQOs0E7wYcgaaHTAcs9IAzxwWxtmTI01ko1SMw3l5w0rjcYidAtWDDldeRbNKj6"
+
+    def test_it_detects_the_reported_token(self):
+        self.assertTrue(handlers._is_opaque_caption(self.OPAQUE))
+        # A leading ':' is punctuation some references arrive with, not words.
+        self.assertTrue(handlers._is_opaque_caption(":" + self.OPAQUE))
+        # A storage/job hash is the same kind of machine output.
+        self.assertTrue(handlers._is_opaque_caption("4feb478d3eb0137ca2d13b589975a9af"))
+
+    def test_real_captions_are_left_alone(self):
+        for text in (
+            "Chapter 3",
+            "My Song — Some Artist",
+            "https://example.com/watch?v=abc",
+            "clip.mp4",
+            "a" * 40,  # a long word with no digit is not a token
+            self.OPAQUE[:20],  # too short to be one
+            "",
+            None,
+        ):
+            self.assertFalse(handlers._is_opaque_caption(text), text)
+
+    def test_the_original_caption_drops_a_token(self):
+        self.assertIsNone(handlers._original_caption({"original_caption": self.OPAQUE}))
+        # The token is gone, but real words still survive a forward.
+        self.assertEqual(handlers._original_caption({"original_caption": "Chapter 3"}), "Chapter 3")
+
+    def test_a_forward_does_not_carry_the_token_over_the_bytes(self):
+        current = {
+            "id": "f1",
+            "type": "document",
+            "name": "notes.pdf",
+            "file_unique_id": "u1",
+            "original_caption": self.OPAQUE,
+        }
+        seen = ForwardAsIsTests._forward(self, current, cached_id="the-file-id")
+        self.assertEqual(seen["sends"][0]["kwargs"]["caption"], "")
+
+    def test_the_copy_route_is_asked_to_clear_the_token_caption(self):
+        current = {
+            "id": "f1",
+            "type": "video",
+            "name": "clip.mp4",
+            "chat_id": 7,
+            "msg_id": 4678,
+            "original_caption": self.OPAQUE,
+        }
+        seen = ForwardAsIsTests._forward(self, current, copy_result=True)
+        # Telegram keeps the source's caption when the field is absent, so an
+        # empty caption is what clears the token instead of preserving it.
+        self.assertEqual(seen["copied"], [{"file": "f1", "chat_id": 7, "caption": ""}])
+
+    def test_the_metadata_caption_ignores_a_token_title_or_name(self):
+        current = {"name": f"{self.OPAQUE}.mp4", "_source_metadata": {"title": self.OPAQUE}}
+        # A token tag/name contributes nothing, so the delivery falls back.
+        self.assertEqual(_metadata_caption(current), "media")
+
+    def test_a_bare_media_still_forwards_with_no_field_at_all(self):
+        # The token case must not change how a genuinely bare media is forwarded:
+        # None (omit the field) preserves the source's own caption.
+        current = {"id": "f1", "type": "document", "name": "notes.pdf", "file_unique_id": "u1"}
+        seen = ForwardAsIsTests._forward(self, current, cached_id="the-file-id")
+        self.assertIsNone(seen["sends"][0]["kwargs"]["caption"])
+
+
 if __name__ == "__main__":
     unittest.main()
