@@ -43,6 +43,7 @@ _SAFE_JOB_FIELDS = (
     "chat_id",
     "user_id",
     "output_ext",
+    "remux_to",
     "size_bytes",
     "file_size",
     "duration",

@@ -85,16 +85,35 @@ class ExtendedMediaConverter:
     # ========== VIDEO FEATURES ==========
 
     async def convert_video_format(self, input_path: str, output_path: str, target_format: str = "mp4") -> bool:
-        """Convert video to different format with proper codec selection."""
+        """Convert video to different format with proper codec selection.
+
+        Every H.264/AAC target states ``-preset veryfast -crf 23`` explicitly:
+        without a preset libx264 silently runs its ``medium`` default, which is
+        several times slower and peaks higher in RAM. An MP4-family target whose
+        source codecs already fit is remuxed (stream copy) instead, so converting
+        an MKV whose streams are H.264/AAC costs seconds rather than an encode.
+        """
         try:
+            _h264_aac = [
+                "-c:v",
+                "libx264",
+                "-preset",
+                "veryfast",
+                "-crf",
+                "23",
+                "-c:a",
+                "aac",
+                "-b:a",
+                "128k",
+            ]
             format_configs = {
-                "mp4": ["-c:v", "libx264", "-c:a", "aac", "-strict", "experimental"],
-                "mkv": ["-c:v", "libx264", "-c:a", "aac"],
-                "avi": ["-c:v", "libx264", "-c:a", "mp3"],
-                "mov": ["-c:v", "libx264", "-c:a", "aac"],
+                "mp4": list(_h264_aac),
+                "mkv": list(_h264_aac),
+                "avi": ["-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-c:a", "mp3"],
+                "mov": list(_h264_aac),
                 "webm": ["-c:v", "libvpx-vp9", "-c:a", "libvorbis"],
-                "flv": ["-c:v", "libx264", "-c:a", "aac"],
-                "m4v": ["-c:v", "libx264", "-c:a", "aac", "-strict", "experimental"],
+                "flv": ["-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-c:a", "aac"],
+                "m4v": list(_h264_aac),
             }
 
             if target_format not in format_configs:
@@ -102,6 +121,20 @@ class ExtendedMediaConverter:
                 return False
 
             cmd = format_configs[target_format]
+            # A container change only: copy the streams when they already fit MP4.
+            try:
+                from utils.ffmpeg_runner import MP4_REMUX_TARGET_EXTS, mp4_remux_args, probe_media
+
+                if os.path.splitext(output_path)[1].lower() in MP4_REMUX_TARGET_EXTS:
+                    remux = mp4_remux_args(await probe_media(input_path))
+                    if remux is not None:
+                        logger.info(
+                            "convert_video_format: %s streams are MP4-compatible; remuxing instead of re-encoding",
+                            input_path,
+                        )
+                        cmd = remux
+            except Exception:
+                logger.debug("convert_video_format: remux probe failed; re-encoding")
             return (await self.execute_ffmpeg(cmd, input_path, output_path))[0]
 
         except Exception as e:
@@ -119,8 +152,12 @@ class ExtendedMediaConverter:
         return success
 
     async def change_framerate(self, input_path: str, output_path: str, fps: float) -> bool:
-        """Change video framerate."""
-        cmd = ["-r", str(fps), "-c:v", "libx264", "-c:a", "copy"]
+        """Change video framerate.
+
+        ``-preset veryfast -crf 23`` is stated so the re-encode does not silently
+        fall back to libx264's ``medium`` default.
+        """
+        cmd = ["-r", str(fps), "-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-c:a", "copy"]
         return (await self.execute_ffmpeg(cmd, input_path, output_path))[0]
 
     async def adjust_bitrate(self, input_path: str, output_path: str, video_bitrate: str, audio_bitrate: str) -> bool:

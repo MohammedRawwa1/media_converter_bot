@@ -41,6 +41,59 @@ CREATE_NEW_PROCESS_GROUP = 0x00000200 if os.name == "nt" else 0
 MP3_METADATA_ARGS: tuple[str, ...] = ("-map_metadata", "0", "-id3v2_version", "3")
 
 
+#: Containers an MP4-family remux can target without re-encoding. A source whose
+#: streams already match one of these can be copied instead of encoded, which
+#: turns a long convert into a few seconds of I/O and takes the encoder's memory
+#: peak out of the job entirely.
+MP4_REMUX_TARGET_EXTS: frozenset[str] = frozenset({".mp4", ".m4v", ".mov"})
+
+#: Video codecs the MP4 container (and Telegram's player) accepts as-is.
+MP4_REMUX_VIDEO_CODECS: frozenset[str] = frozenset({"h264", "hevc", "mpeg4", "av1"})
+
+#: Audio codecs the MP4 container accepts as-is. Anything else (Opus/Vorbis/FLAC
+#: from a typical MKV) cannot be copied and forces a re-encode of the audio at
+#: least; the whole file is re-encoded, which is the safe fallback.
+MP4_REMUX_AUDIO_CODECS: frozenset[str] = frozenset({"aac", "mp3", "ac3", "eac3", "alac"})
+
+
+def mp4_remux_args(probe: dict | None) -> list[str] | None:
+    """ffmpeg args that remux the probed media into MP4 without re-encoding.
+
+    ``probe`` is a :func:`probe_media` result. Returns ``None`` when the source
+    cannot be copied into MP4 (an incompatible video or audio codec, or no video
+    stream at all), so the caller falls back to its ordinary re-encode.
+
+    Subtitles and attachments are deliberately not mapped: the MP4 muxer accepts
+    only ``mov_text``, and copying an MKV's SRT/ASS track would fail the whole
+    remux. The re-encode path drops them too, so this changes nothing the user
+    would have received. ``+faststart`` is kept so the result streams while it
+    downloads, exactly as the re-encode would.
+
+    Only the first video and first audio stream are mapped, matching ffmpeg's
+    own default stream selection for a re-encode - so a media with an extra,
+    incompatible track cannot sink a remux that the primary streams support.
+    """
+    probe = probe or {}
+    video_codec = str(probe.get("video_codec") or "").strip().lower()
+    if video_codec not in MP4_REMUX_VIDEO_CODECS:
+        return None
+    audio_codec = str(probe.get("audio_codec") or "").strip().lower()
+    if audio_codec and audio_codec not in MP4_REMUX_AUDIO_CODECS:
+        return None
+    args = ["-map", "0:v:0"]
+    if audio_codec:
+        args += ["-map", "0:a:0"]
+    args += ["-c:v", "copy"]
+    if video_codec == "hevc":
+        # Tag the HEVC track so the MP4 player (Telegram's included) recognises
+        # it; an untagged HEVC track is common in MKV and can fail to play.
+        args += ["-tag:v", "hvc1"]
+    if audio_codec:
+        args += ["-c:a", "copy"]
+    args += ["-movflags", "+faststart"]
+    return args
+
+
 async def probe_duration(path: str) -> float | None:
     """Probe media duration using ffprobe (sync subprocess wrapped)."""
     # Defensive checks: ensure caller provided a valid path

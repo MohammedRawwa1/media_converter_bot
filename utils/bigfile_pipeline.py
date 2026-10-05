@@ -269,6 +269,7 @@ class BigFilePipeline:
         ffmpeg_args: list | None = None,
         conversion_type: str | None = None,
         output_ext: str | None = None,
+        remux_to: str | None = None,
         caption: str | None = None,
         progress_callback: Callable[[int, int], None] | None = None,
         batch_id: str | None = None,
@@ -791,6 +792,11 @@ class BigFilePipeline:
                 job["caption"] = caption
             # Include output_ext so the worker knows what format extension to use
             job["output_ext"] = _out_ext
+            # A format conversion that only changes the container can be remuxed
+            # by the worker when the source codecs already fit the target; the
+            # worker probes and decides, falling back to the encode args above.
+            if remux_to:
+                job["remux_to"] = remux_to
 
             # For extract_streams, include output_dir and archive_path so the
             # worker's extract_streams branch can place extracted files and create the zip.

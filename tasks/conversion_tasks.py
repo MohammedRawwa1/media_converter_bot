@@ -804,7 +804,26 @@ async def change_resolution(input_path: str, output_path: str, width: int, heigh
         logger.warning(f"Resolution {width}x{height} not even. FFmpeg may adjust.")
 
     try:
-        cmd = ["ffmpeg", "-y", "-i", input_path, "-filter:v", f"scale={width}:{height}", "-c:a", "copy", output_path]
+        # The video is re-encoded for the new size, so its preset has to be
+        # stated: with no ``-c:v``/``-preset`` ffmpeg picks libx264 and runs its
+        # ``medium`` default, far slower than the rest of the bot's encodes.
+        cmd = [
+            "ffmpeg",
+            "-y",
+            "-i",
+            input_path,
+            "-filter:v",
+            f"scale={width}:{height}",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "veryfast",
+            "-crf",
+            "23",
+            "-c:a",
+            "copy",
+            output_path,
+        ]
 
         process = await _spawn_process(*cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
 
@@ -1371,6 +1390,8 @@ async def adjust_bitrate(
             audio_bitrate,
             "-c:v",
             "libx264",
+            "-preset",
+            "veryfast",
             "-c:a",
             "aac",
             output_path,

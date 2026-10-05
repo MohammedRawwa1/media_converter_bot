@@ -10,7 +10,7 @@ import subprocess
 import sys
 import time
 
-from utils.ffmpeg_runner import run_ffmpeg
+from utils.ffmpeg_runner import MP4_REMUX_TARGET_EXTS, mp4_remux_args, run_ffmpeg
 from utils.job_queue import JOB_LIST, close_redis, get_redis, pop_job, publish_update, release_input_lock
 
 try:
@@ -2689,6 +2689,40 @@ async def handle_job(job: dict):
                                         job_id, {"status": "error", "error": "no_input_provided"}
                                     )
                                 return
+
+                        # A format conversion that only needs a different container
+                        # is served by remuxing, not re-encoding: the source's own
+                        # H.264/HEVC + AAC/MP3 streams are copied into MP4, so a
+                        # 664MB MKV finishes in seconds instead of an encode that
+                        # can outlast the job's runtime cap or its memory ceiling.
+                        # The producer marks the job ``remux_to``; anything else
+                        # (compress/optimize, an incompatible source) re-encodes.
+                        if (
+                            isinstance(ffmpeg_args, list)
+                            and str(job.get("remux_to") or "").strip().lower()
+                            in ("mp4", ".mp4", "m4v", ".m4v", "mov", ".mov")
+                            and os.path.splitext(str(output_path or ""))[1].lower() in MP4_REMUX_TARGET_EXTS
+                            and input_path
+                            and os.path.exists(input_path)
+                        ):
+                            try:
+                                # Imported here, not at module scope: ``handle_job``
+                                # already imports ``probe_media`` locally further
+                                # down, which makes the name local for the whole
+                                # function - so the module-level one would be both
+                                # unused and shadowed.
+                                from utils.ffmpeg_runner import probe_media
+
+                                _remux = mp4_remux_args(await probe_media(input_path))
+                            except Exception:
+                                _remux = None
+                                logger.debug("ffmpeg worker: remux probe failed for job %s; re-encoding", job_id)
+                            if _remux is not None:
+                                logger.info(
+                                    "Job %s: source streams are MP4-compatible; remuxing instead of re-encoding",
+                                    job_id,
+                                )
+                                ffmpeg_args = _remux
 
                         coro = run_ffmpeg(
                             input_path,

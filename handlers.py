@@ -421,9 +421,15 @@ _BULK_EXTRACT_BITRATE_DEFAULT = _DEFAULT_AUDIO_BITRATE
 
 # Convert to MP4 — see convert_video_format(). Values are (video_args, audio_args);
 # audio args are replaced by -an when the Remove Audio toggle is also on.
+# Explicit ``-preset veryfast -crf 23``: libx264's default preset is ``medium``,
+# which encoded the same source several times slower and peaked higher in RAM on
+# the memory-constrained host (a large convert then bounced off the worker's
+# memory ceiling or the job's runtime cap and never reached delivery). This
+# matches the runner's own default, so a Convert encode and a job with no args
+# finish the same way.
 _BULK_CONVERT_ARGS: tuple[list[str], list[str]] = (
-    ["-c:v", "libx264", "-movflags", "+faststart"],
-    ["-c:a", "aac", "-strict", "experimental"],
+    ["-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-movflags", "+faststart"],
+    ["-c:a", "aac", "-b:a", "128k"],
 )
 
 # Precedence when several video toggles are on: only one encode pass is possible.
@@ -1197,6 +1203,11 @@ def _resolve_bulk_plan(settings: dict | None) -> dict:
     optimize_preset = _sanitize_bulk_preset(settings.get("bulk_optimize_preset"))
     extract_bitrate = _sanitize_bulk_extract_bitrate(settings.get("bulk_extract_bitrate"))
 
+    # Set only for an actual Convert-to-MP4 plan: the worker probes the source
+    # and remuxes (stream copy) when its codecs already fit, else re-encodes.
+    # Compress/Optimize must always re-encode, so they leave this unset.
+    remux_to: str | None = None
+
     ignored: list[str] = []
     if extract_audio:
         # ``MP3_METADATA_ARGS``: a batch extraction has to keep the media's own
@@ -1212,6 +1223,8 @@ def _resolve_bulk_plan(settings: dict | None) -> dict:
         video_args, audio_args = _bulk_video_recipe(chosen, settings)
         applied = [chosen]
         ignored = list(video_keys[1:])
+        if chosen == "bulk_convert_mp4":
+            remux_to = "mp4"
         if remove_audio:
             ffmpeg_args = list(video_args) + ["-an"]
             applied.append("bulk_remove_audio")
@@ -1229,6 +1242,7 @@ def _resolve_bulk_plan(settings: dict | None) -> dict:
         ffmpeg_args = list(video_args) + list(audio_args)
         output_ext, convert_type = ".mp4", "ffmpeg"
         applied = ["bulk_convert_mp4"]
+        remux_to = "mp4"
 
     if rename:
         applied.append("bulk_rename")
@@ -1237,6 +1251,7 @@ def _resolve_bulk_plan(settings: dict | None) -> dict:
         "ffmpeg_args": ffmpeg_args,
         "output_ext": output_ext,
         "convert_type": convert_type,
+        "remux_to": remux_to,
         "applied": applied,
         "ignored": ignored,
         "rename": rename,
@@ -5965,6 +5980,7 @@ class EnhancedMediaHandler:
                             ffmpeg_args=current_file.get("_pipeline_ffmpeg_args"),
                             conversion_type=current_file.get("_pipeline_conversion_type") or "ffmpeg",
                             output_ext=current_file.get("_pipeline_output_ext"),
+                            remux_to=current_file.get("_pipeline_remux_to"),
                             caption=current_file.get("_pipeline_caption"),
                             progress_callback=_pipeline_progress_cb,
                             batch_id=current_file.get("_pipeline_batch_id"),
@@ -7381,18 +7397,42 @@ class EnhancedMediaHandler:
         await self.safe_edit(query, f"🎬 Queuing conversion to {target_format.upper()}...")
 
         # ── Store conversion metadata so the BigFilePipeline knows what to produce ──
+        # Every H.264/AAC target states its preset and CRF. Without ``-preset``
+        # libx264 runs its ``medium`` default - the very thing that made a large
+        # MKV-to-MP4 convert outlast the job's runtime cap on a small host - and
+        # without a CRF the quality is whatever the default happens to be. Both
+        # values match the runner's fallback, so a convert and a no-arg job agree.
+        _h264_aac = [
+            "-c:v",
+            "libx264",
+            "-preset",
+            "veryfast",
+            "-crf",
+            "23",
+            "-c:a",
+            "aac",
+            "-b:a",
+            "128k",
+            "-movflags",
+            "+faststart",
+        ]
         _format_ffmpeg_args = {
-            "mp4": ["-c:v", "libx264", "-c:a", "aac", "-strict", "experimental", "-movflags", "+faststart"],
-            "mkv": ["-c:v", "libx264", "-c:a", "aac", "-movflags", "+faststart"],
-            "avi": ["-c:v", "libx264", "-c:a", "mp3"],
-            "mov": ["-c:v", "libx264", "-c:a", "aac", "-movflags", "+faststart"],
+            "mp4": list(_h264_aac),
+            "mkv": list(_h264_aac),
+            "avi": ["-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-c:a", "mp3"],
+            "mov": list(_h264_aac),
             "webm": ["-c:v", "libvpx-vp9", "-c:a", "libvorbis"],
-            "flv": ["-c:v", "libx264", "-c:a", "aac"],
-            "m4v": ["-c:v", "libx264", "-c:a", "aac", "-strict", "experimental", "-movflags", "+faststart"],
+            "flv": ["-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-c:a", "aac"],
+            "m4v": list(_h264_aac),
         }
         current_file["_pipeline_ffmpeg_args"] = _format_ffmpeg_args.get(target_format)
         current_file["_pipeline_output_ext"] = f".{target_format}"
         current_file["_pipeline_conversion_type"] = "format_video"
+        # Only an MP4-family target can be served by a stream copy; the worker
+        # probes the source and remuxes when its codecs already fit, otherwise it
+        # re-encodes with the args above.
+        _remux_to = "mp4" if target_format in ("mp4", "m4v", "mov") else None
+        current_file["_pipeline_remux_to"] = _remux_to
         current_file["_pipeline_caption"] = _metadata_caption(current_file)
         session["current_file"] = current_file
 
@@ -7433,6 +7473,7 @@ class EnhancedMediaHandler:
             "original_filename": current_file.get("name") or os.path.basename(output_path),
             "ffmpeg_args": current_file.get("_pipeline_ffmpeg_args") or _format_ffmpeg_args.get(target_format),
             "output_ext": f".{target_format}",
+            "remux_to": current_file.get("_pipeline_remux_to"),
             "progress_channel": f"ffmpeg:progress:{job_id}",
             "chat_id": update.effective_chat.id if update and update.effective_chat else None,
             "thumbnail": current_file.get("thumbnail"),
@@ -10369,6 +10410,7 @@ class EnhancedMediaHandler:
                                 f["_pipeline_ffmpeg_args"] = list(_bulk_args)
                                 f["_pipeline_conversion_type"] = _plan["convert_type"]
                                 f["_pipeline_output_ext"] = _bulk_ext
+                                f["_pipeline_remux_to"] = _plan.get("remux_to")
                                 _bulk_fallback_caption = (
                                     f"✅ Audio extracted ({_plan['extract_bitrate']})"
                                     if _bulk_ext == ".mp3"
@@ -10543,6 +10585,7 @@ class EnhancedMediaHandler:
                                 "original_filename": _bulk_name,
                                 "ffmpeg_args": list(_bulk_args),
                                 "output_ext": _bulk_ext,
+                                "remux_to": _plan.get("remux_to"),
                                 "type": _plan["convert_type"],
                                 "progress_channel": f"ffmpeg:progress:{job_id}",
                                 "chat_id": update.effective_chat.id
@@ -12520,7 +12563,18 @@ class EnhancedMediaHandler:
                 context,
                 current_file,
                 output_path=output_path,
-                ffmpeg_args=["-filter:v", f"scale={width}:{height}", "-c:a", "copy"],
+                ffmpeg_args=[
+                    "-filter:v",
+                    f"scale={width}:{height}",
+                    "-c:v",
+                    "libx264",
+                    "-preset",
+                    "veryfast",
+                    "-crf",
+                    "23",
+                    "-c:a",
+                    "copy",
+                ],
                 output_ext=".mp4",
                 job_type="change_resolution",
                 caption=_metadata_caption(current_file),
@@ -14820,7 +14874,18 @@ class EnhancedMediaHandler:
                         context,
                         current_file,
                         output_path=output_path,
-                        ffmpeg_args=["-r", str(fps), "-c:v", "libx264", "-c:a", "copy"],
+                        ffmpeg_args=[
+                            "-r",
+                            str(fps),
+                            "-c:v",
+                            "libx264",
+                            "-preset",
+                            "veryfast",
+                            "-crf",
+                            "23",
+                            "-c:a",
+                            "copy",
+                        ],
                         output_ext=".mp4",
                         job_type="change_framerate",
                         caption=_metadata_caption(current_file),
