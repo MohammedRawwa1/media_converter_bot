@@ -406,7 +406,7 @@ class SubtitleConverterTests(unittest.TestCase):
 
         cmd = self.converter.captured
         self.assertEqual(cmd[cmd.index("-filter_threads") + 1], "1")
-        self.assertEqual(cmd[cmd.index("-threads") + 1], "2")
+        self.assertEqual(cmd[cmd.index("-threads") + 1], "1")
 
     def test_burn_lets_env_restore_ffmpeg_defaults(self):
         """A bare "0" hands the thread choice back to ffmpeg."""
@@ -436,6 +436,31 @@ class SubtitleConverterTests(unittest.TestCase):
         self.assertEqual(cmd[cmd.index("-preset") + 1], "veryfast")
         self.assertEqual(cmd[cmd.index("-crf") + 1], "23")
         self.assertEqual(cmd[cmd.index("-b:a") + 1], "128k")
+
+    def test_burn_retries_a_sigkill_once_with_lower_memory_settings(self):
+        class _Retrying(ExtendedMediaConverter):
+            def __init__(self):
+                super().__init__()
+                self.commands = []
+
+            async def execute_ffmpeg(self, cmd, input_path=None, output_path=None):
+                self.commands.append(list(cmd))
+                if len(self.commands) == 1:
+                    return False, "ffmpeg was killed by signal 9 (SIGKILL)"
+                return True, "Success"
+
+        converter = _Retrying()
+        with tempfile.TemporaryDirectory() as tmp:
+            subtitle = os.path.join(tmp, "subs.srt")
+            with open(subtitle, "wb") as fh:
+                fh.write(_SRT_BYTES)
+            self.assertTrue(asyncio.run(converter.burn_subtitles("in.mp4", subtitle, "out.mp4")))
+
+        self.assertEqual(len(converter.commands), 2)
+        retry = converter.commands[1]
+        self.assertEqual(retry[retry.index("-filter_threads") + 1], "1")
+        self.assertEqual(retry[retry.index("-threads") + 1], "1")
+        self.assertEqual(retry[retry.index("-preset") + 1], "ultrafast")
 
     def test_mp4_mux_puts_the_index_first(self):
         asyncio.run(self.converter.add_subtitles("v.mp4", "s.srt", "out.mp4"))
@@ -489,6 +514,7 @@ class BatchSubtitleTests(unittest.TestCase):
             "_adopt_stored_source",
             "_download_stored_source",
             "_collect_batch_subtitle",
+            "_batch_subtitle_status_query",
             "_run_batch_subtitles",
             "_start_batch_subtitles",
         ):
@@ -559,24 +585,82 @@ class BatchSubtitleTests(unittest.TestCase):
         chosen = Handler._match_batch_subtitle(videos[0], subs, set(), videos=videos)
         self.assertEqual(chosen["file_id"], "g", "a subtitle with no name to contradict was refused")
 
+    def test_a_stale_s3_key_cannot_replace_the_forwarded_video_source(self):
+        from utils import media_cache, storage
+
+        uid = "telegram-video-uid"
+        expected_key = media_cache.media_library_key(uid)
+        wrong_key = "inputs/old-job/source.mp4"
+        checked_keys = []
+
+        class _Backend:
+            async def exists(self, key):
+                checked_keys.append(key)
+                return key == expected_key
+
+            async def get_file_size(self, key):
+                return 5 if key == expected_key else 999
+
+        async def _get_backend():
+            return _Backend()
+
+        async def _lookup(*_args, **_kwargs):
+            return {"file_unique_id": uid, "size": 5, "input_key": wrong_key}
+
+        handler = self._handler(_RecordingConverter())
+        video = {
+            "id": "telegram-file-id",
+            "file_unique_id": uid,
+            "name": "forwarded.mp4",
+            "size": 5,
+            "type": "video",
+            "input_key": wrong_key,
+        }
+        with (
+            patch.object(handlers_module.config, "get_storage_backend_name", return_value="s3"),
+            patch.object(media_cache, "cache_enabled", return_value=True),
+            patch.object(media_cache, "lookup", side_effect=_lookup),
+            patch.object(storage, "get_storage_backend", side_effect=_get_backend),
+        ):
+            resolved = asyncio.run(handler._resolve_local_source(video, user_id=7, require_stored_key_only=False))
+
+        self.assertEqual(resolved, expected_key)
+        self.assertEqual(video["input_key"], expected_key)
+        self.assertEqual(checked_keys, [expected_key], "the unrelated leftover object was trusted")
+
     def test_collecting_adds_a_valid_subtitle_and_refuses_a_bad_one(self):
         converter = _RecordingConverter()
         handler = self._handler(converter)
-        session = {"bulk_list": [self._video("clip.mp4")]}
+        session = {"bulk_list": [self._video("clip.mp4"), self._video("other.mp4")]}
         context = _FakeContext()
         update = _FakeUpdate([])
+        status_query = _FakeQuery()
+        asyncio.run(handler._start_batch_subtitles(update, context, session, status_query, 7))
+        self.assertEqual(
+            context.user_data["_batch_subtitle_status"],
+            {"chat_id": 99, "message_id": 1},
+        )
         document = SimpleNamespace(file_id="srt1", file_name="clip.srt", file_size=100)
 
         asyncio.run(handler._collect_batch_subtitle(update, context, session, document, ".srt"))
 
         self.assertEqual(len(session["subtitle_files"]), 1)
         self.assertTrue(os.path.exists(session["subtitle_files"][0]["path"]))
+        self.assertFalse(update.message.replies, "a successful receipt should not add another chat message")
+        self.assertIn("1 subtitle file received successfully", handler.edits[-1])
 
-        bad = SimpleNamespace(file_id="srt2", file_name="bad.srt", file_size=10)
+        second = SimpleNamespace(file_id="srt2", file_name="other.srt", file_size=100)
+        asyncio.run(handler._collect_batch_subtitle(update, context, session, second, ".srt"))
+
+        self.assertEqual(len(session["subtitle_files"]), 2)
+        self.assertFalse(update.message.replies, "a successful receipt should not add another chat message")
+        self.assertIn("All 2 subtitle files received successfully", handler.edits[-1])
+
+        bad = SimpleNamespace(file_id="srt3", file_name="bad.srt", file_size=10)
         context_bad = _FakeContext(payload=b"\x00 not a subtitle")
         asyncio.run(handler._collect_batch_subtitle(update, context_bad, session, bad, ".srt"))
 
-        self.assertEqual(len(session["subtitle_files"]), 1, "an invalid subtitle was queued")
+        self.assertEqual(len(session["subtitle_files"]), 2, "an invalid subtitle was queued")
 
     def test_the_run_merges_each_video_in_order_and_summarises(self):
         converter = _RecordingConverter()
@@ -668,7 +752,11 @@ class _BatchHandler:
 class _FakeQuery:
     def __init__(self):
         self.text = ""
-        self.message = SimpleNamespace(message_id=1, edit_text=self._edit)
+        self.message = SimpleNamespace(
+            chat=SimpleNamespace(id=99),
+            message_id=1,
+            edit_text=self._edit,
+        )
 
     async def _edit(self, text, **kwargs):
         self.text = text

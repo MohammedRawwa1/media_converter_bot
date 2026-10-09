@@ -506,6 +506,7 @@ class SplitLazySourceTests(unittest.TestCase):
         "File is too big" on a large audio.
         """
         backend = _FakeBackend()
+        library_key = media_cache.media_library_key("AgADCSIAAtbSIVE")
         current_file = {
             "id": "abc123",
             "name": "Album.mp3",
@@ -522,13 +523,13 @@ class SplitLazySourceTests(unittest.TestCase):
         async def _lookup(uid, *, expected_size=None):
             assert uid == "AgADCSIAAtbSIVE"
             return {
-                "input_key": "inputs/library/abc/source",
+                "input_key": library_key,
                 "size": 1000,
                 "storage": "s3",
             }
 
         async def _intact(backend, key, *, expected_size=None):
-            self.assertEqual(key, "inputs/library/abc/source")
+            self.assertEqual(key, library_key)
             return True
 
         with (
@@ -538,7 +539,7 @@ class SplitLazySourceTests(unittest.TestCase):
         ):
             self._run(handler, current_file)
 
-        self.assertEqual(backend.downloads, ["inputs/library/abc/source"])
+        self.assertEqual(backend.downloads, [library_key])
         self.assertEqual(handler.fetches, 0, "the stored object was reused; Telegram must not be asked")
         self.assertEqual(
             [os.path.basename(part) for part in handler.delivered],

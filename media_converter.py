@@ -353,34 +353,52 @@ class ExtendedMediaConverter:
             # stderr means. Both pools are capped here; set either env to "0" to
             # hand the choice back to ffmpeg.
             filter_threads = os.getenv("FFMPEG_FILTER_THREADS", "1").strip()
-            encoder_threads = os.getenv("FFMPEG_THREADS", "2").strip()
-            cmd = []
-            if filter_threads not in ("", "0"):
-                cmd.extend(["-filter_threads", filter_threads, "-filter_complex_threads", filter_threads])
-            cmd.extend(
-                [
-                    "-vf",
-                    f"subtitles=filename='{filter_path}'",
-                    "-c:v",
-                    "libx264",
-                    "-preset",
-                    "veryfast",
-                    "-crf",
-                    "23",
-                    "-c:a",
-                    "aac",
-                    "-b:a",
-                    "128k",
-                    "-movflags",
-                    "+faststart",
-                ]
+            encoder_threads = os.getenv("FFMPEG_THREADS", "1").strip()
+
+            def _burn_command(filter_thread_count: str, encoder_thread_count: str, preset: str) -> list[str]:
+                command = []
+                if filter_thread_count not in ("", "0"):
+                    command.extend(
+                        ["-filter_threads", filter_thread_count, "-filter_complex_threads", filter_thread_count]
+                    )
+                command.extend(
+                    [
+                        "-vf",
+                        f"subtitles=filename='{filter_path}'",
+                        "-c:v",
+                        "libx264",
+                        "-preset",
+                        preset,
+                        "-crf",
+                        "23",
+                        "-c:a",
+                        "aac",
+                        "-b:a",
+                        "128k",
+                        "-movflags",
+                        "+faststart",
+                    ]
+                )
+                if encoder_thread_count not in ("", "0"):
+                    command.extend(["-threads", encoder_thread_count])
+                maxrate = os.getenv("FFMPEG_MAXRATE", "2M")
+                if maxrate.strip().lower() not in ("0", "unlimited", "none", ""):
+                    command.extend(["-maxrate", maxrate, "-bufsize", os.getenv("FFMPEG_BUFSIZE", "4M")])
+                return command
+
+            result = await self.execute_ffmpeg(
+                _burn_command(filter_threads, encoder_threads, "veryfast"),
+                input_path,
+                output_path,
             )
-            if encoder_threads not in ("", "0"):
-                cmd.extend(["-threads", encoder_threads])
-            maxrate = os.getenv("FFMPEG_MAXRATE", "2M")
-            if maxrate.strip().lower() not in ("0", "unlimited", "none", ""):
-                cmd.extend(["-maxrate", maxrate, "-bufsize", os.getenv("FFMPEG_BUFSIZE", "4M")])
-            return (await self.execute_ffmpeg(cmd, input_path, output_path))[0]
+            if not result[0] and "signal 9 (SIGKILL)" in (result[1] or ""):
+                logger.warning("FFmpeg subtitle burn was SIGKILLed; retrying once with lower-memory settings")
+                result = await self.execute_ffmpeg(
+                    _burn_command("1", "1", "ultrafast"),
+                    input_path,
+                    output_path,
+                )
+            return result[0]
         except Exception as e:
             logger.error(f"burn_subtitles error: {e}")
             return False

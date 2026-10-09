@@ -9,6 +9,7 @@ import re
 import shutil
 import time
 from datetime import UTC, datetime
+from types import SimpleNamespace
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto, Message, Update
 from telegram.error import BadRequest
@@ -3701,6 +3702,9 @@ class EnhancedMediaHandler:
         except Exception:
             return None
 
+        _expected_key = _media_cache.media_library_key(_uid)
+        if not _expected_key:
+            return None
         if backend is None and _gsb is not None:
             try:
                 backend = await _gsb()
@@ -3720,6 +3724,24 @@ class EnhancedMediaHandler:
                 # A cache that cannot answer is a miss, not a reason to give up:
                 # the identity-derived key below needs no descriptor at all.
                 logger.debug("handlers: media cache lookup failed for %s; deriving the stored key", _uid)
+
+        _entry_uid = _entry.get("file_unique_id")
+        if _entry_uid and str(_entry_uid) != str(_uid):
+            logger.warning(
+                "handlers: refusing media-cache descriptor for a different file_unique_id "
+                "(expected=%s cached=%s)",
+                _uid,
+                _entry_uid,
+            )
+            _entry = {}
+            _stored_key = None
+        if _stored_key and _stored_key != _expected_key:
+            logger.warning(
+                "handlers: refusing non-canonical stored source for file_unique_id=%s (key=%s)",
+                _uid,
+                _stored_key,
+            )
+            _stored_key = None
 
         if not _stored_key:
             # No descriptor names this media. Derive the key from the media's own
@@ -3849,9 +3871,16 @@ class EnhancedMediaHandler:
         if local_copy:
             return local_copy
 
-        stored_key = current_file.get("input_key") or await self._adopt_stored_source(
-            current_file, session=session, user_id=user_id
-        )
+        if current_file.get("file_unique_id"):
+            # The media identity decides which object belongs to this file;
+            # current_file.input_key is only a hint until that lookup agrees.
+            stored_key = await self._adopt_stored_source(
+                current_file, session=session, user_id=user_id
+            )
+        else:
+            stored_key = current_file.get("input_key") or await self._adopt_stored_source(
+                current_file, session=session, user_id=user_id
+            )
         if not stored_key:
             return None
         if not require_stored_key_only:
@@ -5707,6 +5736,24 @@ class EnhancedMediaHandler:
         # If already downloaded (local) or already streamed to S3, nothing to do
         path = self._local_copy(current_file)
         input_key = current_file.get("input_key")
+        _file_uid = current_file.get("file_unique_id")
+        if input_key and _file_uid:
+            try:
+                from utils import media_cache as _media_cache
+
+                _expected_key = _media_cache.media_library_key(_file_uid)
+            except Exception:
+                _expected_key = None
+            if input_key != _expected_key:
+                logger.warning(
+                    "Refusing non-canonical input_key for user=%s file_unique_id=%s: %s",
+                    user_id,
+                    _file_uid,
+                    input_key,
+                )
+                current_file.pop("input_key", None)
+                session["current_file"] = current_file
+                input_key = None
         # ── Stale-key guard for pipeline-restored sessions: verify the S3 key
         #    actually exists before reusing it.  Only check when the key came from
         #    an earlier pipeline run (has _pipeline_job_id).  Freshly-streamed keys
@@ -8514,6 +8561,12 @@ class EnhancedMediaHandler:
                     os.remove(path)
         sess["subtitle_files"] = []
         context.user_data["awaiting_bulk_subtitles"] = True
+        status_chat_id, status_message_id = _edit_target_ids(query)
+        if status_chat_id is not None and status_message_id is not None:
+            context.user_data["_batch_subtitle_status"] = {
+                "chat_id": status_chat_id,
+                "message_id": status_message_id,
+            }
         with contextlib.suppress(Exception):
             self._persist_session(user_id)
 
@@ -8528,13 +8581,44 @@ class EnhancedMediaHandler:
             parse_mode="HTML",
         )
 
+    def _batch_subtitle_status_query(self, context: ContextTypes.DEFAULT_TYPE):
+        """Build a safe-edit target for the collector's original batch message."""
+        status = context.user_data.get("_batch_subtitle_status")
+        if not isinstance(status, dict):
+            return None
+        chat_id = status.get("chat_id")
+        message_id = status.get("message_id")
+        if chat_id is None or message_id is None:
+            return None
+
+        async def edit_message_text(text, **kwargs):
+            return await context.bot.edit_message_text(
+                chat_id=chat_id,
+                message_id=message_id,
+                text=text,
+                **kwargs,
+            )
+
+        async def reply_text(text, **kwargs):
+            return await context.bot.send_message(chat_id=chat_id, text=text, **kwargs)
+
+        message = SimpleNamespace(
+            chat=SimpleNamespace(id=chat_id),
+            message_id=message_id,
+            reply_text=reply_text,
+        )
+        return SimpleNamespace(
+            message=message,
+            data="bulk_subtitles",
+            edit_message_text=edit_message_text,
+        )
+
     async def _collect_batch_subtitle(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE, session: dict, document, file_ext: str
     ) -> None:
         """Receive one subtitle for the pending batch run, validated before it waits."""
         message = update.message
         user_id = update.effective_user.id if update.effective_user else None
-        await message.reply_text("📥 Receiving subtitle file...")
 
         input_dir = getattr(config, "INPUT_PATH", "storage/input") if config else "storage/input"
         with contextlib.suppress(OSError):
@@ -8582,11 +8666,35 @@ class EnhancedMediaHandler:
         with contextlib.suppress(Exception):
             self._persist_session(user_id)
 
-        await message.reply_text(
-            f"✅ Subtitle {len(entries)} received: {_name}\n"
-            f"Send the rest, then press ▶️ Start Merge ({len(self._batch_videos(session))} video(s) queued).",
-            reply_markup=self._batch_subtitle_markup(),
+        videos_queued = len(self._batch_videos(session))
+        received = len(entries)
+        subtitle_word = "file" if received == 1 else "files"
+        video_word = "video" if videos_queued == 1 else "videos"
+        confirmation = (
+            f"✅ <b>{received} subtitle {subtitle_word} received successfully.</b>\n"
+            f"🎬 {videos_queued} {video_word} queued. "
+            "Send any remaining subtitles, or press ▶️ Start Merge when ready."
         )
+        if received >= videos_queued:
+            confirmation = (
+                f"✅ <b>All {received} subtitle {subtitle_word} received successfully.</b>\n"
+                f"🎬 {videos_queued} {video_word} queued. Press ▶️ Start Merge when ready."
+            )
+        status_query = self._batch_subtitle_status_query(context)
+        if status_query is not None:
+            await self.safe_edit(
+                status_query,
+                confirmation,
+                reply_markup=self._batch_subtitle_markup(),
+                parse_mode="HTML",
+            )
+        else:
+            logger.warning("batch subtitles: status message unavailable for user %s", user_id)
+            await message.reply_text(
+                confirmation,
+                reply_markup=self._batch_subtitle_markup(),
+                parse_mode="HTML",
+            )
 
     async def _run_batch_subtitles(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE, session, query, user_id
@@ -8694,6 +8802,7 @@ class EnhancedMediaHandler:
         sess.pop("_bulk_subtitles_started_at", None)
         with contextlib.suppress(Exception):
             self._persist_session(user_id)
+        context.user_data.pop("_batch_subtitle_status", None)
 
     async def handle_document(self, update: Update, context: ContextTypes.DEFAULT_TYPE, session: dict):
         """Handle document files (could be video/audio)."""
