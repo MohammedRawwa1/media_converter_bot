@@ -1,5 +1,16 @@
+# ── Base image ──
+# Pulled from Docker's own mirror on AWS ECR Public instead of ``python:3.12-slim``
+# on Docker Hub. Every ``docker.io`` pull first fetches an OAuth token from
+# auth.docker.io, and Railway's builders fail there before any build step runs:
+# "failed to fetch oauth token ... 504 Gateway Timeout". The mirror serves the
+# identical image - same manifest digest and size - and needs no Docker Hub auth.
+# To go back to Docker Hub, restore ``python:3.12-slim`` here and below (and, if
+# the limit is auth-related, set DOCKERHUB_USERNAME/DOCKERHUB_PASSWORD as Railway
+# build variables). ``mirror.gcr.io/library/python:3.12-slim`` is an equivalent
+# fallback registry.
+
 # ── Builder stage: compile native Python packages ──
-FROM python:3.12-slim AS builder
+FROM public.ecr.aws/docker/library/python:3.12-slim AS builder
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
@@ -23,7 +34,8 @@ RUN pip install --no-cache-dir --upgrade pip setuptools wheel \
 
 
 # ── Runtime stage: slim image with only runtime deps ──
-FROM python:3.12-slim
+# Same mirror as the builder stage, for the same reason (see the top of this file).
+FROM public.ecr.aws/docker/library/python:3.12-slim
 
 # Install only runtime OS packages (no build-essential!)
 RUN apt-get update && apt-get install -y --no-install-recommends \
