@@ -105,7 +105,8 @@ def _install_pipeline(monkeypatch, tmp_path, mode, *, cache_enabled=False):
         jobs.append(job)
         return True
 
-    async def _download(self, chat_id, message_id, dest_path, progress_callback=None, user_id=None):
+    async def _download(self, chat_id, message_id, dest_path, progress_callback=None, user_id=None, expected_size=None):
+        assert expected_size == len(SOURCE_BYTES)
         with open(dest_path, "wb") as fh:
             fh.write(SOURCE_BYTES)
         return True

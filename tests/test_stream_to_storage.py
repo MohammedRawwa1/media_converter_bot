@@ -298,7 +298,8 @@ def _install(monkeypatch, tmp_path, *, stream_ok=True, mode="stream", cancel_mid
                     callback(sink.tell(), len(SOURCE_BYTES))
         return True
 
-    async def _download(self, chat_id, message_id, dest_path, progress_callback=None, user_id=None):
+    async def _download(self, chat_id, message_id, dest_path, progress_callback=None, user_id=None, expected_size=None):
+        assert expected_size == len(SOURCE_BYTES)
         with open(dest_path, "wb") as fh:
             fh.write(SOURCE_BYTES)
         return True
