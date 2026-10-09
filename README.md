@@ -590,12 +590,14 @@ pip install -r requirements-dev.txt   # linting + security tools
 #
 # After editing requirements.txt, regenerate the lock with the command recorded
 # in its header:
-#   uv pip compile requirements.txt --generate-hashes --upgrade --python-version 3.12 \
+#   uv pip compile requirements.txt --generate-hashes --python-version 3.12 \
 #     --python-platform x86_64-unknown-linux-gnu --output-file requirements.lock
-# --upgrade is required, not cosmetic: without it uv prefers the versions
-# already in the file, so the command reports no change while CI - which
-# resolves fresh - sees the lock as stale.
-# CI fails if the two drift apart, or if any pinned entry loses its hash.
+# Without --upgrade uv keeps the versions already pinned, so a regenerate is
+# reproducible and the check stays green; pass --upgrade only when you actually
+# mean to bump the whole tree. CI does not require the lock to equal "newest of
+# everything" (nothing could promise that): it fails if a direct requirement is
+# missing from the lock, is pinned outside its specifier, or loses its hash
+# (scripts/check_lock_sync.py), or if the pinned set cannot install hash-verified.
 pip install --require-hashes -r requirements.lock   # optional: verify it locally on Linux
 
 # Create a Pyrogram session (interactive)

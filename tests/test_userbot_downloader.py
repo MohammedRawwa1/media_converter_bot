@@ -76,9 +76,28 @@ class ScanCandidateTests(unittest.TestCase):
         self.assertTrue(mod._scan_candidate_matches(anything))
         self.assertFalse(mod._scan_candidate_matches(SimpleNamespace(id=7, media=object()), expected_size=99))
 
-    def test_both_scans_go_through_the_gate(self):
+    def test_a_pyrogram_file_size_is_read(self):
+        # Telethon exposes ``size``, Pyrogram ``file_size``. Only reading ``size``
+        # made every Pyrogram message look file-less, so the direct lookup could
+        # not be gated before.
+        pyro_video = SimpleNamespace(
+            id=8,
+            media=object(),
+            video=SimpleNamespace(file_size=49_289_926),
+        )
+        self.assertEqual(mod._message_media_size(pyro_video), 49_289_926)
+        self.assertTrue(mod._scan_candidate_matches(pyro_video, expected_size=49_289_926))
+        self.assertFalse(mod._scan_candidate_matches(pyro_video, expected_size=1_048_576))
+
+    def test_every_lookup_goes_through_the_gate(self):
         src = read_source("utils", "userbot_downloader.py")
-        self.assertEqual(src.count("_scan_candidate_matches(m"), 3)
+        # The two scans (date - which lists the media it passes over - and
+        # recent history).
+        self.assertEqual(src.count("_scan_candidate_matches(m,"), 2)
+        # Direct Pyrogram/Telethon lookups and raw-API/history fallbacks must
+        # consult the same gate, or a message id that collides across chats is
+        # downloaded as if it were the requested media.
+        self.assertEqual(src.count("_scan_candidate_matches(msg,"), 6)
 
 
 class ScanSkipsTheWrongMediaTests(unittest.IsolatedAsyncioTestCase):
@@ -148,6 +167,159 @@ class ScanSkipsTheWrongMediaTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(os.path.exists(dest))
 
 
+class PyrogramCandidateGateTests(unittest.IsolatedAsyncioTestCase):
+    """The Pyrogram candidate loop must not download a message that only shares the id.
+
+    A Bot API DM ``chat_id`` is the *user's* id, which a user account resolves to
+    its own peer - so the first candidate can hold an unrelated message with the
+    same numeric id. Taking it downloaded a WhatsApp voice note into the 61MB
+    video's own path and merged that into the delivered file. The announced size
+    is what tells the two apart.
+    """
+
+    class _Client:
+        """Pyrogram stand-in: ``sizes`` maps a peer to the media size it holds.
+
+        A peer absent from the map has no media at that id, which is how the real
+        bot DM looked on the offending run.
+        """
+
+        def __init__(self, sizes):
+            self.sizes = sizes
+            self.asked = []
+            self.downloaded = []
+
+        async def start(self):
+            return self
+
+        async def stop(self):
+            return None
+
+        async def get_messages(self, peer, message_ids=None):
+            self.asked.append(peer)
+            size = self.sizes.get(peer)
+            if size is None:
+                return [SimpleNamespace(id=5038, media=None)]
+            return [SimpleNamespace(id=5038, media=object(), document=SimpleNamespace(file_size=size))]
+
+        async def download_media(self, message, file_name=None, **kwargs):
+            self.downloaded.append(message.document.file_size)
+            with open(file_name, "wb") as fh:
+                fh.write(b"x" * message.document.file_size)
+            return file_name
+
+    @contextlib.contextmanager
+    def _client(self, client):
+        with (
+            patch.object(mod, "PyrogramClient", object()),
+            patch("utils.telethon_session.build_pyrogram_client", lambda *a, **k: client),
+            patch(
+                "utils.telethon_session.get_pyrogram_session_string_for_user",
+                new=AsyncMock(return_value="session-string"),
+            ),
+            patch("utils.telethon_session.get_db_model", return_value=None),
+            patch("utils.telethon_session.get_userbot_credentials", return_value=(1, "hash")),
+            patch.object(mod, "_normalize_target", AsyncMock(return_value=1405333465)),
+            patch.object(mod, "_resolve_pyrogram_peer", AsyncMock(side_effect=lambda _c, peer: peer)),
+            patch.object(mod, "_get_bot_user_id", lambda: 8323674784),
+            patch.object(mod, "_ffprobe_ok", AsyncMock(return_value=True)),
+        ):
+            yield
+
+    async def test_the_bot_dm_peer_is_tried_before_the_users_own_peer(self):
+        # The file was sent to the bot, so the bot's DM is where it lives; asking
+        # peer=user_id first reads Saved Messages, a different chat.
+        client = self._Client({8323674784: 61_461_088})
+        with tempfile.TemporaryDirectory() as tmp, self._client(client):
+            dest = os.path.join(tmp, "video.mp4")
+            ok = await mod._download_with_pyrogram(1405333465, 5038, dest, expected_size=61_461_088)
+
+        self.assertTrue(ok)
+        self.assertEqual(client.asked, [8323674784], "the bot DM must be read first, not the own peer")
+        self.assertEqual(client.downloaded, [61_461_088])
+
+    async def test_a_wrong_sized_candidate_is_skipped_for_the_real_one(self):
+        # The leak, exactly: the first peer resolves to a 123KB voice note under
+        # the same id. It must be refused and the 61MB video taken from the next.
+        client = self._Client({8323674784: 126_944, 1405333465: 61_461_088})
+        with tempfile.TemporaryDirectory() as tmp, self._client(client):
+            dest = os.path.join(tmp, "video.mp4")
+            ok = await mod._download_with_pyrogram(1405333465, 5038, dest, expected_size=61_461_088)
+
+            self.assertTrue(ok)
+            self.assertEqual(client.asked, [8323674784, 1405333465])
+            self.assertEqual(client.downloaded, [61_461_088], "the voice note must never be downloaded")
+            self.assertEqual(os.path.getsize(dest), 61_461_088)
+
+    async def test_the_history_scan_does_not_take_a_wrong_sized_message(self):
+        """The id-matched history fallback needs the same gate as the peer loop.
+
+        ``get_chat_history`` matches on the numeric id alone. In the reported
+        failure the id existed in two different chats, so the scan could pull the
+        wrong file into the requested media's own path and report success.
+        """
+
+        class _HistoryClient:
+            def __init__(self):
+                self.asked = []
+
+            async def start(self):
+                return self
+
+            async def stop(self):
+                return None
+
+            async def get_messages(self, peer, message_ids=None):
+                self.asked.append(peer)
+                return []
+
+            async def get_chat_history(self, peer, limit=None):
+                wrong = SimpleNamespace(id=5038, media=object(), document=SimpleNamespace(file_size=126_944))
+                yield wrong
+
+        client = _HistoryClient()
+        with tempfile.TemporaryDirectory() as tmp:
+            dest = os.path.join(tmp, "video.mp4")
+            with (
+                patch.object(mod, "PyrogramClient", object()),
+                patch("utils.telethon_session.build_pyrogram_client", lambda *a, **k: client),
+                patch(
+                    "utils.telethon_session.get_pyrogram_session_string_for_user",
+                    new=AsyncMock(return_value="session-string"),
+                ),
+                patch("utils.telethon_session.get_db_model", return_value=None),
+                patch("utils.telethon_session.get_userbot_credentials", return_value=(1, "hash")),
+                patch.object(mod, "_normalize_target", AsyncMock(return_value=1405333465)),
+                patch.object(mod, "_resolve_pyrogram_peer", AsyncMock(side_effect=lambda _c, peer: peer)),
+                patch.object(mod, "_get_bot_user_id", lambda: None),
+                patch.object(mod, "_download_and_ensure_path", AsyncMock(return_value=True)) as download_mock,
+                patch.object(mod, "config", SimpleNamespace(RELAY_CHAT_ID=None)),
+            ):
+                ok = await mod._download_with_pyrogram(
+                    1405333465,
+                    5038,
+                    dest,
+                    expected_size=61_461_088,
+                )
+
+        self.assertFalse(ok)
+        download_mock.assert_not_awaited()
+
+    async def test_the_helper_discards_a_file_of_the_wrong_size(self):
+        class _SizeClient:
+            async def download_media(self, message, file_name=None, **kwargs):
+                with open(file_name, "wb") as fh:
+                    fh.write(b"x" * 100)
+                return file_name
+
+        with tempfile.TemporaryDirectory() as tmp:
+            dest = os.path.join(tmp, "asset.bin")
+            kmsg = SimpleNamespace(id=1, media=object())
+            ok = await mod._download_and_ensure_path(_SizeClient(), kmsg, dest, expected_size=61_461_088)
+            self.assertFalse(ok)
+            self.assertFalse(os.path.exists(dest), "the wrong-sized file must not be left behind")
+
+
 class UserbotDownloaderTests(unittest.IsolatedAsyncioTestCase):
     async def test_prefers_pyrogram_when_session_string_is_configured(self):
         pyrogram_mock = AsyncMock(return_value=True)
@@ -167,6 +339,51 @@ class UserbotDownloaderTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(result)
         pyrogram_mock.assert_awaited_once()
         telethon_mock.assert_not_awaited()
+
+    async def test_the_requested_size_reaches_the_pyrogram_download(self):
+        """The gate is only as good as what the caller hands it.
+
+        ``download_forward_via_userbot`` used to pass ``expected_size``/``want_audio``
+        to Telethon only, so the Pyrogram path - the one that runs first whenever a
+        Pyrogram session is configured - had nothing to verify against.
+        """
+        pyrogram_mock = AsyncMock(return_value=True)
+        with (
+            patch.object(mod, "_download_with_pyrogram", pyrogram_mock),
+            patch("utils.userbot_downloader.PyrogramClient", object()),
+            patch(
+                "utils.telethon_session.get_pyrogram_session_string_for_user",
+                new=AsyncMock(return_value="session-string"),
+            ),
+        ):
+            await mod.download_forward_via_userbot(
+                123, 456, os.path.join(tempfile.gettempdir(), "wired"), expected_size=61_461_088, want_audio=True
+            )
+
+        kwargs = pyrogram_mock.await_args.kwargs
+        self.assertEqual(kwargs.get("expected_size"), 61_461_088)
+        self.assertTrue(kwargs.get("want_audio"))
+
+    async def test_relay_copy_of_the_wrong_size_is_refused(self):
+        """A forward made from the wrong peer must not become the source either."""
+        wrong = SimpleNamespace(id=789, media=object(), document=SimpleNamespace(file_size=100))
+        client = AsyncMock()
+        client.forward_messages = AsyncMock(return_value=[wrong])
+        client.get_messages = AsyncMock(return_value=[wrong])
+
+        with patch.object(mod, "_download_and_ensure_path", AsyncMock(return_value=True)) as download_mock:
+            result = await mod._try_relay_fallback(
+                client,
+                123,
+                456,
+                os.path.join(tempfile.gettempdir(), "relay"),
+                relay_chat_id=-100111,
+                client_type="pyrogram",
+                expected_size=61_461_088,
+            )
+
+        self.assertFalse(result)
+        download_mock.assert_not_awaited()
 
     async def test_relay_fallback_retries_download_from_forwarded_message(self):
         forwarded_msg = SimpleNamespace(id=789, media=object())

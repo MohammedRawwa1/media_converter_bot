@@ -19,6 +19,7 @@ from unittest.mock import patch
 from source_helpers import read_source
 
 import handlers as handlers_module
+import media_converter as media_converter_module
 from handlers import EnhancedMediaHandler
 from media_converter import ExtendedMediaConverter
 from utils.keyboard_utils import MediaMenuBuilder
@@ -204,6 +205,16 @@ class SubtitleMergeTests(unittest.TestCase):
         self.assertEqual(handler.fetches, 0, "a media already on disk must not be fetched again")
         self.assertEqual(len(converter.calls), 1)
 
+    def test_a_killed_burn_reports_why_not_a_uniform_failure(self):
+        """A process killed by the OOM killer must say so, not "the merge failed"."""
+        converter = _RecordingConverter(ok=False)
+        converter.last_ffmpeg_failure = "ffmpeg was killed by signal 9 (SIGKILL)"
+        handler = self._handler(converter, self._video_path())
+
+        replies = self._run(handler, self._session(), burn=True)
+
+        self.assertTrue(any("SIGKILL" in text for text in replies), replies)
+
     def test_a_failed_fetch_reports_the_reason_and_does_nothing(self):
         converter = _RecordingConverter()
         handler = self._handler(converter, None)
@@ -330,6 +341,20 @@ class SubtitleValidationTests(unittest.TestCase):
         self.assertTrue(handlers_module._validate_subtitle_file(good, ".ass")[0])
 
 
+class FfmpegKillTests(unittest.TestCase):
+    """A killed encode has to be named as one, not reported as a generic failure.
+
+    exit=-9 with an empty stderr is the OOM killer, and it looked exactly like any
+    other ffmpeg error to the user ("the merge failed").
+    """
+
+    def test_signal_9_is_named(self):
+        self.assertEqual(media_converter_module._signal_name(9), "signal 9 (SIGKILL)")
+
+    def test_an_unknown_signal_number_still_names_the_signal(self):
+        self.assertEqual(media_converter_module._signal_name(12345), "signal 12345")
+
+
 class SubtitleConverterTests(unittest.TestCase):
     """The ffmpeg command itself: codec by container, streams mapped explicitly."""
 
@@ -366,9 +391,35 @@ class SubtitleConverterTests(unittest.TestCase):
                 fh.write(_SRT_BYTES)
             asyncio.run(self.converter.burn_subtitles("in.mp4", subtitle, "out.mp4"))
 
-        vf = self.converter.captured[1]
+        cmd = self.converter.captured
+        vf = cmd[cmd.index("-vf") + 1]
         self.assertTrue(vf.startswith("subtitles=filename="), vf)
         self.assertIn("\\'", vf)
+
+    def test_burn_bounds_the_filter_and_encoder_threads(self):
+        """Peak RAM is what kills a long merge, so both worker pools are capped."""
+        with tempfile.TemporaryDirectory() as tmp:
+            subtitle = os.path.join(tmp, "subs.srt")
+            with open(subtitle, "wb") as fh:
+                fh.write(_SRT_BYTES)
+            asyncio.run(self.converter.burn_subtitles("in.mp4", subtitle, "out.mp4"))
+
+        cmd = self.converter.captured
+        self.assertEqual(cmd[cmd.index("-filter_threads") + 1], "1")
+        self.assertEqual(cmd[cmd.index("-threads") + 1], "2")
+
+    def test_burn_lets_env_restore_ffmpeg_defaults(self):
+        """A bare "0" hands the thread choice back to ffmpeg."""
+        with tempfile.TemporaryDirectory() as tmp:
+            subtitle = os.path.join(tmp, "subs.srt")
+            with open(subtitle, "wb") as fh:
+                fh.write(_SRT_BYTES)
+            with patch.dict(os.environ, {"FFMPEG_FILTER_THREADS": "0", "FFMPEG_THREADS": "0"}):
+                asyncio.run(self.converter.burn_subtitles("in.mp4", subtitle, "out.mp4"))
+
+        cmd = self.converter.captured
+        self.assertNotIn("-filter_threads", cmd)
+        self.assertNotIn("-threads", cmd)
 
     def test_burn_uses_the_memory_constrained_encode_settings(self):
         """veryfast x264 + AAC + faststart, the deployment's small-host preset."""

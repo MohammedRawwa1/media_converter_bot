@@ -1,7 +1,9 @@
 # media_converter.py
 import asyncio
+import contextlib
 import logging
 import os
+import signal
 import tempfile
 
 import config
@@ -24,10 +26,41 @@ except ImportError:
 logger = logging.getLogger(__name__)
 
 
+# Named explicitly rather than through ``signal.Signals``: Windows has no SIGKILL
+# constant, so the enum lookup silently loses the one name that matters most (the
+# OOM killer) exactly where the message is most useful.
+_SIGNAL_NAMES = {
+    1: "SIGHUP",
+    2: "SIGINT",
+    6: "SIGABRT",
+    9: "SIGKILL",
+    11: "SIGSEGV",
+    13: "SIGPIPE",
+    15: "SIGTERM",
+}
+
+
+def _signal_name(number: int) -> str:
+    """Name the signal that killed a subprocess ("signal 9 (SIGKILL)").
+
+    ``returncode`` is negative exactly when a signal terminated the child, and
+    the number alone tells a user nothing - SIGKILL (the OOM killer) versus
+    SIGTERM (a shutdown) is the difference between "make it smaller" and "retry".
+    """
+    name = _SIGNAL_NAMES.get(number)
+    if name is None:
+        with contextlib.suppress(ValueError, AttributeError):
+            name = signal.Signals(number).name
+    return f"signal {number} ({name})" if name else f"signal {number}"
+
+
 class ExtendedMediaConverter:
     """Extended converter with all features from FFmpeg commands."""
 
     def __init__(self):
+        # The last ffmpeg failure's own words, so a caller that only gets a bool
+        # back can still tell the user *why* (a killed process says so).
+        self.last_ffmpeg_failure = ""
         self.supported_formats = {
             "video": [".mp4", ".avi", ".mov", ".mkv", ".flv", ".wmv", ".m4v", ".3gp", ".webm"],
             "audio": [".mp3", ".wav", ".aac", ".flac", ".ogg", ".m4a", ".wma", ".opus"],
@@ -62,6 +95,7 @@ class ExtendedMediaConverter:
             _, stderr = await process.communicate()
 
             if process.returncode == 0:
+                self.last_ffmpeg_failure = ""
                 return True, "Success"
             error_msg = stderr.decode("utf-8", errors="ignore")[:500]
             # ffmpeg's own words are what identify a failure (a source with no
@@ -70,16 +104,28 @@ class ExtendedMediaConverter:
             # a real failure left nothing but "❌ Failed to …" in the chat and
             # nothing at all in the log. The exit code tells the two kinds apart:
             # a normal error is 1, a signal (killed) is negative.
+            if process.returncode < 0:
+                # A negative code is not an ffmpeg error at all: something killed
+                # the process (SIGKILL 9 is almost always the host OOM killer on a
+                # long encode). ffmpeg writes nothing to stderr in that case, so
+                # the reason has to be derived from the signal itself.
+                error_msg = (
+                    f"ffmpeg was killed by {_signal_name(-process.returncode)} - most often the "
+                    "host's out-of-memory killer on a long or high-resolution encode "
+                    "(see FFMPEG_THREADS / FFMPEG_FILTER_THREADS)"
+                )
             logger.error(
                 "FFmpeg failed (exit=%s): %s\n%s",
                 process.returncode,
                 " ".join(str(part) for part in full_cmd),
                 error_msg.strip() or "(ffmpeg wrote nothing to stderr)",
             )
+            self.last_ffmpeg_failure = error_msg.strip()
             return False, error_msg
 
         except Exception as e:
             logger.error(f"FFmpeg execution error: {e}")
+            self.last_ffmpeg_failure = str(e)
             return False, str(e)
 
     # ========== VIDEO FEATURES ==========
@@ -299,22 +345,38 @@ class ExtendedMediaConverter:
         try:
             abs_sub = os.path.abspath(subtitle_path).replace("\\", "/")
             filter_path = abs_sub.replace(":", "\\:").replace("'", "\\'")
-            cmd = [
-                "-vf",
-                f"subtitles=filename='{filter_path}'",
-                "-c:v",
-                "libx264",
-                "-preset",
-                "veryfast",
-                "-crf",
-                "23",
-                "-c:a",
-                "aac",
-                "-b:a",
-                "128k",
-                "-movflags",
-                "+faststart",
-            ]
+            # ── Memory-bounded encode ──
+            # libavfilter and x264 both size their worker pools by core count, and
+            # on a small host that auto-threading is what drives the encode into
+            # the OOM killer on a long 1080p source - the process dies with exit
+            # -9 a few seconds in, which is what "FFmpeg failed (exit=-9)" with no
+            # stderr means. Both pools are capped here; set either env to "0" to
+            # hand the choice back to ffmpeg.
+            filter_threads = os.getenv("FFMPEG_FILTER_THREADS", "1").strip()
+            encoder_threads = os.getenv("FFMPEG_THREADS", "2").strip()
+            cmd = []
+            if filter_threads not in ("", "0"):
+                cmd.extend(["-filter_threads", filter_threads, "-filter_complex_threads", filter_threads])
+            cmd.extend(
+                [
+                    "-vf",
+                    f"subtitles=filename='{filter_path}'",
+                    "-c:v",
+                    "libx264",
+                    "-preset",
+                    "veryfast",
+                    "-crf",
+                    "23",
+                    "-c:a",
+                    "aac",
+                    "-b:a",
+                    "128k",
+                    "-movflags",
+                    "+faststart",
+                ]
+            )
+            if encoder_threads not in ("", "0"):
+                cmd.extend(["-threads", encoder_threads])
             maxrate = os.getenv("FFMPEG_MAXRATE", "2M")
             if maxrate.strip().lower() not in ("0", "unlimited", "none", ""):
                 cmd.extend(["-maxrate", maxrate, "-bufsize", os.getenv("FFMPEG_BUFSIZE", "4M")])

@@ -8245,7 +8245,10 @@ class EnhancedMediaHandler:
             await notify("🔧 Merging subtitles into the video (this may take a while)...")
             ok = await self.converter.burn_subtitles(video_path, subtitle_path, out_path)
             if not (ok and os.path.exists(out_path)):
-                return False, "the merge failed"
+                # ``burn_subtitles`` returns only a bool, but the converter kept
+                # ffmpeg's own words - so a killed encode (exit -9, the OOM killer)
+                # is reported as that instead of a bare "the merge failed".
+                return False, getattr(self.converter, "last_ffmpeg_failure", "") or "the merge failed"
 
             caption = _metadata_caption(current)
             delivery_name = _video_delivery_name(current, out_path)

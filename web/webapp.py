@@ -697,6 +697,10 @@ def upload():
                                     # behalf of whoever sent the media, through that
                                     # user's session, not the deployment's.
                                     user_id=m.get("user_id"),
+                                    # The announced size, so a message that only
+                                    # shares the id is refused rather than fetched.
+                                    expected_size=m.get("size"),
+                                    want_audio=str(m.get("type") or "") == "audio",
                                 )
                             )
                         except Exception:
@@ -859,6 +863,9 @@ def upload():
                             file_unique_id=meta_obj.get("file_unique_id"),
                             # The forward's own user - see the note above.
                             user_id=meta_obj.get("user_id"),
+                            # The announced size - see the note on the other call site.
+                            expected_size=meta_obj.get("size"),
+                            want_audio=str(meta_obj.get("type") or "") == "audio",
                         )
                     )
                 except Exception:

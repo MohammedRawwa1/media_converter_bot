@@ -114,6 +114,11 @@ async def process_forward_hash(forward_hash: str):
             # before this field existed resolves None and keeps the old
             # behaviour rather than failing.
             user_id=meta.get("user_id"),
+            # The size Telegram announced for this media; the downloader uses it
+            # to refuse a message that only shares the id (a Bot API DM id
+            # resolves to the account's own peer, not the DM with the bot).
+            expected_size=meta.get("size"),
+            want_audio=str(meta.get("type") or "") == "audio",
         )
         logger.info(
             "fetcher: userbot download for %s returned ok=%s exists=%s",

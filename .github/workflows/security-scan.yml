@@ -252,37 +252,20 @@ jobs:
         with:
           python-version: ${{ env.PYTHON_VERSION }}
 
-      - name: Install uv
-        run: python -m pip install --upgrade pip uv
-
-      - name: requirements.lock matches requirements.txt
+      - name: requirements.lock covers requirements.txt
         shell: bash
+        # Deterministic, on purpose. The previous gate re-resolved the lock with
+        # `uv pip compile --upgrade` and diffed it, so it compared the committed
+        # lock against "newest of everything" - any dependency publishing a
+        # release failed the job on a commit that changed no dependency, and the
+        # lock header even documented the command *without* --upgrade.
+        # scripts/check_lock_sync.py instead answers the question that matters:
+        # is every direct requirement still pinned, satisfying its specifier, with
+        # a hash? The transitive closure and the hashes are proven by the
+        # `pip install --require-hashes` step below.
         run: |
-          # Same resolution target as the image (Dockerfile base: linux/amd64,
-          # Python 3.12). If this command ever changes, update the lock header too.
-          #
-          # --upgrade is what makes this a *fresh* resolution. Without it uv
-          # prefers the versions already in an existing output file, so the
-          # committed lock silently went stale: re-running the documented
-          # command in place kept multidict 6.8.0 while this check (writing to a
-          # path that does not exist yet) resolved 6.9.0 and failed. Passing it
-          # here and in the header keeps the two commands identical.
-          uv pip compile requirements.txt \
-            --generate-hashes \
-            --upgrade \
-            --python-version 3.12 \
-            --python-platform x86_64-unknown-linux-gnu \
-            --output-file /tmp/regenerated.lock
-
-          # uv echoes the output path in its header comment, so compare content
-          # and ignore comments, otherwise every run would look out of sync.
-          if ! diff <(grep -v '^[[:space:]]*#' requirements.lock) \
-                    <(grep -v '^[[:space:]]*#' /tmp/regenerated.lock); then
-            echo "::error::requirements.lock is out of sync with requirements.txt — regenerate it with the command in its header."
-            exit 1
-          fi
-
-          echo "✅ requirements.lock is in sync."
+          python -m pip install --quiet packaging
+          python scripts/check_lock_sync.py
 
       - name: Install from the lock with hashes enforced
         shell: bash

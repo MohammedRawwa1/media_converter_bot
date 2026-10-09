@@ -518,6 +518,10 @@ async def _process_forward_hash(forward_hash: str):
             tmp,
             msg_date=meta.get("registered_at") or meta.get("created_at"),
             file_unique_id=meta.get("file_unique_id"),
+            # The announced size, so the fetch cannot land on a different
+            # message that merely shares the numeric id.
+            expected_size=meta.get("size"),
+            want_audio=str(meta.get("type") or "") == "audio",
         )
         logger.info(
             "telethon_ingest: userbot download for %s returned ok=%s exists=%s",

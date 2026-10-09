@@ -586,6 +586,11 @@ class BigFilePipeline:
                     temp_path,
                     progress_callback=_download_progress,
                     user_id=user_id,
+                    # The announced size is the only thing that tells the real
+                    # message from an unrelated one that merely shares its id
+                    # (a Bot API DM id resolves to the account's own peer), so
+                    # pass it so the downloader can refuse the wrong media.
+                    expected_size=file_size,
                 )
                 if not download_ok or not os.path.exists(temp_path) or os.path.getsize(temp_path) == 0:
                     return IngestResult(
@@ -989,6 +994,7 @@ class BigFilePipeline:
         dest_path: str,
         progress_callback: Callable[[int, int], None] | None = None,
         user_id: int | None = None,
+        expected_size: int | None = None,
     ) -> bool:
         """Download a message using Pyrogram userbot.
 
@@ -998,6 +1004,8 @@ class BigFilePipeline:
             dest_path: Local path to save the downloaded file.
             progress_callback: Optional callable(current_bytes, total_bytes) for progress.
             user_id: Optional Telegram user ID for per-user session resolution.
+            expected_size: Size Telegram announced for this media, forwarded to the
+                downloader so a message that only shares the id is refused.
 
         Returns True on success, False on failure. Never raises, and never waits
         forever: a download that outlives
@@ -1015,6 +1023,7 @@ class BigFilePipeline:
                 dest_path=dest_path,
                 progress_callback=progress_callback,
                 user_id=user_id,
+                expected_size=expected_size,
             )
 
         started = time.monotonic()

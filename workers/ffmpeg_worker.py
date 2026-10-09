@@ -1905,6 +1905,9 @@ async def handle_job(job: dict):
                     dest_path=_tg_dest,
                     file_unique_id=job.get("file_unique_id"),
                     user_id=job.get("user_id"),
+                    # Telegram's own reported size, so a message that merely
+                    # shares the id is refused instead of becoming the source.
+                    expected_size=job.get("file_size"),
                 )
                 if _tg_ok and os.path.exists(_tg_dest) and os.path.getsize(_tg_dest) > 0:
                     input_path = _tg_dest
@@ -4215,6 +4218,7 @@ async def handle_job(job: dict):
                                                         msg_date=meta.get("registered_at") or meta.get("created_at"),
                                                         file_unique_id=meta.get("file_unique_id"),
                                                         user_id=job.get("user_id"),
+                                                        expected_size=meta.get("size") or job.get("file_size"),
                                                     )
                                                 except Exception:
                                                     ok = False
@@ -4234,6 +4238,7 @@ async def handle_job(job: dict):
                                             job.get("message_id") or job.get("msg_id"),
                                             input_path,
                                             user_id=job.get("user_id"),
+                                            expected_size=job.get("file_size"),
                                         )
                                     except Exception:
                                         ok = False

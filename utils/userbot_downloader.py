@@ -376,13 +376,21 @@ def _message_media_size(message) -> int | None:
 
     ``None`` is the answer for a photo, a poll, a location - anything that is not
     a downloadable file - and for a message with no media at all.
+
+    Two client shapes have to be read: Telethon exposes the announcement as
+    ``size``, Pyrogram as ``file_size``. Only checking ``size`` made every
+    Pyrogram message look like it had no file, which is why the Pyrogram
+    candidate loop could not use this gate before.
     """
     for field in ("document", "audio", "video", "voice", "video_note", "animation", "sticker"):
         media = getattr(message, field, None)
-        size = getattr(media, "size", None) if media is not None else None
-        if size:
-            with contextlib.suppress(TypeError, ValueError):
-                return int(size)
+        if media is None:
+            continue
+        for attr in ("size", "file_size"):
+            size = getattr(media, attr, None)
+            if size:
+                with contextlib.suppress(TypeError, ValueError):
+                    return int(size)
     return None
 
 
@@ -887,6 +895,8 @@ async def _try_relay_fallback(
     relay_chat_id: int | str | None = None,
     client_type: str = "pyrogram",
     progress_callback=None,
+    expected_size: int | None = None,
+    want_audio: bool = False,
 ) -> bool:
     """Try a relay-group fallback by forwarding the original message to a trusted chat
     and retrying the download from the forwarded copy.
@@ -896,6 +906,10 @@ async def _try_relay_fallback(
 
     Args:
         progress_callback: Optional ``(current, total)`` callback for download progress.
+        expected_size: Size Telegram announced for the requested media. The forward
+            is made from the original (chat_id, message_id), so if that pair resolved
+            to the wrong peer the copy holds a different file - the gate refuses it.
+        want_audio: The requested media is an audio.
     """
     if not relay_chat_id:
         return False
@@ -952,10 +966,25 @@ async def _try_relay_fallback(
             relay_msgs = await client.get_messages(relay_chat_id, message_ids=[relay_msg_id])
         if relay_msgs:
             relay_msg = relay_msgs[0] if isinstance(relay_msgs, list) else relay_msgs
-            if (
-                relay_msg
-                and getattr(relay_msg, "media", None)
-                and await _download_and_ensure_path(client, relay_msg, dest_path, progress_callback=progress_callback)
+            _relay_is_source = bool(relay_msg) and bool(getattr(relay_msg, "media", None))
+            if _relay_is_source and expected_size:
+                _relay_is_source = _scan_candidate_matches(
+                    relay_msg, expected_size=expected_size, want_audio=want_audio
+                )
+                if not _relay_is_source:
+                    logger.warning(
+                        "userbot: relay fallback copy %s/%s is %s bytes, not the requested %s bytes; discarding it",
+                        relay_chat_id,
+                        relay_msg_id,
+                        _message_media_size(relay_msg),
+                        expected_size,
+                    )
+            if _relay_is_source and await _download_and_ensure_path(
+                client,
+                relay_msg,
+                dest_path,
+                progress_callback=progress_callback,
+                expected_size=expected_size,
             ):
                 return True
         logger.warning(
@@ -976,6 +1005,8 @@ async def _attempt_recovery_download(
     message_id: int,
     dest_path: str,
     progress_callback=None,
+    expected_size: int | None = None,
+    want_audio: bool = False,
 ) -> bool:
     """Attempt to recover a download that failed with persistent ``-503 Timeout``.
 
@@ -1019,7 +1050,14 @@ async def _attempt_recovery_download(
             messages = await client.get_messages(_peer, message_ids=[message_id])
             if messages:
                 _m = messages[0] if isinstance(messages, list) else messages
-                if _m and getattr(_m, "media", None):
+                if (
+                    _m
+                    and getattr(_m, "media", None)
+                    and (
+                        not expected_size
+                        or _scan_candidate_matches(_m, expected_size=expected_size, want_audio=want_audio)
+                    )
+                ):
                     msg = _m
                     break
         except ValueError as e:
@@ -1049,7 +1087,9 @@ async def _attempt_recovery_download(
     probe_ok = await _probe_file_wakeup(client, msg)
     if probe_ok:
         logger.info("userbot: recovery \u2014 probe succeeded, retrying download immediately")
-        if await _download_and_ensure_path(client, msg, dest_path, progress_callback=progress_callback):
+        if await _download_and_ensure_path(
+            client, msg, dest_path, progress_callback=progress_callback, expected_size=expected_size
+        ):
             return True
         logger.info("userbot: recovery \u2014 probe retry still failed, continuing...")
     else:
@@ -1068,7 +1108,9 @@ async def _attempt_recovery_download(
     recycled = await _recycle_client_session(client)
     if recycled:
         logger.info("userbot: recovery \u2014 session recycled, final retry on original msg")
-        if await _download_and_ensure_path(client, msg, dest_path, progress_callback=progress_callback):
+        if await _download_and_ensure_path(
+            client, msg, dest_path, progress_callback=progress_callback, expected_size=expected_size
+        ):
             return True
 
     logger.warning(
@@ -1090,6 +1132,35 @@ async def _resolve_message_via_telethon(client, chat_id: int | str, message_id: 
     """
     if target is None:
         target = await _normalize_target(chat_id, client)
+
+    # ── DM first: a Bot API DM ``chat_id`` is the *user's* id, which this account
+    # resolves to its own peer (Saved Messages) - a different conversation whose
+    # message with the same numeric id is not the media. The file was sent to the
+    # bot, so the bot's DM is where it lives; try that peer first and keep the
+    # user-id lookups below as the fallback. ──
+    if _is_user_dm_chat(chat_id):
+        bot_user_id = _get_bot_user_id()
+        if bot_user_id is not None and bot_user_id != abs(int(chat_id)):
+            try:
+                logger.info(
+                    "userbot: Telethon DM detected (chat_id=%s); trying the bot DM (bot_id=%s) first",
+                    chat_id,
+                    bot_user_id,
+                )
+                bot_entity = await _resolve_telethon_entity(client, bot_user_id)
+                if bot_entity is not None:
+                    bot_msgs = await client.get_messages(bot_entity, ids=message_id)
+                    if bot_msgs:
+                        bot_msg = bot_msgs[0] if isinstance(bot_msgs, (list, tuple)) else bot_msgs
+                        if getattr(bot_msg, "media", None):
+                            logger.info(
+                                "userbot: Telethon bot DM resolved msg %s/%s with media",
+                                bot_user_id,
+                                message_id,
+                            )
+                            return bot_msgs
+            except Exception as e:
+                logger.warning("userbot: Telethon bot DM lookup failed: %s", e)
 
     # Use smart entity resolution for better channel/chat handling
     resolved_entity = await _resolve_telethon_entity(client, chat_id)
@@ -1476,7 +1547,15 @@ async def _download_with_telethon(
 
         if _telethon_msgs:
             msg = _telethon_msgs[0] if isinstance(_telethon_msgs, (list, tuple)) else _telethon_msgs
-            if getattr(msg, "media", None):
+            # Same rule as the Pyrogram candidate loop: a message that shares the
+            # requested id but holds a different media (wrong peer, or a stale
+            # message in the account's own chat) is not the source. When the
+            # caller declared the size, refuse it and let the scans below look
+            # for the real one instead of writing it into the requested path.
+            _direct_is_source = bool(getattr(msg, "media", None)) and (
+                not expected_size or _scan_candidate_matches(msg, expected_size=expected_size, want_audio=want_audio)
+            )
+            if _direct_is_source:
                 logger.info("userbot: message found; downloading %s/%s to %s", target, message_id, dest_path)
                 for attempt in range(3):
                     try:
@@ -1516,6 +1595,17 @@ async def _download_with_telethon(
                         dl_result = _dl_result
                         _reconcile_download_path(dl_result, dest_path)
                         if os.path.exists(dest_path) and os.path.getsize(dest_path) > 0:
+                            _written = os.path.getsize(dest_path)
+                            if not _size_matches(_written, expected_size or _message_media_size(msg)):
+                                logger.warning(
+                                    "userbot: downloaded %d bytes to %s but %s were expected; discarding it",
+                                    _written,
+                                    dest_path,
+                                    expected_size or _message_media_size(msg),
+                                )
+                                with contextlib.suppress(OSError):
+                                    os.remove(dest_path)
+                                break
                             ok = await _ffprobe_ok(dest_path)
                             if ok:
                                 return True
@@ -1533,6 +1623,15 @@ async def _download_with_telethon(
                     except Exception as e:
                         logger.exception("userbot: download attempt %s failed: %s", attempt + 1, e)
                 logger.debug("userbot: message found but downloads failed validation: %s/%s", target, message_id)
+            elif getattr(msg, "media", None):
+                logger.warning(
+                    "userbot: Telethon message %s/%s is %s bytes, not the requested %s bytes; "
+                    "skipping it and searching the chat instead",
+                    target,
+                    message_id,
+                    _message_media_size(msg),
+                    expected_size,
+                )
 
         # Search by date if provided
         search_done = False
@@ -1698,6 +1797,8 @@ async def _download_with_telethon(
                 relay_chat_id=relay_chat_id,
                 client_type="telethon",
                 progress_callback=progress_callback,
+                expected_size=expected_size,
+                want_audio=want_audio,
             ):
                 return True
 
@@ -1809,7 +1910,7 @@ async def _get_messages_via_raw_channel_api(
     return None
 
 
-async def _download_and_ensure_path(client, msg, dest_path, progress_callback=None):
+async def _download_and_ensure_path(client, msg, dest_path, progress_callback=None, expected_size=None):
     """Download media from *msg* and ensure the file ends up at *dest_path*.
 
     Pyrogram 2.0.106's ``download_media`` resolves relative paths against
@@ -1862,6 +1963,24 @@ async def _download_and_ensure_path(client, msg, dest_path, progress_callback=No
 
     # Check at the absolute destination path (where the file should be)
     if os.path.exists(_abs_dest) and os.path.getsize(_abs_dest) > 0:
+        # What actually landed has to be the media that was asked for. A message
+        # id is only unique *within a chat*: resolving to the wrong peer (a Bot
+        # API DM id maps to the account's own peer, not the DM with the bot) can
+        # land on an unrelated message that merely shares the id, and accepting
+        # it put a different file into this path under the requested name. The
+        # announced-size gate upstream usually refuses it first; this is the
+        # backstop for whatever slipped through.
+        _written = os.path.getsize(_abs_dest)
+        if not _size_matches(_written, expected_size):
+            logger.warning(
+                "userbot: downloaded %d bytes to %s but %s were expected; discarding it",
+                _written,
+                _abs_dest,
+                expected_size,
+            )
+            with contextlib.suppress(OSError):
+                os.remove(_abs_dest)
+            return False
         ok = await _ffprobe_ok(_abs_dest)
         if ok:
             return True
@@ -2163,6 +2282,9 @@ async def _download_with_pyrogram(
     dest_path: str,
     progress_callback=None,
     user_id: int | None = None,
+    *,
+    expected_size: int | None = None,
+    want_audio: bool = False,
 ) -> bool:
     """Download using Pyrogram client (session string fallback).
 
@@ -2172,6 +2294,14 @@ async def _download_with_pyrogram(
         dest_path: Destination file path.
         progress_callback: Optional ``(current, total)`` callback for download progress.
         user_id: Optional Telegram user ID for per-user session resolution.
+        expected_size: Size Telegram announced for the requested media. A message
+            id is only unique within a chat, and a Bot API DM id resolves to the
+            account's *own* peer - so the first candidate can hold a different
+            file with the same id. A candidate whose media is another size (or,
+            for audio, carries no audio) is not the source, so it is skipped
+            instead of downloaded into the requested media's own path.
+        want_audio: The requested media is an audio, so a candidate without an
+            audio stream is not it.
     """
     if PyrogramClient is None:
         logger.info("userbot: Pyrogram not installed; skipping")
@@ -2230,9 +2360,15 @@ async def _download_with_pyrogram(
             if bot_user_id is not None and bot_user_id != abs(int(chat_id)):
                 bot_resolved = await _resolve_pyrogram_peer(client, bot_user_id)
                 if bot_resolved not in _candidates:
-                    _candidates.append(bot_resolved)
+                    # The Bot API DM ``chat_id`` is the *user's* id, which this
+                    # account resolves to its own peer (Saved Messages). That is a
+                    # different chat whose message with the same numeric id is
+                    # some unrelated file. The media was sent to the bot, so the
+                    # bot's DM is the conversation that holds it: try it first and
+                    # keep the own-peer lookup as the fallback.
+                    _candidates.insert(0, bot_resolved)
                     logger.info(
-                        "userbot: added bot user ID %s as candidate for DM download",
+                        "userbot: trying bot user ID %s first as the DM download candidate",
                         bot_user_id,
                     )
 
@@ -2257,9 +2393,31 @@ async def _download_with_pyrogram(
                             bool(getattr(msg, "media", None)),
                             _has_media,
                         )
-                        if _has_media:
+                        # Only a candidate that *is* the requested media counts.
+                        # A peer that resolves to the account's own chat can hold
+                        # an unrelated message with the same id; downloading that
+                        # is how a WhatsApp voice note was merged into a 61MB
+                        # video. When the caller declared the media's size, a
+                        # mismatch means "not this peer" - keep looking instead
+                        # of taking the first thing with media.
+                        _matches = _has_media and (
+                            not expected_size
+                            or _scan_candidate_matches(msg, expected_size=expected_size, want_audio=want_audio)
+                        )
+                        if _matches:
                             _found_msg = True
-                    if msg and _has_media:
+                        elif _has_media:
+                            logger.warning(
+                                "userbot: Pyrogram message %s/%s on peer=%s is %s bytes%s, "
+                                "not the requested %s bytes; trying the next peer",
+                                _peer,
+                                message_id,
+                                _peer,
+                                _message_media_size(msg),
+                                ", no audio" if want_audio and not _message_has_audio(msg) else "",
+                                expected_size,
+                            )
+                    if msg and _matches:
                         logger.info(
                             "userbot: Pyrogram downloading %s/%s -> %s (peer=%s)",
                             _peer,
@@ -2273,7 +2431,13 @@ async def _download_with_pyrogram(
                             getattr(msg, "id", None),
                             bool(getattr(msg, "media", None)),
                         )
-                        if await _download_and_ensure_path(client, msg, dest_path, progress_callback=progress_callback):
+                        if await _download_and_ensure_path(
+                            client,
+                            msg,
+                            dest_path,
+                            progress_callback=progress_callback,
+                            expected_size=expected_size,
+                        ):
                             return True
                         logger.warning(
                             "userbot: Pyrogram download failed for %s/%s (peer=%s)",
@@ -2286,12 +2450,14 @@ async def _download_with_pyrogram(
                         # re-downloading the same file from another peer.
                         break
                     else:
-                        # A message with media but nothing downloadable means this
-                        # peer resolved to the wrong chat (the Bot API user id maps
-                        # to the account's own peer, not the DM with the bot), so
-                        # keep going - the next candidate holds the real file.
+                        # A message with media but nothing downloadable - or one
+                        # whose announced size is not the requested media's - means
+                        # this peer resolved to the wrong chat (the Bot API user id
+                        # maps to the account's own peer, not the DM with the bot),
+                        # so keep going: the next candidate holds the real file.
                         logger.info(
-                            "userbot: Pyrogram message %s/%s has no downloadable media (peer=%s); trying the next peer",
+                            "userbot: Pyrogram message %s/%s has no downloadable media or is not the "
+                            "requested media (peer=%s); trying the next peer",
                             _peer,
                             message_id,
                             _peer,
@@ -2320,13 +2486,20 @@ async def _download_with_pyrogram(
                         )
                         if msg is not None:
                             _found_msg = True
-                            if _has_downloadable_media(msg):
+                            if _has_downloadable_media(msg) and (
+                                not expected_size
+                                or _scan_candidate_matches(msg, expected_size=expected_size, want_audio=want_audio)
+                            ):
                                 logger.info(
                                     "userbot: raw API got msg %s with media, downloading...",
                                     message_id,
                                 )
                                 if await _download_and_ensure_path(
-                                    client, msg, dest_path, progress_callback=progress_callback
+                                    client,
+                                    msg,
+                                    dest_path,
+                                    progress_callback=progress_callback,
+                                    expected_size=expected_size,
                                 ):
                                     return True
                                 logger.warning(
@@ -2380,7 +2553,23 @@ async def _download_with_pyrogram(
             )
             if not _has_downloadable_media(msg):
                 return None
-            if await _download_and_ensure_path(client, msg, dest_path, progress_callback=progress_callback):
+            if expected_size and not _scan_candidate_matches(msg, expected_size=expected_size, want_audio=want_audio):
+                logger.warning(
+                    "userbot: raw API msg %s/%s on peer=%s is %s bytes, not the requested %s bytes",
+                    peer,
+                    message_id,
+                    peer,
+                    _message_media_size(msg),
+                    expected_size,
+                )
+                return None
+            if await _download_and_ensure_path(
+                client,
+                msg,
+                dest_path,
+                progress_callback=progress_callback,
+                expected_size=expected_size,
+            ):
                 return True
             return None
 
@@ -2394,13 +2583,36 @@ async def _download_with_pyrogram(
                 )
                 async for msg in client.get_chat_history(_peer, limit=50):
                     if getattr(msg, "id", None) == message_id and _has_downloadable_media(msg):
+                        # The history scan matches on the id alone, so it needs the
+                        # same gate as the candidate loop: a chat can hold a
+                        # different file under the same numeric id, and downloading
+                        # that is how the wrong media ended up in this path.
+                        if expected_size and not _scan_candidate_matches(
+                            msg, expected_size=expected_size, want_audio=want_audio
+                        ):
+                            logger.warning(
+                                "userbot: Pyrogram history msg %s/%s on peer=%s is %s bytes, "
+                                "not the requested %s bytes; skipping it",
+                                _peer,
+                                message_id,
+                                _peer,
+                                _message_media_size(msg),
+                                expected_size,
+                            )
+                            break
                         logger.info(
                             "userbot: Pyrogram found msg %s/%s in history (peer=%s)",
                             _peer,
                             message_id,
                             _peer,
                         )
-                        if await _download_and_ensure_path(client, msg, dest_path, progress_callback=progress_callback):
+                        if await _download_and_ensure_path(
+                            client,
+                            msg,
+                            dest_path,
+                            progress_callback=progress_callback,
+                            expected_size=expected_size,
+                        ):
                             return True
                         break
             except ValueError as e:
@@ -2437,10 +2649,17 @@ async def _download_with_pyrogram(
                         messages = await client.get_messages(_resolved_id, message_ids=[message_id])
                         if messages:
                             msg = messages[0] if isinstance(messages, list) else messages
-                            if _has_downloadable_media(msg):
+                            if _has_downloadable_media(msg) and (
+                                not expected_size
+                                or _scan_candidate_matches(msg, expected_size=expected_size, want_audio=want_audio)
+                            ):
                                 _found_msg = True
                                 if await _download_and_ensure_path(
-                                    client, msg, dest_path, progress_callback=progress_callback
+                                    client,
+                                    msg,
+                                    dest_path,
+                                    progress_callback=progress_callback,
+                                    expected_size=expected_size,
                                 ):
                                     return True
                 except ValueError as e:
@@ -2487,6 +2706,8 @@ async def _download_with_pyrogram(
                     relay_chat_id=relay_chat_id,
                     client_type="pyrogram",
                     progress_callback=progress_callback,
+                    expected_size=expected_size,
+                    want_audio=want_audio,
                 ):
                     logger.info(
                         "userbot: relay fallback download succeeded for %s/%s",
@@ -2502,7 +2723,13 @@ async def _download_with_pyrogram(
                 message_id,
             )
             if await _attempt_recovery_download(
-                client, chat_id, message_id, dest_path, progress_callback=progress_callback
+                client,
+                chat_id,
+                message_id,
+                dest_path,
+                progress_callback=progress_callback,
+                expected_size=expected_size,
+                want_audio=want_audio,
             ):
                 logger.info(
                     "userbot: recovery download succeeded for %s/%s",
@@ -2583,7 +2810,13 @@ async def download_forward_via_userbot(
     if PyrogramClient is not None and pyrogram_session_configured:
         try:
             result = await _download_with_pyrogram(
-                chat_id, message_id, dest_path, progress_callback=progress_callback, user_id=user_id
+                chat_id,
+                message_id,
+                dest_path,
+                progress_callback=progress_callback,
+                user_id=user_id,
+                expected_size=expected_size,
+                want_audio=want_audio,
             )
             if result:
                 return True
