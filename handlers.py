@@ -3728,8 +3728,7 @@ class EnhancedMediaHandler:
         _entry_uid = _entry.get("file_unique_id")
         if _entry_uid and str(_entry_uid) != str(_uid):
             logger.warning(
-                "handlers: refusing media-cache descriptor for a different file_unique_id "
-                "(expected=%s cached=%s)",
+                "handlers: refusing media-cache descriptor for a different file_unique_id (expected=%s cached=%s)",
                 _uid,
                 _entry_uid,
             )
@@ -3874,9 +3873,7 @@ class EnhancedMediaHandler:
         if current_file.get("file_unique_id"):
             # The media identity decides which object belongs to this file;
             # current_file.input_key is only a hint until that lookup agrees.
-            stored_key = await self._adopt_stored_source(
-                current_file, session=session, user_id=user_id
-            )
+            stored_key = await self._adopt_stored_source(current_file, session=session, user_id=user_id)
         else:
             stored_key = current_file.get("input_key") or await self._adopt_stored_source(
                 current_file, session=session, user_id=user_id
