@@ -200,6 +200,27 @@ class SourceFixTests(unittest.TestCase):
         self.assertIn('parse_mode="HTML"', body)
         self.assertNotIn("**Full Media Analysis**", body)
 
+    def test_media_information_coerces_what_ffprobe_reports(self):
+        """ffprobe reports numbers as strings; ``//`` on one crashed the whole panel."""
+        src = read_source("handlers.py")
+        body = src[src.index("async def show_full_info(") : src.index("async def create_archive(")]
+        self.assertIn('_probe_int(format_info.get("size"))', body)
+        self.assertNotIn('format_info.get("size", 0) // 1024 // 1024', body)
+        # The helpers themselves, including the shapes ffprobe actually sends:
+        # a numeric string, a missing key, and an empty one.
+        self.assertEqual(handlers_module._probe_int("43308482"), 43308482)
+        self.assertEqual(handlers_module._probe_int(None), 0)
+        self.assertEqual(handlers_module._probe_int(""), 0)
+        self.assertEqual(handlers_module._probe_float("2109.396"), 2109.396)
+        self.assertEqual(handlers_module._probe_float(None), 0.0)
+
+    def test_the_metadata_editor_keeps_the_source_container(self):
+        """A hardcoded ``.mp4`` made ``-c copy`` fail for every other input."""
+        src = read_source("handlers.py")
+        branch = src[src.index('context.user_data.get("awaiting_metadata")') :]
+        self.assertIn('safe_extension(current_file.get("name")', branch)
+        self.assertNotIn("_with_metadata.mp4", branch)
+
     def test_apply_bulk_routes_to_the_subtitle_run_when_the_toggle_is_on(self):
         src = read_source("handlers.py")
         body = src[src.index('elif data == "bulk_apply":') : src.index('elif data == "bulk_forward":')]

@@ -519,6 +519,46 @@ class BatchSubtitleTests(unittest.TestCase):
 
         self.assertIsNone(Handler._match_batch_subtitle({"name": "x.mp4"}, subs, {"a", "b", "c"}))
 
+    def test_a_language_tagged_subtitle_still_pairs_and_an_exact_name_wins(self):
+        subs = [
+            {"file_id": "en", "name": "clip.en.srt"},
+            {"file_id": "fr", "name": "clip.fr.srt"},
+        ]
+        chosen = Handler._match_batch_subtitle({"name": "clip.mp4"}, subs, set())
+        self.assertEqual(chosen["file_id"], "en", "no language track was chosen")
+        # The exact language is preferred over the send order.
+        chosen = Handler._match_batch_subtitle({"name": "clip.fr.mp4"}, subs, set())
+        self.assertEqual(chosen["file_id"], "fr", "the exact language lost to the send order")
+
+    def test_the_copy_marker_is_not_collapsed(self):
+        # "(1)" and "(2)" are two different exports of one title; dropping the
+        # marker would let the first subtitle be burned into both.
+        videos = [{"name": "Installation (1).mp4"}, {"name": "Installation (2).mp4"}]
+        subs = [{"file_id": "two", "name": "Installation (2).srt"}]
+        self.assertIsNone(
+            Handler._match_batch_subtitle(videos[0], subs, set(), videos=videos),
+            "a subtitle for the (2) export was handed to the (1) video",
+        )
+        chosen = Handler._match_batch_subtitle(videos[1], subs, set(), videos=videos)
+        self.assertEqual(chosen["file_id"], "two")
+
+    def test_a_subtitle_named_for_another_video_is_not_burned_in(self):
+        """The extra check: never hand over a .srt that names a different video."""
+        videos = [{"name": "one.mp4"}, {"name": "two.mp4"}]
+        subs = [{"file_id": "s2", "name": "two.srt"}]
+        self.assertIsNone(
+            Handler._match_batch_subtitle(videos[0], subs, set(), videos=videos),
+            "one.mp4 was handed two.srt, which names another video",
+        )
+        chosen = Handler._match_batch_subtitle(videos[1], subs, set(), videos=videos)
+        self.assertEqual(chosen["file_id"], "s2")
+
+    def test_a_nameless_subtitle_is_still_handed_out_in_order(self):
+        videos = [{"name": "one.mp4"}, {"name": "two.mp4"}]
+        subs = [{"file_id": "g", "name": "subs.srt"}]
+        chosen = Handler._match_batch_subtitle(videos[0], subs, set(), videos=videos)
+        self.assertEqual(chosen["file_id"], "g", "a subtitle with no name to contradict was refused")
+
     def test_collecting_adds_a_valid_subtitle_and_refuses_a_bad_one(self):
         converter = _RecordingConverter()
         handler = self._handler(converter)
@@ -575,6 +615,22 @@ class BatchSubtitleTests(unittest.TestCase):
 
         self.assertEqual(len(converter.calls), 1)
         self.assertIn("no matching subtitle", query.text)
+
+    def test_the_run_refuses_to_burn_one_videos_subtitle_into_another(self):
+        converter = _RecordingConverter()
+        handler = self._handler(converter)
+        session = {
+            "bulk_list": [self._video("one.mp4"), self._video("two.mp4")],
+            "subtitle_files": [{"file_id": "s2", "name": "two.srt", "path": self._write_srt("two.srt")}],
+        }
+        query = _FakeQuery()
+
+        asyncio.run(handler._run_batch_subtitles(_FakeUpdate([]), _FakeContext(), session, query, 7))
+
+        self.assertEqual(len(converter.calls), 1, "a subtitle was burned into the video it does not name")
+        self.assertIn("two.srt", converter.calls[0][2], "the merge did not use the matching subtitle")
+        self.assertIn("no matching subtitle", query.text)
+        self.assertIn("1/2 merged", query.text)
 
 
 class _BatchHandler:

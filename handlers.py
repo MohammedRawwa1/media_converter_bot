@@ -922,6 +922,29 @@ def _rename_prompt_text(current_file: dict | None) -> str:
     )
 
 
+def _probe_int(value, default: int = 0) -> int:
+    """Coerce a value ffprobe reported, which is a string whenever it exists.
+
+    ffprobe prints every number as text and omits the key entirely when the file
+    does not carry it. The media-info panel did ``format['size'] // 1024 // 1024``
+    on that raw value, so opening it on any normal file raised
+    ``unsupported operand type(s) for //: 'str' and 'int'`` and the panel answered
+    "Failed to analyze media." instead of the information it had already read.
+    """
+    try:
+        return int(float(value))
+    except (TypeError, ValueError):
+        return default
+
+
+def _probe_float(value, default: float = 0.0) -> float:
+    """The float twin of :func:`_probe_int` (durations arrive as text too)."""
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
 def _metadata_caption(current_file: dict | None, fallback: str | None = None) -> str:
     """Build the caption a delivery carries from the captured source metadata.
 
@@ -1331,6 +1354,105 @@ def _bulk_entry_key(entry) -> str | None:
         return text or None
     except Exception:
         return None
+
+
+# Tokens a release appends to a subtitle's name to say which track it is:
+# ``clip.en.srt``, ``clip.en.forced.srt``. They are dropped so the loose name
+# still pairs with ``clip.mp4``; the exact name is always tried first.
+_SUBTITLE_LANG_TOKENS = frozenset(
+    {
+        "en",
+        "eng",
+        "english",
+        "ar",
+        "ara",
+        "arabic",
+        "fr",
+        "fre",
+        "fra",
+        "french",
+        "es",
+        "spa",
+        "spanish",
+        "de",
+        "ger",
+        "deu",
+        "german",
+        "it",
+        "ita",
+        "italian",
+        "ru",
+        "rus",
+        "russian",
+        "tr",
+        "tur",
+        "turkish",
+        "pt",
+        "por",
+        "portuguese",
+        "nl",
+        "dut",
+        "nld",
+        "dutch",
+        "pl",
+        "pol",
+        "polish",
+        "sv",
+        "swe",
+        "swedish",
+        "ja",
+        "jpn",
+        "japanese",
+        "ko",
+        "kor",
+        "korean",
+        "zh",
+        "chi",
+        "zho",
+        "chinese",
+        "hi",
+        "hin",
+        "hindi",
+        "fa",
+        "per",
+        "fas",
+        "persian",
+        "ur",
+        "urd",
+        "urdu",
+        "he",
+        "heb",
+        "hebrew",
+        "forced",
+        "sdh",
+        "cc",
+        "full",
+    }
+)
+
+
+def _subtitle_name_keys(name) -> tuple[str, str]:
+    """Two comparable keys for a media or subtitle name: exact, and loose.
+
+    A batch usually arrives as ``clip.mp4`` beside ``clip.srt``, and sometimes as
+    ``clip.en.srt``; both describe the same clip, so the loose key drops a
+    trailing language/flag token. The exact key is tried first, so a batch that
+    does spell the language out still pairs precisely and ``clip.en`` never pairs
+    with ``clip.fr`` before ``clip.en`` has been considered.
+
+    Deliberately preserved: the ``(1)``/``(2)`` copy marker. A user's two
+    exports of the same title differ only by that marker, and collapsing it would
+    make both videos match the first subtitle.
+    """
+    stem = os.path.splitext(os.path.basename(str(name or "")))[0].strip().lower()
+    stem = re.sub(r"\s+", " ", stem)
+    if not stem:
+        return "", ""
+    parts = stem.split(".")
+    loose = list(parts)
+    while len(loose) > 1 and loose[-1].strip() in _SUBTITLE_LANG_TOKENS:
+        loose.pop()
+    return stem, ".".join(loose)
 
 
 def _bulk_display_name(file_info: dict | None) -> str:
@@ -8307,25 +8429,53 @@ class EnhancedMediaHandler:
         return videos
 
     @staticmethod
-    def _match_batch_subtitle(video: dict, subtitles: list[dict], used: set) -> dict | None:
+    def _match_batch_subtitle(
+        video: dict, subtitles: list[dict], used: set, *, videos: list[dict] | None = None
+    ) -> dict | None:
         """Pick the subtitle for one video: same filename first, else send order.
 
-        The name is the honest pairing (a batch of ``clip.mp4``/``clip.srt`` is
-        how these files arrive together), and the remaining subtitles are handed
-        out in the order they were sent so a batch whose names do not line up is
-        still processed instead of refused.
+        The name is the honest pairing (a batch of ``clip.mp4``/``clip.srt`` is how
+        these files arrive together, and ``clip.en.srt`` pairs through the loose
+        key), so a name match always wins over the order the files were sent in.
+
+        The send-order fallback is a last resort and is skipped for a subtitle
+        whose name matches a *different* video in the batch: handing that one over
+        is exactly how the wrong ``.srt`` gets burned into a video, so the video
+        is reported unmatched instead (pass *videos* - the whole batch - to arm
+        that check). A subtitle with no usable name (``subs.srt``) is still handed
+        out in order, since there is nothing to contradict.
         """
-        vstem = os.path.splitext(os.path.basename(str((video or {}).get("name") or "")))[0].strip().lower()
+        vstem, vloose = _subtitle_name_keys((video or {}).get("name"))
         if vstem:
             for sub in subtitles:
                 if sub.get("file_id") in used:
                     continue
-                sstem = os.path.splitext(os.path.basename(str(sub.get("name") or "")))[0].strip().lower()
+                sstem, _ = _subtitle_name_keys(sub.get("name"))
                 if sstem == vstem:
                     return sub
+            if vloose and vloose != vstem:
+                for sub in subtitles:
+                    if sub.get("file_id") in used:
+                        continue
+                    sstem, sloose = _subtitle_name_keys(sub.get("name"))
+                    if sstem == vloose or sloose == vloose:
+                        return sub
+
+        # Send-order fallback, minus any subtitle that names another video.
+        claimed: set[str] = set()
+        for other in videos or []:
+            ostem, oloose = _subtitle_name_keys((other or {}).get("name"))
+            if ostem and ostem == vstem:
+                continue
+            claimed.update(key for key in (ostem, oloose) if key)
+        claimed.discard(vloose)
         for sub in subtitles:
-            if sub.get("file_id") not in used:
-                return sub
+            if sub.get("file_id") in used:
+                continue
+            sstem, sloose = _subtitle_name_keys(sub.get("name"))
+            if sstem in claimed or sloose in claimed:
+                continue
+            return sub
         return None
 
     @staticmethod
@@ -8481,7 +8631,9 @@ class EnhancedMediaHandler:
 
         for index, video in enumerate(videos, start=1):
             label = _bulk_display_name(video)
-            sub = self._match_batch_subtitle(video, subtitles, used)
+            # The whole batch is passed so the matcher can refuse to hand a
+            # subtitle to a video it was not named for.
+            sub = self._match_batch_subtitle(video, subtitles, used, videos=videos)
             if sub is None:
                 unmatched += 1
                 results.append((label, "⏭️ no matching subtitle"))
@@ -13808,11 +13960,13 @@ class EnhancedMediaHandler:
             # message entirely.
             info_text = "📊 <b>Full Media Analysis</b>\n\n"
             info_text += f"📁 <b>File:</b> {html.escape(str(current_file['name']))}\n"
-            info_text += f"📦 <b>Size:</b> {format_info.get('size', 0) // 1024 // 1024} MB\n"
+            info_text += f"📦 <b>Size:</b> {_probe_int(format_info.get('size')) // (1024 * 1024)} MB\n"
             info_text += f"🎞️ <b>Format:</b> {html.escape(str(format_info.get('format_name', 'N/A')))}\n"
-            info_text += f"⏱️ <b>Duration:</b> {float(format_info.get('duration', 0)):.2f}s\n"
-            bitrate_kbps = int(format_info.get("bit_rate", 0)) // 1000
-            info_text += f"📈 <b>Bitrate:</b> {bitrate_kbps} kbps\n\n"
+            info_text += f"⏱️ <b>Duration:</b> {_probe_float(format_info.get('duration')):.2f}s\n"
+            # ffprobe reports the container bitrate as text (or not at all).
+            _container_bitrate = _probe_int(format_info.get("bit_rate"))
+            _container_label = f"{_container_bitrate // 1000} kbps" if _container_bitrate else "N/A"
+            info_text += f"📈 <b>Bitrate:</b> {_container_label}\n\n"
 
             # Streams information
             info_text += f"🎬 <b>Streams ({len(streams)}):</b>\n"
@@ -13824,11 +13978,15 @@ class EnhancedMediaHandler:
                 if codec_type == "video":
                     info_text += f"  Codec: {html.escape(str(stream.get('codec_name', 'N/A')))}\n"
                     info_text += f"  Resolution: {stream.get('width', 'N/A')}x{stream.get('height', 'N/A')}\n"
-                    num, den = str(stream.get("avg_frame_rate", "0/1")).split("/")
-                    fps = float(num) / float(den) if float(den) != 0 else 0
+                    # A rate that is absent or not ``num/den`` must not take the
+                    # whole panel down with it; a video stream is reason enough to
+                    # be careful, not to raise.
+                    _num, _, _den = str(stream.get("avg_frame_rate") or "0/1").partition("/")
+                    _den_value = _probe_float(_den)
+                    fps = _probe_float(_num) / _den_value if _den_value else 0.0
                     info_text += f"  FPS: {fps:.2f}\n"
                     sb = stream.get("bit_rate")
-                    sb_kbps = f"{int(sb) // 1000} kbps" if sb else "N/A"
+                    sb_kbps = f"{_probe_int(sb) // 1000} kbps" if sb else "N/A"
                     info_text += f"  Bitrate: {sb_kbps}\n"
 
                 elif codec_type == "audio":
@@ -13836,7 +13994,7 @@ class EnhancedMediaHandler:
                     info_text += f"  Channels: {stream.get('channels', 'N/A')}\n"
                     info_text += f"  Sample Rate: {stream.get('sample_rate', 'N/A')} Hz\n"
                     sb = stream.get("bit_rate")
-                    sb_kbps = f"{int(sb) // 1000} kbps" if sb else "N/A"
+                    sb_kbps = f"{_probe_int(sb) // 1000} kbps" if sb else "N/A"
                     info_text += f"  Bitrate: {sb_kbps}\n"
 
                 elif codec_type == "subtitle":
@@ -15062,7 +15220,11 @@ class EnhancedMediaHandler:
                 output_base = getattr(config, "OUTPUT_PATH", "storage/output") if config else "storage/output"
                 with contextlib.suppress(OSError):
                     os.makedirs(output_base, exist_ok=True)
-                output_path = os.path.join(output_base, f"{current_file['id']}_with_metadata.mp4")
+                # Keep the source container: ``edit_metadata`` copies the streams
+                # (``-c copy``), so a hardcoded ``.mp4`` made the write fail for
+                # everything else - a webm's vp9/opus is not an MP4 stream.
+                _metadata_ext = file_utils.safe_extension(current_file.get("name"), ".mp4")
+                output_path = os.path.join(output_base, f"{current_file['id']}_with_metadata{_metadata_ext}")
 
                 # Editing tags needs the bytes. A lazily-registered upload has no
                 # local copy and nothing in storage yet, so the media is fetched
