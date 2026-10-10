@@ -5716,7 +5716,12 @@ class EnhancedMediaHandler:
             file_info["_pipeline_failed"] = True
 
     async def _ensure_current_file_downloaded(
-        self, update: Update, context: ContextTypes.DEFAULT_TYPE, session: dict
+        self,
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+        session: dict,
+        *,
+        force_refresh: bool = False,
     ) -> Message | None:
         """Ensure the session's current_file is downloaded locally. Raises Exception on failure.
 
@@ -5730,11 +5735,22 @@ class EnhancedMediaHandler:
         if not current_file:
             raise Exception("No file in session")
 
-        # If already downloaded (local) or already streamed to S3, nothing to do
-        path = self._local_copy(current_file)
-        input_key = current_file.get("input_key")
+        # A forced refresh is used when the operation must bind output to the
+        # exact Telegram upload, not a prior local/S3 cache entry. It deliberately
+        # drops all reusable source pointers and uses an isolated destination.
+        if force_refresh:
+            current_file.pop("path", None)
+            current_file.pop("_local_input_path", None)
+            current_file.pop("input_key", None)
+            current_file.pop("_subtitle_refresh_path", None)
+            session["current_file"] = current_file
+
+        # If already downloaded (local) or already streamed to S3, nothing to do.
+        # Forced refresh intentionally bypasses both tiers.
+        path = None if force_refresh else self._local_copy(current_file)
+        input_key = None if force_refresh else current_file.get("input_key")
         _file_uid = current_file.get("file_unique_id")
-        if input_key and _file_uid:
+        if not force_refresh and input_key and _file_uid:
             try:
                 from utils import media_cache as _media_cache
 
@@ -5756,7 +5772,7 @@ class EnhancedMediaHandler:
         #    an earlier pipeline run (has _pipeline_job_id).  Freshly-streamed keys
         #    (set seconds ago in the S3 stream path) skip this check to avoid an
         #    unnecessary S3 head-object call on every conversion. ──
-        if input_key and current_file.get("_pipeline_job_id"):
+        if not force_refresh and input_key and current_file.get("_pipeline_job_id"):
             try:
                 from utils.storage import get_storage_backend as _gsb
 
@@ -5777,7 +5793,7 @@ class EnhancedMediaHandler:
             except Exception:
                 # If the check fails, conservatively assume the key is valid
                 pass
-        if input_key or (path and os.path.exists(path)):
+        if not force_refresh and (input_key or (path and os.path.exists(path))):
             return
 
         file_id = current_file.get("id") or current_file.get("file_id")
@@ -5826,7 +5842,10 @@ class EnhancedMediaHandler:
         )
         with contextlib.suppress(OSError):
             os.makedirs(input_dir, exist_ok=True)
-        file_path = os.path.join(input_dir, f"{user_id}_{file_id}{ext}")
+        file_path = os.path.join(
+            input_dir,
+            f"{user_id}_{file_id}_{uuid.uuid4().hex}{ext}" if force_refresh else f"{user_id}_{file_id}{ext}",
+        )
 
         # Track whether the BigFilePipeline already forwarded this file to the relay
         # group, so the error handler below can avoid a duplicate forward.
@@ -5844,7 +5863,7 @@ class EnhancedMediaHandler:
             from utils import media_cache as _media_cache
 
             _uid = current_file.get("file_unique_id")
-            if _uid and _media_cache.cache_enabled():
+            if not force_refresh and _uid and _media_cache.cache_enabled():
                 _expected = current_file.get("size")
                 _entry = await _media_cache.lookup(_uid, expected_size=_expected)
 
@@ -5880,6 +5899,8 @@ class EnhancedMediaHandler:
                     with open(file_path, "wb") as _fh:
                         _fh.write(_cached)
                     current_file["path"] = file_path
+                    if force_refresh:
+                        current_file["_subtitle_refresh_path"] = file_path
                     _merge_cached_source_meta(current_file, _entry)
                     session["current_file"] = current_file
                     with contextlib.suppress(Exception):
@@ -5919,7 +5940,8 @@ class EnhancedMediaHandler:
             file_size = current_file.get("size") or 0
             _declared_conversion = bool(current_file.get("_pipeline_ffmpeg_args"))
             if (
-                file_size
+                not force_refresh
+                and file_size
                 and file_size > bot_api_download_max_mb * 1024 * 1024
                 and _bigfile_pipeline is not None
                 and _declared_conversion
@@ -6505,6 +6527,7 @@ class EnhancedMediaHandler:
                         # followed failed on a source with no audio track at all.
                         expected_size=current_file.get("size"),
                         want_audio=str(current_file.get("type") or "") == "audio",
+                        strict_message=force_refresh,
                     )
                     logger.info(
                         "Userbot download fallback (%s) result for %s/%s: ok=%s exists=%s",
@@ -6524,7 +6547,22 @@ class EnhancedMediaHandler:
                         except Exception:
                             pass
                     if ok and os.path.exists(file_path):
+                        if force_refresh:
+                            expected_size = current_file.get("size")
+                            actual_size = os.path.getsize(file_path)
+                            if expected_size is not None and int(expected_size) != actual_size:
+                                logger.error(
+                                    "Refusing mismatched userbot source for file_id=%s: expected=%s actual=%s",
+                                    file_id,
+                                    expected_size,
+                                    actual_size,
+                                )
+                                with contextlib.suppress(OSError):
+                                    os.remove(file_path)
+                                return False
                         current_file["path"] = file_path
+                        if force_refresh:
+                            current_file["_subtitle_refresh_path"] = file_path
                         # Read the media's own metadata now that its bytes are
                         # here: without this the fallback's download is the one
                         # path into the pipe with no probe verdict, and every
@@ -6538,12 +6576,13 @@ class EnhancedMediaHandler:
                         try:
                             from utils.source_store import remember_fetched_source
 
-                            await remember_fetched_source(
-                                current_file,
-                                file_path,
-                                source_meta=current_file.get("_source_metadata"),
-                                log_prefix="handlers:userbot",
-                            )
+                            if not force_refresh:
+                                await remember_fetched_source(
+                                    current_file,
+                                    file_path,
+                                    source_meta=current_file.get("_source_metadata"),
+                                    log_prefix="handlers:userbot",
+                                )
                         except Exception:
                             logger.debug("handlers: could not record the userbot fetch")
                         session["current_file"] = current_file
@@ -6677,6 +6716,9 @@ class EnhancedMediaHandler:
                 _use_remote = True
         except Exception:
             logger.debug("handlers: Check if we should stream directly to remote storage (S3/R2), skipp...")
+
+        if force_refresh:
+            _use_remote = False
 
         if _use_remote and _backend is not None:
             # ── Pipeline flow: download to temp → ffprobe → upload with job_id key → metadata in Redis ──
@@ -6859,6 +6901,15 @@ class EnhancedMediaHandler:
         else:
             # Fallback: download to local disk
             await file.download_to_drive(file_path)
+            expected_size = current_file.get("size")
+            actual_size = os.path.getsize(file_path)
+            if expected_size is not None and int(expected_size) != actual_size:
+                with contextlib.suppress(OSError):
+                    os.remove(file_path)
+                raise Exception(
+                    f"Downloaded Telegram source size mismatch for file_id={file_id}: "
+                    f"expected {expected_size} bytes, received {actual_size}"
+                )
             try:
                 final_name = await detect_filename(file_path, getattr(update, "message", None))
                 if final_name:
@@ -6866,6 +6917,8 @@ class EnhancedMediaHandler:
             except Exception:
                 logger.debug("detect_filename failed after download")
             current_file["path"] = file_path
+            if force_refresh:
+                current_file["_subtitle_refresh_path"] = file_path
             # Same reason as the userbot fallback above: a media that reached
             # this disk still has to carry the verdict the rest of the bot reads
             # its captions and player tags from.
@@ -6879,12 +6932,13 @@ class EnhancedMediaHandler:
             try:
                 from utils.source_store import remember_fetched_source
 
-                await remember_fetched_source(
-                    current_file,
-                    file_path,
-                    source_meta=current_file.get("_source_metadata"),
-                    log_prefix="handlers",
-                )
+                if not force_refresh:
+                    await remember_fetched_source(
+                        current_file,
+                        file_path,
+                        source_meta=current_file.get("_source_metadata"),
+                        log_prefix="handlers",
+                    )
             except Exception:
                 logger.debug("handlers: failed to remember the fetched media")
 
@@ -8324,17 +8378,6 @@ class EnhancedMediaHandler:
         if not await self._check_conversion_quota(update, context):
             return
 
-        # Make sure the video's bytes are reachable *before* the subtitle is
-        # pulled down, so a media that cannot be fetched does not leave a stray
-        # subtitle on disk. A stored object is reused; otherwise the same fetch
-        # every other button performs.
-        current, _ = await self._ensure_local_media(update, context, session, current, notify=notify)
-        if current is None:
-            return
-        if not (self._local_copy(current) or current.get("input_key")):
-            await notify("❌ File not available on disk.")
-            return
-
         await notify("📥 Downloading subtitle file...")
         file = await context.bot.get_file(document.file_id)
         input_dir = getattr(config, "INPUT_PATH", "storage/input") if config else "storage/input"
@@ -8389,14 +8432,35 @@ class EnhancedMediaHandler:
         """
         user_id = update.effective_user.id if update.effective_user else None
 
-        current, _ = await self._ensure_local_media(update, context, session, current, notify=notify)
-        if current is None:
-            return False, "the video could not be fetched"
-        video_path = await self._resolve_local_source(
-            current, session=session, user_id=user_id, require_stored_key_only=True
-        )
+        session["current_file"] = current
+        try:
+            await self._ensure_current_file_downloaded(
+                update,
+                context,
+                session,
+                force_refresh=True,
+            )
+        except Exception as exc:
+            logger.exception(
+                "subtitle merge: could not fetch the exact Telegram source (file_id=%s, file_unique_id=%s)",
+                current.get("id") or current.get("file_id"),
+                current.get("file_unique_id"),
+            )
+            return False, f"could not fetch the original Telegram video: {exc}"
+
+        current = session.get("current_file") or current
+        video_path = self._local_copy(current)
         if not video_path:
-            return False, "file not available on disk"
+            return False, "the exact Telegram video was not downloaded to local disk"
+        refreshed_source_path = current.get("_subtitle_refresh_path")
+
+        logger.info(
+            "subtitle merge input verified: file_id=%s file_unique_id=%s path=%s bytes=%s",
+            current.get("id") or current.get("file_id"),
+            current.get("file_unique_id"),
+            video_path,
+            os.path.getsize(video_path),
+        )
 
         output_dir = getattr(config, "OUTPUT_PATH", "storage/output") if config else "storage/output"
         with contextlib.suppress(OSError):
@@ -8452,6 +8516,12 @@ class EnhancedMediaHandler:
         finally:
             with contextlib.suppress(OSError):
                 os.remove(out_path)
+            if refreshed_source_path:
+                with contextlib.suppress(OSError):
+                    os.remove(refreshed_source_path)
+                if current.get("path") == refreshed_source_path:
+                    current["path"] = None
+                current.pop("_subtitle_refresh_path", None)
 
     @staticmethod
     def _batch_videos(sess: dict | None) -> list[dict]:

@@ -14,7 +14,7 @@ import os
 import tempfile
 import unittest
 from types import MethodType, SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 from source_helpers import read_source
 
@@ -110,12 +110,14 @@ class _SubtitleHandler:
         self.fetches = 0
         self.delivered: list[str | None] = []
         self.userbot_sends = 0
+        self.force_refreshes: list[bool] = []
 
     async def _check_conversion_quota(self, update, context):
         return True
 
-    async def _ensure_current_file_downloaded(self, update, context, session):
+    async def _ensure_current_file_downloaded(self, update, context, session, *, force_refresh=False):
         self.fetches += 1
+        self.force_refreshes.append(force_refresh)
         session["current_file"]["path"] = self.fetched_path
 
     async def _send_video_result(self, bot, chat_id, file_path, caption="", **delivery_options):
@@ -191,19 +193,94 @@ class SubtitleMergeTests(unittest.TestCase):
         replies = self._run(handler, self._session())
 
         self.assertEqual(handler.fetches, 1, "the freshly sent video was never fetched")
+        self.assertEqual(handler.force_refreshes, [True], "subtitle merge reused a cached source")
         self.assertEqual(len(converter.calls), 1, f"the subtitle was never applied: {replies}")
         self.assertNotIn("❌ File not available on disk.", replies, f"the old refusal came back: {replies}")
         self.assertTrue(handler.delivered, "the subtitled video was not delivered")
 
-    def test_a_local_copy_is_used_without_fetching_anything(self):
+    def test_a_stale_local_copy_is_bypassed_for_the_exact_telegram_file(self):
         converter = _RecordingConverter()
-        local = self._video_path()
-        handler = self._handler(converter, local)
+        stale = self._video_path("stale.mp4")
+        fetched = self._video_path("fresh.mp4")
+        handler = self._handler(converter, fetched)
 
-        self._run(handler, self._session(path=local))
+        self._run(handler, self._session(path=stale, _local_input_path=stale, input_key="s3/old/source.mp4"))
 
-        self.assertEqual(handler.fetches, 0, "a media already on disk must not be fetched again")
+        self.assertEqual(handler.fetches, 1, "a stale local/S3 pointer was trusted")
+        self.assertEqual(handler.force_refreshes, [True])
         self.assertEqual(len(converter.calls), 1)
+        self.assertEqual(converter.calls[0][1], fetched, "ffmpeg did not receive the freshly fetched source")
+        self.assertNotEqual(converter.calls[0][1], stale)
+
+    def test_forced_refresh_downloads_the_current_telegram_file_id_to_a_unique_path(self):
+        from utils import media_cache
+
+        payload = b"the exact telegram video bytes"
+        stale = self._video_path("stale-cache.mp4")
+        downloaded_ids = []
+
+        class _DownloadedFile:
+            async def download_to_drive(self, path):
+                with open(path, "wb") as output:
+                    output.write(payload)
+
+        class _Bot:
+            async def get_file(self, file_id):
+                downloaded_ids.append(file_id)
+                return _DownloadedFile()
+
+        class _FetchHandler:
+            def _persist_session(self, _user_id):
+                return None
+
+        handler = _FetchHandler()
+        handler._local_copy = MethodType(Handler._local_copy, handler)
+        handler._ensure_current_file_downloaded = MethodType(Handler._ensure_current_file_downloaded, handler)
+        current = {
+            "id": "current-telegram-file-id",
+            "file_unique_id": "current-unique-id",
+            "size": len(payload),
+            "name": "current.mp4",
+            "type": "video",
+            "path": stale,
+            "_local_input_path": stale,
+            "input_key": "inputs/another-job/source.mp4",
+        }
+        session = {"current_file": current}
+        update = SimpleNamespace(
+            effective_user=SimpleNamespace(id=7),
+            effective_chat=SimpleNamespace(id=99),
+            message=None,
+            callback_query=None,
+        )
+        context = SimpleNamespace(bot=_Bot())
+        patched_config = SimpleNamespace(
+            INPUT_PATH=os.path.join(self.tmp.name, "input"),
+            BOT_API_DOWNLOAD_MAX_MB=20,
+            ENABLE_USERBOT=True,
+            get_storage_backend_name=lambda: "none",
+        )
+        with (
+            patch.object(handlers_module, "config", patched_config),
+            patch.object(handlers_module, "MAX_FILE_SIZE", 4 * 1024**3),
+            patch.object(handlers_module, "detect_filename", return_value=None),
+            patch.object(handlers_module, "_probe_downloaded_source", new=AsyncMock()),
+            patch.object(media_cache, "cache_enabled", return_value=False),
+        ):
+            asyncio.run(handler._ensure_current_file_downloaded(update, context, session, force_refresh=True))
+
+        fresh_path = current["path"]
+        try:
+            self.assertEqual(downloaded_ids, ["current-telegram-file-id"])
+            self.assertTrue(os.path.exists(fresh_path))
+            with open(fresh_path, "rb") as fetched:
+                self.assertEqual(fetched.read(), payload)
+            self.assertNotEqual(fresh_path, stale)
+            self.assertNotIn("input_key", current)
+            self.assertEqual(current["_subtitle_refresh_path"], fresh_path)
+        finally:
+            if os.path.exists(fresh_path):
+                os.remove(fresh_path)
 
     def test_a_killed_burn_reports_why_not_a_uniform_failure(self):
         """A process killed by the OOM killer must say so, not "the merge failed"."""
@@ -220,7 +297,7 @@ class SubtitleMergeTests(unittest.TestCase):
         handler = self._handler(converter, None)
         session = self._session()
 
-        async def _fail(update, context, session):
+        async def _fail(update, context, session, *, force_refresh=False):
             raise Exception("File too large (1200MB). Max allowed: 1000MB")
 
         handler._ensure_current_file_downloaded = _fail
@@ -228,7 +305,7 @@ class SubtitleMergeTests(unittest.TestCase):
         replies = self._run(handler, session)
 
         self.assertEqual(converter.calls, [], "a failed fetch still attempted the merge")
-        self.assertTrue(any("Failed to download file" in text for text in replies), replies)
+        self.assertTrue(any("could not fetch the original Telegram video" in text for text in replies), replies)
 
     def test_a_session_without_a_video_is_refused_before_downloading(self):
         converter = _RecordingConverter()
@@ -680,6 +757,7 @@ class BatchSubtitleTests(unittest.TestCase):
         asyncio.run(handler._run_batch_subtitles(update, _FakeContext(), session, query, 7))
 
         self.assertEqual(len(converter.calls), 2, "the batch did not merge every video")
+        self.assertEqual(handler.force_refreshes, [True, True], "a batch member reused a cached source")
         self.assertEqual(len(handler.delivered), 2, "not every merged video was delivered")
         self.assertIn("2/2 merged", query.text, "the run did not summarise itself")
         self.assertIn("one.mp4", query.text)
@@ -724,13 +802,15 @@ class _BatchHandler:
         self.converter = converter
         self.delivered: list[str] = []
         self.edits: list[str] = []
+        self.force_refreshes: list[bool] = []
 
     async def _check_conversion_quota(self, update, context):
         return True
 
-    async def _ensure_current_file_downloaded(self, update, context, session):
+    async def _ensure_current_file_downloaded(self, update, context, session, *, force_refresh=False):
         # The session's current_file is the video being worked on; a real fetch
         # would put its bytes here. Each entry already carries its own path.
+        self.force_refreshes.append(force_refresh)
         return None
 
     def _persist_session(self, user_id):
@@ -777,15 +857,11 @@ class ButtonRopeConsistencyTests(unittest.TestCase):
         end = src.index(end_marker, start)
         return src[start:end]
 
-    def test_the_subtitle_path_fetches_before_it_resolves(self):
+    def test_the_subtitle_path_requires_a_fresh_telegram_fetch(self):
         src = read_source("handlers.py")
-        body = src[src.index("async def _apply_subtitle_file(") : src.index("async def handle_document(")]
-        self.assertIn("_ensure_local_media", body)
-        self.assertLess(
-            body.index("_ensure_local_media"),
-            body.index("_resolve_local_source"),
-            "the subtitle path resolved the media before fetching it",
-        )
+        body = src[src.index("async def _burn_subtitle_into_current(") : src.index("def _batch_videos(")]
+        self.assertIn("force_refresh=True", body)
+        self.assertNotIn("_resolve_local_source(", body)
 
     def test_the_screenshot_prompts_fetch_before_they_resolve(self):
         src = read_source("handlers.py")

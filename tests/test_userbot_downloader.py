@@ -166,6 +166,53 @@ class ScanSkipsTheWrongMediaTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(downloaded, [2], "the photo should never have been downloaded")
             self.assertTrue(os.path.exists(dest))
 
+    async def test_strict_download_never_substitutes_a_nearby_same_size_message(self):
+        scans = []
+
+        class _Client:
+            async def start(self):
+                return self
+
+            async def disconnect(self):
+                return None
+
+            def iter_messages(self, target, **kwargs):
+                scans.append((target, kwargs))
+
+                async def _gen():
+                    yield SimpleNamespace(
+                        id=99,
+                        media=object(),
+                        video=SimpleNamespace(size=1_048_576),
+                        document=SimpleNamespace(size=1_048_576),
+                    )
+
+                return _gen()
+
+        with (
+            tempfile.TemporaryDirectory() as tmp,
+            patch.object(mod, "TelegramClient", object()),
+            patch("utils.telethon_session.build_telethon_client", lambda *a, **k: _Client()),
+            patch(
+                "utils.telethon_session.get_telethon_session_string_for_user",
+                new=AsyncMock(return_value=None),
+            ),
+            patch.object(mod, "_normalize_target", AsyncMock(return_value=-100123)),
+            patch.object(mod, "_resolve_message_via_telethon", AsyncMock(return_value=None)),
+            patch("utils.telethon_session.get_db_model", return_value=None),
+            patch("utils.telethon_session.get_userbot_credentials", return_value=(1, "hash")),
+        ):
+            ok = await mod._download_with_telethon(
+                -100123,
+                4460,
+                os.path.join(tmp, "strict.mp4"),
+                expected_size=1_048_576,
+                strict_message=True,
+            )
+
+        self.assertFalse(ok)
+        self.assertEqual(scans, [], "strict mode fell back to another message with the same size")
+
 
 class PyrogramCandidateGateTests(unittest.IsolatedAsyncioTestCase):
     """The Pyrogram candidate loop must not download a message that only shares the id.

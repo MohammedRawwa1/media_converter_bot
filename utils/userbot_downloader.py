@@ -1489,6 +1489,7 @@ async def _download_with_telethon(
     *,
     expected_size: int | None = None,
     want_audio: bool = False,
+    strict_message: bool = False,
 ) -> bool:
     """Download using Telethon client.
 
@@ -1552,8 +1553,13 @@ async def _download_with_telethon(
             # message in the account's own chat) is not the source. When the
             # caller declared the size, refuse it and let the scans below look
             # for the real one instead of writing it into the requested path.
-            _direct_is_source = bool(getattr(msg, "media", None)) and (
-                not expected_size or _scan_candidate_matches(msg, expected_size=expected_size, want_audio=want_audio)
+            _direct_is_source = (
+                (not strict_message or getattr(msg, "id", None) == message_id)
+                and bool(getattr(msg, "media", None))
+                and (
+                    not expected_size
+                    or _scan_candidate_matches(msg, expected_size=expected_size, want_audio=want_audio)
+                )
             )
             if _direct_is_source:
                 logger.info("userbot: message found; downloading %s/%s to %s", target, message_id, dest_path)
@@ -1626,12 +1632,20 @@ async def _download_with_telethon(
             elif getattr(msg, "media", None):
                 logger.warning(
                     "userbot: Telethon message %s/%s is %s bytes, not the requested %s bytes; "
-                    "skipping it and searching the chat instead",
+                    "refusing the exact-message lookup",
                     target,
                     message_id,
                     _message_media_size(msg),
                     expected_size,
                 )
+
+        if strict_message:
+            logger.warning(
+                "userbot: exact Telethon source lookup failed for %s/%s; refusing chat scans",
+                target,
+                message_id,
+            )
+            return False
 
         # Search by date if provided
         search_done = False
@@ -2285,6 +2299,7 @@ async def _download_with_pyrogram(
     *,
     expected_size: int | None = None,
     want_audio: bool = False,
+    strict_message: bool = False,
 ) -> bool:
     """Download using Pyrogram client (session string fallback).
 
@@ -2302,6 +2317,8 @@ async def _download_with_pyrogram(
             instead of downloaded into the requested media's own path.
         want_audio: The requested media is an audio, so a candidate without an
             audio stream is not it.
+        strict_message: Do not substitute a nearby message when the exact
+            source message cannot be fetched or validated.
     """
     if PyrogramClient is None:
         logger.info("userbot: Pyrogram not installed; skipping")
@@ -2371,6 +2388,12 @@ async def _download_with_pyrogram(
                         "userbot: trying bot user ID %s first as the DM download candidate",
                         bot_user_id,
                     )
+            if strict_message:
+                # The Bot API's positive DM chat id can resolve to Saved
+                # Messages, where the same message id may identify unrelated
+                # media. For strict downloads, try only the bot conversation
+                # when it is known; otherwise fail closed on the requested peer.
+                _candidates = _candidates[:1]
 
         _found_msg = False
         for _peer in _candidates:
@@ -2400,9 +2423,13 @@ async def _download_with_pyrogram(
                         # video. When the caller declared the media's size, a
                         # mismatch means "not this peer" - keep looking instead
                         # of taking the first thing with media.
-                        _matches = _has_media and (
-                            not expected_size
-                            or _scan_candidate_matches(msg, expected_size=expected_size, want_audio=want_audio)
+                        _matches = (
+                            (not strict_message or getattr(msg, "id", None) == message_id)
+                            and _has_media
+                            and (
+                                not expected_size
+                                or _scan_candidate_matches(msg, expected_size=expected_size, want_audio=want_audio)
+                            )
                         )
                         if _matches:
                             _found_msg = True
@@ -2533,6 +2560,14 @@ async def _download_with_pyrogram(
                     message_id,
                     e,
                 )
+
+        if strict_message:
+            logger.warning(
+                "userbot: exact Pyrogram source lookup failed for %s/%s; refusing chat scans",
+                target,
+                message_id,
+            )
+            return False
 
         async def _try_large_channel(peer):
             """Try downloading from a large Bot API channel ID using raw MTProto.
@@ -2762,6 +2797,7 @@ async def download_forward_via_userbot(
     *,
     expected_size: int | None = None,
     want_audio: bool = False,
+    strict_message: bool = False,
 ) -> bool:
     """Download a message media using a user account.
 
@@ -2780,6 +2816,8 @@ async def download_forward_via_userbot(
         the scans so they cannot hand back a *different* message's media.
       want_audio: The requested media is an audio, so a scan candidate without an
         audio stream is not it.
+      strict_message: Do not substitute a nearby message when the exact source
+        message cannot be fetched or validated.
 
     Returns True on success, False on failure. Raises RuntimeError for missing config.
     """
@@ -2817,6 +2855,7 @@ async def download_forward_via_userbot(
                 user_id=user_id,
                 expected_size=expected_size,
                 want_audio=want_audio,
+                strict_message=strict_message,
             )
             if result:
                 return True
@@ -2837,6 +2876,7 @@ async def download_forward_via_userbot(
                 user_id=user_id,
                 expected_size=expected_size,
                 want_audio=want_audio,
+                strict_message=strict_message,
             )
             if result:
                 return True
