@@ -500,7 +500,13 @@ async def extract_audio(
         return False, str(e)
 
 
-async def merge_videos(video_paths: list[str], output_path: str, timeout_seconds: int = 18000) -> tuple[bool, str]:
+async def merge_videos(
+    video_paths: list[str],
+    output_path: str,
+    timeout_seconds: int = 18000,
+    *,
+    reencode: bool = False,
+) -> tuple[bool, str]:
     """Merge multiple videos asynchronously with timeout protection."""
     # Validate inputs
     if not video_paths:
@@ -517,14 +523,55 @@ async def merge_videos(video_paths: list[str], output_path: str, timeout_seconds
 
     concat_file = None
     try:
-        # Create concat file
-        concat_content = "\n".join([f"file '{os.path.abspath(path)}'" for path in video_paths])
+        # Create a concat manifest with ffmpeg-safe paths, including Windows paths
+        # and filenames containing quotes.
+        def _concat_quote(path: str) -> str:
+            normalized = os.path.abspath(path).replace("\\", "/")
+            return f"file '{normalized.replace(chr(39), chr(39) + chr(92) + chr(39) + chr(39))}'"
+
+        concat_content = "\n".join(_concat_quote(path) for path in video_paths)
 
         with tempfile.NamedTemporaryFile(mode="w", delete=False, suffix=".txt") as f:
             f.write(concat_content)
             concat_file = f.name
 
-        cmd = ["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", concat_file, "-c", "copy", output_path]
+        cmd = [FFMPEG_PATH, "-y", "-hide_banner", "-loglevel", "error"]
+        if reencode:
+            try:
+                threads = max(1, int(os.getenv("FFMPEG_THREADS", "1")))
+                filter_threads = max(1, int(os.getenv("FFMPEG_FILTER_THREADS", "1")))
+            except (TypeError, ValueError):
+                threads = filter_threads = 1
+            cmd.extend(["-filter_threads", str(filter_threads)])
+        cmd.extend(["-f", "concat", "-safe", "0", "-i", concat_file])
+        if reencode:
+            cmd.extend(
+                [
+                    "-map",
+                    "0:v:0",
+                    "-map",
+                    "0:a?",
+                    "-c:v",
+                    "libx264",
+                    "-preset",
+                    "veryfast",
+                    "-crf",
+                    "28",
+                    "-threads",
+                    str(threads),
+                    "-pix_fmt",
+                    "yuv420p",
+                    "-c:a",
+                    "aac",
+                    "-b:a",
+                    "128k",
+                    "-movflags",
+                    "+faststart",
+                ]
+            )
+        else:
+            cmd.extend(["-c", "copy"])
+        cmd.append(output_path)
 
         try:
             stdout, stderr, returncode = await run_subprocess_with_timeout(

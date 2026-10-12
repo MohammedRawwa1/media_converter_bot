@@ -63,6 +63,7 @@ SEND_EXEMPT = {
 INLINE_RESULT_PRODUCERS = (
     "_apply_fade",
     "_trim_current_media",
+    "_merge_videos_core",
     "merge_audios",
     "normalize_audio",
     "adjust_bitrate",
@@ -477,10 +478,15 @@ def test_video_tools_only_adds_what_the_main_menu_does_not():
     main = _action_triggers(
         [(b.text, b.callback_data) for row in MediaMenuBuilder.get_main_menu("video").inline_keyboard for b in row]
     )
+    main_callbacks = {b.callback_data for row in MediaMenuBuilder.get_main_menu("video").inline_keyboard for b in row}
+    video_callbacks = {b.callback_data for row in MediaMenuBuilder.get_video_tools_menu().inline_keyboard for b in row}
     # Repair and reorder are the video jobs the main menu has no button for, so
     # they live here; everything else on the panel is likewise not on the main menu.
     assert {"repair_video", "video_reorder"} <= video, video
     assert not (video & main), f"the video tools panel repeats the main menu: {sorted(video & main)}"
+    assert "merge_options" in main_callbacks, "the merge entry point belongs on the media context menu"
+    assert "merge_options" not in video_callbacks, "the merge entry point should not remain in Video Tools"
+    assert "merge_view" not in main_callbacks, "the obsolete Merge And shortcut should be removed"
     assert "menu_advanced" not in main, "the Advanced Tools panel is gone, so its button must be too"
 
 

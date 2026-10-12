@@ -117,6 +117,18 @@ class SessionLoadTests(unittest.TestCase):
 
         self.assertEqual(loaded["merge_list"], [])
         self.assertEqual(loaded["bulk_list"], [])
+        self.assertEqual(loaded["video_merge_selection"], [])
+
+    def test_callback_restores_the_persisted_video_merge_selection(self):
+        source = read_source("handlers.py")
+        callback = source[source.index("async def callback_handler(") :]
+        restore = callback[
+            callback.index("self.user_sessions[user_id] = {") : callback.index(
+                "else:", callback.index("self.user_sessions[user_id] = {")
+            )
+        ]
+
+        self.assertIn('"video_merge_selection": persisted.get("video_merge_selection", [])', restore)
 
     def test_the_json_file_is_read_without_asking_mongo(self):
         model = _FakeModel(session={"current_file": "from-mongo"})
@@ -174,7 +186,12 @@ class SessionSaveTests(unittest.TestCase):
 
     def _stub(self, model=None, current_file=None):
         stub = _with_session_helpers(_SessionStub(self.tmp.name, model))
-        stub.user_sessions[7] = {"current_file": current_file, "merge_list": [], "bulk_list": []}
+        stub.user_sessions[7] = {
+            "current_file": current_file,
+            "merge_list": [],
+            "bulk_list": [],
+            "video_merge_selection": [{"file_unique_id": "video-1"}],
+        }
         return stub
 
     def test_the_write_is_scheduled_on_the_running_loop(self):
@@ -193,6 +210,7 @@ class SessionSaveTests(unittest.TestCase):
         user_id, payload = model.saved[0]
         self.assertEqual(user_id, 7)
         self.assertEqual(payload["current_file"], {"id": "abc"})
+        self.assertEqual(payload["video_merge_selection"], [{"file_unique_id": "video-1"}])
 
     def test_the_file_is_written_even_with_no_running_loop(self):
         model = _FakeModel()
@@ -204,7 +222,9 @@ class SessionSaveTests(unittest.TestCase):
 
         self.assertEqual(model.saved, [], "a foreign loop must not be created for this")
         with open(stub._file(self.tmp), encoding="utf-8") as fh:
-            self.assertEqual(json.load(fh)["current_file"], {"id": "abc"})
+            persisted = json.load(fh)
+        self.assertEqual(persisted["current_file"], {"id": "abc"})
+        self.assertEqual(persisted["video_merge_selection"], [{"file_unique_id": "video-1"}])
 
     def test_a_failing_session_save_is_not_fatal(self):
         model = _FakeModel(error=RuntimeError("mongo down"))

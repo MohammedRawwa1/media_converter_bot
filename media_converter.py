@@ -271,6 +271,13 @@ class ExtendedMediaConverter:
         success, _ = await _merge_vids(video_paths, output_path)
         return success
 
+    async def merge_videos_compressed(self, video_paths: list[str], output_path: str) -> bool:
+        """Merge videos in one low-thread H.264 CRF 28 pass."""
+        from tasks.conversion_tasks import merge_videos as _merge_vids
+
+        success, _ = await _merge_vids(video_paths, output_path, reencode=True)
+        return success
+
     async def merge_audios(self, audio_paths: list[str], output_path: str) -> bool:
         """Merge multiple audio files.
 

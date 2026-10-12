@@ -55,7 +55,6 @@ from .callbacks import (
     MERGE_ADD,
     MERGE_AUDIOS_START,
     MERGE_CLEAR,
-    MERGE_MENU,
     MERGE_VIDEOS_START,
     MERGE_VIEW,
     MP3_DEFAULT_BITRATE,
@@ -193,11 +192,11 @@ class MediaMenuBuilder:
         """Get main menu based on file type."""
 
         # Shared helpers for common rows
-        def row(left_label, left_cb, right_label, right_cb):
-            return [
-                InlineKeyboardButton(left_label, callback_data=left_cb),
-                InlineKeyboardButton(right_label, callback_data=right_cb),
-            ]
+        def row(left_label, left_cb, right_label=None, right_cb=None):
+            buttons = [InlineKeyboardButton(left_label, callback_data=left_cb)]
+            if right_label is not None and right_cb is not None:
+                buttons.append(InlineKeyboardButton(right_label, callback_data=right_cb))
+            return buttons
 
         # Build rows according to the UI image. Adapt some labels based on
         # the `file_type` so that video uploads show video-oriented tools.
@@ -228,10 +227,10 @@ class MediaMenuBuilder:
             row(
                 "✂️ Media Trimmer",
                 TRIM_AUDIO if file_type == "audio" else TRIM_VIDEO,
-                "➕ Audio Merger" if file_type == "audio" else "➕ Video Merger",
-                "merge_audio" if file_type == "audio" else MERGE_MENU,
+                "➕ Audio Merger" if file_type == "audio" else "🔀 Merge",
+                "merge_audio" if file_type == "audio" else "merge_options",
             ),
-            row("🔉 Remove Audio", REMOVE_AUDIO, "🔀 Merge And", MERGE_VIEW),
+            row("🔉 Remove Audio", REMOVE_AUDIO),
             row(conv_label, conv_cb, split_label, VIDEOS_SPLITTER),
             row("🖼️ Screenshots", SCREENSHOTS_MENU, "🖼️ Manual Shots", MANUAL_SHOTS),
             row("🎵 Video To Audio", VIDEO_TO_AUDIO, "📉 Compress", COMPRESS_MENU),
@@ -640,27 +639,31 @@ class MediaMenuBuilder:
 
     @staticmethod
     def get_merge_options_menu() -> InlineKeyboardMarkup:
-        """The merge variants: a plain merge plus merge-and-trim/compress/convert.
+        """Compatibility wrapper for the initial, empty merge review."""
+        return MediaMenuBuilder.get_video_merge_review_menu([], False)
 
-        The merge itself is one stream copy, so the follow-up work (a cut, a
-        re-encode, a container change) runs as a second pass on the merged file.
-        Offering them together is what makes the button useful instead of a dead
-        end that only repeats "start merge".
-        """
-        # Each button carries its own one-line hint, so the encode it runs is on
-        # the button itself rather than something the user has to guess.
-        buttons = [
-            [
-                InlineKeyboardButton("🔀 Merge\nstream copy — no re-encode", callback_data=MERGE_VIDEOS_START),
-                InlineKeyboardButton("✂️ Merge + Trim\nmerge, then cut", callback_data="merge_trim"),
-            ],
-            [
-                InlineKeyboardButton("📉 Merge + Compress\nH.264 CRF 23 · veryfast", callback_data="merge_compress"),
-                InlineKeyboardButton("🔄 Merge + Convert\nremux to your format", callback_data="merge_convert"),
-            ],
-            [InlineKeyboardButton("➕ Add Files", callback_data=MERGE_MENU)],
-            _nav_row(MENU_MAIN),
-        ]
+    @staticmethod
+    def get_video_merge_review_menu(remove_labels: list[str], can_start: bool) -> InlineKeyboardMarkup:
+        """Review the detected videos and require two valid selections to proceed."""
+        buttons = []
+        for index, label in enumerate(remove_labels):
+            buttons.append([InlineKeyboardButton(f"🗑️ Remove {label}", callback_data=f"merge_remove:{index}")])
+
+        if can_start:
+            buttons.append([InlineKeyboardButton("▶️ Start Merge · H.264 CRF 28", callback_data="merge_videos_start")])
+            buttons.append(
+                [
+                    InlineKeyboardButton("✂️ Merge + Trim", callback_data="merge_trim"),
+                    InlineKeyboardButton("🔄 Merge + Convert", callback_data="merge_convert"),
+                ]
+            )
+        else:
+            buttons.append(
+                [InlineKeyboardButton("⚠️ Select exactly 2 valid MP4 videos", callback_data="merge_unavailable")]
+            )
+
+        buttons.append([InlineKeyboardButton("↩️ Reset to detected videos", callback_data="merge_reset")])
+        buttons.append(_nav_row(MENU_MAIN))
         return InlineKeyboardMarkup(buttons)
 
     @staticmethod
@@ -706,8 +709,9 @@ class MediaMenuBuilder:
         the video actions it acts on directly (Convert Format, Compress, Trim,
         Remove Audio, Screenshots, ...), so none of them is repeated here. What
         this panel adds is the rest of the video toolbox - the container pickers,
-        resolution and framerate, the merge variants, adding a soundtrack, stream
-        extraction, a repair, and reordering the collected queue before a merge.
+        resolution and framerate, adding a soundtrack, stream extraction, a repair,
+        and reordering the collected queue before a merge. The merge entry point
+        and its variants live on the media context menu.
         """
         buttons = [
             [
@@ -718,10 +722,6 @@ class MediaMenuBuilder:
                 InlineKeyboardButton("📐 Resolution", callback_data=RESOLUTION_MENU),
                 InlineKeyboardButton("⏱️ Framerate", callback_data="framerate_menu"),
             ],
-            # Opens the merge variants: a plain merge, and the merge-and-X
-            # combinations. The plain merge on the main menu collects the files;
-            # these finish them, so together they are one flow rather than two.
-            [InlineKeyboardButton("🔀 Merge", callback_data="merge_options")],
             [
                 InlineKeyboardButton("🔉 Add Audio", callback_data=ADD_AUDIO),
                 # Opens the extraction picker: Audio Only / Video Only /

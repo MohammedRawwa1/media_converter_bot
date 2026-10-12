@@ -518,6 +518,8 @@ _IMAGE_EXTS = (".jpg", ".jpeg", ".png", ".webp", ".bmp")
 # a batch entry's kind when the entry arrives without one - the merge list stores
 # bare path strings - so an inferred file is guarded *and* grouped as what it is.
 _VIDEO_EXTS = (".mp4", ".avi", ".mov", ".mkv", ".flv", ".wmv", ".m4v", ".3gp", ".webm")
+_VIDEO_MERGE_MAX_COUNT = 2
+_VIDEO_MERGE_MAX_BYTES = 500 * 1024 * 1024
 _AUDIO_EXTS = (".mp3", ".wav", ".aac", ".flac", ".ogg", ".m4a", ".wma", ".opus")
 
 # "Video Only" extraction: keep the first video stream, drop audio/subtitles.
@@ -1109,6 +1111,7 @@ def _session_lists_defaulted(data) -> dict | None:
         return None
     data.setdefault("merge_list", [])
     data.setdefault("bulk_list", [])
+    data.setdefault("video_merge_selection", [])
     return data
 
 
@@ -3038,6 +3041,7 @@ class EnhancedMediaHandler:
                 "current_file": session.get("current_file"),
                 "merge_list": session.get("merge_list", []),
                 "bulk_list": session.get("bulk_list", []),
+                "video_merge_selection": session.get("video_merge_selection", []),
                 "_bulk_apply_started_at": session.get("_bulk_apply_started_at"),
             }
             # Write locally for fast local recovery
@@ -8377,6 +8381,7 @@ class EnhancedMediaHandler:
             "id": file_id,
             "size": video.file_size,
             "name": final_name,
+            "source_name": _original_name or default_name,
             "thumbnail": thumb,
             "forward": forward_info,
             "chat_id": getattr(update.message, "chat", None) and getattr(update.message.chat, "id", None),
@@ -9184,6 +9189,7 @@ class EnhancedMediaHandler:
             "id": document.file_id,
             "size": document.file_size,
             "name": final_name,
+            "source_name": file_name,
             "thumbnail": thumb,
             "forward": forward_info,
             "chat_id": getattr(update.message, "chat", None) and getattr(update.message.chat, "id", None),
@@ -9619,6 +9625,7 @@ class EnhancedMediaHandler:
                         "current_file": persisted.get("current_file"),
                         "merge_list": persisted.get("merge_list", []),
                         "bulk_list": persisted.get("bulk_list", []),
+                        "video_merge_selection": persisted.get("video_merge_selection", []),
                         "_bulk_apply_started_at": _persisted_guard,
                     }
                 else:
@@ -9736,29 +9743,46 @@ class EnhancedMediaHandler:
                 return
 
             elif data == "merge_videos_menu":
-                await self.safe_edit(
-                    query,
-                    "🔀 **Merge Videos**\nSend multiple video files, then click 'Start Merge':",
-                    reply_markup=MediaMenuBuilder.get_merge_menu("video"),
-                )
+                session["video_merge_selection"] = self._video_merge_candidates(session)
+                self._persist_session(user_id)
+                await self._show_video_merge_selection(query, session)
 
             elif data == "merge_videos_start":
                 await self.merge_videos(update, context, session)
 
             elif data == "merge_options":
-                # The variants of the merge, so the button leads somewhere rather
-                # than reporting "need at least 2 videos" on a list that may not
-                # even exist yet.
-                await self.safe_edit(
-                    query,
-                    "🔀 <b>Merge Videos</b>\n\n"
-                    "Collect the videos with ➕ Add Files (or the ➕ Video Merger panel), "
-                    "then pick how the merged file should finish:",
-                    reply_markup=MediaMenuBuilder.get_merge_options_menu(),
-                    parse_mode="HTML",
-                )
+                session["video_merge_selection"] = self._video_merge_candidates(session)
+                self._persist_session(user_id)
+                await self._show_video_merge_selection(query, session)
+
+            elif data.startswith("merge_remove:"):
+                try:
+                    index = int(data.split(":", 1)[1])
+                    selected = session.get("video_merge_selection")
+                    if not isinstance(selected, list) or not 0 <= index < len(selected):
+                        raise ValueError("stale selection")
+                    selected.pop(index)
+                    session["video_merge_selection"] = selected
+                    self._persist_session(user_id)
+                    await self._show_video_merge_selection(query, session)
+                except (TypeError, ValueError):
+                    await self.safe_edit(query, "❌ That list entry is no longer available. Reopen Merge to refresh.")
+                return
+
+            elif data == "merge_reset":
+                session["video_merge_selection"] = self._video_merge_candidates(session)
+                self._persist_session(user_id)
+                await self._show_video_merge_selection(query, session)
+                return
+
+            elif data == "merge_unavailable":
+                await self._show_video_merge_selection(query, session)
+                return
 
             elif data == "merge_trim":
+                if not self._video_merge_ready(session):
+                    await self._show_video_merge_selection(query, session)
+                    return
                 for key in list(context.user_data.keys()):
                     if key.startswith("awaiting_"):
                         del context.user_data[key]
@@ -9773,9 +9797,12 @@ class EnhancedMediaHandler:
                 )
 
             elif data == "merge_compress":
-                await self.merge_videos(update, context, session, post="compress")
+                await self.merge_videos(update, context, session)
 
             elif data == "merge_convert":
+                if not self._video_merge_ready(session):
+                    await self._show_video_merge_selection(query, session)
+                    return
                 for key in list(context.user_data.keys()):
                     if key.startswith("awaiting_"):
                         del context.user_data[key]
@@ -12791,6 +12818,179 @@ class EnhancedMediaHandler:
 
         await self._run_with_concurrency_limit(user_id, "compression", do_compression())
 
+    @staticmethod
+    def _video_merge_candidates(session: dict) -> list[dict]:
+        candidates = []
+        seen = set()
+        for raw in session.get("bulk_list") or []:
+            item = _normalize_bulk_item(raw)
+            if not item or item.get("type") != "video":
+                continue
+            key = _bulk_item_key(item)
+            key = str(key) if key is not None else None
+            if key is not None and key in seen:
+                continue
+            if key is not None:
+                seen.add(key)
+            candidates.append(dict(item))
+        return candidates
+
+    @staticmethod
+    def _video_merge_item_error(item: dict) -> str | None:
+        if item.get("type") != "video":
+            return "video only"
+        source_name = item.get("source_name") or item.get("name") or item.get("path") or ""
+        if os.path.splitext(str(source_name))[1].lower() != ".mp4":
+            return "MP4 only"
+        try:
+            size = int(item.get("size"))
+        except (TypeError, ValueError):
+            return "size unavailable"
+        if size <= 0:
+            return "size unavailable"
+        if size > _VIDEO_MERGE_MAX_BYTES:
+            return "over 500 MB"
+        return None
+
+    @classmethod
+    def _video_merge_ready(cls, session: dict) -> bool:
+        selected = session.get("video_merge_selection")
+        return (
+            isinstance(selected, list)
+            and len(selected) == _VIDEO_MERGE_MAX_COUNT
+            and all(isinstance(item, dict) and cls._video_merge_item_error(item) is None for item in selected)
+        )
+
+    async def _show_video_merge_selection(self, query, session: dict) -> None:
+        selected = session.get("video_merge_selection")
+        if not isinstance(selected, list):
+            selected = []
+            session["video_merge_selection"] = selected
+
+        lines = [
+            "🔀 <b>Merge Videos</b>",
+            f"Kept: <b>{len(selected)}/{_VIDEO_MERGE_MAX_COUNT}</b> (exactly {_VIDEO_MERGE_MAX_COUNT} required)",
+            f"Limit: {_VIDEO_MERGE_MAX_BYTES // (1024 * 1024)} MB per video · MP4 only",
+        ]
+        remove_labels = []
+        valid_count = 0
+        for index, item in enumerate(selected):
+            name = _bulk_display_name(item)
+            remove_labels.append(str(index + 1))
+            reason = self._video_merge_item_error(item)
+            if reason is None:
+                size_mb = int(item["size"]) / (1024 * 1024)
+                status = f"✅ {size_mb:.1f} MB"
+                valid_count += 1
+            else:
+                status = f"❌ {reason}"
+            lines.append(f"{index + 1}. {html.escape(name)} — {status}")
+
+        if not selected:
+            lines.extend(
+                [
+                    "",
+                    "No videos detected yet. Send or forward videos here; they are added automatically.",
+                ]
+            )
+        elif len(selected) > _VIDEO_MERGE_MAX_COUNT:
+            lines.extend(["", f"Remove videos until exactly {_VIDEO_MERGE_MAX_COUNT} remain."])
+        elif valid_count != _VIDEO_MERGE_MAX_COUNT:
+            lines.extend(["", "Remove invalid entries or send MP4 videos under the size limit."])
+
+        await self.safe_edit(
+            query,
+            "\n".join(lines),
+            reply_markup=MediaMenuBuilder.get_video_merge_review_menu(
+                remove_labels,
+                self._video_merge_ready(session),
+            ),
+            parse_mode="HTML",
+        )
+
+    async def _prepare_video_merge_sources(
+        self,
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+        session: dict,
+        notify,
+    ) -> tuple[list[str], list[str]]:
+        """Fetch exactly the selected Telegram sources one at a time.
+
+        Stored objects are not reused because the cache records a Telegram
+        unique ID and byte size, not a content digest; a same-size replacement
+        cannot be ruled out. A forced isolated refresh downloads the exact
+        queued Telegram file ID and refuses nearby-message substitutions.
+        """
+        selected = session.get("video_merge_selection")
+        if not self._video_merge_ready(session):
+            raise ValueError("Choose exactly two videos that are MP4 and at most 500 MB each.")
+
+        user_id = getattr(getattr(update, "effective_user", None), "id", None)
+        paths: list[str] = []
+        owned_paths: list[str] = []
+
+        try:
+            for index, queued_item in enumerate(selected, 1):
+                item = dict(queued_item)
+                name = _bulk_display_name(item)
+                expected_size = int(item["size"])
+                await notify(f"📥 Preparing video {index}/{_VIDEO_MERGE_MAX_COUNT}: {name}")
+
+                isolated_item = dict(queued_item)
+                had_current = "current_file" in session
+                previous = session.get("current_file")
+                session["current_file"] = isolated_item
+                try:
+                    await self._ensure_current_file_downloaded(
+                        update,
+                        context,
+                        session,
+                        force_refresh=True,
+                    )
+                except Exception as exc:
+                    for candidate in (isolated_item.get("path"), isolated_item.get("_local_input_path")):
+                        if candidate and os.path.exists(candidate):
+                            owned_paths.append(candidate)
+                    raise RuntimeError(f"Could not fetch the exact source for {name}: {exc}") from exc
+                finally:
+                    if had_current:
+                        session["current_file"] = previous
+                    else:
+                        session.pop("current_file", None)
+                    if user_id is not None:
+                        self._persist_session(user_id)
+                source_path = self._local_copy(isolated_item)
+                if not source_path:
+                    for candidate in (isolated_item.get("path"), isolated_item.get("_local_input_path")):
+                        if candidate and os.path.exists(candidate):
+                            owned_paths.append(candidate)
+                    raise RuntimeError(f"Exact source unavailable for {name}; no nearby message was substituted.")
+                owned_paths.append(source_path)
+
+                actual_size = os.path.getsize(source_path)
+                if actual_size != expected_size:
+                    raise RuntimeError(
+                        f"Size check failed for {name}: expected {expected_size} bytes, received {actual_size}."
+                    )
+                if actual_size > _VIDEO_MERGE_MAX_BYTES:
+                    raise RuntimeError(f"{name} exceeds the 500 MB per-video merge limit.")
+
+                from utils.ffmpeg_runner import probe_media
+
+                metadata = await probe_media(source_path)
+                formats = set(str(metadata.get("format_name") or "").lower().split(","))
+                if "mp4" not in formats or int(metadata.get("video_streams") or 0) < 1:
+                    raise RuntimeError(f"{name} is not a valid MP4 video.")
+                paths.append(source_path)
+
+            return paths, owned_paths
+        except Exception:
+            for path in owned_paths:
+                with contextlib.suppress(OSError):
+                    os.remove(path)
+            raise
+
     async def merge_videos(
         self,
         update: Update,
@@ -12801,13 +13001,7 @@ class EnhancedMediaHandler:
         trim: tuple | None = None,
         target_format: str | None = None,
     ):
-        """Merge the collected videos, optionally trimming/compressing/converting.
-
-        ``post`` is the 🔀 Merge menu's variant: ``"trim"`` (with ``trim=(start,
-        end)``), ``"compress"`` or ``"convert"`` (with ``target_format``). The
-        follow-up is a second, single pass over the merged file, so the sources
-        are still read once.
-        """
+        """Merge the two videos currently kept in the auto-detected review list."""
         if not await self._require_callback(update):
             return
         query = update.callback_query
@@ -12833,118 +13027,120 @@ class EnhancedMediaHandler:
         trim: tuple | None = None,
         target_format: str | None = None,
     ) -> None:
-        """The merge itself, shared by the button and by the typed follow-ups.
-
-        ``notify`` is how the caller reports progress (an edit for a button, a
-        reply for a typed answer), so the two entries cannot diverge. Nothing here
-        requires a callback query, which is what lets a Merge + Trim/Convert typed
-        answer run the same code. The caller owns the quota check.
-        """
-        merge_list = session.get("merge_list") or []
-        if len(merge_list) < 2:
-            await notify("❌ Need at least 2 videos to merge.\nSend video files first, then press Merge.")
+        """Fetch, validate, compress, and deliver the two explicitly kept videos."""
+        user_id = getattr(getattr(update, "effective_user", None), "id", None)
+        if session.get("_video_merge_running"):
+            await notify("⏳ A merge is already running for this account.")
+            return
+        if not self._video_merge_ready(session):
+            await self._show_video_merge_selection(
+                getattr(update, "callback_query", None),
+                session,
+            ) if getattr(update, "callback_query", None) else await notify(
+                "❌ Choose exactly two MP4 videos, each no larger than 500 MB."
+            )
             return
 
-        await notify(f"🔀 Merging {len(merge_list)} videos...")
+        session["_video_merge_running"] = True
 
-        output_dir = getattr(config, "OUTPUT_PATH", "storage/output") if config else "storage/output"
-        with contextlib.suppress(OSError):
-            os.makedirs(output_dir, exist_ok=True)
-        stamp = int(datetime.now(UTC).timestamp())
-        merged_path = os.path.join(output_dir, f"merged_{stamp}.mp4")
-        success = await self.converter.merge_videos(merge_list, merged_path)
-        merged_ok = bool(success and os.path.exists(merged_path))
-        final_path: str | None = merged_path if merged_ok else None
-
-        # The merge-and-X variants: one extra pass on the merged file. A failed
-        # follow-up must not throw the merge away - the merged file is itself a
-        # complete video - so it is kept below and handed to the session, and the
-        # user retries only the cut/re-encode/remux.
-        if final_path and post:
+        async def _run_merge() -> None:
+            owned_inputs: list[str] = []
+            produced_paths: set[str] = set()
+            preserve_merged = False
             try:
-                if post == "trim" and trim:
-                    _candidate = os.path.join(output_dir, f"merged_trimmed_{stamp}.mp4")
-                    _ok = await self.converter.trim_video(merged_path, _candidate, trim[0], trim[1])
-                    final_path = _candidate if _ok else None
-                elif post == "compress":
-                    _candidate = os.path.join(output_dir, f"merged_compressed_{stamp}.mp4")
-                    _ok, _ = await self.converter.execute_ffmpeg(
-                        [
-                            "-c:v",
-                            "libx264",
-                            "-preset",
-                            "veryfast",
-                            "-crf",
-                            "23",
-                            "-c:a",
-                            "aac",
-                            "-b:a",
-                            "128k",
-                            "-movflags",
-                            "+faststart",
-                        ],
-                        merged_path,
-                        _candidate,
-                    )
-                    final_path = _candidate if _ok else None
-                elif post == "convert" and target_format:
-                    _candidate = os.path.join(output_dir, f"merged_{stamp}.{target_format}")
-                    _ok = await self.converter.convert_video_format(merged_path, _candidate, target_format)
-                    final_path = _candidate if _ok else None
-            except Exception:
-                logger.exception("merge: the %s follow-up failed", post)
-                final_path = None
+                input_paths, owned_inputs = await self._prepare_video_merge_sources(
+                    update,
+                    context,
+                    session,
+                    notify,
+                )
+                output_dir = getattr(config, "OUTPUT_PATH", "storage/output") if config else "storage/output"
+                os.makedirs(output_dir, exist_ok=True)
+                token = uuid.uuid4().hex
+                merged_path = os.path.join(output_dir, f"merged_{user_id or 'user'}_{token}.mp4")
+                produced_paths.add(merged_path)
 
-        if final_path and os.path.exists(final_path):
-            _session_file = session.get("current_file")
-            await self._send_video_result(
-                context.bot,
-                update.effective_chat.id,
-                final_path,
-                caption=_metadata_caption(_session_file),
-                delivery_name=_video_delivery_name(_session_file, final_path),
-                upload_mode=_user_upload_mode(getattr(update.effective_user, "id", None)),
-            )
-            # Cleanup: the intermediate when a follow-up produced it, the merged
-            # file itself otherwise, and the sources either way.
-            for _produced in {merged_path, final_path}:
-                with contextlib.suppress(OSError):
-                    os.remove(_produced)
-            for file_path in merge_list:
-                with contextlib.suppress(OSError):
-                    os.remove(file_path)
-            session["merge_list"] = []
-        elif merged_ok and post:
-            # The merge worked; only the follow-up failed. Keep the merged file
-            # (do not delete it) and hand it to the session as the current media,
-            # so a retry of just the cut/re-encode/remux costs no second merge.
-            _merged_name = f"merged_{stamp}.mp4"
-            _merged_entry = {
-                "path": merged_path,
-                "type": "video",
-                "id": f"merged_{stamp}",
-                "name": _merged_name,
-                "size": os.path.getsize(merged_path) if os.path.exists(merged_path) else None,
-            }
-            session["current_file"] = _merged_entry
-            _register_bulk_file(session, _merged_entry)
-            for file_path in merge_list:
-                with contextlib.suppress(OSError):
-                    os.remove(file_path)
-            session["merge_list"] = []
-            _hint = {
-                "trim": "✂️ Media Trimmer",
-                "compress": "📉 Compress",
-                "convert": "🔄 Convert Format",
-            }.get(post or "", "the matching tool")
-            await notify(
-                f"⚠️ The merge succeeded, but the {post} step failed.\n"
-                f"The merged video is kept as the current file — open {_hint} to retry it."
-            )
-        else:
-            with contextlib.suppress(OSError):
-                os.remove(merged_path)
-            await notify("❌ Merge failed.")
+                await notify("🔀 Merging and compressing 2 videos (H.264 CRF 28, one FFmpeg thread)…")
+                success = await self.converter.merge_videos_compressed(input_paths, merged_path)
+                merged_ok = bool(success and os.path.exists(merged_path) and os.path.getsize(merged_path) > 0)
+                final_path = merged_path if merged_ok else None
+
+                if final_path and post:
+                    candidate_ext = target_format if post == "convert" and target_format else "mp4"
+                    candidate = os.path.join(output_dir, f"merged_{user_id or 'user'}_{token}_{post}.{candidate_ext}")
+                    produced_paths.add(candidate)
+                    try:
+                        if post == "trim" and trim:
+                            ok = await self.converter.trim_video(merged_path, candidate, trim[0], trim[1])
+                        elif post == "convert" and target_format:
+                            ok = await self.converter.convert_video_format(merged_path, candidate, target_format)
+                        else:
+                            ok = False
+                    except Exception:
+                        logger.exception("merge: the %s follow-up failed", post)
+                        ok = False
+                    final_path = candidate if ok and os.path.exists(candidate) else None
+
+                if final_path:
+                    names = [_bulk_display_name(item)[:100] for item in session["video_merge_selection"]]
+                    caption = f"Merged 2 videos: {names[0]} + {names[1]}"
+                    delivery_ok = await self._deliver_inline_result(
+                        update,
+                        context,
+                        final_path,
+                        session["video_merge_selection"][0],
+                        kind="video",
+                        delivery_name="merged_video.mp4",
+                        caption=caption[:1024],
+                        notify=notify,
+                    )
+                    if delivery_ok:
+                        await notify("✅ Merge complete.")
+                        for path in produced_paths:
+                            with contextlib.suppress(OSError):
+                                os.remove(path)
+                        session["video_merge_selection"] = []
+                        if user_id is not None:
+                            self._persist_session(user_id)
+                        return
+
+                if merged_ok and post and final_path is None:
+                    merged_name = os.path.basename(merged_path)
+                    merged_entry = {
+                        "path": merged_path,
+                        "type": "video",
+                        "id": f"merged_{token}",
+                        "name": merged_name,
+                        "source_name": merged_name,
+                        "size": os.path.getsize(merged_path),
+                    }
+                    session["current_file"] = merged_entry
+                    _register_bulk_file(session, merged_entry)
+                    preserve_merged = True
+                    await notify(
+                        f"⚠️ The two videos were merged and compressed, but the {post} step failed. "
+                        "The merged file is kept as the current video."
+                    )
+                elif not merged_ok:
+                    await notify("❌ Merge failed. The inputs were kept; check that both MP4 files are valid.")
+            except (ValueError, RuntimeError) as exc:
+                await notify(f"❌ {exc}")
+            except Exception:
+                logger.exception("video merge failed")
+                await notify("❌ Merge failed unexpectedly. The selected source files were kept.")
+            finally:
+                for path in owned_inputs:
+                    with contextlib.suppress(OSError):
+                        os.remove(path)
+                if not preserve_merged:
+                    for path in produced_paths:
+                        with contextlib.suppress(OSError):
+                            os.remove(path)
+
+        try:
+            await self._run_with_concurrency_limit(user_id, "video_merge", _run_merge())
+        finally:
+            session.pop("_video_merge_running", None)
 
     async def merge_audios(self, update: Update, context: ContextTypes.DEFAULT_TYPE, session: dict):
         """Merge multiple audio files."""
