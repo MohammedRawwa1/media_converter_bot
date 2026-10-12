@@ -7,7 +7,6 @@ Keep all callback identifiers here as the single source of truth.
 MENU_MAIN = "menu_main"
 MENU_VIDEO = "menu_video"
 MENU_AUDIO = "menu_audio"
-MENU_ADVANCED = "menu_advanced"
 # Shorthand to show the merge menu (used by main menu)
 MERGE_MENU = "merge_videos_menu"
 

@@ -60,9 +60,10 @@ try:
     import uuid
 
     from utils.job_queue import enqueue_job
-    from utils.keyboard_utils import MediaMenuBuilder
+    from utils.keyboard_utils import REORDER_PER_PAGE, MediaMenuBuilder
 except ImportError:
     MediaMenuBuilder = None
+    REORDER_PER_PAGE = 5
     try:
         enqueue_job
     except NameError:
@@ -322,6 +323,47 @@ _UPLOAD_MODES = (_UPLOAD_MODE_VIDEO, _UPLOAD_MODE_FILE)
 # guard is time-bounded so a crashed apply can never lock a user out of their own
 # batch until it expires.
 _BULK_APPLY_GUARD_SECONDS = 12 * 3600
+
+#: How long a claimed in-process action stays claimed without being released. The
+#: release is explicit and immediate; this window only covers a run that died
+#: mid-way (an OOM on a long fade), so nobody is locked out of a button by a crash.
+_INLINE_OP_GUARD_SECONDS = float(os.getenv("INLINE_OP_GUARD_SECONDS", "1800"))
+
+#: In-process actions where a second press races the first over a single output
+#: path. ``trigger -> guard key``; the key groups the triggers that run the same
+#: job, so the three fade buttons and the two trims are one action each. Every one
+#: of these encodes into a fixed path (``{id}_faded``, ``{id}_trimmed``, ...) and
+#: removes it after sending, so overlapping runs delete each other's file.
+_INLINE_OP_GUARD_KEYS = {
+    "trim_video": "trim",
+    "trim_audio": "trim",
+    "fade_in": "fade",
+    "fade_out": "fade",
+    "fade_both": "fade",
+    "normalize_audio": "normalize",
+    "merge_audios_start": "merge_audios",
+}
+
+#: Picked values of an action that is itself one job (``bitrate_320``).
+_INLINE_OP_GUARD_PREFIXES = {"bitrate_": "bitrate", "vbitrate_": "bitrate"}
+
+#: Opened-by-a-value triggers: they only reveal a picker, so nothing is claimed.
+_INLINE_OP_PICKERS = frozenset({"bitrate_menu", "bitrate_custom"})
+
+
+def _inline_op_key(data: str) -> str | None:
+    """The in-process action ``data`` starts, when it is one of the racing ones."""
+    if not isinstance(data, str):
+        return None
+    if data in _INLINE_OP_GUARD_KEYS:
+        return _INLINE_OP_GUARD_KEYS[data]
+    if data in _INLINE_OP_PICKERS:
+        return None
+    for prefix, key in _INLINE_OP_GUARD_PREFIXES.items():
+        if data.startswith(prefix):
+            return key
+    return None
+
 
 # The pipeline dedup key holds the job ingesting a media, or this placeholder
 # while the request that is ingesting it has no job id yet. The placeholder
@@ -3257,6 +3299,32 @@ class EnhancedMediaHandler:
         """
         return await self._say_in_chat(update, context, text, **kwargs) is not None
 
+    def _claim_inline_op(self, session: dict | None, key: str) -> bool:
+        """Claim an in-process action for this session, or report it is running.
+
+        These actions encode into one fixed output path and delete it after sending
+        it, so two presses of the same button overlap and the first to finish takes
+        the file out from under the other. The marker lives on the session (the
+        same place the batch guards live) and is released when the dispatch ends.
+        """
+        if not isinstance(session, dict) or not key:
+            return True
+        marker = f"_inline_op_{key}"
+        now = time.time()
+        try:
+            started = float(session.get(marker) or 0)
+        except (TypeError, ValueError):
+            started = 0
+        if started and (now - started) < _INLINE_OP_GUARD_SECONDS:
+            return False
+        session[marker] = now
+        return True
+
+    def _release_inline_op(self, session: dict | None, key: str | None) -> None:
+        """Release a claim made by :meth:`_claim_inline_op`."""
+        if isinstance(session, dict) and key:
+            session.pop(f"_inline_op_{key}", None)
+
     async def _require_callback(self, update) -> bool:
         """Ensure the update contains a callback_query. Return True if present."""
         if getattr(update, "callback_query", None) is None:
@@ -4182,6 +4250,129 @@ class EnhancedMediaHandler:
             logger.info("handlers: sent %s via userbot (msg_id=%s)", delivery_name, msg_id)
             return True
         return False
+
+    async def _deliver_inline_result(
+        self,
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+        output_path: str,
+        current_file: dict | None,
+        *,
+        kind: str,
+        delivery_name: str | None = None,
+        caption: str | None = None,
+        notify=None,
+    ) -> bool:
+        """Send what an in-process conversion produced, whatever its size.
+
+        Fade, trim, merge-audio, normalize and bitrate all encode here and hand the
+        result straight to Telegram, which is the one place the size tiers have to
+        be applied - and they are the tiers every other delivery in this bot uses:
+
+        * over ``config.BOT_API_MAX_BYTES`` (50MB by default) the Bot API refuses
+          the upload outright, so the file goes over MTProto through the userbot,
+          the road an over-limit split part and an over-limit subtitle merge
+          already take;
+        * everything else keeps the ordinary delivery - which is what carries the
+          streamed header (``supports_streaming``) plus the probed duration and
+          dimensions of a video, and the media's own title/performer plus its
+          stated length for audio.
+
+        A result over the ceiling with the userbot switched off is reported as
+        exactly that rather than attempted, because Telegram's own "file is too
+        big" arrives *after* the encode and reads as the button having failed.
+        The same goes for a send that fails for any other reason, so no caller is
+        left rendering a success it cannot back up.
+
+        ``notify`` is the caller's own reporter (an async callable taking the
+        text); it is used for the failure cases only. Returns True when the file
+        was delivered.
+        """
+
+        def _mb(value: int) -> int:
+            return max(1, value // 1024 // 1024)
+
+        async def _fail(message: str) -> bool:
+            """Tell the user why the result did not arrive, through the caller."""
+            logger.warning("handlers: %s could not be delivered: %s", name, message)
+            if notify is not None:
+                with contextlib.suppress(Exception):
+                    await notify(message)
+            else:
+                with contextlib.suppress(Exception):
+                    await context.bot.send_message(chat_id=chat_id, text=message)
+            return False
+
+        size = 0
+        with contextlib.suppress(OSError):
+            size = os.path.getsize(output_path) if output_path else 0
+        user_id = getattr(getattr(update, "effective_user", None), "id", None)
+        chat_id = getattr(getattr(update, "effective_chat", None), "id", None)
+        name = delivery_name or os.path.basename(output_path or "") or "result"
+        text = caption if caption is not None else _metadata_caption(current_file)
+        _as_document = kind != "audio" and _user_upload_mode(user_id) == _UPLOAD_MODE_FILE
+        # Read tolerantly, the way every other ceiling check here does: a test or a
+        # stripped-down config object without the constant means "no ceiling", not
+        # an exception in the middle of a delivery.
+        _ceiling = int(getattr(config, "BOT_API_MAX_BYTES", 0) or 0)
+
+        if _ceiling and size > _ceiling:
+            if not getattr(config, "ENABLE_USERBOT", False):
+                return await _fail(
+                    f"❌ The result is {_mb(size)}MB — over Telegram's Bot API limit "
+                    f"({getattr(config, 'BOT_API_MAX_MB', 50)}MB) and the userbot is off, "
+                    "so it cannot be delivered."
+                )
+            if kind == "audio":
+                sent = await self._send_audio_via_userbot(
+                    chat_id, output_path, text, name, current_file or {}, user_id=user_id
+                )
+            else:
+                sent = await self._send_part_via_userbot(
+                    chat_id,
+                    output_path,
+                    text,
+                    name,
+                    False,
+                    current_file or {},
+                    name,
+                    user_id=user_id,
+                    as_document=_as_document,
+                )
+            if sent:
+                return True
+            return await _fail(
+                f"❌ The result is {_mb(size)}MB — over Telegram's Bot API limit, and the userbot could not send it."
+            )
+
+        try:
+            if kind == "audio":
+                # The output's own length: a re-encode can change it, and Telegram
+                # will not derive it for a long clip (see _audio_delivery_duration).
+                _duration = await _audio_delivery_duration(output_path)
+                with open(output_path, "rb") as audio_file:
+                    await context.bot.send_audio(
+                        chat_id=chat_id,
+                        audio=audio_file,
+                        caption=text,
+                        **_audio_tag_kwargs(current_file, name, _duration),
+                        filename=name,
+                    )
+            else:
+                # The streamed delivery: the header and the probed metadata are
+                # set here rather than left to a bare document send.
+                await self._send_video_result(
+                    context.bot,
+                    chat_id,
+                    output_path,
+                    caption=text,
+                    delivery_name=name,
+                    upload_mode=_user_upload_mode(user_id),
+                )
+        except Exception:
+            logger.exception("handlers: could not deliver %s", name)
+            return await _fail(f"❌ {name} was produced but could not be sent.")
+        return True
 
     async def _redeliver_current_media(
         self,
@@ -8612,7 +8803,7 @@ class EnhancedMediaHandler:
             await self.safe_edit(
                 query,
                 "❌ No videos collected yet.\nSend the videos first — they are collected "
-                "automatically — then press 📝 Batch Subtitles.",
+                "automatically — then press 📂 Send Subtitle Files.",
             )
             return
 
@@ -9153,31 +9344,23 @@ class EnhancedMediaHandler:
             await notify("❌ Failed to trim media. Check that the times are within the file duration and try again.")
             return
 
+        # The trim's own delivery, tiers and all: an over-limit trimmed export
+        # used to be handed to the Bot API with no ceiling check, which is the same
+        # "failed after the encode" shape the fade had.
+        _trim_name = delivery_name if is_audio else _video_delivery_name(current_file, output_path)
         try:
-            if is_audio:
-                # The trimmed output's own length: Telegram will not derive it
-                # for a long clip (see _audio_delivery_duration).
-                _audio_duration = await _audio_delivery_duration(output_path)
-                with open(output_path, "rb") as audio_file:
-                    await context.bot.send_audio(
-                        chat_id=update.effective_chat.id,
-                        audio=audio_file,
-                        caption=_metadata_caption(current_file),
-                        # The media's own title/performer are preserved, so the
-                        # delivered audio is the same track it was.
-                        **_audio_tag_kwargs(current_file, delivery_name, _audio_duration),
-                        filename=delivery_name,
-                    )
-            else:
-                await self._send_video_result(
-                    context.bot,
-                    update.effective_chat.id,
-                    output_path,
-                    caption=_metadata_caption(current_file),
-                    delivery_name=_video_delivery_name(current_file, output_path),
-                    upload_mode=_user_upload_mode(update.effective_user.id),
-                )
-            await notify(f"✅ Trim complete ({start_norm} → {end_norm}).")
+            delivered = await self._deliver_inline_result(
+                update,
+                context,
+                output_path,
+                current_file,
+                kind="audio" if is_audio else "video",
+                delivery_name=_trim_name,
+                caption=_metadata_caption(current_file),
+                notify=notify,
+            )
+            if delivered:
+                await notify(f"✅ Trim complete ({start_norm} → {end_norm}).")
         finally:
             with contextlib.suppress(OSError):
                 os.remove(output_path)
@@ -9274,33 +9457,22 @@ class EnhancedMediaHandler:
             await self.safe_edit(
                 query, "✅ Fade applied! Sending file...", reply_markup=MediaMenuBuilder.get_back_button()
             )
-            try:
-                if is_audio:
-                    # Deliver faded audio as streamable audio, not as a document.
-                    # The faded output's own length: Telegram will not derive it
-                    # for a long clip (see _audio_delivery_duration).
-                    _audio_duration = await _audio_delivery_duration(output_path)
-                    with open(output_path, "rb") as audio_file:
-                        await context.bot.send_audio(
-                            chat_id=update.effective_chat.id,
-                            audio=audio_file,
-                            caption=_metadata_caption(current_file),
-                            **_audio_tag_kwargs(session.get("current_file"), delivery_name, _audio_duration),
-                            filename=delivery_name,
-                        )
-                else:
-                    with open(output_path, "rb") as f:
-                        await context.bot.send_document(
-                            chat_id=update.effective_chat.id,
-                            document=f,
-                            filename=_document_delivery_name(current_file, output_path),
-                        )
-            except Exception:
-                await self.safe_edit(
-                    query,
-                    "✅ Fade applied but failed to send. Check the output folder.",
-                    reply_markup=MediaMenuBuilder.get_back_button(),
-                )
+            # The faded export used to be a bare ``send_document``: no caption, no
+            # probed metadata and - the part that hurt - no size tier, so an
+            # over-limit video failed *after* the encode and read as a broken
+            # button. It goes out the way every other result does now, audio as
+            # streamable audio and video through the streamed delivery, with the
+            # userbot carrying anything over the Bot API's ceiling.
+            await self._deliver_inline_result(
+                update,
+                context,
+                output_path,
+                current_file,
+                kind="audio" if is_audio else "video",
+                delivery_name=(delivery_name if is_audio else _video_delivery_name(current_file, output_path)),
+                caption=_metadata_caption(current_file),
+                notify=lambda text: self.safe_edit(query, text, reply_markup=MediaMenuBuilder.get_back_button()),
+            )
             return
 
         await self.safe_edit(query, "❌ Failed to apply fade effect.", reply_markup=MediaMenuBuilder.get_back_button())
@@ -9417,6 +9589,11 @@ class EnhancedMediaHandler:
         # Import canonical callback names for comparison when needed
         # canonical callback names (if ever needed) are provided by `utils.callbacks`.
         # We don't import them here to avoid unused-name noise from linters.
+        # Claimed inside the try, released in the finally below: a claim has to
+        # survive every early return in between, and a press that raises on the way
+        # must not leave the action locked.
+        _inline_key: str | None = None
+        _inline_session = None
         try:
             # Map video bitrate shortcuts to generic bitrate handler
             if isinstance(data, str) and data.startswith("vbitrate_"):
@@ -9450,6 +9627,23 @@ class EnhancedMediaHandler:
             session = self.user_sessions[user_id]
             current_file = session.get("current_file")
 
+            # ── Idempotency for the in-process actions ──
+            # Fade, trim, normalize, bitrate and merge-audio all encode here into
+            # one fixed output path and then remove it once sent. A second press
+            # while the first is still running overlaps it, and whichever finishes
+            # first deletes the file the other is about to send - the same guard
+            # shape the batch runs use (``_bulk_apply_started_at``).
+            _inline_key = _inline_op_key(data)
+            if _inline_key is not None:
+                _inline_session = session
+                if not self._claim_inline_op(session, _inline_key):
+                    await self.safe_edit(
+                        query,
+                        f"⏳ {_inline_key.replace('_', ' ').title()} is already running for your account — "
+                        "wait for it to finish before starting it again.",
+                    )
+                    return
+
             # Main menu navigation
             if data == "menu_main":
                 await self.safe_edit(
@@ -9470,13 +9664,6 @@ class EnhancedMediaHandler:
                     query,
                     "🎧 **Audio Tools**\nChoose an action:",
                     reply_markup=MediaMenuBuilder.get_audio_tools_menu(),
-                )
-
-            elif data == "menu_advanced":
-                await self.safe_edit(
-                    query,
-                    "🔧 **Advanced Tools**\nChoose an action:",
-                    reply_markup=MediaMenuBuilder.get_advanced_tools_menu(),
                 )
 
             # Video tools
@@ -9531,6 +9718,7 @@ class EnhancedMediaHandler:
                 await self.safe_edit(
                     query,
                     "✂️ Trimmer 1 selected.\nSend START time (HH:MM:SS[.ms])\nExample: 00:01:00",
+                    reply_markup=MediaMenuBuilder.get_back_button(),
                 )
                 return
 
@@ -9543,6 +9731,7 @@ class EnhancedMediaHandler:
                 await self.safe_edit(
                     query,
                     "✂️ Trimmer 2 selected.\nSend START time (HH:MM:SS[.ms])\nExample: 00:05:00",
+                    reply_markup=MediaMenuBuilder.get_back_button(),
                 )
                 return
 
@@ -9580,6 +9769,7 @@ class EnhancedMediaHandler:
                     "Send the start and end time for the merged video, "
                     "e.g. <code>00:10 00:40</code> (or <code>00:10-00:40</code>).",
                     parse_mode="HTML",
+                    reply_markup=MediaMenuBuilder.get_back_button(),
                 )
 
             elif data == "merge_compress":
@@ -9595,6 +9785,7 @@ class EnhancedMediaHandler:
                     "🔄 <b>Merge + Convert</b>\n\nSend the target video format "
                     "(e.g. <code>mkv</code>, <code>mov</code>, <code>avi</code>).",
                     parse_mode="HTML",
+                    reply_markup=MediaMenuBuilder.get_back_button(),
                 )
 
             elif data == "remove_audio":
@@ -9620,6 +9811,7 @@ class EnhancedMediaHandler:
                     await self.safe_edit(
                         query,
                         "📐 Enter custom resolution (widthxheight, e.g. 1280x720):",
+                        reply_markup=MediaMenuBuilder.get_back_button(),
                     )
                     context.user_data["awaiting_custom_resolution"] = True
 
@@ -9692,12 +9884,19 @@ class EnhancedMediaHandler:
                             reply_markup=MediaMenuBuilder.get_back_button(),
                         )
                         try:
-                            with open(output_path, "rb") as f:
-                                await context.bot.send_document(
-                                    chat_id=update.effective_chat.id,
-                                    document=f,
-                                    filename=_document_delivery_name(current_file, output_path),
-                                )
+                            # The custom optimize path used to be a bare document
+                            # send: no caption, no probed metadata, and no ceiling
+                            # check, so a large re-encode failed after finishing.
+                            await self._deliver_inline_result(
+                                update,
+                                context,
+                                output_path,
+                                current_file,
+                                kind="video",
+                                delivery_name=_video_delivery_name(current_file, output_path),
+                                caption=_metadata_caption(current_file),
+                                notify=lambda text: self.safe_edit(query, text),
+                            )
                         except Exception:
                             await self.safe_edit(
                                 query,
@@ -9905,6 +10104,7 @@ class EnhancedMediaHandler:
                 await self.safe_edit(
                     query,
                     "⏱️ **Change Framerate**\nEnter target FPS (e.g., 24, 30, 60).",
+                    reply_markup=MediaMenuBuilder.get_back_button(),
                 )
                 # Clear previous prompts *before* arming this one, otherwise the
                 # loop below would delete the flag we just set.
@@ -9967,7 +10167,11 @@ class EnhancedMediaHandler:
                     if key.startswith("awaiting_"):
                         del context.user_data[key]
                 context.user_data["awaiting_trim"] = "start"
-                await self.safe_edit(query, "✂️ **Trim Audio**\nSend start time (HH:MM:SS):")
+                await self.safe_edit(
+                    query,
+                    "✂️ **Trim Audio**\nSend start time (HH:MM:SS):",
+                    reply_markup=MediaMenuBuilder.get_back_button(),
+                )
 
             elif data == "caption_editor":
                 # Ask for the one caption this media should be delivered with.
@@ -9979,7 +10183,12 @@ class EnhancedMediaHandler:
                 if not current_file:
                     await self.safe_edit(query, "❌ No file found to caption.")
                     return
-                await self.safe_edit(query, _caption_prompt_text(current_file), parse_mode="HTML")
+                await self.safe_edit(
+                    query,
+                    _caption_prompt_text(current_file),
+                    parse_mode="HTML",
+                    reply_markup=MediaMenuBuilder.get_back_button(),
+                )
                 for key in list(context.user_data.keys()):
                     if key.startswith("awaiting_"):
                         del context.user_data[key]
@@ -9995,7 +10204,12 @@ class EnhancedMediaHandler:
                 # *next* action downloading the same file again (see
                 # _adopt_rename_source).
                 await self._adopt_rename_source(current_file, session=session, user_id=user_id)
-                await self.safe_edit(query, _rename_prompt_text(current_file), parse_mode="HTML")
+                await self.safe_edit(
+                    query,
+                    _rename_prompt_text(current_file),
+                    parse_mode="HTML",
+                    reply_markup=MediaMenuBuilder.get_back_button(),
+                )
                 for key in list(context.user_data.keys()):
                     if key.startswith("awaiting_"):
                         del context.user_data[key]
@@ -10015,6 +10229,7 @@ class EnhancedMediaHandler:
                     "📌 Send the length of each part:\n• `10:00` / `01:00:00` / `30m` / `2h` — part length\n"
                     "• `4` — split into 4 equal parts\n"
                     "• `00:10-00:20` — cut that single range out",
+                    reply_markup=MediaMenuBuilder.get_back_button(),
                 )
                 for key in list(context.user_data.keys()):
                     if key.startswith("awaiting_"):
@@ -10071,6 +10286,7 @@ class EnhancedMediaHandler:
                 await self.safe_edit(
                     query,
                     "🏷️ Edit metadata: send JSON (example in README).",
+                    reply_markup=MediaMenuBuilder.get_back_button(),
                 )
                 for key in list(context.user_data.keys()):
                     if key.startswith("awaiting_"):
@@ -10398,7 +10614,7 @@ class EnhancedMediaHandler:
                             await self.safe_edit(
                                 query,
                                 "📝 <b>Batch Subtitles is on</b>, but no .srt files were received.\n"
-                                "Press 📝 Batch Subtitles to send them, then Apply Bulk again.",
+                                "Press 📂 Send Subtitle Files to send them, then Apply Bulk again.",
                                 parse_mode="HTML",
                             )
                             return
@@ -11250,11 +11466,10 @@ class EnhancedMediaHandler:
                 await self.show_bulk_menu(update, context)
 
             elif data == "video_reorder":
-                # Placeholder for video reorder feature
-                await self.safe_edit(
-                    query,
-                    "🔁 Video Reorder\n\nThis feature is coming soon — you can manage order via the merge list for now.",
-                )
+                await self.show_video_reorder(update, context, session)
+
+            elif isinstance(data, str) and data.startswith("reorder_"):
+                await self._handle_reorder_move(update, context, session, data)
 
             elif data == "mp3_tag_editor":
                 # Simple entry point for mp3 tag edits (advanced editor may be added later)
@@ -11267,6 +11482,7 @@ class EnhancedMediaHandler:
                     await self.safe_edit(
                         query,
                         '✏️ Mp3 Tag Editor\n\nSend a JSON object with tag keys and values (example: {"title":"Song"}).',
+                        reply_markup=MediaMenuBuilder.get_back_button(),
                     )
                 except Exception:
                     await self.safe_edit(query, "⚠️ Failed to open Mp3 Tag Editor.")
@@ -11328,6 +11544,7 @@ class EnhancedMediaHandler:
                     await self.safe_edit(
                         query,
                         f"✏️ Send the audio bitrate ({_AUDIO_BITRATE_MIN_KBPS}k-{_AUDIO_BITRATE_MAX_KBPS}k, e.g. 128k):",
+                        reply_markup=MediaMenuBuilder.get_back_button(),
                     )
                 else:
                     bitrate = _sanitize_audio_bitrate(value, default="")
@@ -11356,6 +11573,7 @@ class EnhancedMediaHandler:
                         query,
                         f"✏️ Send the quality (CRF {_BULK_COMPRESS_CRF_MIN}-{_BULK_COMPRESS_CRF_MAX}, "
                         "e.g. 23 — lower means better quality):",
+                        reply_markup=MediaMenuBuilder.get_back_button(),
                     )
                 else:
                     crf = _parse_bulk_crf(value)
@@ -11383,6 +11601,7 @@ class EnhancedMediaHandler:
                     await self.safe_edit(
                         query,
                         f"✏️ Send the seconds per photo ({_BULK_SLIDESHOW_MIN:g}-{_BULK_SLIDESHOW_MAX:g}, e.g. 4):",
+                        reply_markup=MediaMenuBuilder.get_back_button(),
                     )
                 else:
                     seconds = _sanitize_bulk_slideshow_seconds(value, default=0)
@@ -11411,6 +11630,7 @@ class EnhancedMediaHandler:
                         query,
                         f"✏️ Send the batch extract bitrate ({_AUDIO_BITRATE_MIN_KBPS}k-"
                         f"{_AUDIO_BITRATE_MAX_KBPS}k, e.g. 128k):",
+                        reply_markup=MediaMenuBuilder.get_back_button(),
                     )
                 else:
                     bitrate = _sanitize_audio_bitrate(value, default="")
@@ -11487,7 +11707,11 @@ class EnhancedMediaHandler:
                     if key.startswith("awaiting_"):
                         del context.user_data[key]
                 context.user_data[f"awaiting_settings_{which}"] = True
-                await self.safe_edit(query, f"✏️ Send the filename {which} (send '-' to clear it):")
+                await self.safe_edit(
+                    query,
+                    f"✏️ Send the filename {which} (send '-' to clear it):",
+                    reply_markup=MediaMenuBuilder.get_back_button(),
+                )
 
             elif data == "settings_clear_rename":
                 if user_settings is None:
@@ -11546,6 +11770,7 @@ class EnhancedMediaHandler:
                     await self.safe_edit(
                         query,
                         "✏️ Send the archive part size (e.g. `500MB`, `1.5GB`) or a number of equal parts (e.g. `3`):",
+                        reply_markup=MediaMenuBuilder.get_back_button(),
                     )
                 else:
                     canonical = archive_split.normalize(value)
@@ -11778,7 +12003,11 @@ class EnhancedMediaHandler:
                     if key.startswith("awaiting_"):
                         del context.user_data[key]
                 context.user_data["awaiting_subtitle_file"] = True
-                await self.safe_edit(query, "➕ **Add Subtitles**\nSend subtitle file (.srt, .ass):")
+                await self.safe_edit(
+                    query,
+                    "➕ **Add Subtitles**\nSend subtitle file (.srt, .ass):",
+                    reply_markup=MediaMenuBuilder.get_back_button(),
+                )
 
             elif data == "burn_subtitles":
                 # Ask user to send subtitle file to burn into current video
@@ -11793,6 +12022,7 @@ class EnhancedMediaHandler:
                     await self.safe_edit(
                         query,
                         ("✏️ **Burn Subtitles**\nSend subtitle file (.srt, .ass) to burn into the current video:"),
+                        reply_markup=MediaMenuBuilder.get_back_button(),
                     )
 
             # Information
@@ -11864,6 +12094,11 @@ class EnhancedMediaHandler:
                 # Best-effort only
                 logger.exception("Failed to notify user after callback_handler exception")
             return
+        finally:
+            # Whatever the branch did - delivered, queued a job, reported a
+            # failure or returned early - the action this press claimed is free
+            # again. Queued work is tracked by its own job, not by this marker.
+            self._release_inline_op(_inline_session, _inline_key)
 
     # ========== IMPLEMENTATION METHODS ==========
 
@@ -12274,28 +12509,23 @@ class EnhancedMediaHandler:
             output_path = os.path.join(output_dir, f"{current_file['id']}_audio.mp3")
 
             async def _deliver():
-                """Send the extracted MP3 as streamable Telegram audio (music player)."""
-                file_size = os.path.getsize(output_path)
-                if file_size > config.BOT_API_MAX_BYTES:
-                    await notify(
-                        f"❌ File too large ({file_size // 1024 // 1024}MB).\nTry compression first.",
-                    )
-                    return
-                # send_audio keeps the file in Telegram's music player (streamable)
-                # instead of delivering it as an opaque downloadable document.
-                # The extracted track's own length: Telegram will not derive it
-                # for a long clip (see _audio_delivery_duration).
-                _audio_duration = await _audio_delivery_duration(output_path)
-                with open(output_path, "rb") as audio_file:
-                    await context.bot.send_audio(
-                        chat_id=update.effective_chat.id,
-                        audio=audio_file,
-                        caption=caption,
-                        # The media's own title/performer are preserved, so the
-                        # delivered audio is the same track it was.
-                        **_audio_tag_kwargs(current_file, delivery_name, _audio_duration),
-                        filename=delivery_name,
-                    )
+                """Send the extracted MP3, over the Bot API's ceiling included."""
+                # This used to be the one place that answered "too large" with a
+                # refusal ("try compression first"), even though the userbot tier
+                # exists for exactly this and the extraction had already run: a
+                # long video's track is over the ceiling at 320k, and the request
+                # was thrown away after the encode. It takes the shared delivery
+                # now, so an over-limit track is carried over MTProto instead.
+                await self._deliver_inline_result(
+                    update,
+                    context,
+                    output_path,
+                    current_file,
+                    kind="audio",
+                    delivery_name=delivery_name,
+                    caption=caption,
+                    notify=notify,
+                )
 
             if AsyncFileLock:
                 # Defensive: ensure we have a concrete file path before attempting locks
@@ -12747,17 +12977,19 @@ class EnhancedMediaHandler:
             # ``or "Merged Audio"`` already guarantees a non-empty name, so there is
             # no empty stem for a fallback id to fill in.
             delivery_name = _audio_delivery_name(_first_name or "Merged Audio", extension=".mp3")
-            # The merged output's own length: Telegram will not derive it for a
-            # long clip (see _audio_delivery_duration).
-            _audio_duration = await _audio_delivery_duration(output_path)
-            with open(output_path, "rb") as audio_file:
-                await context.bot.send_audio(
-                    chat_id=update.effective_chat.id,
-                    audio=audio_file,
-                    caption=_metadata_caption(session.get("current_file")),
-                    **_audio_tag_kwargs(session.get("current_file"), delivery_name, _audio_duration),
-                    filename=delivery_name,
-                )
+            # A merge is the one audio result whose size grows with the batch: a
+            # few long tracks clear the Bot API's ceiling in one go, so it takes
+            # the same tiers (and the same stated length) as every other result.
+            await self._deliver_inline_result(
+                update,
+                context,
+                output_path,
+                session.get("current_file"),
+                kind="audio",
+                delivery_name=delivery_name,
+                caption=_metadata_caption(session.get("current_file")),
+                notify=lambda text: self.safe_edit(query, text),
+            )
 
             # Cleanup
             os.remove(output_path)
@@ -12767,6 +12999,99 @@ class EnhancedMediaHandler:
             session["merge_list"] = []
         else:
             await self.safe_edit(query, "❌ Merge failed.")
+
+    @staticmethod
+    def _reorder_item_name(item, index: int) -> str:
+        """How the reorder panel names one collected item.
+
+        The merge list holds either a path (a video/audio file) or a dict (a
+        photo entry), and a row with no label reads as a button that does
+        nothing - so a nameless entry still gets a stable, numbered label.
+        """
+        if isinstance(item, dict):
+            return _bulk_display_name(item)
+        name = os.path.basename(str(item)) if item else ""
+        return name or f"file {index + 1}"
+
+    async def show_video_reorder(self, update: Update, context: ContextTypes.DEFAULT_TYPE, session: dict, page=1):
+        """Show the collected queue as a list whose order can be set (Video Tools).
+
+        The merge plays ``session["merge_list"]`` in order, so this panel and the
+        merge read the same list: a move edits it in place and the panel is drawn
+        again from it, and there is no separate "order" to fall out of sync.
+        """
+        if not await self._require_callback(update):
+            return
+        query = update.callback_query
+        items = session.get("merge_list") or []
+        total = len(items)
+        last_page = max(1, (total + REORDER_PER_PAGE - 1) // REORDER_PER_PAGE)
+        try:
+            page = max(1, min(int(page), last_page))
+        except (TypeError, ValueError):
+            page = 1
+        start = (page - 1) * REORDER_PER_PAGE
+        window = items[start : start + REORDER_PER_PAGE]
+
+        if not items:
+            await self.safe_edit(
+                query,
+                "🔁 <b>Video Reorder</b>\n\n"
+                "The list is empty. Collect the files first with ➕ Video Merger "
+                "(or ➕ Add File), then reopen this to set their order.",
+                reply_markup=MediaMenuBuilder.get_reorder_menu([], page=1),
+                parse_mode="HTML",
+            )
+            return
+
+        lines = [f"🔁 <b>Video Reorder</b>  ({page}/{last_page} · {total} item(s))", ""]
+        for offset, item in enumerate(window):
+            position = start + offset
+            lines.append(f"{position + 1}. {html.escape(self._reorder_item_name(item, position))}")
+        lines += ["", "A merge plays them top to bottom. Use ⬆️/⬇️ to move one place."]
+        await self.safe_edit(
+            query,
+            "\n".join(lines),
+            reply_markup=MediaMenuBuilder.get_reorder_menu(items, page=page),
+            parse_mode="HTML",
+        )
+
+    async def _handle_reorder_move(self, update: Update, context: ContextTypes.DEFAULT_TYPE, session: dict, data: str):
+        """Move one collected item up/down (``reorder_up:N``) or turn a page."""
+        if not await self._require_callback(update):
+            return
+        query = update.callback_query
+        items = session.get("merge_list") or []
+
+        action, _, remainder = data.partition(":")
+        direction = "up" if action.endswith("up") else ("down" if action.endswith("down") else None)
+        try:
+            index = int(remainder)
+        except (TypeError, ValueError):
+            index = -1
+
+        if direction is None:
+            # ``reorder_page:<n>`` - a turn of the page, not a move.
+            await self.show_video_reorder(update, context, session, page=index if index > 0 else 1)
+            return
+
+        target = index - 1 if direction == "up" else index + 1
+        moved = False
+        if 0 <= index < len(items) and 0 <= target < len(items):
+            items[index], items[target] = items[target], items[index]
+            session["merge_list"] = items
+            moved = True
+            try:
+                self._persist_session(update.effective_user.id)
+            except Exception:
+                logger.debug("Could not persist session after a reorder move")
+
+        with contextlib.suppress(BadRequest):
+            await query.answer("Moved" if moved else "Nothing to move")
+        # Show the page the moved item landed on, so a move at a page boundary
+        # follows the item instead of leaving the user looking at a stale page.
+        page = max(1, target // REORDER_PER_PAGE + 1) if moved else 1
+        await self.show_video_reorder(update, context, session, page=page)
 
     async def remove_audio(self, update: Update, context: ContextTypes.DEFAULT_TYPE, session: dict):
         """Remove audio from video."""
@@ -13893,21 +14218,22 @@ class EnhancedMediaHandler:
         success, reason = await self.converter.execute_ffmpeg(cmd, local_input, output_path)
 
         if success and os.path.exists(output_path):
-            # The output's own length, not the source's: a re-encode can change
-            # it, and Telegram will not derive either for a long clip
-            # (see _audio_delivery_duration).
-            _audio_duration = await _audio_delivery_duration(output_path)
-            with open(output_path, "rb") as audio_file:
-                await context.bot.send_audio(
-                    chat_id=update.effective_chat.id,
-                    audio=audio_file,
-                    caption=_metadata_caption(current_file),
-                    **_audio_tag_kwargs(current_file, delivery_name, _audio_duration),
-                    filename=delivery_name,
-                )
+            # A high bitrate on a long track is the audio result that grows past
+            # the Bot API's ceiling, so this delivery reads the ceiling too.
+            delivered = await self._deliver_inline_result(
+                update,
+                context,
+                output_path,
+                current_file,
+                kind="audio",
+                delivery_name=delivery_name,
+                caption=_metadata_caption(current_file),
+                notify=notify,
+            )
             with contextlib.suppress(OSError):
                 os.remove(output_path)
-            await notify(f"✅ Bitrate set to {audio_bitrate}. Here is your file.")
+            if delivered:
+                await notify(f"✅ Bitrate set to {audio_bitrate}. Here is your file.")
             return
 
         # ── The inline encode failed: hand the work to a worker ──
@@ -13997,18 +14323,18 @@ class EnhancedMediaHandler:
 
         if success and os.path.exists(output_path):
             delivery_name = _audio_delivery_name(current_file.get("name"), current_file.get("id"))
-            # The output's own length, not the source's: a re-encode can change
-            # it, and Telegram will not derive either for a long clip
-            # (see _audio_delivery_duration).
-            _audio_duration = await _audio_delivery_duration(output_path)
-            with open(output_path, "rb") as audio_file:
-                await context.bot.send_audio(
-                    chat_id=update.effective_chat.id,
-                    audio=audio_file,
-                    caption=_metadata_caption(current_file),
-                    **_audio_tag_kwargs(current_file, delivery_name, _audio_duration),
-                    filename=delivery_name,
-                )
+            # The normalize result takes the shared delivery, so its size tier and
+            # the media's own tags are the same here as everywhere else.
+            await self._deliver_inline_result(
+                update,
+                context,
+                output_path,
+                current_file,
+                kind="audio",
+                delivery_name=delivery_name,
+                caption=_metadata_caption(current_file),
+                notify=lambda text: self.safe_edit(query, text),
+            )
             os.remove(output_path)
         else:
             await self.safe_edit(query, "❌ Failed to normalize audio.")
@@ -14353,6 +14679,9 @@ class EnhancedMediaHandler:
             await self.safe_edit(
                 query,
                 "✏️ Send the archive part size (e.g. `500MB`, `1.5GB`) or a number of equal parts (e.g. `3`):",
+                reply_markup=InlineKeyboardMarkup(
+                    [[InlineKeyboardButton("❌ Cancel", callback_data="archive_cancel")]]
+                ),
             )
             return
         canonical = archive_split.normalize(value)
@@ -14395,6 +14724,12 @@ class EnhancedMediaHandler:
         unavailable: list[str] = []
         for index, entry in enumerate(selection, start=1):
             name = _bulk_display_name(entry)
+            # Name the member being fetched, and count it. This loop fetches what
+            # the batch staged one file at a time - an over-limit member comes back
+            # over MTProto - and it used to sit on a single "Collecting N file(s)..."
+            # line for as long as that took, which is the archive looking like it
+            # had stopped.
+            await self.safe_edit(query, f"📦 Collecting {index}/{total}: {name}...")
             try:
                 await self._ensure_bulk_file_downloaded(update, context, session, entry)
             except Exception:
@@ -14746,7 +15081,8 @@ class EnhancedMediaHandler:
             name = _sanitize_archive_name(user_input)
             if not name:
                 await update.message.reply_text(
-                    "❌ That name has no usable characters. Send a name like `myclips`, or press ✅ Use default name."
+                    "❌ That name has no usable characters. Send a name like `myclips`, or press ✅ Use default name.",
+                    reply_markup=MediaMenuBuilder.get_archive_name_menu(),
                 )
                 return ConversationHandler.END
             context.user_data.pop("awaiting_archive_name", None)
@@ -14804,7 +15140,10 @@ class EnhancedMediaHandler:
                     context.user_data["trimmer_start"] = user_input.strip()
                     context.user_data["awaiting_trimmer"] = "trimmer1_end"
                     await update.message.reply_text(
-                        "📥 Start time saved. Now send END time (HH:MM:SS[.ms])\nExample: 00:10:00"
+                        "📥 Start time saved. Now send END time (HH:MM:SS[.ms])\nExample: 00:10:00",
+                        reply_markup=InlineKeyboardMarkup(
+                            [[InlineKeyboardButton("❌ Cancel", callback_data="cancel")]]
+                        ),
                     )
                     return
 
@@ -14831,7 +15170,10 @@ class EnhancedMediaHandler:
                     context.user_data["trimmer_start"] = user_input.strip()
                     context.user_data["awaiting_trimmer"] = "trimmer2_duration"
                     await update.message.reply_text(
-                        "📥 Start time saved. Now send DURATION (HH:MM:SS[.ms] or seconds)\nExample: 00:10:00"
+                        "📥 Start time saved. Now send DURATION (HH:MM:SS[.ms] or seconds)\nExample: 00:10:00",
+                        reply_markup=InlineKeyboardMarkup(
+                            [[InlineKeyboardButton("❌ Cancel", callback_data="cancel")]]
+                        ),
                     )
                     return
 

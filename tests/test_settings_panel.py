@@ -7,7 +7,7 @@ at all without a loaded file - it answered "No audio file found".
 
 Everything in the panel is pinned here: its buttons carry only ``settings_``
 triggers, the pickers mark the active value, and the media actions that used to
-live behind it (Audio/Video/Advanced Tools, Video Metadata, Mp3 Tag Editor, audio
+live behind it (Audio/Video Tools, Video Metadata, Mp3 Tag Editor, audio
 rename) are reachable from the menus that act on media instead.
 
 The panel is also paginated: the pages, their titles and the Prev/Next row all
@@ -34,7 +34,6 @@ from utils.keyboard_utils import MediaMenuBuilder
 _PROCESSING_TRIGGERS = {
     "menu_audio",
     "menu_video",
-    "menu_advanced",
     "full_info",
     "mp3_tag_editor",
     "video_renamer",
@@ -105,7 +104,9 @@ class SettingsPanelTriggerTests(unittest.TestCase):
         main = _callbacks(MediaMenuBuilder.get_main_menu("video"))
         self.assertIn("menu_audio", main)
         self.assertIn("menu_video", main)
-        self.assertIn("menu_advanced", main)
+        # Advanced Tools is gone: its one action (Repair) lives in Video Tools now.
+        self.assertNotIn("menu_advanced", main)
+        self.assertIn("repair_video", _callbacks(MediaMenuBuilder.get_video_tools_menu()))
         self.assertIn("mp3_tag_editor", _callbacks(MediaMenuBuilder.get_audio_tools_menu()))
 
     def test_the_panel_is_rendered_from_settings_alone(self):
@@ -302,8 +303,13 @@ class SettingsBitratePickerTests(unittest.TestCase):
         from utils.callbacks import SETTINGS_BITRATE_PREFIX
 
         rendered = _callbacks(MediaMenuBuilder.get_settings_bitrate_menu("128k"))
-        self.assertEqual(rendered[-1], "settings_page:2")
-        for callback_data in rendered[:-1]:
+        # The nav row closes the picker: Back to its page and a Cancel. Every
+        # other button only stores a value.
+        self.assertIn("settings_page:2", rendered)
+        self.assertIn("cancel", rendered)
+        for callback_data in rendered:
+            if callback_data in ("settings_page:2", "cancel"):
+                continue
             self.assertTrue(callback_data.startswith(SETTINGS_BITRATE_PREFIX), callback_data)
 
 

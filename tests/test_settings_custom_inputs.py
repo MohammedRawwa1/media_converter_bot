@@ -94,6 +94,11 @@ class _StubHandler:
     async def _ensure_current_file_downloaded(self, update, context, session):
         return None
 
+    async def _deliver_inline_result(self, *args, **kwargs):
+        # The real shared delivery, bound to the stub: the send a conversion's
+        # result takes (and with it the size tier) is the behaviour under test.
+        return await Handler._deliver_inline_result(self, *args, **kwargs)
+
     async def _send_video_result(self, bot, chat_id, file_path, caption="", **delivery_options):
         # Mirrors the real helper's signature, which also takes the delivered
         # name and the user's media/document preference.
@@ -162,7 +167,13 @@ class TrimHelperTests(unittest.TestCase):
 
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
-        self.output_patch = patch.object(handlers_module, "config", SimpleNamespace(OUTPUT_PATH=self.tmp.name))
+        # The config the shared delivery reads its ceiling from; a stub with only
+        # OUTPUT_PATH would make the tier untestable rather than untested.
+        self.output_patch = patch.object(
+            handlers_module,
+            "config",
+            SimpleNamespace(OUTPUT_PATH=self.tmp.name, BOT_API_MAX_BYTES=50 * 1024**2, BOT_API_MAX_MB=50),
+        )
         self.output_patch.start()
 
     def tearDown(self):

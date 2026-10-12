@@ -109,7 +109,10 @@ class MediaRenamerWiringTests(unittest.TestCase):
 
     def test_the_prompt_is_rendered_as_html(self):
         src = read_source("handlers.py")
-        self.assertIn('await self.safe_edit(query, _rename_prompt_text(current_file), parse_mode="HTML")', src)
+        window = src[src.index("_rename_prompt_text(current_file)") :][:400]
+        self.assertIn('parse_mode="HTML"', window)
+        # The prompt carries a way out too, so a rename can be abandoned.
+        self.assertIn("reply_markup=MediaMenuBuilder.get_back_button()", window)
 
 
 if __name__ == "__main__":

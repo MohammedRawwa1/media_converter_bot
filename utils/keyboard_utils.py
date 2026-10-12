@@ -37,7 +37,8 @@ from .callbacks import (
     COMPRESS_QUALITY_KEY,
     COMPRESS_QUALITY_LABELS,
     CONFIRM,
-    CONVERT_FORMAT_MENU,
+    CONVERT_TO_FILE,
+    CONVERT_TO_VIDEO,
     CREATE_ARCHIVE,
     EDIT_METADATA,
     EXTRACT_MENU,
@@ -48,11 +49,11 @@ from .callbacks import (
     INFO,
     MANUAL_SHOTS,
     MEDIA_FORWARDER,
-    MENU_ADVANCED,
     MENU_AUDIO,
     MENU_MAIN,
     MENU_VIDEO,
     MERGE_ADD,
+    MERGE_AUDIOS_START,
     MERGE_CLEAR,
     MERGE_MENU,
     MERGE_VIDEOS_START,
@@ -63,6 +64,7 @@ from .callbacks import (
     OPTIMIZE_MENU,
     OPTIMIZE_PRESET_KEY,
     REMOVE_AUDIO,
+    REPAIR_VIDEO,
     RESOLUTION_MENU,
     SCREENSHOTS_MENU,
     SETTINGS_ARCHIVE_PART_MENU,
@@ -79,7 +81,6 @@ from .callbacks import (
     STREAM_REMOVER,
     SUBTITLE_MERGER,
     THUMBNAIL_EXTRACTOR,
-    THUMBNAIL_GRID,
     TRIM_AUDIO,
     TRIM_VIDEO,
     TRIMMER_1,
@@ -88,6 +89,7 @@ from .callbacks import (
     UPLOAD_MODE_LABELS,
     UPLOAD_MODE_VIDEO,
     VIDEO_RENAMER,
+    VIDEO_REORDER,
     VIDEO_TO_AUDIO,
     VIDEOS_SPLITTER,
     archive_part_key,
@@ -161,6 +163,28 @@ def _custom_bitrate_button(
     return InlineKeyboardButton(mark, callback_data=callback_data)
 
 
+#: How many items the Video Reorder panel shows at once: a numbered name with a
+#: pair of arrows beside it, five to a page, is one screen without scrolling.
+REORDER_PER_PAGE = 5
+
+
+def _nav_row(back=MENU_MAIN, cancel=CANCEL) -> list[InlineKeyboardButton]:
+    """The row a panel closes with: Back to its parent, and a Cancel.
+
+    Cancel is the promise that a half-started flow can be dropped in one tap -
+    the pending input is cleared and the loaded media left untouched - so it sits
+    on every panel, next to Back rather than instead of it. The main menu has no
+    parent to go back to and carries its own Cancel already.
+
+    ``cancel`` is the archive flow's own trigger where a panel is part of it: a
+    generic Cancel there would clear the prompts but leave the staged archive.
+    """
+    return [
+        InlineKeyboardButton("↩️ Back", callback_data=back),
+        InlineKeyboardButton("❌ Cancel", callback_data=cancel),
+    ]
+
+
 class MediaMenuBuilder:
     """Builds interactive keyboards for media conversion options."""
 
@@ -217,7 +241,6 @@ class MediaMenuBuilder:
             # button: they all act on the loaded media, and /usersettings must
             # stay a preferences panel that never starts a conversion.
             row("🎧 Audio Tools", MENU_AUDIO, "🎬 Video Tools", MENU_VIDEO),
-            [InlineKeyboardButton("🔧 Advanced Tools", callback_data=MENU_ADVANCED)],
             # Single-button rows for create/archive and final cancel button
             [InlineKeyboardButton("📦 Create Archive", callback_data=CREATE_ARCHIVE)],
             # Add quick access to bulk actions
@@ -248,7 +271,7 @@ class MediaMenuBuilder:
                 InlineKeyboardButton("WEBM", callback_data="format_webm"),
                 InlineKeyboardButton("FLV", callback_data="format_flv"),
             ],
-            [InlineKeyboardButton("↩️ Back", callback_data=MENU_MAIN)],
+            _nav_row(MENU_MAIN),
         ]
         return InlineKeyboardMarkup(buttons)
 
@@ -269,7 +292,7 @@ class MediaMenuBuilder:
         buttons = [
             [_quality(BULK_CRF_CHOICES[0]), _quality(BULK_CRF_CHOICES[1])],
             [_quality(BULK_CRF_CHOICES[2]), _quality(BULK_CRF_CHOICES[3])],
-            [InlineKeyboardButton("↩️ Back", callback_data="menu_main")],
+            _nav_row("menu_main"),
         ]
         return InlineKeyboardMarkup(buttons)
 
@@ -295,7 +318,7 @@ class MediaMenuBuilder:
                 InlineKeyboardButton("360p (640x360)", callback_data="res_640_360"),
                 InlineKeyboardButton("Custom", callback_data="res_custom"),
             ],
-            [InlineKeyboardButton("↩️ Back", callback_data="menu_main")],
+            _nav_row("menu_main"),
         ]
         return InlineKeyboardMarkup(buttons)
 
@@ -315,7 +338,7 @@ class MediaMenuBuilder:
                 InlineKeyboardButton("OGG", callback_data="audio_ogg"),
                 InlineKeyboardButton("M4A", callback_data="audio_m4a"),
             ],
-            [InlineKeyboardButton("↩️ Back", callback_data=MENU_MAIN)],
+            _nav_row(MENU_MAIN),
         ]
         return InlineKeyboardMarkup(buttons)
 
@@ -369,7 +392,7 @@ class MediaMenuBuilder:
                 ],
             ]
 
-        buttons.append([InlineKeyboardButton("↩️ Back", callback_data=MENU_MAIN)])
+        buttons.append(_nav_row(MENU_MAIN))
         return InlineKeyboardMarkup(buttons)
 
     @staticmethod
@@ -389,7 +412,7 @@ class MediaMenuBuilder:
         rows = [MP3_QUALITY_CHOICES[i : i + 2] for i in range(0, len(MP3_QUALITY_CHOICES), 2)]
         buttons = [[InlineKeyboardButton(_label(v), callback_data=mp3_quality_key(v)) for v in row] for row in rows]
         buttons.append([_custom_bitrate_button(current, mp3_quality_key("custom"))])
-        buttons.append([InlineKeyboardButton("↩️ Back", callback_data=MENU_MAIN)])
+        buttons.append(_nav_row(MENU_MAIN))
         return InlineKeyboardMarkup(buttons)
 
     @staticmethod
@@ -408,7 +431,7 @@ class MediaMenuBuilder:
                 InlineKeyboardButton("🖼️ Grid (3x3)", callback_data="screenshot_grid_3"),
                 InlineKeyboardButton("🖼️ Grid (4x4)", callback_data="screenshot_grid_4"),
             ],
-            [InlineKeyboardButton("↩️ Back", callback_data=MENU_MAIN)],
+            _nav_row(MENU_MAIN),
         ]
         return InlineKeyboardMarkup(buttons)
 
@@ -418,7 +441,7 @@ class MediaMenuBuilder:
         buttons = [
             [InlineKeyboardButton("Trimmer 1: Start -> End", callback_data=TRIMMER_1)],
             [InlineKeyboardButton("Trimmer 2: Start + Duration", callback_data=TRIMMER_2)],
-            [InlineKeyboardButton("↩️ Back", callback_data=MENU_MAIN)],
+            _nav_row(MENU_MAIN),
         ]
         return InlineKeyboardMarkup(buttons)
 
@@ -443,8 +466,11 @@ class MediaMenuBuilder:
             ("Optimize", "bulk_optimize"),
             # Burns a subtitle into every queued video. Turning it on asks for the
             # .srt files first; Apply Bulk then runs them one video at a time
-            # instead of the worker-job plan the other toggles share.
-            ("Batch Subtitles", "bulk_subtitles"),
+            # instead of the worker-job plan the other toggles share. The label
+            # says "mode" because the row below is what sends the files - the two
+            # rows used to both read "Batch Subtitles", which looked like two
+            # buttons for one operation while they do different halves of it.
+            ("Batch Subtitles Mode", "bulk_subtitles"),
         ]
 
         buttons = []
@@ -483,14 +509,17 @@ class MediaMenuBuilder:
         )
 
         # Batch subtitles: its own flow, because it needs the .srt files before it
-        # can run - the button asks for them, then merges one video at a time.
-        buttons.append([InlineKeyboardButton("📝 Batch Subtitles", callback_data="bulk_subtitles")])
+        # can run - the button asks for them, then merges one video at a time. The
+        # label names that half of the job, so it cannot be mistaken for the mode
+        # toggle above it (which turns the same flow on and off).
+        buttons.append([InlineKeyboardButton("📂 Send Subtitle Files", callback_data="bulk_subtitles")])
 
-        # actions: apply, clear the collected batch, and back
+        # actions: apply the collected batch, go back, or abandon it
         buttons.append(
             [
                 InlineKeyboardButton("▶️ Apply Bulk", callback_data="bulk_apply"),
                 InlineKeyboardButton("↩️ Back", callback_data=MENU_MAIN),
+                InlineKeyboardButton("❌ Cancel", callback_data=CANCEL),
             ]
         )
         # Forwarding the batch costs nothing to add here: it is the same cover
@@ -522,7 +551,7 @@ class MediaMenuBuilder:
             [_quality(BULK_CRF_CHOICES[0]), _quality(BULK_CRF_CHOICES[1])],
             [_quality(BULK_CRF_CHOICES[2]), _quality(BULK_CRF_CHOICES[3])],
             [InlineKeyboardButton("✏️ Custom CRF", callback_data=bulk_crf_key("custom"))],
-            [InlineKeyboardButton("↩️ Back", callback_data="bulk_menu")],
+            _nav_row("bulk_menu"),
         ]
         return InlineKeyboardMarkup(buttons)
 
@@ -541,7 +570,7 @@ class MediaMenuBuilder:
         rows = [MP3_QUALITY_CHOICES[i : i + 2] for i in range(0, len(MP3_QUALITY_CHOICES), 2)]
         buttons = [[InlineKeyboardButton(_label(v), callback_data=bulk_bitrate_key(v)) for v in row] for row in rows]
         buttons.append([_custom_bitrate_button(current, bulk_bitrate_key("custom"))])
-        buttons.append([InlineKeyboardButton("↩️ Back", callback_data="bulk_menu")])
+        buttons.append(_nav_row("bulk_menu"))
         return InlineKeyboardMarkup(buttons)
 
     @staticmethod
@@ -559,7 +588,7 @@ class MediaMenuBuilder:
         buttons = [
             [_preset("web"), _preset("mobile")],
             [_preset("tv"), _preset("storage")],
-            [InlineKeyboardButton("↩️ Back", callback_data="bulk_menu")],
+            _nav_row("bulk_menu"),
         ]
         return InlineKeyboardMarkup(buttons)
 
@@ -577,22 +606,35 @@ class MediaMenuBuilder:
 
         rows = [BULK_SLIDESHOW_CHOICES[i : i + 3] for i in range(0, len(BULK_SLIDESHOW_CHOICES), 3)]
         buttons = [[_choice(v) for v in row] for row in rows]
-        buttons.append([InlineKeyboardButton("↩️ Back", callback_data="bulk_menu")])
+        buttons.append(_nav_row("bulk_menu"))
         return InlineKeyboardMarkup(buttons)
 
     @staticmethod
     def get_merge_menu(media_type: str = "video") -> InlineKeyboardMarkup:
-        """Get merge options menu."""
+        """Get merge options menu, with the start trigger of the kind it is for.
+
+        An audio merge and a video merge are two different jobs - one writes MP3
+        and one writes MP4 - so the start button has to name the one this menu was
+        opened for. It always sent ``merge_videos_start``, which is why the Audio
+        Tools' 🔀 Merge could only ever report "Need at least 2 videos", and why
+        the audio merge (``merge_audios_start``) sat handled at the dispatcher and
+        offered by no keyboard at all.
+        """
+        is_audio = str(media_type or "").lower() == "audio"
         buttons = [
             [
+                # Both merges read the same collected list, so collecting stays
+                # the same button; only the start differs.
                 InlineKeyboardButton("➕ Add File", callback_data=MERGE_ADD),
                 InlineKeyboardButton("👀 View List", callback_data=MERGE_VIEW),
             ],
             [
-                InlineKeyboardButton("▶️ Start Merge", callback_data=MERGE_VIDEOS_START),
+                InlineKeyboardButton(
+                    "▶️ Start Merge", callback_data=MERGE_AUDIOS_START if is_audio else MERGE_VIDEOS_START
+                ),
                 InlineKeyboardButton("🗑️ Clear List", callback_data=MERGE_CLEAR),
             ],
-            [InlineKeyboardButton("↩️ Back", callback_data=MENU_MAIN)],
+            _nav_row(MENU_MAIN),
         ]
         return InlineKeyboardMarkup(buttons)
 
@@ -617,7 +659,7 @@ class MediaMenuBuilder:
                 InlineKeyboardButton("🔄 Merge + Convert\nremux to your format", callback_data="merge_convert"),
             ],
             [InlineKeyboardButton("➕ Add Files", callback_data=MERGE_MENU)],
-            [InlineKeyboardButton("↩️ Back", callback_data=MENU_MAIN)],
+            _nav_row(MENU_MAIN),
         ]
         return InlineKeyboardMarkup(buttons)
 
@@ -636,7 +678,7 @@ class MediaMenuBuilder:
             [_preset("web"), _preset("mobile")],
             [_preset("tv"), _preset("storage")],
             [InlineKeyboardButton("🔧 Custom", callback_data="optimize_custom")],
-            [InlineKeyboardButton("↩️ Back", callback_data=MENU_MAIN)],
+            _nav_row(MENU_MAIN),
         ]
         return InlineKeyboardMarkup(buttons)
 
@@ -652,41 +694,48 @@ class MediaMenuBuilder:
                 InlineKeyboardButton("📝 Subtitles", callback_data="extract_subtitles"),
                 InlineKeyboardButton("📦 All Streams", callback_data="extract_all"),
             ],
-            [InlineKeyboardButton("↩️ Back", callback_data=MENU_MAIN)],
+            _nav_row(MENU_MAIN),
         ]
         return InlineKeyboardMarkup(buttons)
 
     @staticmethod
     def get_video_tools_menu() -> InlineKeyboardMarkup:
-        """Get video tools menu."""
+        """The video tools the main menu does not already carry.
+
+        Every action has one home: the main menu is the context menu and offers
+        the video actions it acts on directly (Convert Format, Compress, Trim,
+        Remove Audio, Screenshots, ...), so none of them is repeated here. What
+        this panel adds is the rest of the video toolbox - the container pickers,
+        resolution and framerate, the merge variants, adding a soundtrack, stream
+        extraction, a repair, and reordering the collected queue before a merge.
+        """
         buttons = [
             [
-                InlineKeyboardButton("🎬 Convert Format", callback_data=CONVERT_FORMAT_MENU),
-                InlineKeyboardButton("📉 Compress", callback_data=COMPRESS_MENU),
-            ],
-            [
-                InlineKeyboardButton("🔄 Convert To Video", callback_data="convert_to_video"),
-                InlineKeyboardButton("🔄 Convert To File", callback_data="convert_to_file"),
+                InlineKeyboardButton("🔄 Convert To Video", callback_data=CONVERT_TO_VIDEO),
+                InlineKeyboardButton("🔄 Convert To File", callback_data=CONVERT_TO_FILE),
             ],
             [
                 InlineKeyboardButton("📐 Resolution", callback_data=RESOLUTION_MENU),
                 InlineKeyboardButton("⏱️ Framerate", callback_data="framerate_menu"),
             ],
+            # Opens the merge variants: a plain merge, and the merge-and-X
+            # combinations. The plain merge on the main menu collects the files;
+            # these finish them, so together they are one flow rather than two.
+            [InlineKeyboardButton("🔀 Merge", callback_data="merge_options")],
             [
-                InlineKeyboardButton("✂️ Trim", callback_data=TRIM_VIDEO),
-                # Opens the merge variants: a plain merge, and the merge-and-X
-                # combinations. Pressing it used to run a merge straight away,
-                # which could only ever answer "need at least 2 videos".
-                InlineKeyboardButton("🔀 Merge", callback_data="merge_options"),
-            ],
-            [
-                InlineKeyboardButton("🎧 Remove Audio", callback_data=REMOVE_AUDIO),
                 InlineKeyboardButton("🔉 Add Audio", callback_data=ADD_AUDIO),
+                # Opens the extraction picker: Audio Only / Video Only /
+                # Subtitles / All Streams.
+                InlineKeyboardButton("🗂️ Extract Streams", callback_data=EXTRACT_MENU),
             ],
-            # Opens the extraction picker: Audio Only / Video Only /
-            # Subtitles / All Streams.
-            [InlineKeyboardButton("🗂️ Extract Streams", callback_data=EXTRACT_MENU)],
-            [InlineKeyboardButton("↩️ Back", callback_data=MENU_MAIN)],
+            # Repair and reorder are video jobs with no home on the main menu: a
+            # repair rewrites the container of a broken video, and a reorder sets
+            # the order the collected files will be merged in.
+            [
+                InlineKeyboardButton("🔧 Repair", callback_data=REPAIR_VIDEO),
+                InlineKeyboardButton("🔁 Video Reorder", callback_data=VIDEO_REORDER),
+            ],
+            _nav_row(MENU_MAIN),
         ]
         return InlineKeyboardMarkup(buttons)
 
@@ -713,25 +762,51 @@ class MediaMenuBuilder:
             # Renaming is not a video action: an audio file's delivered name is
             # exactly as worth setting, so the button is reachable from here too.
             [InlineKeyboardButton("✏️ Media Renamer", callback_data=VIDEO_RENAMER)],
-            [InlineKeyboardButton("↩️ Back", callback_data=MENU_MAIN)],
+            _nav_row(MENU_MAIN),
         ]
         return InlineKeyboardMarkup(buttons)
 
     @staticmethod
-    def get_advanced_tools_menu() -> InlineKeyboardMarkup:
-        """Get advanced tools menu."""
-        buttons = [
-            [
-                InlineKeyboardButton("📦 Create Archive", callback_data="create_archive"),
-                InlineKeyboardButton("🔧 Repair", callback_data="repair_video"),
-            ],
-            [
-                InlineKeyboardButton("📊 Media Info", callback_data=INFO),
-                InlineKeyboardButton("🖼️ Thumbnail", callback_data=THUMBNAIL_GRID),
-                InlineKeyboardButton("✏️ Metadata", callback_data=EDIT_METADATA),
-            ],
-            [InlineKeyboardButton("↩️ Back", callback_data=MENU_MAIN)],
-        ]
+    def get_reorder_menu(items=None, page: int = 1) -> InlineKeyboardMarkup:
+        """The collected queue, with an up/down pair per item.
+
+        A merge plays the collected list in order, so the panel that shows it is
+        where the order is set: up and down move one place, and the panel is drawn
+        again from the live list, so the numbering on screen is the order a merge
+        will use - there is no second copy of the order that could drift from it.
+        """
+        items = list(items or [])
+        total = len(items)
+        last_page = max(1, (total + REORDER_PER_PAGE - 1) // REORDER_PER_PAGE)
+        try:
+            page = int(page)
+        except (TypeError, ValueError):
+            page = 1
+        page = max(1, min(page, last_page))
+        start = (page - 1) * REORDER_PER_PAGE
+        window = items[start : start + REORDER_PER_PAGE]
+
+        buttons: list[list[InlineKeyboardButton]] = []
+        for offset in range(len(window)):
+            index = start + offset
+            row = []
+            if index > 0:
+                # The number in the label is part of it: two arrows with the same
+                # text would read as one button doing two things.
+                row.append(InlineKeyboardButton(f"⬆️ {index + 1}", callback_data=f"reorder_up:{index}"))
+            if index < total - 1:
+                row.append(InlineKeyboardButton(f"⬇️ {index + 1}", callback_data=f"reorder_down:{index}"))
+            if row:
+                buttons.append(row)
+
+        nav = []
+        if page > 1:
+            nav.append(InlineKeyboardButton("⬅️ Prev", callback_data=f"reorder_page:{page - 1}"))
+        if page < last_page:
+            nav.append(InlineKeyboardButton("Next ➡️", callback_data=f"reorder_page:{page + 1}"))
+        if nav:
+            buttons.append(nav)
+        buttons.append(_nav_row(MENU_VIDEO))
         return InlineKeyboardMarkup(buttons)
 
     @staticmethod
@@ -745,7 +820,7 @@ class MediaMenuBuilder:
             [
                 InlineKeyboardButton("🔊 Both", callback_data=FADE_BOTH),
             ],
-            [InlineKeyboardButton("↩️ Back", callback_data=MENU_MAIN)],
+            _nav_row(MENU_MAIN),
         ]
         return InlineKeyboardMarkup(buttons)
 
@@ -827,13 +902,13 @@ class MediaMenuBuilder:
             ]
         )
         buttons.append([InlineKeyboardButton("✏️ Custom (size or parts)", callback_data=archive_part_key("custom"))])
-        buttons.append([InlineKeyboardButton("↩️ Back", callback_data=ARCHIVE_PART_BACK)])
+        buttons.append(_nav_row(ARCHIVE_PART_BACK, cancel=ARCHIVE_CANCEL))
         return InlineKeyboardMarkup(buttons)
 
     @staticmethod
     def get_back_button() -> InlineKeyboardMarkup:
         """Get simple back button."""
-        buttons = [[InlineKeyboardButton("🔙 Back", callback_data=MENU_MAIN)]]
+        buttons = [_nav_row()]
         return InlineKeyboardMarkup(buttons)
 
     # ── /usersettings ────────────────────────────────────────────────────────
@@ -927,7 +1002,7 @@ class MediaMenuBuilder:
         buttons.append(
             [
                 InlineKeyboardButton("♻️ Reset Settings", callback_data="reset_settings"),
-                InlineKeyboardButton("✖️ Close", callback_data=MENU_MAIN),
+                InlineKeyboardButton("❌ Cancel", callback_data=CANCEL),
             ]
         )
         return InlineKeyboardMarkup(buttons)
@@ -952,7 +1027,7 @@ class MediaMenuBuilder:
             [_quality(BULK_CRF_CHOICES[0]), _quality(BULK_CRF_CHOICES[1])],
             [_quality(BULK_CRF_CHOICES[2]), _quality(BULK_CRF_CHOICES[3])],
             [InlineKeyboardButton("✏️ Custom quality", callback_data=settings_quality_key("custom"))],
-            [InlineKeyboardButton("↩️ Back", callback_data=settings_page_key(2))],
+            _nav_row(settings_page_key(2)),
         ]
         return InlineKeyboardMarkup(buttons)
 
@@ -972,7 +1047,7 @@ class MediaMenuBuilder:
         rows = [BULK_SLIDESHOW_CHOICES[i : i + 3] for i in range(0, len(BULK_SLIDESHOW_CHOICES), 3)]
         buttons = [[_choice(v) for v in row] for row in rows]
         buttons.append([InlineKeyboardButton("✏️ Custom", callback_data=settings_slideshow_key("custom"))])
-        buttons.append([InlineKeyboardButton("↩️ Back", callback_data=settings_page_key(3))])
+        buttons.append(_nav_row(settings_page_key(3)))
         return InlineKeyboardMarkup(buttons)
 
     @staticmethod
@@ -988,7 +1063,7 @@ class MediaMenuBuilder:
             [InlineKeyboardButton(_label(v), callback_data=settings_bulk_bitrate_key(v)) for v in row] for row in rows
         ]
         buttons.append([InlineKeyboardButton("✏️ Custom bitrate", callback_data=settings_bulk_bitrate_key("custom"))])
-        buttons.append([InlineKeyboardButton("↩️ Back", callback_data=settings_page_key(3))])
+        buttons.append(_nav_row(settings_page_key(3)))
         return InlineKeyboardMarkup(buttons)
 
     @staticmethod
@@ -1029,7 +1104,7 @@ class MediaMenuBuilder:
         buttons.append(
             [InlineKeyboardButton("✏️ Custom (size or parts)", callback_data=settings_archive_part_key("custom"))]
         )
-        buttons.append([InlineKeyboardButton("↩️ Back", callback_data=settings_page_key(3))])
+        buttons.append(_nav_row(settings_page_key(3)))
         return InlineKeyboardMarkup(buttons)
 
     @staticmethod
@@ -1048,7 +1123,7 @@ class MediaMenuBuilder:
         buttons = [
             [_preset("web"), _preset("mobile")],
             [_preset("tv"), _preset("storage")],
-            [InlineKeyboardButton("↩️ Back", callback_data=settings_page_key(2))],
+            _nav_row(settings_page_key(2)),
         ]
         return InlineKeyboardMarkup(buttons)
 
@@ -1069,7 +1144,7 @@ class MediaMenuBuilder:
             [InlineKeyboardButton(_label(v), callback_data=settings_bitrate_key(v)) for v in row] for row in rows
         ]
         buttons.append([_custom_bitrate_button(current, settings_bitrate_key("custom"))])
-        buttons.append([InlineKeyboardButton("↩️ Back", callback_data="settings_page:2")])
+        buttons.append(_nav_row("settings_page:2"))
         return InlineKeyboardMarkup(buttons)
 
     @staticmethod
@@ -1082,7 +1157,7 @@ class MediaMenuBuilder:
             [InlineKeyboardButton(f"Prefix: {prefix or '(none)'}", callback_data="settings_set_prefix")],
             [InlineKeyboardButton(f"Suffix: {suffix or '(none)'}", callback_data="settings_set_suffix")],
             [InlineKeyboardButton("🗑️ Clear Both", callback_data="settings_clear_rename")],
-            [InlineKeyboardButton("↩️ Back", callback_data="settings_page:1")],
+            _nav_row("settings_page:1"),
         ]
         return InlineKeyboardMarkup(buttons)
 

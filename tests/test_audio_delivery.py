@@ -482,7 +482,8 @@ class BulkQualityMenuTests(unittest.TestCase):
         rendered = self._buttons(MediaMenuBuilder.get_bulk_bitrate_menu("128k"))
         self.assertTrue(rendered, "expected the bitrate picker to render buttons")
         for callback_data in rendered:
-            if callback_data == "bulk_menu":
+            # The nav row closes the picker; every other button stores a value.
+            if callback_data in ("bulk_menu", "cancel"):
                 continue
             self.assertTrue(callback_data.startswith("bulk_set_bitrate:"), callback_data)
             self.assertFalse(callback_data.startswith(MP3_QUALITY_PREFIX))
@@ -1476,7 +1477,8 @@ class MenuTriggerCoverageTests(unittest.TestCase):
         ("get_extraction_menu()", lambda b: b.get_extraction_menu()),
         ("get_video_tools_menu()", lambda b: b.get_video_tools_menu()),
         ("get_audio_tools_menu()", lambda b: b.get_audio_tools_menu()),
-        ("get_advanced_tools_menu()", lambda b: b.get_advanced_tools_menu()),
+        ("get_reorder_menu()", lambda b: b.get_reorder_menu()),
+        ('get_reorder_menu(("a", "b", "c"))', lambda b: b.get_reorder_menu(("a", "b", "c"))),
         ("get_fade_menu()", lambda b: b.get_fade_menu()),
         ("get_confirm_menu()", lambda b: b.get_confirm_menu()),
         ("get_back_button()", lambda b: b.get_back_button()),
