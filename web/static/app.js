@@ -97,6 +97,41 @@ const eventSources = {}
 const wsConnections = {}
 const jobTokens = {}
 
+// A Telegram progress button opens the Web UI with a per-job capability.
+// Validate it before attaching so malformed or stale links never start a
+// stream, then remove the capability from browser history.
+async function attachTrackedJob(){
+  const params = new URLSearchParams(location.search)
+  const jobId = params.get('track')
+  const jobToken = params.get('job_token')
+  if (!jobId || !jobToken || !/^[A-Za-z0-9_-]+$/.test(jobId)) return
+
+  jobTokens[jobId] = jobToken
+  try{
+    const res = await fetch(appendToken(`/status/${jobId}`, jobId))
+    if (!res.ok) {
+      delete jobTokens[jobId]
+      showTrackingError('This progress link is invalid or the job is no longer available.')
+      return
+    }
+    const status = await res.json()
+    history.replaceState(null, '', location.pathname)
+    addJobCard(jobId, `Telegram job ${jobId.slice(0, 8)}`, Number(status.in_bytes) || 0)
+  }catch(err){
+    delete jobTokens[jobId]
+    showTrackingError('Could not connect to the job progress service. Try opening the progress link again.')
+  }
+}
+
+function showTrackingError(message){
+  const notice = document.createElement('div')
+  notice.className = 'job'
+  notice.textContent = message
+  jobsDiv.prepend(notice)
+}
+
+attachTrackedJob()
+
 function initWebSocket(jobId){
   // Returns true if a websocket connection attempt was started.
   if (!window.WebSocket) return false

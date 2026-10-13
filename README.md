@@ -403,6 +403,8 @@ The dashboard is served with an inline keyboard. **🔄 Refresh** re-collects ev
 
 For Railway's 1 GB box the shipped `.env.example` is tuned to: `MAX_CONCURRENT_FFMPEG=1`, `JOB_MAX_SECONDS=3600`, `BATCH_LOCK_TTL_SECONDS` empty (it inherits `JOB_MAX_SECONDS`, so a slot can never expire mid-job), `WORKER_MEMORY_CEILING_BYTES=805306368` and `WORKER_RESTART_AFTER_JOB_BYTES=805306368` (~75% of the container). Production `numReplicas` is `1` for both the worker and the bot host.
 
+Slow inline conversion and merge actions start a Telegram status message and a capability-protected Web UI tracker after `INLINE_PROGRESS_START_SECONDS` (default `12`). The heartbeat refreshes every `INLINE_PROGRESS_INTERVAL_SECONDS` (default `5`) and reports elapsed time; worker-queued FFmpeg jobs continue to report their actual encode percentage. Inline operations are cancelled at `INLINE_OPERATION_MAX_SECONDS` (default `7200`), and successful tracked operations delete the tracker and the message that started the action.
+
 ---
 
 ## 🔧 Environment Variables

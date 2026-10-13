@@ -2512,14 +2512,20 @@ class EnhancedMediaHandler:
                                     web_base = web_base[: -len(suf)]
                                     break
                             web_base = web_base.rstrip("/")
-                            # The status route is authorized by the job's own
-                            # capability (utils/job_access.py), so the link has to
-                            # carry it — the job id alone is not a credential.
+                            # The Web UI can attach to an existing job when it
+                            # receives that job's capability. The job id alone
+                            # is not a credential.
+                            from urllib.parse import urlencode
+
                             from utils.job_access import JOB_CAPABILITY_PARAM, issue_job_token
 
                             _capability = await issue_job_token(job_id)
-                            status_url = f"{web_base}/status/{job_id}?{JOB_CAPABILITY_PARAM}={_capability}"
+                            if _capability:
+                                status_url = (
+                                    f"{web_base}/?{urlencode({'track': job_id, JOB_CAPABILITY_PARAM: _capability})}"
+                                )
                     except Exception:
+                        logger.exception("_watch_job_progress could not create Web UI link for job %s", job_id)
                         status_url = None
 
                     if status_url:
@@ -2595,6 +2601,7 @@ class EnhancedMediaHandler:
                                         display_output = presigned
                                 except Exception:
                                     logger.debug("handlers: operation failed")
+
                     except Exception:
                         logger.debug("handlers: operation failed")
 
@@ -2800,6 +2807,179 @@ class EnhancedMediaHandler:
                 logger.debug("handlers: operation failed")
         except Exception:
             logger.exception("_watch_job_progress failed for %s", job_id)
+
+    async def _watch_inline_callback_progress(
+        self,
+        update,
+        context,
+        callback_data: str,
+        operation_task: asyncio.Task,
+        finished: asyncio.Event,
+        outcome: dict,
+    ) -> None:
+        """Publish elapsed-time heartbeats for slow callback work, not quick clicks."""
+        threshold = max(1.0, float(os.getenv("INLINE_PROGRESS_START_SECONDS", "12")))
+        interval = max(1.0, float(os.getenv("INLINE_PROGRESS_INTERVAL_SECONDS", "5")))
+        max_runtime = max(60.0, float(os.getenv("INLINE_OPERATION_MAX_SECONDS", "7200")))
+        started = time.monotonic()
+        job_id = uuid.uuid4().hex
+        key = f"ffmpeg:job:{job_id}"
+        channel = f"ffmpeg:progress:{job_id}"
+        redis = None
+        progress_message = None
+
+        try:
+            try:
+                await asyncio.wait_for(finished.wait(), timeout=threshold)
+                return
+            except TimeoutError:
+                pass
+
+            if finished.is_set():
+                return
+
+            from utils.job_queue import get_redis
+
+            redis = await get_redis()
+            label = callback_data.replace("_", " ").title()
+            initial = {
+                "status": "processing",
+                "progress": "0",
+                "message": f"{label} is running",
+                "started_at": str(time.time()),
+                "progress_channel": channel,
+            }
+            initial["job_id"] = job_id
+            await redis.hset(key, mapping=initial)
+            await redis.expire(key, 86400)
+
+            from urllib.parse import urlencode
+
+            from utils.job_access import JOB_CAPABILITY_PARAM, issue_job_token
+
+            capability = await issue_job_token(job_id)
+            web_base = getattr(config, "WEB_UPLOAD_URL", None) or getattr(config, "WEBAPP_URL", None)
+            buttons = []
+            if web_base and capability:
+                url = f"{str(web_base).rstrip('/')}/?{urlencode({'track': job_id, JOB_CAPABILITY_PARAM: capability})}"
+                buttons.append(InlineKeyboardButton("📊 Progress", url=url))
+            buttons.append(InlineKeyboardButton("❌ Cancel", callback_data=f"cancel_job:{job_id}"))
+            keyboard = InlineKeyboardMarkup([buttons])
+
+            chat = getattr(update, "effective_chat", None)
+            if chat is not None:
+                progress_message = await context.bot.send_message(
+                    chat_id=chat.id,
+                    text=f"⏳ {label} is still processing…",
+                    reply_markup=keyboard,
+                )
+
+            while not finished.is_set():
+                elapsed = int(time.monotonic() - started)
+                if elapsed >= max_runtime:
+                    outcome["status"] = "error"
+                    outcome["message"] = f"Operation timed out after {elapsed}s; processing was stopped."
+                    operation_task.cancel()
+                    break
+
+                try:
+                    cancel = await redis.hget(key, "cancel")
+                    if cancel in (b"1", "1", 1):
+                        outcome["status"] = "cancelled"
+                        outcome["message"] = "Operation cancelled."
+                        operation_task.cancel()
+                        break
+                except Exception:
+                    logger.exception("Could not check inline operation cancellation for %s", job_id)
+
+                message = f"{label} is still processing · {elapsed}s elapsed"
+                await redis.hset(key, mapping={"status": "processing", "progress": "0", "message": message})
+                event = {"status": "processing", "progress": 0, "message": message}
+                event["job_id"] = job_id
+                await redis.publish(channel, json.dumps(event))
+                if progress_message is not None:
+                    with contextlib.suppress(Exception):
+                        await progress_message.edit_text(f"⏳ {message}", reply_markup=keyboard)
+                try:
+                    await asyncio.wait_for(finished.wait(), timeout=interval)
+                except TimeoutError:
+                    continue
+
+            status = outcome.get("status", "done")
+            terminal_message = outcome.get("message", "Operation finished")
+            await redis.hset(
+                key,
+                mapping={
+                    "status": status,
+                    "progress": "100" if status == "done" else "0",
+                    "message": terminal_message,
+                    "finished_at": str(time.time()),
+                },
+            )
+            event = {
+                "status": status,
+                "progress": 100 if status == "done" else 0,
+                "message": terminal_message,
+            }
+            event["job_id"] = job_id
+            await redis.publish(channel, json.dumps(event))
+            if status == "done":
+                source_message = getattr(getattr(update, "callback_query", None), "message", None)
+                if source_message is None:
+                    source_message = getattr(update, "message", None)
+                for message in (
+                    progress_message,
+                    source_message,
+                ):
+                    if message is not None:
+                        with contextlib.suppress(Exception):
+                            await message.delete()
+            elif progress_message is not None:
+                with contextlib.suppress(Exception):
+                    await progress_message.edit_text(f"⚠️ {terminal_message}")
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Inline callback progress tracker failed for %s", callback_data)
+        finally:
+            if redis is not None:
+                with contextlib.suppress(Exception):
+                    close = getattr(redis, "aclose", None)
+                    if close is not None:
+                        await close()
+                    else:
+                        await redis.close()
+
+    @staticmethod
+    def _callback_needs_inline_progress(callback_data: str) -> bool:
+        """Keep watchdogs off menus, remuxes and other normally quick actions."""
+        if callback_data in {
+            "convert_mp3",
+            "remove_audio",
+            "extract_audio",
+            "extract_video",
+            "extract_all_streams",
+            "extract_streams",
+            "compress_video",
+            "repair_video",
+            "merge_videos_start",
+            "merge_compress",
+            "merge_trim",
+            "merge_convert",
+            "merge_audios_start",
+            "merge_av_menu",
+            "normalize_audio",
+            "trim_start",
+            "trim_video",
+            "fade_in",
+            "fade_out",
+            "fade_both",
+            "add_subtitles",
+            "trim_audio",
+            "extract_subtitles",
+        }:
+            return True
+        return callback_data.startswith(("bitrate_", "vbitrate_", "format_", "res_", "framerate_", "compress_"))
 
     async def _watch_queued_message(self, query, context, job_id: str, queued_message, superseded=None) -> None:
         """Hand a queued job's own message to a watcher, whichever update queued it.
@@ -9657,6 +9837,25 @@ class EnhancedMediaHandler:
         # Remap data if an alias exists
         data = aliases.get(data, data)
 
+        _progress_finished = None
+        _progress_watch_task = None
+        _progress_outcome = None
+        if self._callback_needs_inline_progress(data):
+            _progress_finished = asyncio.Event()
+            _progress_outcome = {"status": "done", "message": "Operation finished"}
+            operation_task = asyncio.current_task()
+            if operation_task is not None:
+                _progress_watch_task = asyncio.create_task(
+                    self._watch_inline_callback_progress(
+                        update,
+                        context,
+                        data,
+                        operation_task,
+                        _progress_finished,
+                        _progress_outcome,
+                    )
+                )
+
         # Wrap handler dispatch in try/except to catch unexpected errors
         # Import canonical callback names for comparison when needed
         # canonical callback names (if ever needed) are provided by `utils.callbacks`.
@@ -12165,6 +12364,9 @@ class EnhancedMediaHandler:
             else:
                 await self.safe_edit(query, f"Unknown command: {data}")
         except Exception as e:
+            if _progress_outcome is not None:
+                _progress_outcome["status"] = "error"
+                _progress_outcome["message"] = "Operation failed."
             # Log unexpected exceptions along with callback metadata
             try:
                 await self._log_bad_callback(
@@ -12222,6 +12424,15 @@ class EnhancedMediaHandler:
                 logger.exception("Failed to notify user after callback_handler exception")
             return
         finally:
+            if _progress_finished is not None:
+                _progress_finished.set()
+            if _progress_watch_task is not None:
+                try:
+                    await asyncio.wait_for(_progress_watch_task, timeout=5)
+                except TimeoutError:
+                    _progress_watch_task.cancel()
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await _progress_watch_task
             # Whatever the branch did - delivered, queued a job, reported a
             # failure or returned early - the action this press claimed is free
             # again. Queued work is tracked by its own job, not by this marker.
@@ -15511,7 +15722,7 @@ class EnhancedMediaHandler:
         except Exception as e:
             logger.error(f"Failed to log to MongoDB: {e}")
 
-    async def handle_text_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+    async def _handle_text_message_impl(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Route a plain text message to whichever flow is waiting for it.
 
         Almost every inline "Custom"/"Enter …" button arms an ``awaiting_*`` flag
@@ -16437,3 +16648,54 @@ class EnhancedMediaHandler:
                 del context.user_data[key]
 
         return ConversationHandler.END
+
+    async def handle_text_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Track custom inputs that start potentially long media operations."""
+        heavy_inputs = (
+            "awaiting_framerate",
+            "awaiting_resolution",
+            "awaiting_custom_resolution",
+            "awaiting_bitrate",
+            "awaiting_video_bitrate",
+            "awaiting_merge_trim",
+            "awaiting_merge_convert",
+            "awaiting_trimmer",
+            "awaiting_trim",
+        )
+        pending = next((name for name in heavy_inputs if context.user_data.get(name)), None)
+        if pending is None:
+            return await self._handle_text_message_impl(update, context)
+
+        finished = asyncio.Event()
+        outcome = {"status": "done", "message": "Operation finished"}
+        operation_task = asyncio.current_task()
+        watcher = None
+        if operation_task is not None:
+            watcher = asyncio.create_task(
+                self._watch_inline_callback_progress(
+                    update,
+                    context,
+                    pending.removeprefix("awaiting_"),
+                    operation_task,
+                    finished,
+                    outcome,
+                )
+            )
+        try:
+            return await self._handle_text_message_impl(update, context)
+        except Exception:
+            outcome["status"] = "error"
+            outcome["message"] = "Operation failed."
+            raise
+        finally:
+            if operation_task is not None and operation_task.cancelling() and outcome["status"] == "done":
+                outcome["status"] = "cancelled"
+                outcome["message"] = "Operation cancelled."
+            finished.set()
+            if watcher is not None:
+                try:
+                    await asyncio.wait_for(watcher, timeout=5)
+                except TimeoutError:
+                    watcher.cancel()
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await watcher

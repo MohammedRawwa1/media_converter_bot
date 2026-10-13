@@ -92,7 +92,14 @@ class ExtendedMediaConverter:
                     *full_cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
                 )
 
-            _, stderr = await process.communicate()
+            try:
+                _, stderr = await process.communicate()
+            except asyncio.CancelledError:
+                if process.returncode is None:
+                    process.kill()
+                    with contextlib.suppress(Exception):
+                        await asyncio.wait_for(process.wait(), timeout=5)
+                raise
 
             if process.returncode == 0:
                 self.last_ffmpeg_failure = ""

@@ -13,6 +13,8 @@ reaches a terminal state.
 
 import ast
 import asyncio
+import json
+import os
 import unittest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
@@ -206,6 +208,93 @@ class PipelineJobWatchTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(ack.deleted)
         self.assertEqual(rec.watched, [])
 
+    async def test_slow_inline_callback_tracks_on_both_surfaces_and_deletes_both_messages(self):
+        handler, _ = _handler()
+        source_message = FakeMessage("processing")
+        query = SimpleNamespace(message=source_message)
+        update = _update(query=query)
+        tracked_messages = []
+
+        class Redis:
+            def __init__(self):
+                self.hashes = {}
+                self.events = []
+
+            async def hset(self, key, mapping):
+                self.hashes.setdefault(key, {}).update(mapping)
+
+            async def expire(self, *_args):
+                return True
+
+            async def publish(self, channel, value):
+                self.events.append((channel, json.loads(value)))
+
+            async def hget(self, *_args):
+                return None
+
+            async def aclose(self):
+                return None
+
+        redis = Redis()
+
+        class Bot:
+            async def send_message(self, **kwargs):
+                message = FakeMessage(kwargs["text"])
+                message.reply_markup = kwargs.get("reply_markup")
+                tracked_messages.append(message)
+                return message
+
+        finished = asyncio.Event()
+        with (
+            patch.dict(os.environ, {"INLINE_PROGRESS_START_SECONDS": "1"}),
+            patch("utils.job_queue.get_redis", AsyncMock(return_value=redis)),
+            patch("utils.job_access.issue_job_token", AsyncMock(return_value="capability")),
+            patch.object(handlers_module.config, "WEBAPP_URL", "https://example.test", create=True),
+        ):
+            watcher = asyncio.create_task(
+                handler._watch_inline_callback_progress(
+                    update,
+                    SimpleNamespace(bot=Bot()),
+                    "merge_audios_start",
+                    asyncio.current_task(),
+                    finished,
+                    {"status": "done", "message": "Operation finished"},
+                )
+            )
+            await asyncio.sleep(1.05)
+            finished.set()
+            await watcher
+
+        self.assertEqual(len(tracked_messages), 1)
+        self.assertTrue(tracked_messages[0].deleted)
+        self.assertTrue(source_message.deleted)
+        self.assertEqual(next(iter(redis.hashes.values()))["status"], "done")
+        self.assertEqual(redis.events[-1][1]["progress"], 100)
+        self.assertIsNotNone(tracked_messages[0].reply_markup)
+
+    async def test_quick_callback_finishes_without_creating_a_progress_job(self):
+        handler, _ = _handler()
+        finished = asyncio.Event()
+        finished.set()
+        bot = SimpleNamespace(send_message=AsyncMock())
+
+        await handler._watch_inline_callback_progress(
+            _update(query=SimpleNamespace(message=FakeMessage())),
+            SimpleNamespace(bot=bot),
+            "merge_audios_start",
+            asyncio.current_task(),
+            finished,
+            {"status": "done", "message": "Operation finished"},
+        )
+
+        bot.send_message.assert_not_awaited()
+
+    def test_inline_watchdog_skips_quick_remux_and_navigation_actions(self):
+        self.assertFalse(handlers_module.EnhancedMediaHandler._callback_needs_inline_progress("menu_video"))
+        self.assertFalse(handlers_module.EnhancedMediaHandler._callback_needs_inline_progress("remux"))
+        self.assertTrue(handlers_module.EnhancedMediaHandler._callback_needs_inline_progress("res_1080"))
+        self.assertTrue(handlers_module.EnhancedMediaHandler._callback_needs_inline_progress("merge_audios_start"))
+
 
 class TypedBitratePipelineTests(unittest.IsolatedAsyncioTestCase):
     """The typed custom-bitrate prompt takes the button workflow's route.
@@ -387,9 +476,9 @@ class RealWatcherTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("done", rendered)
         keyboard = notice.edits[0][1]["reply_markup"].inline_keyboard[0]
         self.assertEqual(keyboard[1].callback_data, f"cancel_job:{JOB_ID}")
-        # The web UI: the job's own page, authorized by its capability. The
-        # upload suffix is stripped, so the Flask mount keeps its prefix.
-        self.assertIn(f"/status/{JOB_ID}?", keyboard[0].url)
+        # The Web UI attaches to the existing job, authorized by its capability.
+        # The upload suffix is stripped, so the Flask mount keeps its prefix.
+        self.assertIn(f"/flask/?track={JOB_ID}&job_token=", keyboard[0].url)
         self.assertTrue(keyboard[0].url.startswith("https://example.test/"))
         self.assertIn("capability", keyboard[0].url)
         self.assertTrue(notice.deleted, "the queued message must not outlive the job")
