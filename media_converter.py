@@ -157,7 +157,22 @@ class ExtendedMediaConverter:
                 "mkv": list(_h264_aac),
                 "avi": ["-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-c:a", "mp3"],
                 "mov": list(_h264_aac),
-                "webm": ["-c:v", "libvpx-vp9", "-c:a", "libvorbis"],
+                "webm": [
+                    "-c:v",
+                    "libvpx-vp9",
+                    "-deadline",
+                    "realtime",
+                    "-cpu-used",
+                    "5",
+                    "-threads",
+                    "1",
+                    "-crf",
+                    "30",
+                    "-b:v",
+                    "0",
+                    "-c:a",
+                    "libvorbis",
+                ],
                 "flv": ["-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-c:a", "aac"],
                 "m4v": list(_h264_aac),
             }
@@ -181,6 +196,12 @@ class ExtendedMediaConverter:
                         cmd = remux
             except Exception:
                 logger.debug("convert_video_format: remux probe failed; re-encoding")
+            if "-map_metadata" not in cmd:
+                cmd = list(cmd) + ["-map_metadata", "0"]
+                if os.path.splitext(output_path)[1].lower() in {".mp4", ".m4v", ".mov", ".mkv"}:
+                    cmd += ["-map_chapters", "0"]
+            if os.path.splitext(output_path)[1].lower() in {".mp4", ".m4v", ".mov"} and "-movflags" not in cmd:
+                cmd = list(cmd) + ["-movflags", "+faststart"]
             return (await self.execute_ffmpeg(cmd, input_path, output_path))[0]
 
         except Exception as e:
@@ -203,7 +224,30 @@ class ExtendedMediaConverter:
         ``-preset veryfast -crf 23`` is stated so the re-encode does not silently
         fall back to libx264's ``medium`` default.
         """
-        cmd = ["-r", str(fps), "-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-c:a", "copy"]
+        cmd = [
+            "-map",
+            "0:v:0",
+            "-map",
+            "0:a?",
+            "-r",
+            str(fps),
+            "-c:v",
+            "libx264",
+            "-preset",
+            "veryfast",
+            "-crf",
+            "23",
+            "-c:a",
+            "aac",
+            "-b:a",
+            "128k",
+            "-map_metadata",
+            "0",
+            "-map_chapters",
+            "0",
+            "-movflags",
+            "+faststart",
+        ]
         return (await self.execute_ffmpeg(cmd, input_path, output_path))[0]
 
     async def adjust_bitrate(self, input_path: str, output_path: str, video_bitrate: str, audio_bitrate: str) -> bool:
@@ -243,22 +287,72 @@ class ExtendedMediaConverter:
         cmd = ["-an", "-c:v", "copy"]  # No audio
         return (await self.execute_ffmpeg(cmd, input_path, output_path))[0]
 
-    async def merge_audio_video(self, video_path: str, audio_path: str, output_path: str) -> bool:
-        """Merge audio and video tracks."""
-        # Use complex filter for merging
-        cmd = [
-            "-i",
-            video_path,
-            "-i",
-            audio_path,
-            "-c:v",
-            "copy",
-            "-c:a",
-            "aac",
-            "-strict",
-            "experimental",
-            "-shortest",
-        ]
+    async def merge_audio_video(
+        self,
+        video_path: str,
+        audio_path: str,
+        output_path: str,
+        *,
+        video_file: dict | None = None,
+    ) -> bool:
+        """Mix a selected track with the video's audio without shortening its video."""
+        from utils.ffmpeg_runner import probe_media
+
+        probe = await probe_media(video_path)
+        if not probe.get("video_streams"):
+            logger.error("Cannot add audio: video probe failed or source has no video stream: %s", video_path)
+            return False
+
+        cmd = ["-i", video_path, "-i", audio_path]
+        if probe.get("audio_streams"):
+            cmd.extend(
+                [
+                    "-filter_complex",
+                    "[0:a:0][1:a:0]amix=inputs=2:duration=longest:dropout_transition=0,apad[aout]",
+                    "-map",
+                    "0:v:0",
+                    "-map",
+                    "[aout]",
+                ]
+            )
+        else:
+            cmd.extend(
+                [
+                    "-map",
+                    "0:v:0",
+                    "-map",
+                    "1:a:0",
+                    "-af",
+                    "apad",
+                ]
+            )
+        cmd.extend(
+            [
+                "-c:v",
+                "copy",
+                "-c:a",
+                "aac",
+                "-b:a",
+                "128k",
+                "-shortest",
+                "-map_metadata",
+                "0",
+                "-map_metadata:s:a:0",
+                "1:s:a:0",
+                "-map_chapters",
+                "0",
+                "-movflags",
+                "+faststart",
+            ]
+        )
+        if video_file:
+            metadata = video_file.get("_source_metadata") or video_file.get("source_metadata") or {}
+            for key, value in (
+                ("title", metadata.get("title")),
+                ("artist", metadata.get("performer") or metadata.get("artist")),
+            ):
+                if value:
+                    cmd.extend(["-metadata", f"{key}={value}"])
         return (await self.execute_ffmpeg(cmd, None, output_path))[0]
 
     async def merge_videos(self, video_paths: list[str], output_path: str) -> bool:

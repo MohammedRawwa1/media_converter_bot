@@ -118,6 +118,7 @@ class SessionLoadTests(unittest.TestCase):
         self.assertEqual(loaded["merge_list"], [])
         self.assertEqual(loaded["bulk_list"], [])
         self.assertEqual(loaded["video_merge_selection"], [])
+        self.assertEqual(loaded["audio_merge_selection"], [])
 
     def test_callback_restores_the_persisted_video_merge_selection(self):
         source = read_source("handlers.py")
@@ -129,6 +130,7 @@ class SessionLoadTests(unittest.TestCase):
         ]
 
         self.assertIn('"video_merge_selection": persisted.get("video_merge_selection", [])', restore)
+        self.assertIn('"audio_merge_selection": persisted.get("audio_merge_selection", [])', restore)
 
     def test_the_json_file_is_read_without_asking_mongo(self):
         model = _FakeModel(session={"current_file": "from-mongo"})
@@ -191,6 +193,7 @@ class SessionSaveTests(unittest.TestCase):
             "merge_list": [],
             "bulk_list": [],
             "video_merge_selection": [{"file_unique_id": "video-1"}],
+            "audio_merge_selection": [{"file_unique_id": "audio-1"}],
         }
         return stub
 
@@ -211,6 +214,7 @@ class SessionSaveTests(unittest.TestCase):
         self.assertEqual(user_id, 7)
         self.assertEqual(payload["current_file"], {"id": "abc"})
         self.assertEqual(payload["video_merge_selection"], [{"file_unique_id": "video-1"}])
+        self.assertEqual(payload["audio_merge_selection"], [{"file_unique_id": "audio-1"}])
 
     def test_the_file_is_written_even_with_no_running_loop(self):
         model = _FakeModel()
@@ -225,6 +229,7 @@ class SessionSaveTests(unittest.TestCase):
             persisted = json.load(fh)
         self.assertEqual(persisted["current_file"], {"id": "abc"})
         self.assertEqual(persisted["video_merge_selection"], [{"file_unique_id": "video-1"}])
+        self.assertEqual(persisted["audio_merge_selection"], [{"file_unique_id": "audio-1"}])
 
     def test_a_failing_session_save_is_not_fatal(self):
         model = _FakeModel(error=RuntimeError("mongo down"))

@@ -37,7 +37,6 @@ from .callbacks import (
     COMPRESS_QUALITY_KEY,
     COMPRESS_QUALITY_LABELS,
     CONFIRM,
-    CONVERT_TO_FILE,
     CONVERT_TO_VIDEO,
     CREATE_ARCHIVE,
     EDIT_METADATA,
@@ -52,11 +51,6 @@ from .callbacks import (
     MENU_AUDIO,
     MENU_MAIN,
     MENU_VIDEO,
-    MERGE_ADD,
-    MERGE_AUDIOS_START,
-    MERGE_CLEAR,
-    MERGE_VIDEOS_START,
-    MERGE_VIEW,
     MP3_DEFAULT_BITRATE,
     MP3_QUALITY_CHOICES,
     MP3_TAG_EDITOR,
@@ -610,32 +604,11 @@ class MediaMenuBuilder:
 
     @staticmethod
     def get_merge_menu(media_type: str = "video") -> InlineKeyboardMarkup:
-        """Get merge options menu, with the start trigger of the kind it is for.
-
-        An audio merge and a video merge are two different jobs - one writes MP3
-        and one writes MP4 - so the start button has to name the one this menu was
-        opened for. It always sent ``merge_videos_start``, which is why the Audio
-        Tools' 🔀 Merge could only ever report "Need at least 2 videos", and why
-        the audio merge (``merge_audios_start``) sat handled at the dispatcher and
-        offered by no keyboard at all.
-        """
+        """Compatibility wrapper for the automatic, typed merge review menus."""
         is_audio = str(media_type or "").lower() == "audio"
-        buttons = [
-            [
-                # Both merges read the same collected list, so collecting stays
-                # the same button; only the start differs.
-                InlineKeyboardButton("➕ Add File", callback_data=MERGE_ADD),
-                InlineKeyboardButton("👀 View List", callback_data=MERGE_VIEW),
-            ],
-            [
-                InlineKeyboardButton(
-                    "▶️ Start Merge", callback_data=MERGE_AUDIOS_START if is_audio else MERGE_VIDEOS_START
-                ),
-                InlineKeyboardButton("🗑️ Clear List", callback_data=MERGE_CLEAR),
-            ],
-            _nav_row(MENU_MAIN),
-        ]
-        return InlineKeyboardMarkup(buttons)
+        if is_audio:
+            return MediaMenuBuilder.get_audio_merge_review_menu([], False)
+        return MediaMenuBuilder.get_video_merge_review_menu([], False)
 
     @staticmethod
     def get_merge_options_menu() -> InlineKeyboardMarkup:
@@ -663,6 +636,23 @@ class MediaMenuBuilder:
             )
 
         buttons.append([InlineKeyboardButton("↩️ Reset to detected videos", callback_data="merge_reset")])
+        buttons.append(_nav_row(MENU_MAIN))
+        return InlineKeyboardMarkup(buttons)
+
+    @staticmethod
+    def get_audio_merge_review_menu(remove_labels: list[str], can_start: bool) -> InlineKeyboardMarkup:
+        """Review automatically detected audio files; manual file-add controls are unnecessary."""
+        buttons = [
+            [InlineKeyboardButton(f"🗑️ Remove {label}", callback_data=f"audio_merge_remove:{index}")]
+            for index, label in enumerate(remove_labels)
+        ]
+        if can_start:
+            buttons.append([InlineKeyboardButton("▶️ Start Merge", callback_data="merge_audios_start")])
+        else:
+            buttons.append(
+                [InlineKeyboardButton("⚠️ Select at least 2 valid audio files", callback_data="audio_merge_unavailable")]
+            )
+        buttons.append([InlineKeyboardButton("↩️ Reset to detected audio", callback_data="audio_merge_reset")])
         buttons.append(_nav_row(MENU_MAIN))
         return InlineKeyboardMarkup(buttons)
 
@@ -695,7 +685,7 @@ class MediaMenuBuilder:
             ],
             [
                 InlineKeyboardButton("📝 Subtitles", callback_data="extract_subtitles"),
-                InlineKeyboardButton("📦 All Streams", callback_data="extract_all"),
+                InlineKeyboardButton("📦 Media Tracks", callback_data="extract_all"),
             ],
             _nav_row(MENU_MAIN),
         ]
@@ -703,21 +693,9 @@ class MediaMenuBuilder:
 
     @staticmethod
     def get_video_tools_menu() -> InlineKeyboardMarkup:
-        """The video tools the main menu does not already carry.
-
-        Every action has one home: the main menu is the context menu and offers
-        the video actions it acts on directly (Convert Format, Compress, Trim,
-        Remove Audio, Screenshots, ...), so none of them is repeated here. What
-        this panel adds is the rest of the video toolbox - the container pickers,
-        resolution and framerate, adding a soundtrack, stream extraction, a repair,
-        and reordering the collected queue before a merge. The merge entry point
-        and its variants live on the media context menu.
-        """
+        """The video tools that are not already on the media context menu."""
         buttons = [
-            [
-                InlineKeyboardButton("🔄 Convert To Video", callback_data=CONVERT_TO_VIDEO),
-                InlineKeyboardButton("🔄 Convert To File", callback_data=CONVERT_TO_FILE),
-            ],
+            [InlineKeyboardButton("🔄 Video Format", callback_data=CONVERT_TO_VIDEO)],
             [
                 InlineKeyboardButton("📐 Resolution", callback_data=RESOLUTION_MENU),
                 InlineKeyboardButton("⏱️ Framerate", callback_data="framerate_menu"),
@@ -725,14 +703,13 @@ class MediaMenuBuilder:
             [
                 InlineKeyboardButton("🔉 Add Audio", callback_data=ADD_AUDIO),
                 # Opens the extraction picker: Audio Only / Video Only /
-                # Subtitles / All Streams.
+                # Subtitles / Media Tracks.
                 InlineKeyboardButton("🗂️ Extract Streams", callback_data=EXTRACT_MENU),
             ],
-            # Repair and reorder are video jobs with no home on the main menu: a
-            # repair rewrites the container of a broken video, and a reorder sets
-            # the order the collected files will be merged in.
+            # Remux repair only fixes container/index problems; it cannot restore
+            # damaged frames, so the label does not promise general recovery.
             [
-                InlineKeyboardButton("🔧 Repair", callback_data=REPAIR_VIDEO),
+                InlineKeyboardButton("🔧 Remux Repair", callback_data=REPAIR_VIDEO),
                 InlineKeyboardButton("🔁 Video Reorder", callback_data=VIDEO_REORDER),
             ],
             _nav_row(MENU_MAIN),

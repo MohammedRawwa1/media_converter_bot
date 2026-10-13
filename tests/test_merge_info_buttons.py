@@ -232,6 +232,81 @@ class MergeVariantTests(unittest.TestCase):
         invalid_format = [valid[0], {**valid[1], "source_name": "two.mkv"}]
         self.assertFalse(Handler._video_merge_ready({"video_merge_selection": invalid_format}))
 
+    def test_audio_merge_candidates_are_auto_detected_and_typed(self):
+        session = {
+            "bulk_list": [
+                {"id": "a1", "type": "audio", "source_name": "one.mp3", "name": "one.mp3", "size": 10},
+                {"id": "v1", "type": "video", "source_name": "clip.mp4", "size": 10},
+                {"id": "a1", "type": "audio", "source_name": "one.mp3", "name": "one.mp3", "size": 10},
+                {"id": "a2", "type": "audio", "source_name": "two.ogg", "name": "two.ogg", "size": 20},
+            ]
+        }
+
+        result = Handler._audio_merge_candidates(session)
+
+        self.assertEqual([item["id"] for item in result], ["a1", "a2"])
+        self.assertTrue(Handler._audio_merge_ready({"audio_merge_selection": result}))
+        self.assertFalse(Handler._audio_merge_ready({"audio_merge_selection": result[:1]}))
+        self.assertFalse(
+            Handler._audio_merge_ready(
+                {"audio_merge_selection": [result[0], {**result[1], "source_name": "not-audio.mp4"}]}
+            )
+        )
+
+    def test_audio_merge_review_has_remove_start_reset_not_manual_add_view_or_clear(self):
+        markup = MediaMenuBuilder.get_audio_merge_review_menu(["1", "2"], True)
+        callbacks = [button.callback_data for row in markup.inline_keyboard for button in row]
+
+        self.assertIn("audio_merge_remove:0", callbacks)
+        self.assertIn("audio_merge_remove:1", callbacks)
+        self.assertIn("merge_audios_start", callbacks)
+        self.assertIn("audio_merge_reset", callbacks)
+        self.assertFalse({"merge_add", "merge_view", "merge_clear"} & set(callbacks))
+
+    def test_audio_merge_refreshes_exact_sources_and_validates_streams(self):
+        handler = object.__new__(Handler)
+        refreshed_ids = []
+        persisted_current_files = []
+        previous = {"id": "unrelated", "type": "audio", "name": "unrelated.mp3"}
+
+        async def _ensure(_self, _update, _context, session, *, force_refresh=False):
+            self.assertTrue(force_refresh)
+            item = session["current_file"]
+            refreshed_ids.append(item["id"])
+            path = os.path.join(self.tmp.name, f"{item['id']}.mp3")
+            with open(path, "wb") as fh:
+                fh.write(b"audio")
+            item["path"] = path
+
+        handler._ensure_current_file_downloaded = MethodType(_ensure, handler)
+        handler._local_copy = MethodType(Handler._local_copy, handler)
+        handler._persist_session = lambda _user_id: persisted_current_files.append(session.get("current_file"))
+        session = {
+            "current_file": previous,
+            "audio_merge_selection": [
+                {"id": "telegram-a1", "type": "audio", "name": "one.mp3", "source_name": "one.mp3", "size": 5},
+                {"id": "telegram-a2", "type": "audio", "name": "two.mp3", "source_name": "two.mp3", "size": 5},
+            ],
+        }
+        probe = AsyncMock(return_value={"audio_streams": 1})
+
+        async def _notify(_text):
+            return None
+
+        with patch("utils.ffmpeg_runner.probe_media", probe):
+            paths, owned = asyncio.run(
+                Handler._prepare_audio_merge_sources(
+                    handler, _FakeUpdate(), SimpleNamespace(bot=object()), session, _notify
+                )
+            )
+
+        self.assertEqual(refreshed_ids, ["telegram-a1", "telegram-a2"])
+        self.assertEqual(len(paths), 2)
+        self.assertIs(session["current_file"], previous)
+        self.assertEqual(persisted_current_files, [previous, previous])
+        for path in owned:
+            os.remove(path)
+
     def test_merge_fetches_the_exact_two_sources_sequentially_and_cleans_them(self):
         handler = object.__new__(Handler)
         fetched_ids = []

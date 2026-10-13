@@ -4,6 +4,7 @@ import contextlib
 import html
 import json
 import logging
+import math
 import os
 import re
 import shutil
@@ -342,6 +343,7 @@ _INLINE_OP_GUARD_KEYS = {
     "fade_both": "fade",
     "normalize_audio": "normalize",
     "merge_audios_start": "merge_audios",
+    "merge_av_menu": "merge_audio_video",
 }
 
 #: Picked values of an action that is itself one job (``bitrate_320``).
@@ -713,6 +715,19 @@ def _video_delivery_name(current_file: dict | None, output_path: str | None) -> 
     if not stem:
         return os.path.basename(str(output_path or "")) or "video.mp4"
     return f"{stem}{ext or '.mp4'}"
+
+
+def _source_metadata_ffmpeg_args(current_file: dict | None, *, include_chapters: bool = True) -> list[str]:
+    """Explicitly retain source metadata and, when supported, source chapters."""
+    args = ["-map_metadata", "0"]
+    if include_chapters:
+        args.extend(["-map_chapters", "0"])
+    title, performer = _source_media_tags(current_file)
+    if title:
+        args.extend(["-metadata", f"title={title}"])
+    if performer:
+        args.extend(["-metadata", f"artist={performer}"])
+    return args
 
 
 def _source_media_tags(current_file: dict | None) -> tuple[str, str]:
@@ -1112,6 +1127,7 @@ def _session_lists_defaulted(data) -> dict | None:
     data.setdefault("merge_list", [])
     data.setdefault("bulk_list", [])
     data.setdefault("video_merge_selection", [])
+    data.setdefault("audio_merge_selection", [])
     return data
 
 
@@ -3042,6 +3058,7 @@ class EnhancedMediaHandler:
                 "merge_list": session.get("merge_list", []),
                 "bulk_list": session.get("bulk_list", []),
                 "video_merge_selection": session.get("video_merge_selection", []),
+                "audio_merge_selection": session.get("audio_merge_selection", []),
                 "_bulk_apply_started_at": session.get("_bulk_apply_started_at"),
             }
             # Write locally for fast local recovery
@@ -7828,18 +7845,55 @@ class EnhancedMediaHandler:
             "aac",
             "-b:a",
             "128k",
-            "-movflags",
-            "+faststart",
         ]
         _format_ffmpeg_args = {
-            "mp4": list(_h264_aac),
-            "mkv": list(_h264_aac),
-            "avi": ["-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-c:a", "mp3"],
-            "mov": list(_h264_aac),
-            "webm": ["-c:v", "libvpx-vp9", "-c:a", "libvorbis"],
-            "flv": ["-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-c:a", "aac"],
-            "m4v": list(_h264_aac),
+            "mp4": list(_h264_aac) + ["-movflags", "+faststart"] + _source_metadata_ffmpeg_args(current_file),
+            "mkv": list(_h264_aac) + _source_metadata_ffmpeg_args(current_file),
+            "avi": [
+                "-c:v",
+                "libx264",
+                "-preset",
+                "veryfast",
+                "-crf",
+                "23",
+                "-c:a",
+                "mp3",
+                *_source_metadata_ffmpeg_args(current_file, include_chapters=False),
+            ],
+            "mov": list(_h264_aac) + ["-movflags", "+faststart"] + _source_metadata_ffmpeg_args(current_file),
+            "webm": [
+                "-c:v",
+                "libvpx-vp9",
+                "-deadline",
+                "realtime",
+                "-cpu-used",
+                "5",
+                "-threads",
+                "1",
+                "-crf",
+                "30",
+                "-b:v",
+                "0",
+                "-c:a",
+                "libvorbis",
+                *_source_metadata_ffmpeg_args(current_file, include_chapters=False),
+            ],
+            "flv": [
+                "-c:v",
+                "libx264",
+                "-preset",
+                "veryfast",
+                "-crf",
+                "23",
+                "-c:a",
+                "aac",
+                *_source_metadata_ffmpeg_args(current_file, include_chapters=False),
+            ],
+            "m4v": list(_h264_aac) + ["-movflags", "+faststart"] + _source_metadata_ffmpeg_args(current_file),
         }
+        if target_format not in _format_ffmpeg_args:
+            await self.safe_edit(query, f"❌ Unsupported video format: {target_format}.")
+            return
         current_file["_pipeline_ffmpeg_args"] = _format_ffmpeg_args.get(target_format)
         current_file["_pipeline_output_ext"] = f".{target_format}"
         current_file["_pipeline_conversion_type"] = "format_video"
@@ -8444,7 +8498,7 @@ class EnhancedMediaHandler:
         if _audio_original:
             default_name = _audio_original
         elif audio.title:
-            default_name = audio.title
+            default_name = audio.title if os.path.splitext(audio.title)[1] else f"{audio.title}{ext}"
         else:
             # UTC, so the name does not shift with the host's zone.
             default_name = f"audio_{datetime.now(UTC).strftime('%Y%m%d_%H%M%S')}{ext}"
@@ -8492,6 +8546,7 @@ class EnhancedMediaHandler:
             "id": audio.file_id,
             "size": audio.file_size,
             "name": final_name,
+            "source_name": _audio_original or default_name,
             "thumbnail": thumb,
             "forward": forward_info,
             "chat_id": getattr(update.message, "chat", None) and getattr(update.message.chat, "id", None),
@@ -8505,6 +8560,10 @@ class EnhancedMediaHandler:
 
         # Collect every sent file so "Apply Bulk" can run on the whole batch.
         _register_bulk_file(session, session["current_file"])
+        try:
+            self._persist_session(user_id)
+        except Exception:
+            logger.debug("Could not persist session after registering audio")
 
         logger.info(
             "registered current_file for user %s id=%s forward=%s size=%s",
@@ -8519,11 +8578,18 @@ class EnhancedMediaHandler:
         if await self._buffer_album_item(update, context, session, user_id, "audio"):
             return
 
-        # ── Show action menu — let user choose what to do with the audio ──
-        await update.message.reply_text(
-            f"✅ Audio registered!\n🎵 {audio.title or 'Unknown title'}\nChoose an action:",
-            reply_markup=MediaMenuBuilder.get_main_menu("audio"),
-        )
+        # A pending Add Audio operation already has its video; keep that flow
+        # visible instead of making the user navigate away to another menu.
+        if context.user_data.get("_add_audio_video_target"):
+            await update.message.reply_text(
+                f"✅ Audio registered: {final_name}\nOpen Video Tools and press Add Audio to attach it.",
+                reply_markup=MediaMenuBuilder.get_video_tools_menu(),
+            )
+        else:
+            await update.message.reply_text(
+                f"✅ Audio registered!\n🎵 {audio.title or 'Unknown title'}\nChoose an action:",
+                reply_markup=MediaMenuBuilder.get_main_menu("audio"),
+            )
 
     async def _apply_subtitle_file(
         self,
@@ -9626,6 +9692,7 @@ class EnhancedMediaHandler:
                         "merge_list": persisted.get("merge_list", []),
                         "bulk_list": persisted.get("bulk_list", []),
                         "video_merge_selection": persisted.get("video_merge_selection", []),
+                        "audio_merge_selection": persisted.get("audio_merge_selection", []),
                         "_bulk_apply_started_at": _persisted_guard,
                     }
                 else:
@@ -9819,10 +9886,7 @@ class EnhancedMediaHandler:
                 await self.remove_audio(update, context, session)
 
             elif data == "merge_av_menu":
-                await self.safe_edit(
-                    query,
-                    "🎵 **Merge Audio with Video**\nFirst send the audio file, then select this option again.",
-                )
+                await self.add_audio_to_video(update, context, session)
 
             elif data == "resolution_menu":
                 await self.safe_edit(
@@ -9832,12 +9896,13 @@ class EnhancedMediaHandler:
                 )
 
             elif data == "res_custom":
-                if not current_file:
-                    await self.safe_edit(query, "❌ No file registered. Send a file first.")
+                if not current_file or current_file.get("type") != "video":
+                    await self.safe_edit(query, "❌ Send or select a video first.")
                 else:
                     await self.safe_edit(
                         query,
-                        "📐 Enter custom resolution (widthxheight, e.g. 1280x720):",
+                        "📐 Enter a target canvas (even width 16–7680 × height 16–4320, e.g. 1280x720). "
+                        "The video’s aspect ratio will be preserved.",
                         reply_markup=MediaMenuBuilder.get_back_button(),
                     )
                     context.user_data["awaiting_custom_resolution"] = True
@@ -9967,7 +10032,12 @@ class EnhancedMediaHandler:
                 # Opened from the video tools menu; the individual actions are
                 # handled by extract_audio / extract_streams / extract_subtitles.
                 _has_video = bool(current_file) and current_file.get("type") == "video"
-                _hint = "" if _has_video else "\n\nℹ️ Video Only, Subtitles and All Streams need a video file."
+                _hint = (
+                    "\n\nℹ️ Video Only, Subtitles and Media Tracks need a video file. "
+                    "Media Tracks extracts video, audio and subtitle streams; data tracks are skipped."
+                    if not _has_video
+                    else "\n\nℹ️ Media Tracks extracts video, audio and subtitle streams; data tracks are skipped."
+                )
                 await self.safe_edit(
                     query,
                     f"🗂️ **Extract Streams**\nChoose what to extract:{_hint}",
@@ -10014,13 +10084,9 @@ class EnhancedMediaHandler:
                     )
                     return
                 # Route to video or audio conversion depending on current file type
-                try:
-                    if current_file and current_file.get("type") == "video":
-                        await self.convert_video_format(update, context, session, format_type)
-                    else:
-                        await self.convert_audio_format(update, context, session, format_type)
-                except Exception:
-                    # Fallback to audio conversion to preserve previous behavior
+                if current_file and current_file.get("type") == "video":
+                    await self.convert_video_format(update, context, session, format_type)
+                else:
                     await self.convert_audio_format(update, context, session, format_type)
 
             elif data == "bitrate_menu":
@@ -10128,9 +10194,12 @@ class EnhancedMediaHandler:
                     await query.answer("Merge list cleared")
 
             elif data == "framerate_menu":
+                if not current_file or current_file.get("type") != "video":
+                    await self.safe_edit(query, "❌ Send or select a video first.")
+                    return
                 await self.safe_edit(
                     query,
-                    "⏱️ **Change Framerate**\nEnter target FPS (e.g., 24, 30, 60).",
+                    "⏱️ **Change Framerate**\nEnter target FPS from 1 to 120 (e.g., 23.976, 30, 60).",
                     reply_markup=MediaMenuBuilder.get_back_button(),
                 )
                 # Clear previous prompts *before* arming this one, otherwise the
@@ -10160,6 +10229,7 @@ class EnhancedMediaHandler:
                 for key in list(context.user_data.keys()):
                     if key.startswith("awaiting_"):
                         del context.user_data[key]
+                context.user_data.pop("_add_audio_video_target", None)
                 await self.safe_edit(
                     query,
                     "❌ Operation cancelled.",
@@ -10290,14 +10360,35 @@ class EnhancedMediaHandler:
                 )
 
             elif data == "merge_audios_menu":
-                await self.safe_edit(
-                    query,
-                    "🔀 **Merge Audio Files**\nSend multiple audio files, then click 'Start Merge':",
-                    reply_markup=MediaMenuBuilder.get_merge_menu("audio"),
-                )
+                session["audio_merge_selection"] = self._audio_merge_candidates(session)
+                self._persist_session(user_id)
+                await self._show_audio_merge_selection(query, session)
 
             elif data == "merge_audios_start":
                 await self.merge_audios(update, context, session)
+
+            elif data.startswith("audio_merge_remove:"):
+                try:
+                    index = int(data.split(":", 1)[1])
+                    selected = session.get("audio_merge_selection")
+                    if not isinstance(selected, list) or not 0 <= index < len(selected):
+                        raise ValueError("stale selection")
+                    selected.pop(index)
+                    self._persist_session(user_id)
+                    await self._show_audio_merge_selection(query, session)
+                except (TypeError, ValueError):
+                    await self.safe_edit(query, "❌ That audio entry is no longer available. Reopen Merge to refresh.")
+                return
+
+            elif data == "audio_merge_reset":
+                session["audio_merge_selection"] = self._audio_merge_candidates(session)
+                self._persist_session(user_id)
+                await self._show_audio_merge_selection(query, session)
+                return
+
+            elif data == "audio_merge_unavailable":
+                await self._show_audio_merge_selection(query, session)
+                return
 
             elif data == "normalize_audio":
                 await self.normalize_audio(update, context, session)
@@ -11515,17 +11606,26 @@ class EnhancedMediaHandler:
                     await self.safe_edit(query, "⚠️ Failed to open Mp3 Tag Editor.")
 
             elif data == "convert_to_video":
-                # Show video format menu
+                if not current_file or current_file.get("type") != "video":
+                    await self.safe_edit(query, "❌ Send or select a video first.")
+                    return
                 await self.safe_edit(
                     query,
-                    "🔄 Convert To Video\nSelect target container:",
+                    "🔄 <b>Video Format</b>\nSelect a target container. MP4 (H.264/AAC) is the best choice for Windows compatibility.",
                     reply_markup=MediaMenuBuilder.get_format_menu("video"),
+                    parse_mode="HTML",
                 )
 
             elif data == "convert_to_file":
-                # Generic convert menu
+                if not current_file:
+                    await self.safe_edit(query, "❌ Send a media file first.")
+                    return
+                media_type = "video" if current_file.get("type") == "video" else "audio"
                 await self.safe_edit(
-                    query, "🔄 Convert To File\nSelect target format:", reply_markup=MediaMenuBuilder.get_format_menu()
+                    query,
+                    f"🔄 <b>Convert {media_type.title()} Format</b>\nSelect a target format:",
+                    reply_markup=MediaMenuBuilder.get_format_menu(media_type),
+                    parse_mode="HTML",
                 )
 
             elif data == "batch_process":
@@ -12991,6 +13091,168 @@ class EnhancedMediaHandler:
                     os.remove(path)
             raise
 
+    @staticmethod
+    def _audio_merge_candidates(session: dict) -> list[dict]:
+        candidates = []
+        seen = set()
+        for raw in session.get("bulk_list") or []:
+            item = _normalize_bulk_item(raw)
+            if not item or item.get("type") != "audio":
+                continue
+            key = _bulk_item_key(item)
+            key = str(key) if key is not None else None
+            if key is not None and key in seen:
+                continue
+            if key is not None:
+                seen.add(key)
+            candidates.append(dict(item))
+        return candidates
+
+    @staticmethod
+    def _audio_merge_item_error(item: dict) -> str | None:
+        if item.get("type") != "audio":
+            return "audio only"
+        source_name = item.get("source_name") or item.get("name") or item.get("path") or ""
+        if os.path.splitext(str(source_name))[1].lower() not in _AUDIO_EXTS:
+            return "unsupported audio format"
+        try:
+            size = int(item.get("size"))
+            max_size = int(MAX_FILE_SIZE)
+        except (TypeError, ValueError):
+            return "size unavailable"
+        if size <= 0:
+            return "size unavailable"
+        if size > max_size:
+            return f"over {max_size // (1024 * 1024)} MB"
+        return None
+
+    @classmethod
+    def _audio_merge_ready(cls, session: dict) -> bool:
+        selected = session.get("audio_merge_selection")
+        return (
+            isinstance(selected, list)
+            and len(selected) >= 2
+            and len(selected) <= _BULK_LIST_LIMIT
+            and all(isinstance(item, dict) and cls._audio_merge_item_error(item) is None for item in selected)
+        )
+
+    async def _show_audio_merge_selection(self, query, session: dict) -> None:
+        selected = session.get("audio_merge_selection")
+        if not isinstance(selected, list):
+            selected = []
+            session["audio_merge_selection"] = selected
+
+        lines = [
+            "🔀 <b>Merge Audio</b>",
+            f"Kept: <b>{len(selected)}</b> audio file(s) (at least 2 required)",
+        ]
+        remove_labels = []
+        valid_count = 0
+        for index, item in enumerate(selected):
+            name = _bulk_display_name(item)
+            remove_labels.append(str(index + 1))
+            reason = self._audio_merge_item_error(item)
+            if reason is None:
+                size_mb = int(item["size"]) / (1024 * 1024)
+                status = f"✅ {size_mb:.1f} MB"
+                valid_count += 1
+            else:
+                status = f"❌ {reason}"
+            lines.append(f"{index + 1}. {html.escape(name)} — {status}")
+
+        if not selected:
+            lines.extend(
+                ["", "No audio files detected yet. Send or forward audio files here; they are added automatically."]
+            )
+        elif valid_count != len(selected) or len(selected) < 2:
+            lines.extend(["", "Remove invalid entries or send at least two supported audio files."])
+
+        await self.safe_edit(
+            query,
+            "\n".join(lines),
+            reply_markup=MediaMenuBuilder.get_audio_merge_review_menu(
+                remove_labels,
+                self._audio_merge_ready(session),
+            ),
+            parse_mode="HTML",
+        )
+
+    async def _prepare_audio_merge_sources(
+        self,
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+        session: dict,
+        notify,
+    ) -> tuple[list[str], list[str]]:
+        """Refresh and validate each selected Telegram audio source sequentially."""
+        selected = session.get("audio_merge_selection")
+        if not self._audio_merge_ready(session):
+            raise ValueError("Choose at least two supported audio files.")
+
+        user_id = getattr(getattr(update, "effective_user", None), "id", None)
+        paths: list[str] = []
+        owned_paths: list[str] = []
+        try:
+            for index, queued_item in enumerate(selected, 1):
+                item = dict(queued_item)
+                name = _bulk_display_name(item)
+                expected_size = int(item["size"])
+                await notify(f"📥 Preparing audio {index}/{len(selected)}: {name}")
+
+                had_current = "current_file" in session
+                previous = session.get("current_file")
+                item["name"] = item.get("source_name") or item.get("name") or item.get("path")
+                session["current_file"] = item
+                try:
+                    await self._ensure_current_file_downloaded(
+                        update,
+                        context,
+                        session,
+                        force_refresh=True,
+                    )
+                except Exception as exc:
+                    for candidate in (item.get("path"), item.get("_local_input_path")):
+                        if candidate and os.path.exists(candidate):
+                            owned_paths.append(candidate)
+                    raise RuntimeError(f"Could not fetch the exact source for {name}: {exc}") from exc
+                finally:
+                    if had_current:
+                        session["current_file"] = previous
+                    else:
+                        session.pop("current_file", None)
+                    if user_id is not None:
+                        self._persist_session(user_id)
+
+                source_path = self._local_copy(item)
+                if not source_path:
+                    for candidate in (item.get("path"), item.get("_local_input_path")):
+                        if candidate and os.path.exists(candidate):
+                            owned_paths.append(candidate)
+                    raise RuntimeError(f"Exact source unavailable for {name}; no nearby message was substituted.")
+                owned_paths.append(source_path)
+
+                actual_size = os.path.getsize(source_path)
+                if actual_size != expected_size:
+                    raise RuntimeError(
+                        f"Size check failed for {name}: expected {expected_size} bytes, received {actual_size}."
+                    )
+                if actual_size > int(MAX_FILE_SIZE):
+                    raise RuntimeError(f"{name} exceeds the maximum allowed file size.")
+
+                from utils.ffmpeg_runner import probe_media
+
+                metadata = await probe_media(source_path)
+                if int(metadata.get("audio_streams") or 0) < 1:
+                    raise RuntimeError(f"{name} does not contain a readable audio stream.")
+                paths.append(source_path)
+
+            return paths, owned_paths
+        except Exception:
+            for path in owned_paths:
+                with contextlib.suppress(OSError):
+                    os.remove(path)
+            raise
+
     async def merge_videos(
         self,
         update: Update,
@@ -13090,7 +13352,11 @@ class EnhancedMediaHandler:
                         final_path,
                         session["video_merge_selection"][0],
                         kind="video",
-                        delivery_name="merged_video.mp4",
+                        delivery_name=(
+                            f"{os.path.splitext(os.path.basename(names[0]))[0]}_merged.mp4"
+                            if names
+                            else "merged_video.mp4"
+                        ),
                         caption=caption[:1024],
                         notify=notify,
                     )
@@ -13143,7 +13409,7 @@ class EnhancedMediaHandler:
             session.pop("_video_merge_running", None)
 
     async def merge_audios(self, update: Update, context: ContextTypes.DEFAULT_TYPE, session: dict):
-        """Merge multiple audio files."""
+        """Merge audio files selected from the automatically detected upload list."""
         if not await self._require_callback(update):
             return
         query = update.callback_query
@@ -13151,50 +13417,72 @@ class EnhancedMediaHandler:
         if not await self._check_conversion_quota(update, context):
             return
 
-        if "merge_list" not in session or len(session["merge_list"]) < 2:
-            await self.safe_edit(
-                query,
-                "❌ Need at least 2 audio files to merge.\nSend audio files first, then click 'Start Merge'.",
-            )
+        if session.get("_audio_merge_running"):
+            await self.safe_edit(query, "⏳ An audio merge is already running for this account.")
+            return
+        if not self._audio_merge_ready(session):
+            await self._show_audio_merge_selection(query, session)
             return
 
-        await self.safe_edit(query, f"🔀 Merging {len(session['merge_list'])} audio files...")
+        user_id = getattr(getattr(update, "effective_user", None), "id", None)
+        session["_audio_merge_running"] = True
+        input_paths: list[str] = []
+        owned_paths: list[str] = []
+        output_path: str | None = None
+        try:
+            input_paths, owned_paths = await self._prepare_audio_merge_sources(
+                update,
+                context,
+                session,
+                lambda text: self.safe_edit(query, text),
+            )
+            await self.safe_edit(query, f"🔀 Merging {len(input_paths)} audio files…")
 
-        output_dir = getattr(config, "OUTPUT_PATH", "storage/output") if config else "storage/output"
-        with contextlib.suppress(OSError):
+            output_dir = getattr(config, "OUTPUT_PATH", "storage/output") if config else "storage/output"
             os.makedirs(output_dir, exist_ok=True)
-        output_path = os.path.join(output_dir, f"merged_{int(datetime.now(UTC).timestamp())}.mp3")
-        success = await self.converter.merge_audios(session["merge_list"], output_path)
+            output_path = os.path.join(output_dir, f"merged_audio_{user_id or 'user'}_{uuid.uuid4().hex}.mp3")
+            success = await self.converter.merge_audios(input_paths, output_path)
 
-        if success and os.path.exists(output_path):
-            # Use the first input's name as the base so the merge keeps a
-            # recognisable (and streamable) audio filename.
-            _first_name = session["current_file"].get("name") if session.get("current_file") else None
-            # ``or "Merged Audio"`` already guarantees a non-empty name, so there is
-            # no empty stem for a fallback id to fill in.
-            delivery_name = _audio_delivery_name(_first_name or "Merged Audio", extension=".mp3")
-            # A merge is the one audio result whose size grows with the batch: a
-            # few long tracks clear the Bot API's ceiling in one go, so it takes
-            # the same tiers (and the same stated length) as every other result.
-            await self._deliver_inline_result(
+            if not success or not os.path.exists(output_path) or os.path.getsize(output_path) <= 0:
+                await self.safe_edit(query, "❌ Audio merge failed. Your selected files are still available to retry.")
+                return
+
+            first = session["audio_merge_selection"][0]
+            first_name = first.get("source_name") or first.get("name") or "Merged Audio"
+            delivery_name = _audio_delivery_name(first_name, first.get("id"), extension=".mp3")
+            delivered = await self._deliver_inline_result(
                 update,
                 context,
                 output_path,
-                session.get("current_file"),
+                first,
                 kind="audio",
                 delivery_name=delivery_name,
-                caption=_metadata_caption(session.get("current_file")),
+                caption=_metadata_caption(first),
                 notify=lambda text: self.safe_edit(query, text),
             )
-
-            # Cleanup
-            os.remove(output_path)
-            for file_path in session["merge_list"]:
-                if os.path.exists(file_path):
-                    os.remove(file_path)
-            session["merge_list"] = []
-        else:
-            await self.safe_edit(query, "❌ Merge failed.")
+            if delivered:
+                await self.safe_edit(query, "✅ Audio merge complete.")
+                session["audio_merge_selection"] = []
+                self._persist_session(user_id)
+            else:
+                await self.safe_edit(
+                    query, "❌ The merged audio could not be delivered. Your selection is still available to retry."
+                )
+        except (ValueError, RuntimeError) as exc:
+            await self.safe_edit(query, f"❌ {exc}")
+        except Exception:
+            logger.exception("audio merge failed")
+            await self.safe_edit(
+                query, "❌ Audio merge failed unexpectedly. Your selected files are still available to retry."
+            )
+        finally:
+            for path in owned_paths:
+                with contextlib.suppress(OSError):
+                    os.remove(path)
+            if output_path:
+                with contextlib.suppress(OSError):
+                    os.remove(output_path)
+            session.pop("_audio_merge_running", None)
 
     @staticmethod
     def _reorder_item_name(item, index: int) -> str:
@@ -13210,16 +13498,16 @@ class EnhancedMediaHandler:
         return name or f"file {index + 1}"
 
     async def show_video_reorder(self, update: Update, context: ContextTypes.DEFAULT_TYPE, session: dict, page=1):
-        """Show the collected queue as a list whose order can be set (Video Tools).
-
-        The merge plays ``session["merge_list"]`` in order, so this panel and the
-        merge read the same list: a move edits it in place and the panel is drawn
-        again from it, and there is no separate "order" to fall out of sync.
-        """
+        """Show and reorder the exact selection consumed by the video merge."""
         if not await self._require_callback(update):
             return
         query = update.callback_query
-        items = session.get("merge_list") or []
+        items = session.get("video_merge_selection")
+        if not isinstance(items, list) or not items:
+            items = self._video_merge_candidates(session)
+            session["video_merge_selection"] = items
+            with contextlib.suppress(Exception):
+                self._persist_session(update.effective_user.id)
         total = len(items)
         last_page = max(1, (total + REORDER_PER_PAGE - 1) // REORDER_PER_PAGE)
         try:
@@ -13233,8 +13521,8 @@ class EnhancedMediaHandler:
             await self.safe_edit(
                 query,
                 "🔁 <b>Video Reorder</b>\n\n"
-                "The list is empty. Collect the files first with ➕ Video Merger "
-                "(or ➕ Add File), then reopen this to set their order.",
+                "No videos have been detected yet. Send or forward the videos first, "
+                "then open Merge or Video Reorder again.",
                 reply_markup=MediaMenuBuilder.get_reorder_menu([], page=1),
                 parse_mode="HTML",
             )
@@ -13244,7 +13532,7 @@ class EnhancedMediaHandler:
         for offset, item in enumerate(window):
             position = start + offset
             lines.append(f"{position + 1}. {html.escape(self._reorder_item_name(item, position))}")
-        lines += ["", "A merge plays them top to bottom. Use ⬆️/⬇️ to move one place."]
+        lines += ["", "Merge uses this exact order, top to bottom. Use ⬆️/⬇️ to move one place."]
         await self.safe_edit(
             query,
             "\n".join(lines),
@@ -13257,7 +13545,7 @@ class EnhancedMediaHandler:
         if not await self._require_callback(update):
             return
         query = update.callback_query
-        items = session.get("merge_list") or []
+        items = session.get("video_merge_selection") or []
 
         action, _, remainder = data.partition(":")
         direction = "up" if action.endswith("up") else ("down" if action.endswith("down") else None)
@@ -13275,7 +13563,7 @@ class EnhancedMediaHandler:
         moved = False
         if 0 <= index < len(items) and 0 <= target < len(items):
             items[index], items[target] = items[target], items[index]
-            session["merge_list"] = items
+            session["video_merge_selection"] = items
             moved = True
             try:
                 self._persist_session(update.effective_user.id)
@@ -13288,6 +13576,98 @@ class EnhancedMediaHandler:
         # follows the item instead of leaving the user looking at a stale page.
         page = max(1, target // REORDER_PER_PAGE + 1) if moved else 1
         await self.show_video_reorder(update, context, session, page=page)
+
+    async def add_audio_to_video(self, update: Update, context: ContextTypes.DEFAULT_TYPE, session: dict):
+        """Attach the selected audio to a video while keeping the video as the named source."""
+        if not await self._require_callback(update):
+            return
+        query = update.callback_query
+        current_file = session.get("current_file")
+        pending_key = "_add_audio_video_target"
+        target_video = context.user_data.get(pending_key)
+
+        if current_file and current_file.get("type") == "video":
+            context.user_data[pending_key] = dict(current_file)
+            await self.safe_edit(
+                query,
+                "🎵 Send the audio track to mix with the video’s existing sound, then open "
+                "Video Tools → Add Audio again. The video’s duration, name, and metadata will be kept.",
+            )
+            return
+        if not current_file or current_file.get("type") != "audio" or not target_video:
+            await self.safe_edit(query, "❌ Select a video, choose Add Audio, then send an audio file.")
+            return
+        if not await self._check_conversion_quota(update, context):
+            return
+
+        audio_file = dict(current_file)
+        original_current = session.get("current_file")
+        local_paths: list[str] = []
+        output_path = None
+        try:
+            for source in (dict(target_video), audio_file):
+                session["current_file"] = source
+                refreshed, _ = await self._ensure_local_media(update, context, session, source, query=query)
+                if refreshed is None:
+                    return
+                source = refreshed
+                if source.get("_pipeline_job_id"):
+                    await self.safe_edit(
+                        query,
+                        "❌ This source is still being downloaded by the large-file pipeline. "
+                        "Wait for it to finish, then send/select the files again.",
+                    )
+                    return
+                source_path = self._local_copy(source)
+                if not source_path:
+                    source_path = await self._resolve_local_source(
+                        source,
+                        user_id=update.effective_user.id,
+                        session=session,
+                        require_stored_key_only=True,
+                    )
+                if not source_path:
+                    await self.safe_edit(query, f"❌ Could not read {source.get('name') or 'a source file'}.")
+                    return
+                await _probe_downloaded_source(source, source_path)
+                local_paths.append(source_path)
+                if source.get("type") == "video":
+                    target_video = source
+
+            output_dir = getattr(config, "OUTPUT_PATH", "storage/output") if config else "storage/output"
+            os.makedirs(output_dir, exist_ok=True)
+            token = uuid.uuid4().hex
+            output_path = os.path.join(output_dir, f"add_audio_{token}.mp4")
+            await self.safe_edit(query, "🎵 Adding audio to the video…")
+            success = await self.converter.merge_audio_video(
+                local_paths[0], local_paths[1], output_path, video_file=target_video
+            )
+            if not success or not os.path.exists(output_path) or os.path.getsize(output_path) <= 0:
+                await self.safe_edit(query, "❌ Could not add this audio track. The original files are unchanged.")
+                return
+
+            delivered = await self._deliver_inline_result(
+                update,
+                context,
+                output_path,
+                target_video,
+                kind="video",
+                delivery_name=_video_delivery_name(target_video, output_path),
+                caption=_metadata_caption(target_video),
+                notify=lambda text, **kwargs: self.safe_edit(query, text, **kwargs),
+            )
+            if delivered:
+                context.user_data.pop(pending_key, None)
+        except Exception:
+            logger.exception("Failed to add audio to video")
+            await self.safe_edit(query, "❌ Failed to add audio. The original files are unchanged.")
+        finally:
+            session["current_file"] = original_current
+            with contextlib.suppress(Exception):
+                self._persist_session(update.effective_user.id)
+            if output_path and os.path.exists(output_path):
+                with contextlib.suppress(OSError):
+                    os.remove(output_path)
 
     async def remove_audio(self, update: Update, context: ContextTypes.DEFAULT_TYPE, session: dict):
         """Remove audio from video."""
@@ -13410,14 +13790,21 @@ class EnhancedMediaHandler:
         # there instead of ffmpeg being handed a path this session does not have.
         input_path = self._local_copy(current_file)
         if input_path is None:
+            scale_filter = (
+                f"scale={width}:{height}:force_original_aspect_ratio=decrease,pad={width}:{height}:(ow-iw)/2:(oh-ih)/2"
+            )
             queued = await self._enqueue_keyed_job(
                 update,
                 context,
                 current_file,
                 output_path=output_path,
                 ffmpeg_args=[
-                    "-filter:v",
-                    f"scale={width}:{height}",
+                    "-map",
+                    "0:v:0",
+                    "-map",
+                    "0:a?",
+                    "-vf",
+                    scale_filter,
                     "-c:v",
                     "libx264",
                     "-preset",
@@ -13425,7 +13812,12 @@ class EnhancedMediaHandler:
                     "-crf",
                     "23",
                     "-c:a",
-                    "copy",
+                    "aac",
+                    "-b:a",
+                    "128k",
+                    *_source_metadata_ffmpeg_args(current_file),
+                    "-movflags",
+                    "+faststart",
                 ],
                 output_ext=".mp4",
                 job_type="change_resolution",
@@ -13641,13 +14033,29 @@ class EnhancedMediaHandler:
             return
 
         # ── Store conversion metadata so the BigFilePipeline knows what to produce ──
-        current_file["_pipeline_ffmpeg_args"] = ["-c", "copy"]
+        current_file["_pipeline_ffmpeg_args"] = [
+            "-fflags",
+            "+genpts",
+            "-err_detect",
+            "ignore_err",
+            "-map",
+            "0:v:0?",
+            "-map",
+            "0:a?",
+            "-c",
+            "copy",
+            *_source_metadata_ffmpeg_args(current_file),
+            "-movflags",
+            "+faststart",
+        ]
         current_file["_pipeline_output_ext"] = ".mp4"
         current_file["_pipeline_conversion_type"] = "repair_video"
         current_file["_pipeline_caption"] = _metadata_caption(current_file)
         session["current_file"] = current_file
 
-        await self.safe_edit(query, "🔧 Attempting to repair video...")
+        await self.safe_edit(
+            query, "🔧 Attempting a container remux (repairs indexing/timestamp issues, not damaged frames)…"
+        )
         current_file, _ = await self._ensure_local_media(update, context, session, current_file, query=query)
         if current_file is None:
             return
@@ -13684,11 +14092,11 @@ class EnhancedMediaHandler:
             "output_path": output_path,
             # Keeps the delivered filename derived from the original name.
             "original_filename": current_file.get("name") or os.path.basename(output_path),
-            "ffmpeg_args": ["-c", "copy"],
+            "ffmpeg_args": list(current_file["_pipeline_ffmpeg_args"]),
             "progress_channel": f"ffmpeg:progress:{job_id}",
             "chat_id": update.effective_chat.id if update and update.effective_chat else None,
             "thumbnail": current_file.get("thumbnail"),
-            "caption": "✅ Video repaired (if possible)",
+            "caption": "✅ Container remux completed",
             "cleanup_input": True,
             "cleanup_output": True,
         }
@@ -15477,57 +15885,89 @@ class EnhancedMediaHandler:
                 await update.message.reply_text(f"✅ Bulk compress CRF set to {_crf}.")
 
         elif context.user_data.get("awaiting_resolution") or context.user_data.get("awaiting_custom_resolution"):
-            if "x" in user_input:
-                try:
-                    width, height = map(int, user_input.split("x"))
-                    await update.message.reply_text(f"📐 Changing resolution to {width}x{height}...")
+            match = re.fullmatch(r"\s*(\d{1,4})\s*[xX]\s*(\d{1,4})\s*", user_input)
+            if not match:
+                await update.message.reply_text("❌ Use WIDTHxHEIGHT, for example 1280x720.")
+                return
+            width, height = map(int, match.groups())
+            if not (16 <= width <= 7680 and 16 <= height <= 4320 and width % 2 == 0 and height % 2 == 0):
+                await update.message.reply_text("❌ Use even dimensions: width 16–7680 and height 16–4320.")
+                return
+            if not current_file or current_file.get("type") != "video":
+                await update.message.reply_text("❌ Select a video before changing its resolution.")
+                for key in ("awaiting_resolution", "awaiting_custom_resolution"):
+                    context.user_data.pop(key, None)
+                return
 
-                    output_base = getattr(config, "OUTPUT_PATH", "storage/output") if config else "storage/output"
-                    with contextlib.suppress(OSError):
-                        os.makedirs(output_base, exist_ok=True)
-                    output_path = os.path.join(output_base, f"{current_file['id']}_{width}x{height}.mp4")
-                    input_path = self._local_copy(current_file)
-                    if input_path is None:
-                        # No local copy: the worker scales the stored object (see
-                        # change_resolution), which is also what the button does.
-                        if not await self._enqueue_keyed_job(
-                            update,
-                            context,
-                            current_file,
-                            output_path=output_path,
-                            ffmpeg_args=["-filter:v", f"scale={width}:{height}", "-c:a", "copy"],
-                            output_ext=".mp4",
-                            job_type="change_resolution",
-                            caption=_metadata_caption(current_file),
-                            notify=update.message.reply_text,
-                        ):
-                            await update.message.reply_text(
-                                "❌ The media has no local copy and no stored object to work from."
-                            )
-                    else:
-                        success = await self.converter.change_resolution(input_path, output_path, width, height)
-
-                        if success and os.path.exists(output_path):
-                            await self._send_video_result(
-                                context.bot,
-                                update.effective_chat.id,
-                                output_path,
-                                caption=_metadata_caption(current_file),
-                                delivery_name=_video_delivery_name(current_file, output_path),
-                                upload_mode=_user_upload_mode(update.effective_user.id),
-                            )
-                            os.remove(output_path)
-                        else:
-                            await update.message.reply_text("❌ Failed to change resolution.")
-                except Exception:
-                    logger.exception("Invalid resolution input while parsing WIDTHxHEIGHT")
-                    await update.message.reply_text("❌ Invalid format. Use WIDTHxHEIGHT.")
+            for key in ("awaiting_resolution", "awaiting_custom_resolution"):
+                context.user_data.pop(key, None)
+            if not await self._check_conversion_quota(update, context):
+                return
+            await update.message.reply_text(f"📐 Changing resolution to {width}x{height}…")
+            current_file, _ = await self._ensure_local_media(
+                update, context, session, current_file, notify=update.message.reply_text
+            )
+            if current_file is None:
+                return
+            output_base = getattr(config, "OUTPUT_PATH", "storage/output") if config else "storage/output"
+            os.makedirs(output_base, exist_ok=True)
+            output_path = os.path.join(output_base, f"{current_file['id']}_{width}x{height}.mp4")
+            scale_filter = (
+                f"scale={width}:{height}:force_original_aspect_ratio=decrease,pad={width}:{height}:(ow-iw)/2:(oh-ih)/2"
+            )
+            ffmpeg_args = [
+                "-map",
+                "0:v:0",
+                "-map",
+                "0:a?",
+                "-vf",
+                scale_filter,
+                "-c:v",
+                "libx264",
+                "-preset",
+                "veryfast",
+                "-crf",
+                "23",
+                "-c:a",
+                "aac",
+                "-b:a",
+                "128k",
+                *_source_metadata_ffmpeg_args(current_file),
+                "-movflags",
+                "+faststart",
+            ]
+            input_path = self._local_copy(current_file)
+            if input_path is None:
+                if not await self._enqueue_keyed_job(
+                    update,
+                    context,
+                    current_file,
+                    output_path=output_path,
+                    ffmpeg_args=ffmpeg_args,
+                    output_ext=".mp4",
+                    job_type="change_resolution",
+                    caption=_metadata_caption(current_file),
+                    notify=update.message.reply_text,
+                ):
+                    await update.message.reply_text("❌ The media has no local copy and no stored object to work from.")
             else:
-                await update.message.reply_text("❌ Invalid format. Use WIDTHxHEIGHT.")
-
-            for key in list(context.user_data.keys()):
-                if key.startswith("awaiting_"):
-                    del context.user_data[key]
+                try:
+                    success = await self.converter.change_resolution(input_path, output_path, width, height)
+                    if success and os.path.exists(output_path):
+                        await self._send_video_result(
+                            context.bot,
+                            update.effective_chat.id,
+                            output_path,
+                            caption=_metadata_caption(current_file),
+                            delivery_name=_video_delivery_name(current_file, output_path),
+                            upload_mode=_user_upload_mode(update.effective_user.id),
+                        )
+                    else:
+                        await update.message.reply_text("❌ Failed to change resolution.")
+                finally:
+                    if os.path.exists(output_path):
+                        with contextlib.suppress(OSError):
+                            os.remove(output_path)
 
         elif context.user_data.get("awaiting_caption"):
             # The Caption Editor's answer. Both halves matter: the caption is
@@ -15725,53 +16165,70 @@ class EnhancedMediaHandler:
                         del context.user_data[key]
 
         elif context.user_data.get("awaiting_framerate"):
-            # Handle custom framerate input
+            if not current_file or current_file.get("type") != "video":
+                await update.message.reply_text("❌ Select a video before changing its framerate.")
+                context.user_data.pop("awaiting_framerate", None)
+                return
             try:
-                fps = float(user_input)
-                await update.message.reply_text(f"⏱️ Changing framerate to {fps} fps...")
-                output_base = getattr(config, "OUTPUT_PATH", "storage/output") if config else "storage/output"
-                with contextlib.suppress(OSError):
-                    os.makedirs(output_base, exist_ok=True)
-                output_path = os.path.join(output_base, f"{current_file['id']}_fr_{int(fps)}.mp4")
-                # The media may only be a stored object (a repeat, or an ingest
-                # that streamed straight to storage): make it available the one
-                # shared way before deciding between an inline encode and a job.
-                current_file, _ = await self._ensure_local_media(
-                    update, context, session, current_file, notify=update.message.reply_text
-                )
-                if current_file is None:
-                    return
-                input_path = self._local_copy(current_file)
-                if input_path is None:
-                    # No local copy: the worker re-encodes the stored object.
-                    if not await self._enqueue_keyed_job(
-                        update,
-                        context,
-                        current_file,
-                        output_path=output_path,
-                        ffmpeg_args=[
-                            "-r",
-                            str(fps),
-                            "-c:v",
-                            "libx264",
-                            "-preset",
-                            "veryfast",
-                            "-crf",
-                            "23",
-                            "-c:a",
-                            "copy",
-                        ],
-                        output_ext=".mp4",
-                        job_type="change_framerate",
-                        caption=_metadata_caption(current_file),
-                        notify=update.message.reply_text,
-                    ):
-                        await update.message.reply_text(
-                            "❌ The media has no local copy and no stored object to work from."
-                        )
-                else:
-                    success = await self.converter.change_framerate(input_path, output_path, fps)
+                fps = float(user_input.strip())
+            except (TypeError, ValueError):
+                fps = float("nan")
+            if not math.isfinite(fps) or not 1 <= fps <= 120:
+                await update.message.reply_text("❌ Enter a finite framerate from 1 to 120 (for example 23.976).")
+                return
 
+            if not await self._check_conversion_quota(update, context):
+                context.user_data.pop("awaiting_framerate", None)
+                return
+            context.user_data.pop("awaiting_framerate", None)
+            await update.message.reply_text(f"⏱️ Changing framerate to {fps:g} fps…")
+            output_base = getattr(config, "OUTPUT_PATH", "storage/output") if config else "storage/output"
+            os.makedirs(output_base, exist_ok=True)
+            fps_token = f"{fps:.3f}".rstrip("0").rstrip(".").replace(".", "p")
+            output_path = os.path.join(output_base, f"{current_file['id']}_fr_{fps_token}.mp4")
+            ffmpeg_args = [
+                "-map",
+                "0:v:0",
+                "-map",
+                "0:a?",
+                "-r",
+                f"{fps:g}",
+                "-c:v",
+                "libx264",
+                "-preset",
+                "veryfast",
+                "-crf",
+                "23",
+                "-c:a",
+                "aac",
+                "-b:a",
+                "128k",
+                *_source_metadata_ffmpeg_args(current_file),
+                "-movflags",
+                "+faststart",
+            ]
+            current_file, _ = await self._ensure_local_media(
+                update, context, session, current_file, notify=update.message.reply_text
+            )
+            if current_file is None:
+                return
+            input_path = self._local_copy(current_file)
+            if input_path is None:
+                if not await self._enqueue_keyed_job(
+                    update,
+                    context,
+                    current_file,
+                    output_path=output_path,
+                    ffmpeg_args=ffmpeg_args,
+                    output_ext=".mp4",
+                    job_type="change_framerate",
+                    caption=_metadata_caption(current_file),
+                    notify=update.message.reply_text,
+                ):
+                    await update.message.reply_text("❌ The media has no local copy and no stored object to work from.")
+            else:
+                try:
+                    success = await self.converter.change_framerate(input_path, output_path, fps)
                     if success and os.path.exists(output_path):
                         await self._send_video_result(
                             context.bot,
@@ -15781,14 +16238,12 @@ class EnhancedMediaHandler:
                             delivery_name=_video_delivery_name(current_file, output_path),
                             upload_mode=_user_upload_mode(update.effective_user.id),
                         )
-                        os.remove(output_path)
                     else:
                         await update.message.reply_text("❌ Failed to change framerate.")
-            except Exception:
-                await update.message.reply_text("❌ Invalid FPS value. Use a number like 24 or 29.97.")
-                for key in list(context.user_data.keys()):
-                    if key.startswith("awaiting_"):
-                        del context.user_data[key]
+                finally:
+                    if os.path.exists(output_path):
+                        with contextlib.suppress(OSError):
+                            os.remove(output_path)
 
         elif context.user_data.get("awaiting_mp3_bitrate"):
             # Handle a custom bitrate for video -> MP3 extraction

@@ -3,6 +3,7 @@ import asyncio
 import contextlib
 import logging
 import os
+import re
 import tempfile
 
 import config
@@ -544,6 +545,7 @@ async def merge_videos(
                 threads = filter_threads = 1
             cmd.extend(["-filter_threads", str(filter_threads)])
         cmd.extend(["-f", "concat", "-safe", "0", "-i", concat_file])
+        cmd.extend(["-map_metadata", "0", "-map_chapters", "0"])
         if reencode:
             cmd.extend(
                 [
@@ -842,25 +844,30 @@ async def change_resolution(input_path: str, output_path: str, width: int, heigh
         return False, error
 
     # Validate dimensions
-    if width <= 0 or height <= 0:
-        error = f"Invalid dimensions: {width}x{height}. Both must be > 0"
+    if not (16 <= width <= 7680 and 16 <= height <= 4320):
+        error = f"Invalid dimensions: {width}x{height}. Use width 16-7680 and height 16-4320."
         logger.error(error)
         return False, error
 
     if width % 2 != 0 or height % 2 != 0:
-        logger.warning(f"Resolution {width}x{height} not even. FFmpeg may adjust.")
+        error = f"Invalid dimensions: {width}x{height}. Width and height must both be even."
+        logger.error(error)
+        return False, error
 
     try:
-        # The video is re-encoded for the new size, so its preset has to be
-        # stated: with no ``-c:v``/``-preset`` ffmpeg picks libx264 and runs its
-        # ``medium`` default, far slower than the rest of the bot's encodes.
+        # Fit the source inside the requested canvas instead of distorting its
+        # aspect ratio, and explicitly copy the source's container metadata.
         cmd = [
             "ffmpeg",
             "-y",
             "-i",
             input_path,
-            "-filter:v",
-            f"scale={width}:{height}",
+            "-map",
+            "0:v:0",
+            "-map",
+            "0:a?",
+            "-vf",
+            f"scale={width}:{height}:force_original_aspect_ratio=decrease,pad={width}:{height}:(ow-iw)/2:(oh-ih)/2",
             "-c:v",
             "libx264",
             "-preset",
@@ -868,7 +875,15 @@ async def change_resolution(input_path: str, output_path: str, width: int, heigh
             "-crf",
             "23",
             "-c:a",
-            "copy",
+            "aac",
+            "-b:a",
+            "128k",
+            "-map_metadata",
+            "0",
+            "-map_chapters",
+            "0",
+            "-movflags",
+            "+faststart",
             output_path,
         ]
 
@@ -1121,9 +1136,31 @@ async def split_media_segments(
 
 
 async def repair_video(input_path: str, output_path: str) -> tuple[bool, str]:
-    """Repair corrupted video asynchronously."""
+    """Rebuild a video container and regenerate missing presentation timestamps."""
     try:
-        cmd = ["ffmpeg", "-y", "-i", input_path, "-c", "copy", output_path]
+        cmd = [
+            "ffmpeg",
+            "-y",
+            "-fflags",
+            "+genpts",
+            "-err_detect",
+            "ignore_err",
+            "-i",
+            input_path,
+            "-map",
+            "0:v:0?",
+            "-map",
+            "0:a?",
+            "-c",
+            "copy",
+            "-map_metadata",
+            "0",
+            "-map_chapters",
+            "0",
+            "-movflags",
+            "+faststart",
+            output_path,
+        ]
 
         process = await _spawn_process(*cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
 
@@ -1256,8 +1293,13 @@ async def generate_sample(input_path: str, output_path: str, duration: int = 30)
         return False, str(e)
 
 
-async def extract_streams(input_path: str, output_dir: str) -> tuple[bool, dict[str, str]]:
-    """Extract all streams asynchronously."""
+async def extract_streams(
+    input_path: str,
+    output_dir: str,
+    *,
+    source_stem: str | None = None,
+) -> tuple[bool, dict[str, str]]:
+    """Extract each supported video, audio and subtitle stream without remapping another track."""
     try:
         # Validate input path before probing
         valid, error = _validate_input_file(input_path)
@@ -1274,33 +1316,73 @@ async def extract_streams(input_path: str, output_dir: str) -> tuple[bool, dict[
 
         import json
 
+        if process.returncode != 0:
+            logger.error("ffprobe failed while extracting streams: %s", stderr.decode("utf-8", errors="ignore")[-500:])
+            return False, {}
         probe_data = json.loads(stdout.decode())
         streams = probe_data.get("streams", [])
 
         extracted = {}
+        attempted_outputs = []
+        failures = []
+        safe_stem = os.path.basename(str(source_stem or os.path.splitext(os.path.basename(input_path))[0]))
+        safe_stem = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", safe_stem).strip(" .") or "video"
 
         for i, stream in enumerate(streams):
+            stream_index = stream.get("index", i)
             codec_type = stream.get("codec_type", "unknown")
 
             if codec_type == "video":
-                output = os.path.join(output_dir, f"stream_video_{i}.mp4")
-                cmd = ["ffmpeg", "-y", "-i", input_path, "-map", f"0:v:{i}", "-c:v", "copy", "-an", output]
+                extension = ".mkv"
+                args = ["-c:v", "copy", "-an"]
+                output_metadata_specifier = "v:0"
             elif codec_type == "audio":
-                output = os.path.join(output_dir, f"stream_audio_{i}.aac")
-                cmd = ["ffmpeg", "-y", "-i", input_path, "-map", f"0:a:{i}", "-c:a", "copy", "-vn", output]
+                extension = ".mka"
+                args = ["-c:a", "copy", "-vn"]
+                output_metadata_specifier = "a:0"
             elif codec_type == "subtitle":
-                output = os.path.join(output_dir, f"stream_subtitle_{i}.srt")
-                cmd = ["ffmpeg", "-y", "-i", input_path, "-map", f"0:s:{i}", "-c:s", "srt", output]
+                extension = ".mks"
+                args = ["-c:s", "copy"]
+                output_metadata_specifier = "s:0"
             else:
                 continue
 
+            output = os.path.join(output_dir, f"{safe_stem}_{codec_type}_{stream_index}{extension}")
+            attempted_outputs.append(output)
+            cmd = [
+                "ffmpeg",
+                "-y",
+                "-i",
+                input_path,
+                "-map",
+                f"0:{stream_index}",
+                "-map_metadata",
+                "0",
+                f"-map_metadata:{output_metadata_specifier}",
+                f"0:{stream_index}",
+                "-map_chapters",
+                "0",
+                *args,
+                output,
+            ]
             proc = await _spawn_process(*cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
 
-            _, _ = await proc.communicate()
+            _, error = await proc.communicate()
 
-            if proc.returncode == 0:
-                extracted[f"{codec_type}_{i}"] = output
+            if proc.returncode == 0 and os.path.exists(output) and os.path.getsize(output) > 0:
+                extracted[f"{codec_type}_{stream_index}"] = output
+            else:
+                failures.append(f"{codec_type} stream {stream_index}: {error.decode('utf-8', errors='ignore')[-300:]}")
 
+        if failures:
+            logger.error("Could not extract all media streams: %s", "; ".join(failures))
+            for output in attempted_outputs:
+                with contextlib.suppress(OSError):
+                    os.remove(output)
+            return False, {}
+        if not extracted:
+            logger.warning("No supported video, audio, or subtitle streams found in %s", input_path)
+            return False, {}
         return True, extracted
 
     except Exception as e:

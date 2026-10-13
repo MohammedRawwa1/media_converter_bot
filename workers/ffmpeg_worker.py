@@ -2901,7 +2901,11 @@ async def handle_job(job: dict):
                             getattr(config, "OUTPUT_PATH", "storage/output"), f"{job_id}_streams"
                         )
                         os.makedirs(out_dir, exist_ok=True)
-                        ok, extracted = await extract_streams(input_path, out_dir)
+                        ok, extracted = await extract_streams(
+                            input_path,
+                            out_dir,
+                            source_stem=os.path.splitext(os.path.basename(job.get("original_filename") or "video"))[0],
+                        )
                         if ok and extracted:
                             archive_path = job.get("archive_path") or f"{out_dir}.zip"
                             ok2, msg2 = await create_archive(list(extracted.values()), archive_path)

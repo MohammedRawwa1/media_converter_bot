@@ -90,7 +90,7 @@ def mp4_remux_args(probe: dict | None) -> list[str] | None:
         args += ["-tag:v", "hvc1"]
     if audio_codec:
         args += ["-c:a", "copy"]
-    args += ["-movflags", "+faststart"]
+    args += ["-map_metadata", "0", "-map_chapters", "0", "-movflags", "+faststart"]
     return args
 
 

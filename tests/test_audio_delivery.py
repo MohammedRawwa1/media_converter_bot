@@ -1352,29 +1352,46 @@ class MergeAudiosDeliveryTests(unittest.TestCase):
                     fh.write(b"merged")
                 return True
 
-        class FakeBot:
-            async def send_audio(self, **kwargs):
-                captured.update(kwargs)
+        async def _prepare(_update, _context, _session, _notify):
+            return [os.path.join(TMP, "a.mp3"), os.path.join(TMP, "b.mp3")], []
+
+        async def _deliver(_update, _context, _path, _current, **kwargs):
+            captured.update(kwargs)
+            return True
 
         handler._require_callback = _yes
         handler._check_conversion_quota = _yes
         handler.safe_edit = _noop
         handler.converter = FakeConverter()
+        handler._prepare_audio_merge_sources = _prepare
+        handler._persist_session = lambda _user_id: None
+        handler._deliver_inline_result = _deliver
 
         session = {
-            "current_file": {"name": "First.mp3", "_source_metadata": {"title": "Tagged"}},
-            "merge_list": [os.path.join(TMP, "a.mp3"), os.path.join(TMP, "b.mp3")],
+            "audio_merge_selection": [
+                {
+                    "id": "audio-1",
+                    "type": "audio",
+                    "name": "First.mp3",
+                    "source_name": "First.mp3",
+                    "size": 10,
+                    "_source_metadata": {"title": "Tagged"},
+                },
+                {"id": "audio-2", "type": "audio", "name": "Second.mp3", "source_name": "Second.mp3", "size": 10},
+            ],
         }
         update = SimpleNamespace(
             callback_query=SimpleNamespace(message=None),
             effective_chat=SimpleNamespace(id=1),
+            effective_user=SimpleNamespace(id=7),
         )
-        context = SimpleNamespace(bot=FakeBot())
+        context = SimpleNamespace(bot=SimpleNamespace())
 
         asyncio.run(handler.merge_audios(update, context, session))
 
         self.assertEqual(captured.get("caption"), "Tagged")
-        self.assertEqual(session["merge_list"], [])
+        self.assertEqual(captured.get("delivery_name"), "First.mp3")
+        self.assertEqual(session["audio_merge_selection"], [])
 
 
 class DocumentDeliveryPreferenceTests(unittest.TestCase):

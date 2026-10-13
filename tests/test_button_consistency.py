@@ -523,13 +523,22 @@ def test_the_reorder_move_is_routed_and_offered():
 
 
 def test_the_audio_merge_menu_starts_the_audio_merge():
-    """Audio Tools' 🔀 Merge used to run the video merge on an audio list."""
-    audio = {b.callback_data for row in MediaMenuBuilder.get_merge_menu("audio").inline_keyboard for b in row}
-    video = {b.callback_data for row in MediaMenuBuilder.get_merge_menu("video").inline_keyboard for b in row}
+    """The two typed review lists expose only their corresponding merge action."""
+    audio = {
+        b.callback_data
+        for row in MediaMenuBuilder.get_audio_merge_review_menu(["1", "2"], True).inline_keyboard
+        for b in row
+    }
+    video = {
+        b.callback_data
+        for row in MediaMenuBuilder.get_video_merge_review_menu(["1", "2"], True).inline_keyboard
+        for b in row
+    }
     assert "merge_audios_start" in audio
     assert "merge_videos_start" not in audio
     assert "merge_videos_start" in video
     assert "merge_audios_start" not in video
+    assert not {"merge_add", "merge_view", "merge_clear"} & audio
 
 
 def test_both_merge_starts_are_routed():
