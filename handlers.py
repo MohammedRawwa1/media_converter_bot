@@ -540,6 +540,11 @@ _EXTRACT_VIDEO_FFMPEG_ARGS = [
     "+faststart",
 ]
 
+# "Remove Audio": drop every audio stream and copy the video stream as-is, so the
+# picture is untouched and no re-encode runs. Shared by the button and the
+# big-file pipeline so a large source is stripped with the same recipe.
+_REMOVE_AUDIO_FFMPEG_ARGS = ["-an", "-c:v", "copy"]
+
 
 def _sanitize_audio_bitrate(value, default: str = _DEFAULT_AUDIO_BITRATE) -> str:
     """Normalize a user-supplied audio bitrate to a safe ``"<kbps>k"`` string."""
@@ -13881,7 +13886,22 @@ class EnhancedMediaHandler:
                     os.remove(output_path)
 
     async def remove_audio(self, update: Update, context: ContextTypes.DEFAULT_TYPE, session: dict):
-        """Remove audio from video."""
+        """Remove the audio track from the current video.
+
+        The same steps every other action button takes, in the same order:
+        make the source local (the big-file pipeline fetches it when it is past
+        the Bot API ceiling), validate that there is an audio track to remove,
+        run the operation with a watcher on its progress, then deliver the
+        result through the shared size tiers.
+
+        Two things this button used to skip are what made it behave unlike its
+        neighbours: it never declared what a pipeline fetch should produce, so a
+        large source was queued with no ffmpeg arguments and came back as the
+        same video with its audio intact; and it ran the removal inline with no
+        watcher and no ceiling-aware delivery, so a long job showed no progress
+        and an over-limit result failed to upload after the work was already
+        done.
+        """
         if not await self._require_callback(update):
             return
         query = update.callback_query
@@ -13894,16 +13914,49 @@ class EnhancedMediaHandler:
         if not await self._check_conversion_quota(update, context):
             return
 
+        user_id = update.effective_user.id
+
+        # ── Cancel any stale pipeline job so these arguments take effect ──
+        if current_file.get("_pipeline_job_id"):
+            await self._cancel_stale_pipeline_job(session, "remove_audio", user_id)
+
+        # ── Declare what a pipeline fetch should produce ──
+        # Without this a source the pipeline has to fetch was queued with no
+        # ffmpeg arguments and no conversion type, so the audio was never
+        # removed. The same recipe as the inline path below, so both produce the
+        # same file.
+        current_file["_pipeline_ffmpeg_args"] = list(_REMOVE_AUDIO_FFMPEG_ARGS)
+        current_file["_pipeline_output_ext"] = ".mp4"
+        current_file["_pipeline_conversion_type"] = "remove_audio"
+        current_file["_pipeline_caption"] = _metadata_caption(current_file)
+        session["current_file"] = current_file
+
         await self.safe_edit(query, "🔉 Removing audio...")
 
-        current_file, _ = await self._ensure_local_media(update, context, session, current_file, query=query)
+        current_file, _pipeline_notice = await self._ensure_local_media(
+            update, context, session, current_file, query=query
+        )
         if current_file is None:
+            return
+        # The pipeline queued the fetch *and* the conversion: it owns both, so
+        # queueing a second job here would process the media twice.
+        if current_file.get("_pipeline_job_id"):
+            _pipeline_job_id = current_file["_pipeline_job_id"]
+            await self._watch_pipeline_job(
+                update,
+                context,
+                _pipeline_job_id,
+                f"✅ Large file queued (Job: {_pipeline_job_id[:8]}...). I'll send the video when ready.",
+                query=query,
+                notice=_pipeline_notice,
+            )
             return
 
         output_dir = getattr(config, "OUTPUT_PATH", "storage/output") if config else "storage/output"
         with contextlib.suppress(OSError):
             os.makedirs(output_dir, exist_ok=True)
         output_path = os.path.join(output_dir, f"{current_file['id']}_no_audio.mp4")
+        delivery_name = _video_delivery_name(current_file, output_path)
 
         # No local copy: the source is a stored object, so the worker reads it
         # there - the route the compressor and the repair already take. There is
@@ -13915,7 +13968,7 @@ class EnhancedMediaHandler:
                 context,
                 current_file,
                 output_path=output_path,
-                ffmpeg_args=["-an", "-c:v", "copy"],
+                ffmpeg_args=list(_REMOVE_AUDIO_FFMPEG_ARGS),
                 output_ext=".mp4",
                 job_type="remove_audio",
                 caption=_metadata_caption(current_file),
@@ -13925,20 +13978,53 @@ class EnhancedMediaHandler:
                 await self.safe_edit(query, "❌ The media has no local copy and no stored object to work from.")
             return
 
-        success = await self.converter.remove_audio(input_path, output_path)
+        # ── Validation, before any encode ──
+        # A silent video has nothing to remove, and ffmpeg's exit code for that
+        # is indistinguishable from a real failure. Answer what is actually the
+        # matter instead of running the work.
+        if not await _source_has_audio(input_path, current_file):
+            await self.safe_edit(query, "❌ This video has no audio track to remove.")
+            return
 
-        if success and os.path.exists(output_path):
-            await self._send_video_result(
-                context.bot,
-                update.effective_chat.id,
-                output_path,
-                caption=_metadata_caption(current_file),
-                delivery_name=_video_delivery_name(current_file, output_path),
-                upload_mode=_user_upload_mode(update.effective_user.id),
-            )
-            os.remove(output_path)
-        else:
+        # ── Run it where the other conversions run: a worker job with progress
+        # and a watcher. The result is delivered by the worker, so a video over
+        # the Bot API ceiling still reaches the user. ──
+        queued = await self._enqueue_worker_job(
+            update,
+            context,
+            current_file,
+            output_path=output_path,
+            ffmpeg_args=list(_REMOVE_AUDIO_FFMPEG_ARGS),
+            output_ext=".mp4",
+            job_type="remove_audio",
+            caption=_metadata_caption(current_file),
+            delivery_name=delivery_name,
+            query=query,
+        )
+        if queued:
+            return
+
+        # ── No queue in this process: run it inline, then deliver through the
+        # same size tiers the queued path uses. ──
+        success = await self.converter.remove_audio(input_path, output_path)
+        if not success or not os.path.exists(output_path):
             await self.safe_edit(query, "❌ Failed to remove audio.")
+            return
+
+        delivered = await self._deliver_inline_result(
+            update,
+            context,
+            output_path,
+            current_file,
+            kind="video",
+            delivery_name=delivery_name,
+            caption=_metadata_caption(current_file),
+            notify=lambda text, **kwargs: self.safe_edit(query, text, **kwargs),
+        )
+        with contextlib.suppress(OSError):
+            os.remove(output_path)
+        if delivered:
+            await self.safe_edit(query, "✅ Audio removed. Here is your video.")
 
     async def change_resolution(
         self,
