@@ -276,6 +276,7 @@ class BigFilePipeline:
         batch_seq: int = 0,
         batch_total: int = 0,
         cancel_check: Callable[[], bool] | None = None,
+        extra: dict | None = None,
     ) -> IngestResult:
         """Download a large file via Pyrogram userbot, upload to S3, enqueue a processing job.
 
@@ -810,6 +811,13 @@ class BigFilePipeline:
                 _streams_dir = os.path.join(_out_base, f"{job_id}_streams")
                 job["output_dir"] = _streams_dir
                 job["archive_path"] = f"{_streams_dir}.zip"
+
+            # Job shapes whose work is fields rather than ffmpeg arguments (trim's
+            # start/end, fade's in/out) travel the same way a keyed job carries them,
+            # so the worker runs the identical recipe whichever path fetched the
+            # media. Merged last: these are the caller's explicit values.
+            if extra:
+                job.update(extra)
 
             if batch_id:
                 from utils.batch_pipeline import tag_batch_job

@@ -610,6 +610,77 @@ async def _source_has_audio(path: str | None, current_file: dict | None = None) 
         return True
 
 
+def _declare_pipeline_conversion(
+    current_file: dict,
+    *,
+    ffmpeg_args: list | None,
+    output_ext: str | None,
+    conversion_type: str,
+    caption: str | None = None,
+    remux_to: str | None = None,
+    extra: dict | None = None,
+) -> None:
+    """Tell the big-file pipeline what this action produces, before the fetch.
+
+    A pipeline job is handed its ffmpeg arguments at ingest time, so this
+    declaration is what lets a source past the Bot API download ceiling be
+    fetched and converted in one step. It also has to be *this* action's
+    declaration: the session survives from one button to the next, so a stale
+    one left by the previous conversion would otherwise be what the next large
+    file is fetched and processed for.
+    """
+    current_file["_pipeline_ffmpeg_args"] = list(ffmpeg_args) if ffmpeg_args else None
+    current_file["_pipeline_output_ext"] = output_ext
+    current_file["_pipeline_conversion_type"] = conversion_type
+    current_file["_pipeline_caption"] = caption
+    if remux_to:
+        current_file["_pipeline_remux_to"] = remux_to
+    else:
+        current_file.pop("_pipeline_remux_to", None)
+    # Fields a job shape needs at run time (trim's start/end, fade's in/out).
+    if extra:
+        current_file["_pipeline_extra"] = dict(extra)
+    else:
+        current_file.pop("_pipeline_extra", None)
+
+
+#: Conversions whose work is job fields rather than ffmpeg arguments. Their
+#: fields (``_pipeline_extra``) are handed to ingest, and only for these types:
+#: a leftover from an earlier trim must never rename a later compression.
+_PIPELINE_FIELD_CONVERSIONS = frozenset({"trim", "fade"})
+
+
+def _has_pipeline_declaration(current_file: dict) -> bool:
+    """Whether this fetch has been told what to produce.
+
+    Either half counts: an encode declares its ffmpeg arguments, while the job
+    shapes whose work is fields rather than arguments (extract_streams, trim,
+    fade) declare only their conversion type. A source is not put through the
+    pipeline on a guess - the job it is queued for has to be the caller's.
+    """
+    return bool(current_file.get("_pipeline_ffmpeg_args")) or bool(current_file.get("_pipeline_conversion_type"))
+
+
+def _clear_pipeline_conversion(current_file: dict) -> None:
+    """Drop a conversion declaration this action cannot honour.
+
+    Screenshots, analysis, subtitle reads, splits, merges and archive work are
+    not single-input ffmpeg conversions, so the pipeline cannot run them. The
+    declaration inherited from the last conversion must not be what fetches
+    their source: it would queue that old conversion instead of leaving the
+    handler with the file it actually needs.
+    """
+    for key in (
+        "_pipeline_ffmpeg_args",
+        "_pipeline_output_ext",
+        "_pipeline_conversion_type",
+        "_pipeline_caption",
+        "_pipeline_remux_to",
+        "_pipeline_extra",
+    ):
+        current_file.pop(key, None)
+
+
 async def _already_at_bitrate(
     current_file: dict | None,
     target: str,
@@ -4726,6 +4797,9 @@ class EnhancedMediaHandler:
             if announce:
                 with contextlib.suppress(Exception):
                     _fetching = await self._say_in_chat(update, context, "⬇️ Fetching the media to re-send…")
+            # Re-sending is not a conversion: the previous button's pipeline
+            # declaration must not be what fetches this source.
+            _clear_pipeline_conversion(current_file)
             try:
                 await self._ensure_current_file_downloaded(update, context, session)
             except Exception as exc:
@@ -5161,6 +5235,9 @@ class EnhancedMediaHandler:
             fetching = None
             with contextlib.suppress(Exception):
                 fetching = await update.message.reply_text("⬇️ Fetching the media to split…")
+            # Splitting writes several parts from one source, which is not a
+            # pipeline job shape: clear a declaration left by the last conversion.
+            _clear_pipeline_conversion(current_file)
             try:
                 await self._ensure_current_file_downloaded(update, context, session)
             except Exception as exc:
@@ -5802,6 +5879,8 @@ class EnhancedMediaHandler:
         }
         had_current = "current_file" in session
         previous = session.get("current_file")
+        # Unpacking an archive reads the media; it cannot be a conversion job.
+        _clear_pipeline_conversion(entry)
         session["current_file"] = entry
         archive_path = None
         try:
@@ -5903,6 +5982,8 @@ class EnhancedMediaHandler:
         context: ContextTypes.DEFAULT_TYPE,
         session: dict,
         file_info: dict,
+        *,
+        declared: bool = False,
     ):
         """Make one bulk-list entry available locally and return its usable path.
 
@@ -5919,6 +6000,11 @@ class EnhancedMediaHandler:
         had_current = "current_file" in session
         previous = session.get("current_file")
         pipeline_job_before = file_info.get("_pipeline_job_id")
+        # A bulk conversion declares on its entry just before calling here; any
+        # other collection (a slideshow input, an archive member) must not
+        # inherit the declaration of the previous conversion on this entry.
+        if not declared:
+            _clear_pipeline_conversion(file_info)
         session["current_file"] = file_info
         try:
             await self._ensure_current_file_downloaded(update, context, session)
@@ -6327,15 +6413,14 @@ class EnhancedMediaHandler:
             # to the pipeline / userbot route directly.
             #
             # The pipeline is only used when the caller has *declared what to
-            # produce* (``_pipeline_ffmpeg_args``): a pipeline job is handed its
-            # ffmpeg arguments at ingest time, so a caller that declares none would
-            # get a default-args conversion of a file it never asked to convert
-            # that way. Those callers are not stranded - without a declaration the
-            # media is fetched by the userbot fallback below, which is the local
-            # file they actually need.
+            # produce*: ffmpeg arguments for an encode, or a conversion type for
+            # the job shapes whose work is fields rather than arguments
+            # (extract_streams, trim, fade). A caller that declares neither is not
+            # stranded - it is fetched by the userbot fallback below, which is the
+            # local file it actually needs.
             bot_api_download_max_mb = getattr(config, "BOT_API_DOWNLOAD_MAX_MB", 20)
             file_size = current_file.get("size") or 0
-            _declared_conversion = bool(current_file.get("_pipeline_ffmpeg_args"))
+            _declared_conversion = _has_pipeline_declaration(current_file)
             if (
                 not force_refresh
                 and file_size
@@ -6572,6 +6657,11 @@ class EnhancedMediaHandler:
                             batch_seq=int(current_file.get("_pipeline_batch_seq") or 0),
                             batch_total=int(current_file.get("_pipeline_batch_total") or 0),
                             cancel_check=lambda: _pipeline_cancelled[0],
+                            extra=(
+                                current_file.get("_pipeline_extra")
+                                if current_file.get("_pipeline_conversion_type") in _PIPELINE_FIELD_CONVERSIONS
+                                else None
+                            ),
                         )
                         if _ingest.error == "batch cancelled":
                             with contextlib.suppress(Exception):
@@ -9539,14 +9629,8 @@ class EnhancedMediaHandler:
         if not await self._check_conversion_quota(update, context):
             return
 
-        # Lazy-download: a media-cache repeat has no local copy yet, and the
-        # trim used to dead-end on those with "No file available to trim".
-        current_file, _ = await self._ensure_local_media(update, context, session, current_file, notify=notify)
-        if current_file is None:
-            return
-
         is_audio = current_file.get("type") == "audio"
-        ext = os.path.splitext(current_file.get("name") or self._local_copy(current_file) or "")[1].lower()
+        ext = os.path.splitext(current_file.get("name") or "")[1].lower()
         supported = self.converter.supported_formats.get("audio" if is_audio else "video") or ()
         if ext not in supported:
             ext = ".mp3" if is_audio else ".mp4"
@@ -9564,6 +9648,43 @@ class EnhancedMediaHandler:
             if is_audio
             else f"{_stem}_trimmed{ext}"
         )
+
+        # A job already running for this media is not the one this fetch may
+        # queue: cancel it so it cannot deliver a stale result of its own.
+        if current_file.get("_pipeline_job_id"):
+            await self._cancel_stale_pipeline_job(session, "trim", update.effective_user.id)
+
+        # Declared before the fetch: a source past the Bot API ceiling is then
+        # fetched and trimmed in one pipeline job. Trim's work is its start/end
+        # pair, so those travel as job fields rather than ffmpeg arguments.
+        _declare_pipeline_conversion(
+            current_file,
+            ffmpeg_args=None,
+            output_ext=ext,
+            conversion_type="trim",
+            caption=_metadata_caption(current_file),
+            extra={"start_time": start_norm, "end_time": end_norm, "output_filename": delivery_name},
+        )
+        session["current_file"] = current_file
+
+        # Lazy-download: a media-cache repeat has no local copy yet, and the
+        # trim used to dead-end on those with "No file available to trim".
+        current_file, _pipeline_notice = await self._ensure_local_media(
+            update, context, session, current_file, notify=notify
+        )
+        if current_file is None:
+            return
+        if current_file.get("_pipeline_job_id"):
+            _pipeline_job_id = current_file["_pipeline_job_id"]
+            await self._watch_pipeline_job(
+                update,
+                context,
+                _pipeline_job_id,
+                f"✅ Large file queued (Job: {_pipeline_job_id[:8]}...). I'll send the trimmed file when ready.",
+                message=message,
+                notice=_pipeline_notice,
+            )
+            return
 
         local_input = self._local_copy(current_file)
         if not (local_input and os.path.exists(local_input)):
@@ -9675,8 +9796,39 @@ class EnhancedMediaHandler:
 
         await self.safe_edit(query, "📈 Applying fade effect...", reply_markup=MediaMenuBuilder.get_back_button())
 
-        current_file, _ = await self._ensure_local_media(update, context, session, current_file, query=query)
+        # A job already running for this media is not the one this fetch may
+        # queue: cancel it so it cannot deliver a stale result of its own.
+        if current_file.get("_pipeline_job_id"):
+            await self._cancel_stale_pipeline_job(session, "fade", update.effective_user.id)
+
+        # Declared before the fetch: a source past the Bot API ceiling is fetched
+        # and faded in one pipeline job. The fade's work is its in/out pair, so
+        # those travel as job fields rather than ffmpeg arguments.
+        _declare_pipeline_conversion(
+            current_file,
+            ffmpeg_args=None,
+            output_ext=ext,
+            conversion_type="fade",
+            caption=_metadata_caption(current_file),
+            extra={"fade_in": fade_in, "fade_out": fade_out, "output_filename": delivery_name},
+        )
+        session["current_file"] = current_file
+
+        current_file, _pipeline_notice = await self._ensure_local_media(
+            update, context, session, current_file, query=query
+        )
         if current_file is None:
+            return
+        if current_file.get("_pipeline_job_id"):
+            _pipeline_job_id = current_file["_pipeline_job_id"]
+            await self._watch_pipeline_job(
+                update,
+                context,
+                _pipeline_job_id,
+                f"✅ Large file queued (Job: {_pipeline_job_id[:8]}...). I'll send the faded file when ready.",
+                query=query,
+                notice=_pipeline_notice,
+            )
             return
 
         input_path = self._local_copy(current_file)
@@ -10129,10 +10281,49 @@ class EnhancedMediaHandler:
                     await self.safe_edit(
                         query, "\u2699\ufe0f Custom optimization: compressing with CRF 23, preset medium, faststart..."
                     )
-                    current_file, _ = await self._ensure_local_media(
+                    _custom_optimize_args = [
+                        "-c:v",
+                        "libx264",
+                        "-preset",
+                        "medium",
+                        "-crf",
+                        "23",
+                        "-movflags",
+                        "+faststart",
+                        "-c:a",
+                        "aac",
+                    ]
+                    # A job already running for this media is not the one this
+                    # fetch may queue: cancel it so it cannot deliver a stale
+                    # result of its own.
+                    if current_file.get("_pipeline_job_id"):
+                        await self._cancel_stale_pipeline_job(session, "optimize_video", user_id)
+                    # Declared before the fetch: the pipeline has to know this is a
+                    # custom optimize, not whatever the previous button queued.
+                    _declare_pipeline_conversion(
+                        current_file,
+                        ffmpeg_args=_custom_optimize_args,
+                        output_ext=".mp4",
+                        conversion_type="optimize_video",
+                        caption=_metadata_caption(current_file),
+                    )
+                    session["current_file"] = current_file
+                    current_file, _pipeline_notice = await self._ensure_local_media(
                         update, context, session, current_file, query=query
                     )
                     if current_file is None:
+                        return
+                    if current_file.get("_pipeline_job_id"):
+                        _pipeline_job_id = current_file["_pipeline_job_id"]
+                        await self._watch_pipeline_job(
+                            update,
+                            context,
+                            _pipeline_job_id,
+                            f"✅ Large file queued (Job: {_pipeline_job_id[:8]}...). "
+                            "I'll send the optimized video when ready.",
+                            query=query,
+                            notice=_pipeline_notice,
+                        )
                         return
                     output_dir = getattr(config, "OUTPUT_PATH", "storage/output") if config else "storage/output"
                     with contextlib.suppress(OSError):
@@ -10147,18 +10338,7 @@ class EnhancedMediaHandler:
                             context,
                             current_file,
                             output_path=os.path.join(output_dir, f"{current_file.get('id', 'unknown')}_optimized.mp4"),
-                            ffmpeg_args=[
-                                "-c:v",
-                                "libx264",
-                                "-preset",
-                                "medium",
-                                "-crf",
-                                "23",
-                                "-movflags",
-                                "+faststart",
-                                "-c:a",
-                                "aac",
-                            ],
+                            ffmpeg_args=_custom_optimize_args,
                             output_ext=".mp4",
                             job_type="optimize_video",
                             caption=_metadata_caption(current_file),
@@ -11312,7 +11492,7 @@ class EnhancedMediaHandler:
                                 # stopped the apply dead - no next file queued, no
                                 # bar moving, nothing said.
                                 _file_path = await asyncio.wait_for(
-                                    self._ensure_bulk_file_downloaded(update, context, sess, f),
+                                    self._ensure_bulk_file_downloaded(update, context, sess, f, declared=True),
                                     timeout=_BULK_FETCH_TIMEOUT_SECONDS,
                                 )
                             except TimeoutError:
@@ -13256,6 +13436,8 @@ class EnhancedMediaHandler:
                 isolated_item = dict(queued_item)
                 had_current = "current_file" in session
                 previous = session.get("current_file")
+                # A merge input is fetched for the merge, never converted on its own.
+                _clear_pipeline_conversion(isolated_item)
                 session["current_file"] = isolated_item
                 try:
                     await self._ensure_current_file_downloaded(
@@ -13418,6 +13600,8 @@ class EnhancedMediaHandler:
                 had_current = "current_file" in session
                 previous = session.get("current_file")
                 item["name"] = item.get("source_name") or item.get("name") or item.get("path")
+                # A merge input is fetched for the merge, never converted on its own.
+                _clear_pipeline_conversion(item)
                 session["current_file"] = item
                 try:
                     await self._ensure_current_file_downloaded(
@@ -13822,6 +14006,8 @@ class EnhancedMediaHandler:
         output_path = None
         try:
             for source in (dict(target_video), audio_file):
+                # Both inputs are read for the mix; neither is a pipeline conversion.
+                _clear_pipeline_conversion(source)
                 session["current_file"] = source
                 refreshed, _ = await self._ensure_local_media(update, context, session, source, query=query)
                 if refreshed is None:
@@ -13925,10 +14111,13 @@ class EnhancedMediaHandler:
         # ffmpeg arguments and no conversion type, so the audio was never
         # removed. The same recipe as the inline path below, so both produce the
         # same file.
-        current_file["_pipeline_ffmpeg_args"] = list(_REMOVE_AUDIO_FFMPEG_ARGS)
-        current_file["_pipeline_output_ext"] = ".mp4"
-        current_file["_pipeline_conversion_type"] = "remove_audio"
-        current_file["_pipeline_caption"] = _metadata_caption(current_file)
+        _declare_pipeline_conversion(
+            current_file,
+            ffmpeg_args=_REMOVE_AUDIO_FFMPEG_ARGS,
+            output_ext=".mp4",
+            conversion_type="remove_audio",
+            caption=_metadata_caption(current_file),
+        )
         session["current_file"] = current_file
 
         await self.safe_edit(query, "🔉 Removing audio...")
@@ -14074,8 +14263,64 @@ class EnhancedMediaHandler:
         width, height = res_map[resolution]
         await self.safe_edit(query, f"📐 Changing resolution to {width}x{height}...")
 
-        current_file, _ = await self._ensure_local_media(update, context, session, current_file, query=query)
+        # A job already running for this media is not the one this fetch may
+        # queue: cancel it so it cannot deliver a stale result of its own.
+        if current_file.get("_pipeline_job_id"):
+            await self._cancel_stale_pipeline_job(session, "change_resolution", update.effective_user.id)
+
+        # Declared before the fetch, so a source the pipeline has to download is
+        # queued for *this* scale, not for whatever the previous button left on
+        # the session.
+        scale_filter = (
+            f"scale={width}:{height}:force_original_aspect_ratio=decrease,pad={width}:{height}:(ow-iw)/2:(oh-ih)/2"
+        )
+        ffmpeg_args = [
+            "-map",
+            "0:v:0",
+            "-map",
+            "0:a?",
+            "-vf",
+            scale_filter,
+            "-c:v",
+            "libx264",
+            "-preset",
+            "veryfast",
+            "-crf",
+            "23",
+            "-c:a",
+            "aac",
+            "-b:a",
+            "128k",
+            *_source_metadata_ffmpeg_args(current_file),
+            "-movflags",
+            "+faststart",
+        ]
+        _declare_pipeline_conversion(
+            current_file,
+            ffmpeg_args=ffmpeg_args,
+            output_ext=".mp4",
+            conversion_type="change_resolution",
+            caption=_metadata_caption(current_file),
+        )
+        session["current_file"] = current_file
+
+        current_file, _pipeline_notice = await self._ensure_local_media(
+            update, context, session, current_file, query=query
+        )
         if current_file is None:
+            return
+        # The pipeline queued the fetch and the encode: watching it is the only
+        # work left here, and queueing a second job would scale the media twice.
+        if current_file.get("_pipeline_job_id"):
+            _pipeline_job_id = current_file["_pipeline_job_id"]
+            await self._watch_pipeline_job(
+                update,
+                context,
+                _pipeline_job_id,
+                f"✅ Large file queued (Job: {_pipeline_job_id[:8]}...). I'll send the video when ready.",
+                query=query,
+                notice=_pipeline_notice,
+            )
             return
 
         output_dir = getattr(config, "OUTPUT_PATH", "storage/output") if config else "storage/output"
@@ -14087,35 +14332,12 @@ class EnhancedMediaHandler:
         # there instead of ffmpeg being handed a path this session does not have.
         input_path = self._local_copy(current_file)
         if input_path is None:
-            scale_filter = (
-                f"scale={width}:{height}:force_original_aspect_ratio=decrease,pad={width}:{height}:(ow-iw)/2:(oh-ih)/2"
-            )
             queued = await self._enqueue_keyed_job(
                 update,
                 context,
                 current_file,
                 output_path=output_path,
-                ffmpeg_args=[
-                    "-map",
-                    "0:v:0",
-                    "-map",
-                    "0:a?",
-                    "-vf",
-                    scale_filter,
-                    "-c:v",
-                    "libx264",
-                    "-preset",
-                    "veryfast",
-                    "-crf",
-                    "23",
-                    "-c:a",
-                    "aac",
-                    "-b:a",
-                    "128k",
-                    *_source_metadata_ffmpeg_args(current_file),
-                    "-movflags",
-                    "+faststart",
-                ],
+                ffmpeg_args=ffmpeg_args,
                 output_ext=".mp4",
                 job_type="change_resolution",
                 caption=_metadata_caption(current_file),
@@ -14436,6 +14658,8 @@ class EnhancedMediaHandler:
         if not await self._check_conversion_quota(update, context):
             return
 
+        # A screenshot reads a frame; it is not a conversion the pipeline can run.
+        _clear_pipeline_conversion(current_file)
         current_file, _ = await self._ensure_local_media(update, context, session, current_file, query=query)
         if current_file is None:
             return
@@ -14524,6 +14748,8 @@ class EnhancedMediaHandler:
             logger.info("ffmpeg-python not available for take_screenshot; falling back to CLI where possible")
             return
 
+        # A screenshot reads a frame; it is not a conversion the pipeline can run.
+        _clear_pipeline_conversion(current_file)
         current_file, _ = await self._ensure_local_media(update, context, session, current_file, query=query)
         if current_file is None:
             return
@@ -14615,6 +14841,8 @@ class EnhancedMediaHandler:
             await self.safe_edit(query, "❌ No video file found.")
             return
 
+        # A thumbnail grid reads frames; it is not a conversion the pipeline can run.
+        _clear_pipeline_conversion(current_file)
         current_file, _ = await self._ensure_local_media(update, context, session, current_file, query=query)
         if current_file is None:
             return
@@ -14659,10 +14887,17 @@ class EnhancedMediaHandler:
             return
 
         # ── Store conversion metadata so the BigFilePipeline knows what to produce ──
-        current_file["_pipeline_ffmpeg_args"] = None
-        current_file["_pipeline_output_ext"] = ".zip"
-        current_file["_pipeline_conversion_type"] = "extract_streams"
-        current_file["_pipeline_caption"] = _metadata_caption(current_file)
+        # Its work is the multi-stream extraction the worker owns, so it declares
+        # a conversion type rather than ffmpeg arguments (the gate accepts either).
+        if current_file.get("_pipeline_job_id"):
+            await self._cancel_stale_pipeline_job(session, "extract_streams", update.effective_user.id)
+        _declare_pipeline_conversion(
+            current_file,
+            ffmpeg_args=None,
+            output_ext=".zip",
+            conversion_type="extract_streams",
+            caption=_metadata_caption(current_file),
+        )
         session["current_file"] = current_file
 
         current_file, _ = await self._ensure_local_media(update, context, session, current_file, query=query)
@@ -15200,8 +15435,38 @@ class EnhancedMediaHandler:
             audio_bitrate,
         ]
 
-        current_file, _ = await self._ensure_local_media(update, context, session, current_file, query=query)
+        # A job already running for this media is not the one this fetch may
+        # queue: cancel it so it cannot deliver a stale result of its own.
+        if current_file.get("_pipeline_job_id"):
+            await self._cancel_stale_pipeline_job(session, "normalize_audio", update.effective_user.id)
+
+        # Declared before the fetch: a source past the download ceiling is then
+        # fetched by the pipeline and normalized in one job, instead of being
+        # pulled to this disk by hand (or queued for a previous button's args).
+        _declare_pipeline_conversion(
+            current_file,
+            ffmpeg_args=cmd,
+            output_ext=".mp3",
+            conversion_type="format_audio",
+            caption=_metadata_caption(current_file),
+        )
+        session["current_file"] = current_file
+
+        current_file, _pipeline_notice = await self._ensure_local_media(
+            update, context, session, current_file, query=query
+        )
         if current_file is None:
+            return
+        if current_file.get("_pipeline_job_id"):
+            _pipeline_job_id = current_file["_pipeline_job_id"]
+            await self._watch_pipeline_job(
+                update,
+                context,
+                _pipeline_job_id,
+                f"✅ Large file queued (Job: {_pipeline_job_id[:8]}...). I'll send the audio when ready.",
+                query=query,
+                notice=_pipeline_notice,
+            )
             return
 
         local_input = self._local_copy(current_file)
@@ -15259,6 +15524,9 @@ class EnhancedMediaHandler:
 
         await self.safe_edit(query, "📝 Extracting subtitles...")
 
+        # Reading a subtitle stream is not a video conversion: any declaration
+        # left by the previous button must not fetch this source.
+        _clear_pipeline_conversion(current_file)
         current_file, _ = await self._ensure_local_media(update, context, session, current_file, query=query)
         if current_file is None:
             return
@@ -15338,6 +15606,8 @@ class EnhancedMediaHandler:
             logger.warning("ffmpeg-python not available for media analysis")
             return
 
+        # Analysis reads the media; it is not a conversion the pipeline can run.
+        _clear_pipeline_conversion(current_file)
         current_file, _ = await self._ensure_local_media(update, context, session, current_file, query=query)
         if current_file is None:
             return
@@ -16201,14 +16471,12 @@ class EnhancedMediaHandler:
             if not await self._check_conversion_quota(update, context):
                 return
             await update.message.reply_text(f"📐 Changing resolution to {width}x{height}…")
-            current_file, _ = await self._ensure_local_media(
-                update, context, session, current_file, notify=update.message.reply_text
-            )
-            if current_file is None:
-                return
-            output_base = getattr(config, "OUTPUT_PATH", "storage/output") if config else "storage/output"
-            os.makedirs(output_base, exist_ok=True)
-            output_path = os.path.join(output_base, f"{current_file['id']}_{width}x{height}.mp4")
+            # A job already running for this media is not the one this fetch may
+            # queue: cancel it so it cannot deliver a stale result of its own.
+            if current_file.get("_pipeline_job_id"):
+                await self._cancel_stale_pipeline_job(session, "change_resolution", user_id)
+            # Built before the fetch so a large source is fetched by the pipeline
+            # for this scale, not for whatever the previous action declared.
             scale_filter = (
                 f"scale={width}:{height}:force_original_aspect_ratio=decrease,pad={width}:{height}:(ow-iw)/2:(oh-ih)/2"
             )
@@ -16233,6 +16501,33 @@ class EnhancedMediaHandler:
                 "-movflags",
                 "+faststart",
             ]
+            _declare_pipeline_conversion(
+                current_file,
+                ffmpeg_args=ffmpeg_args,
+                output_ext=".mp4",
+                conversion_type="change_resolution",
+                caption=_metadata_caption(current_file),
+            )
+            session["current_file"] = current_file
+            current_file, _pipeline_notice = await self._ensure_local_media(
+                update, context, session, current_file, notify=update.message.reply_text
+            )
+            if current_file is None:
+                return
+            if current_file.get("_pipeline_job_id"):
+                _pipeline_job_id = current_file["_pipeline_job_id"]
+                await self._watch_pipeline_job(
+                    update,
+                    context,
+                    _pipeline_job_id,
+                    f"✅ Large file queued (Job: {_pipeline_job_id[:8]}...). I'll send the video when ready.",
+                    message=update.message,
+                    notice=_pipeline_notice,
+                )
+                return
+            output_base = getattr(config, "OUTPUT_PATH", "storage/output") if config else "storage/output"
+            os.makedirs(output_base, exist_ok=True)
+            output_path = os.path.join(output_base, f"{current_file['id']}_{width}x{height}.mp4")
             input_path = self._local_copy(current_file)
             if input_path is None:
                 if not await self._enqueue_keyed_job(

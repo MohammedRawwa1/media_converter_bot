@@ -615,3 +615,110 @@ def test_the_bulk_menu_names_the_subtitle_rows_apart():
     assert "Batch Subtitles Mode — Off" in labels
     assert labels["Batch Subtitles Mode — Off"] == "bulk_toggle:bulk_subtitles"
     assert labels["📂 Send Subtitle Files"] == "bulk_subtitles"
+
+
+# ── the big-file pipeline: the media and the work request travel together ──
+
+#: The calls that fetch a source. A pipeline job is handed its ffmpeg arguments
+#: at ingest time, so whatever is on the session at this moment decides what a
+#: large file is fetched *for* - this button's conversion, or one the previous
+#: button left behind.
+PIPELINE_FETCHES = ("_ensure_local_media", "_ensure_current_file_downloaded")
+
+#: The shared fetch guard itself (it has no operation of its own to declare), and
+#: the subtitle burn, which forces a fresh Telegram download and therefore
+#: bypasses the pipeline by design.
+PIPELINE_FETCH_EXEMPT = {"_ensure_local_media", "_burn_subtitle_into_current"}
+
+
+def test_every_fetch_declares_its_conversion_or_clears_the_stale_one():
+    offenders = []
+    for name, nodes in _functions(_tree("handlers.py")).items():
+        if name in PIPELINE_FETCH_EXEMPT:
+            continue
+        for node in nodes:
+            first_fetch = None
+            prepared = False
+            for inner in ast.walk(node):
+                if not isinstance(inner, ast.Call):
+                    continue
+                called = _calls(inner)
+                if any(c.endswith(tuple(PIPELINE_FETCHES)) for c in called):
+                    line = inner.lineno
+                    if first_fetch is None or line < first_fetch:
+                        first_fetch = line
+            if first_fetch is None:
+                continue
+            for inner in ast.walk(node):
+                if getattr(inner, "lineno", 0) >= first_fetch:
+                    continue
+                if isinstance(inner, ast.Call):
+                    called = _calls(inner)
+                    if any(c.endswith(("_declare_pipeline_conversion", "_clear_pipeline_conversion")) for c in called):
+                        prepared = True
+                        break
+                # The older declarers write the fields directly; that still counts.
+                if isinstance(inner, ast.Assign) and "_pipeline_ffmpeg_args" in ast.unparse(inner):
+                    prepared = True
+                    break
+            if not prepared:
+                offenders.append(f"{name}:{node.lineno}")
+    assert not offenders, f"these fetches would use a stale pipeline declaration: {offenders}"
+
+
+def test_a_stale_declaration_is_replaced_or_cleared():
+    stale = {
+        "_pipeline_ffmpeg_args": ["-crf", "23"],
+        "_pipeline_output_ext": ".mp4",
+        "_pipeline_conversion_type": "compress_video",
+        "_pipeline_caption": "old",
+    }
+
+    cleared = dict(stale)
+    handlers._clear_pipeline_conversion(cleared)
+    assert not [key for key in cleared if key.startswith("_pipeline_")]
+
+    declared = dict(stale)
+    handlers._declare_pipeline_conversion(
+        declared,
+        ffmpeg_args=["-an", "-c:v", "copy"],
+        output_ext=".mp4",
+        conversion_type="remove_audio",
+        caption="new",
+    )
+    assert declared["_pipeline_conversion_type"] == "remove_audio"
+    assert declared["_pipeline_ffmpeg_args"] == ["-an", "-c:v", "copy"]
+    assert declared["_pipeline_caption"] == "new"
+
+
+class _BulkFetchStub:
+    def __init__(self):
+        self.fetched = []
+
+    async def _ensure_current_file_downloaded(self, update, context, session):
+        self.fetched.append(dict(session.get("current_file") or {}))
+
+
+def test_a_bulk_entry_is_fetched_for_the_batchs_own_conversion_only():
+    stub = _BulkFetchStub()
+
+    async def _fetch(entry, declared):
+        await EnhancedMediaHandler._ensure_bulk_file_downloaded(stub, None, None, {}, entry, declared=declared)
+
+    entry = {
+        "id": "e1",
+        "name": "clip.mp4",
+        "_pipeline_ffmpeg_args": ["-crf", "23"],
+        "_pipeline_conversion_type": "compress_video",
+    }
+    _run(_fetch(entry, False))
+    assert "_pipeline_ffmpeg_args" not in entry, "a non-conversion bulk action inherited an old declaration"
+
+    declared = {
+        "id": "e2",
+        "name": "clip.mp4",
+        "_pipeline_ffmpeg_args": ["-an", "-c:v", "copy"],
+        "_pipeline_conversion_type": "remove_audio",
+    }
+    _run(_fetch(declared, True))
+    assert declared["_pipeline_conversion_type"] == "remove_audio", "the batch's own declaration was cleared"

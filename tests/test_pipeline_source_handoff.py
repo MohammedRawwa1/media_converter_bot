@@ -258,3 +258,43 @@ def test_default_mode_is_header():
     """The default has to be the one that keeps a whole copy out of the bucket."""
     assert bigfile_pipeline.PIPELINE_SOURCE_UPLOAD in ("header", "full", "local")
     assert media_cache.__name__ == "utils.media_cache"
+
+
+def test_job_fields_travel_with_the_ingest(monkeypatch, tmp_path):
+    """Trim/fade work is fields, not ffmpeg args: the ingest has to carry them.
+
+    The worker's trim and fade branches read ``start_time``/``end_time`` and
+    ``fade_in``/``fade_out``, so a pipeline job that lost them would encode the
+    wrong cut - or nothing at all - even though the fetch succeeded.
+    """
+    result, _storage, jobs = _ingest(
+        monkeypatch,
+        tmp_path,
+        "local",
+        ffmpeg_args=None,
+        conversion_type="trim",
+        output_ext=".mp4",
+        extra={
+            "start_time": "00:00:10",
+            "end_time": "00:00:20",
+            "output_filename": "movie_trimmed.mp4",
+        },
+    )
+
+    assert result.ok
+    job = jobs[-1]
+    assert job["type"] == "trim"
+    assert job["start_time"] == "00:00:10"
+    assert job["end_time"] == "00:00:20"
+    assert job["output_filename"] == "movie_trimmed.mp4"
+    assert job["output_ext"] == ".mp4"
+
+
+def test_no_extra_fields_are_added_when_none_are_passed(monkeypatch, tmp_path):
+    """The default ingest job is unchanged."""
+    result, _storage, jobs = _ingest(monkeypatch, tmp_path, "local", extra=None)
+
+    assert result.ok
+    job = jobs[-1]
+    assert "start_time" not in job
+    assert "fade_in" not in job
