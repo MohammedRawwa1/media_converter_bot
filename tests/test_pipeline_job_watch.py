@@ -292,6 +292,14 @@ class PipelineJobWatchTests(unittest.IsolatedAsyncioTestCase):
     def test_inline_watchdog_skips_quick_remux_and_navigation_actions(self):
         self.assertFalse(handlers_module.EnhancedMediaHandler._callback_needs_inline_progress("menu_video"))
         self.assertFalse(handlers_module.EnhancedMediaHandler._callback_needs_inline_progress("remux"))
+        # The video converter always queues its conversion, and the worker's own
+        # watcher reports the real percentage: the elapsed-time heartbeat must
+        # not run over the download and then delete the job's message.
+        for data in ("format_mp4", "format_mkv", "format_mov", "format_webm"):
+            self.assertFalse(handlers_module.EnhancedMediaHandler._callback_needs_inline_progress(data))
+        # An audio target can be encoded inline (a small file has no job), so it
+        # keeps the heartbeat.
+        self.assertTrue(handlers_module.EnhancedMediaHandler._callback_needs_inline_progress("format_mp3"))
         self.assertTrue(handlers_module.EnhancedMediaHandler._callback_needs_inline_progress("res_1080"))
         self.assertTrue(handlers_module.EnhancedMediaHandler._callback_needs_inline_progress("merge_audios_start"))
 

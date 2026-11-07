@@ -649,6 +649,14 @@ def _declare_pipeline_conversion(
 #: a leftover from an earlier trim must never rename a later compression.
 _PIPELINE_FIELD_CONVERSIONS = frozenset({"trim", "fade"})
 
+#: Video-container targets the converter always hands to a worker job.
+#: ``convert_video_format`` fetches the source, enqueues the conversion and
+#: watches that job's own progress, so the inline elapsed-time heartbeat must
+#: not also run for these callbacks (see
+#: ``EnhancedMediaHandler._callback_needs_inline_progress``). Audio targets are
+#: deliberately absent: a small audio file is encoded inline and has no job.
+_QUEUED_VIDEO_FORMAT_TARGETS = frozenset({"mp4", "mkv", "avi", "mov", "webm", "flv", "m4v"})
+
 
 def _has_pipeline_declaration(current_file: dict) -> bool:
     """Whether this fetch has been told what to produce.
@@ -3028,7 +3036,20 @@ class EnhancedMediaHandler:
 
     @staticmethod
     def _callback_needs_inline_progress(callback_data: str) -> bool:
-        """Keep watchdogs off menus, remuxes and other normally quick actions."""
+        """Keep watchdogs off menus, remuxes and other normally quick actions.
+
+        A video-format target is a queued conversion, not inline work: the
+        handler downloads the source and hands the conversion to a worker, whose
+        own watcher reports the real encode percentage. Starting the elapsed-time
+        heartbeat for it showed "still processing · Ns elapsed" while the source
+        was still downloading, and once the callback returned it deleted the very
+        message the job watcher had taken over. Audio targets keep the heartbeat:
+        a small file really is encoded in this process.
+        """
+        if callback_data.startswith("format_"):
+            target = callback_data[len("format_") :].lower()
+            if target in _QUEUED_VIDEO_FORMAT_TARGETS:
+                return False
         if callback_data in {
             "convert_mp3",
             "remove_audio",
