@@ -691,8 +691,7 @@ class ConversionRateLimiterRedis:
                 wait = 3600.0
 
             return False, (
-                f"❌ Rate limit reached (max {self.conversions_per_hour} per hour). "
-                + t("rate_limited", seconds=wait)
+                f"❌ Rate limit reached (max {self.conversions_per_hour} per hour). " + t("rate_limited", seconds=wait)
             )
         except Exception:
             return True, "Conversion allowed"

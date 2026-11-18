@@ -105,7 +105,7 @@ MESSAGES: dict[str, dict[str, str]] = {
             "\u2022 \u0645\u0639\u0644\u0648\u0645\u0627\u062a \u0627\u0644\u0645\u0644\u0641 \u0627\u0644\u0643\u0627\u0645\u0644\u0629\u060c \u0625\u0646\u0634\u0627\u0621 ZIP\u060c \u0627\u0644\u0645\u0639\u0627\u0644\u062c\u0629 \u0627\u0644\u062f\u0641\u0639\u064a\u0629\n\n"
             "<b>\u062d\u062f\u0648\u062f \u0627\u0644\u0645\u0644\u0641\u0627\u062a:</b> \u0627\u0644\u062d\u062f \u0627\u0644\u0623\u0642\u0635\u0649 4 \u062c\u064a\u062c\u0627\u0628\u0627\u064a\u062a\u060c \u0648\u0627\u0644\u0646\u062a\u0627\u0626\u062c \u062a\u064f\u062d\u0630\u0641 \u0628\u0639\u062f \u0627\u0644\u0625\u0631\u0633\u0627\u0644.\n\n"
             "<b>\U0001f510 \u062f\u0644\u064a\u0644 \u062a\u0633\u062c\u064a\u0644 \u0627\u0644\u062f\u062e\u0648\u0644:</b>\n"
-            "\u0627\u0633\u062a\u062e\u062f\u0645 <code>/login [\u0631\u0642\u0645 \u0627\u0644\u0647\u0627\u062a\u0641]</code> \u0623\u0648 <code>/loginpyro [\u0631\u0642\u0645 \u0627\u0644\u0647\u0627\u062a\u0641]</code>\u060c \u062b\u0645 \u0623\u062f\u062e\u0644 \u0631\u0645\u0632 \u0627\u0644\u062a\u062d\u0642\u0642 \u0628\u0623\u0631\u0642\u0627\u0645 \u0645\u0641\u0635\u0648\u0644\u0629 \u0628\u0645\u0633\u0627\u0641\u0627\u062a \u0645\u062b\u0644 <code>\"1 2 3 4 5\"</code>."
+            '\u0627\u0633\u062a\u062e\u062f\u0645 <code>/login [\u0631\u0642\u0645 \u0627\u0644\u0647\u0627\u062a\u0641]</code> \u0623\u0648 <code>/loginpyro [\u0631\u0642\u0645 \u0627\u0644\u0647\u0627\u062a\u0641]</code>\u060c \u062b\u0645 \u0623\u062f\u062e\u0644 \u0631\u0645\u0632 \u0627\u0644\u062a\u062d\u0642\u0642 \u0628\u0623\u0631\u0642\u0627\u0645 \u0645\u0641\u0635\u0648\u0644\u0629 \u0628\u0645\u0633\u0627\u0641\u0627\u062a \u0645\u062b\u0644 <code>"1 2 3 4 5"</code>.'
         ),
     },
     "ar": {
@@ -194,20 +194,95 @@ def t(key: str, lang: str | None = None, text: str | None = None, **kwargs) -> s
 
 #: Command-menu entries as ``(command, {lang: description})``.
 COMMANDS = [
-    ("start", {"en": "Welcome & quick start", "ar": "\u0627\u0644\u062a\u0631\u062d\u064a\u0628 \u0648\u0627\u0644\u0628\u062f\u0621 \u0627\u0644\u0633\u0631\u064a\u0639"}),
-    ("help", {"en": "All features and commands", "ar": "\u0643\u0644 \u0627\u0644\u0645\u064a\u0632\u0627\u062a \u0648\u0627\u0644\u0623\u0648\u0627\u0645\u0631"}),
+    (
+        "start",
+        {
+            "en": "Welcome & quick start",
+            "ar": "\u0627\u0644\u062a\u0631\u062d\u064a\u0628 \u0648\u0627\u0644\u0628\u062f\u0621 \u0627\u0644\u0633\u0631\u064a\u0639",
+        },
+    ),
+    (
+        "help",
+        {
+            "en": "All features and commands",
+            "ar": "\u0643\u0644 \u0627\u0644\u0645\u064a\u0632\u0627\u062a \u0648\u0627\u0644\u0623\u0648\u0627\u0645\u0631",
+        },
+    ),
     ("usersettings", {"en": "Your preferences", "ar": "\u062a\u0641\u0636\u064a\u0644\u0627\u062a\u0643"}),
-    ("bulkmenu", {"en": "Process a batch of URLs", "ar": "\u0645\u0639\u0627\u0644\u062c\u0629 \u062f\u0641\u0639\u0629 \u0645\u0646 \u0627\u0644\u0631\u0648\u0627\u0628\u0637"}),
-    ("cancel", {"en": "Stop the current operation", "ar": "\u0625\u064a\u0642\u0627\u0641 \u0627\u0644\u0639\u0645\u0644\u064a\u0629 \u0627\u0644\u062d\u0627\u0644\u064a\u0629"}),
-    ("canceljob", {"en": "Cancel a pending job", "ar": "\u0625\u0644\u063a\u0627\u0621 \u0645\u0647\u0645\u0629 \u0645\u0646\u062a\u0638\u0631\u0629"}),
-    ("login", {"en": "Log in with Telethon", "ar": "\u062a\u0633\u062c\u064a\u0644 \u0627\u0644\u062f\u062e\u0648\u0644 \u0628\u0627\u0644\u062a\u064a\u0644\u064a\u062c\u0631\u0627\u0645"}),
-    ("loginpyro", {"en": "Log in with Pyrogram", "ar": "\u062a\u0633\u062c\u064a\u0644 \u0627\u0644\u062f\u062e\u0648\u0644 \u0628\u0628\u0627\u064a\u0631\u0648\u062c\u0631\u0627\u0645"}),
-    ("logout", {"en": "Log out the Telethon session", "ar": "\u062e\u0631\u0648\u062c \u062c\u0644\u0633\u0629 \u0627\u0644\u062a\u064a\u0644\u064a\u062c\u0631\u0627\u0645"}),
-    ("logoutpyro", {"en": "Log out the Pyrogram session", "ar": "\u062e\u0631\u0648\u062c \u062c\u0644\u0633\u0629 \u0628\u0627\u064a\u0631\u0648\u062c\u0631\u0627\u0645"}),
-    ("loginstatus", {"en": "Check session health", "ar": "\u062d\u0627\u0644\u0629 \u0627\u0644\u062c\u0644\u0633\u0629"}),
-    ("session_status", {"en": "Queue, users and session health", "ar": "\u0627\u0644\u0637\u0627\u0628\u0648\u0631 \u0648\u0627\u0644\u0645\u0633\u062a\u062e\u062f\u0645\u0648\u0646 \u0648\u062d\u0627\u0644\u0629 \u0627\u0644\u062c\u0644\u0633\u0629"}),
-    ("admin", {"en": "Manage allowed users (admin)", "ar": "\u0625\u062f\u0627\u0631\u0629 \u0627\u0644\u0645\u0633\u062a\u062e\u062f\u0645\u064a\u0646 \u0627\u0644\u0645\u0633\u0645\u0648\u062d \u0644\u0647\u0645 (\u0627\u0644\u0645\u0634\u0631\u0641)"}),
-    ("cancelall", {"en": "Cancel all jobs (admin)", "ar": "\u0625\u0644\u063a\u0627\u0621 \u0643\u0644 \u0627\u0644\u0645\u0647\u0627\u0645 (\u0627\u0644\u0645\u0634\u0631\u0641)"}),
+    (
+        "bulkmenu",
+        {
+            "en": "Process a batch of URLs",
+            "ar": "\u0645\u0639\u0627\u0644\u062c\u0629 \u062f\u0641\u0639\u0629 \u0645\u0646 \u0627\u0644\u0631\u0648\u0627\u0628\u0637",
+        },
+    ),
+    (
+        "cancel",
+        {
+            "en": "Stop the current operation",
+            "ar": "\u0625\u064a\u0642\u0627\u0641 \u0627\u0644\u0639\u0645\u0644\u064a\u0629 \u0627\u0644\u062d\u0627\u0644\u064a\u0629",
+        },
+    ),
+    (
+        "canceljob",
+        {
+            "en": "Cancel a pending job",
+            "ar": "\u0625\u0644\u063a\u0627\u0621 \u0645\u0647\u0645\u0629 \u0645\u0646\u062a\u0638\u0631\u0629",
+        },
+    ),
+    (
+        "login",
+        {
+            "en": "Log in with Telethon",
+            "ar": "\u062a\u0633\u062c\u064a\u0644 \u0627\u0644\u062f\u062e\u0648\u0644 \u0628\u0627\u0644\u062a\u064a\u0644\u064a\u062c\u0631\u0627\u0645",
+        },
+    ),
+    (
+        "loginpyro",
+        {
+            "en": "Log in with Pyrogram",
+            "ar": "\u062a\u0633\u062c\u064a\u0644 \u0627\u0644\u062f\u062e\u0648\u0644 \u0628\u0628\u0627\u064a\u0631\u0648\u062c\u0631\u0627\u0645",
+        },
+    ),
+    (
+        "logout",
+        {
+            "en": "Log out the Telethon session",
+            "ar": "\u062e\u0631\u0648\u062c \u062c\u0644\u0633\u0629 \u0627\u0644\u062a\u064a\u0644\u064a\u062c\u0631\u0627\u0645",
+        },
+    ),
+    (
+        "logoutpyro",
+        {
+            "en": "Log out the Pyrogram session",
+            "ar": "\u062e\u0631\u0648\u062c \u062c\u0644\u0633\u0629 \u0628\u0627\u064a\u0631\u0648\u062c\u0631\u0627\u0645",
+        },
+    ),
+    (
+        "loginstatus",
+        {"en": "Check session health", "ar": "\u062d\u0627\u0644\u0629 \u0627\u0644\u062c\u0644\u0633\u0629"},
+    ),
+    (
+        "session_status",
+        {
+            "en": "Queue, users and session health",
+            "ar": "\u0627\u0644\u0637\u0627\u0628\u0648\u0631 \u0648\u0627\u0644\u0645\u0633\u062a\u062e\u062f\u0645\u0648\u0646 \u0648\u062d\u0627\u0644\u0629 \u0627\u0644\u062c\u0644\u0633\u0629",
+        },
+    ),
+    (
+        "admin",
+        {
+            "en": "Manage allowed users (admin)",
+            "ar": "\u0625\u062f\u0627\u0631\u0629 \u0627\u0644\u0645\u0633\u062a\u062e\u062f\u0645\u064a\u0646 \u0627\u0644\u0645\u0633\u0645\u0648\u062d \u0644\u0647\u0645 (\u0627\u0644\u0645\u0634\u0631\u0641)",
+        },
+    ),
+    (
+        "cancelall",
+        {
+            "en": "Cancel all jobs (admin)",
+            "ar": "\u0625\u0644\u063a\u0627\u0621 \u0643\u0644 \u0627\u0644\u0645\u0647\u0627\u0645 (\u0627\u0644\u0645\u0634\u0631\u0641)",
+        },
+    ),
 ]
 
 

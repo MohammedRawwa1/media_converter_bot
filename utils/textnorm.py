@@ -33,10 +33,7 @@ _NON_WORD_SEP_RE = re.compile(r"[\W_]+", re.UNICODE)
 _SPACE_RE = re.compile(r"\s+")
 
 # Arabic diacritics (harakat/tashkeel) and Quranic annotation marks.
-_AR_DIACRITICS_RE = re.compile(
-    "[\u0610-\u061a\u064b-\u065f\u0670\u06d6-\u06dc"
-    "\u06df-\u06e8\u06ea-\u06ed]"
-)
+_AR_DIACRITICS_RE = re.compile("[\u0610-\u061a\u064b-\u065f\u0670\u06d6-\u06dc\u06df-\u06e8\u06ea-\u06ed]")
 _TATWEEL_RE = re.compile("\u0640")
 
 # Orthographic variants that read as the same word to a searcher.

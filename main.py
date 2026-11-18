@@ -2708,9 +2708,7 @@ async def main(background: bool = False) -> None:
                 try:
                     from telegram import BotCommand
 
-                    await application.bot.set_my_commands(
-                        [BotCommand(cmd, desc) for cmd, desc in command_menu()]
-                    )
+                    await application.bot.set_my_commands([BotCommand(cmd, desc) for cmd, desc in command_menu()])
                 except Exception:
                     logger.debug("could not publish the command menu")
                 with contextlib.suppress(Exception):
