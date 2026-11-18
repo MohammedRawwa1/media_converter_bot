@@ -101,6 +101,7 @@ from .callbacks import (
     settings_quality_key,
     settings_slideshow_key,
 )
+from .i18n import t
 
 
 def _bitrate_preset(current, choices=MP3_QUALITY_CHOICES) -> str | None:
@@ -173,8 +174,8 @@ def _nav_row(back=MENU_MAIN, cancel=CANCEL) -> list[InlineKeyboardButton]:
     generic Cancel there would clear the prompts but leave the staged archive.
     """
     return [
-        InlineKeyboardButton("↩️ Back", callback_data=back),
-        InlineKeyboardButton("❌ Cancel", callback_data=cancel),
+        InlineKeyboardButton(t("menu_back"), callback_data=back),
+        InlineKeyboardButton(t("menu_cancel"), callback_data=cancel),
     ]
 
 
@@ -196,7 +197,7 @@ class MediaMenuBuilder:
         # the `file_type` so that video uploads show video-oriented tools.
         is_video = file_type == "video"
 
-        conv_label = "🎬 Video Converter" if is_video else "🎧 Audio Converter"
+        conv_label = t("menu_video_converter") if is_video else t("menu_audio_converter")
         # Use explicit `video_converter` callback so the UI shows the video converter
         # alias; handlers remap this alias to the canonical `convert_format_menu`.
         conv_cb = "video_converter"
@@ -204,41 +205,41 @@ class MediaMenuBuilder:
         # One label for both kinds: the splitter takes an audio file and a video
         # file through the same stream copy, so naming it after one of them hid
         # the action from the other.
-        split_label = "🔪 Media Splitter"
+        split_label = t("menu_splitter")
 
         buttons: list[list[InlineKeyboardButton]] = [
-            row("🖼️ Thumbnail Extractor", THUMBNAIL_EXTRACTOR, "🗑️ Delete Thumbnail", "delete_custom_thumb"),
+            row(t("menu_thumbnail_extractor"), THUMBNAIL_EXTRACTOR, t("menu_delete_thumbnail"), "delete_custom_thumb"),
             # The caption half only: the tool takes one line of text and re-sends
             # the media with it, and there is no buttons half to speak of - the
             # old label promised an editor that never existed.
-            row("💬 Caption Editor", CAPTION_EDITOR, "🔀 Batch Process", "batch_process"),
-            row("📝 Metadata Editor", EDIT_METADATA, "📤 Media Forwarder", MEDIA_FORWARDER),
-            row("🔇 Stream Remover", STREAM_REMOVER, "🎵 Stream Extractor", STREAM_EXTRACTOR),
+            row(t("menu_caption_editor"), CAPTION_EDITOR, t("menu_batch_process"), "batch_process"),
+            row(t("menu_metadata_editor"), EDIT_METADATA, t("menu_media_forwarder"), MEDIA_FORWARDER),
+            row(t("menu_stream_remover"), STREAM_REMOVER, t("menu_stream_extractor"), STREAM_EXTRACTOR),
             # Trim and merge act on the media that is actually loaded: an audio
             # file must not be sent to the video-only trimmer/merger.
             # The trimmer handles audio and video alike, so the label is neutral;
             # only the trigger differs (each opens its own kind's flow).
             row(
-                "✂️ Media Trimmer",
+                t("menu_trim_media"),
                 TRIM_AUDIO if file_type == "audio" else TRIM_VIDEO,
-                "➕ Audio Merger" if file_type == "audio" else "🔀 Merge",
+                t("menu_merge_audio") if file_type == "audio" else t("menu_merge"),
                 "merge_audio" if file_type == "audio" else "merge_options",
             ),
-            row("🔉 Remove Audio", REMOVE_AUDIO),
+            row(t("menu_remove_audio"), REMOVE_AUDIO),
             row(conv_label, conv_cb, split_label, VIDEOS_SPLITTER),
-            row("🖼️ Screenshots", SCREENSHOTS_MENU, "🖼️ Manual Shots", MANUAL_SHOTS),
-            row("🎵 Video To Audio", VIDEO_TO_AUDIO, "📉 Compress", COMPRESS_MENU),
-            row("⚡ Video Optimizer", OPTIMIZE_MENU, "🔗 Subtitle Merger", SUBTITLE_MERGER),
-            row("✏️ Media Renamer", VIDEO_RENAMER, "🛈 Media Information", INFO),
+            row(t("menu_screenshots"), SCREENSHOTS_MENU, t("menu_manual_shots"), MANUAL_SHOTS),
+            row(t("menu_video_to_audio"), VIDEO_TO_AUDIO, t("menu_compress"), COMPRESS_MENU),
+            row(t("menu_optimizer"), OPTIMIZE_MENU, t("menu_subtitle_merger"), SUBTITLE_MERGER),
+            row(t("menu_renamer"), VIDEO_RENAMER, t("menu_info"), INFO),
             # The tool sub-menus. They live here rather than behind the settings
             # button: they all act on the loaded media, and /usersettings must
             # stay a preferences panel that never starts a conversion.
-            row("🎧 Audio Tools", MENU_AUDIO, "🎬 Video Tools", MENU_VIDEO),
+            row(t("menu_audio_tools"), MENU_AUDIO, t("menu_video_tools"), MENU_VIDEO),
             # Single-button rows for create/archive and final cancel button
-            [InlineKeyboardButton("📦 Create Archive", callback_data=CREATE_ARCHIVE)],
+            [InlineKeyboardButton(t("menu_create_archive"), callback_data=CREATE_ARCHIVE)],
             # Add quick access to bulk actions
-            [InlineKeyboardButton("📦 Bulk Actions", callback_data="bulk_menu")],
-            [InlineKeyboardButton("❌ Cancel", callback_data=CANCEL)],
+            [InlineKeyboardButton(t("menu_bulk_actions"), callback_data="bulk_menu")],
+            [InlineKeyboardButton(t("menu_cancel"), callback_data=CANCEL)],
         ]
 
         # If file_type provided, you may want to prioritize tools, but keep

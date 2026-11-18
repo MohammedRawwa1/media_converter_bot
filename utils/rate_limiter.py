@@ -10,6 +10,8 @@ import os
 import time
 from collections import defaultdict
 
+from utils.i18n import t
+
 try:
     # optional redis usage for distributed rate limiting
     from utils.job_queue import get_redis
@@ -608,7 +610,7 @@ class ConversionRateLimiter:
         wait_time = max(0.0, (earliest + 3600) - now)
         return False, (
             f"❌ Rate limit reached ({len(recent)}/{self.conversions_per_hour} per hour)\n"
-            f"Please wait {wait_time:.1f} seconds before next conversion"
+            + t("rate_limited", seconds=wait_time)
         )
 
     async def mark_conversion_started(self, user_id: str) -> bool:
@@ -690,7 +692,7 @@ class ConversionRateLimiterRedis:
 
             return False, (
                 f"❌ Rate limit reached (max {self.conversions_per_hour} per hour). "
-                f"Please wait {wait:.1f} seconds before starting a conversion."
+                + t("rate_limited", seconds=wait)
             )
         except Exception:
             return True, "Conversion allowed"

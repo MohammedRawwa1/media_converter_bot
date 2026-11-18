@@ -33,6 +33,7 @@ _REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
+from utils.textnorm import clean_text, normalize_text
 from utils.time_utils import utc_iso
 
 # --- Tokenizer (adapted from tg-index project notes) ---------------------------------
@@ -91,7 +92,7 @@ def normalize_and_classify(filename: str) -> dict[str, Any]:
     s = s.replace("\n", " ")
     s = _sep_re.sub(" ", s)
     s = " ".join(_split_camel(s))
-    s = s.lower()
+    s = clean_text(s)
     s = _space_re.sub(" ", s).strip()
 
     parts = s.split(" ")
@@ -116,7 +117,8 @@ def normalize_and_classify(filename: str) -> dict[str, Any]:
             continue
         if p in _release_junk:
             continue
-        if re.match(r"^[a-z0-9]+$", p):
+        # any letter/digit token of any script is a title token
+        if re.match(r"^[^\W_]+$", p, re.UNICODE):
             title_tokens.append(p)
             continue
         other.append(p)
@@ -142,9 +144,7 @@ def normalize_and_classify(filename: str) -> dict[str, Any]:
 def tokenize_query(query: str) -> list[str]:
     q = _sep_re.sub(" ", query)
     q = " ".join(_split_camel(q))
-    q = q.lower().strip()
-    tokens = [t for t in _space_re.split(q) if t]
-    return tokens
+    return [t for t in normalize_text(q).split() if t]
 
 
 # --- FFprobe / FFmpeg helpers --------------------------------------------------------

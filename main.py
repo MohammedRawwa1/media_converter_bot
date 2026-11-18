@@ -76,6 +76,7 @@ from utils.error_handler import (
     get_error_handler,
     setup_comprehensive_logging,
 )
+from utils.i18n import command_menu, t
 from utils.job_queue import cancel_job
 from utils.login_handler import cleanup_login_flow, register_login_handlers
 from utils.markdown_utils import escape_markdown as _escape_markdown
@@ -566,10 +567,10 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     # Enforce ACL for private bots
     try:
         if not is_user_allowed(user_id):
-            await update.message.reply_text("Access denied. This bot is private.")
+            await update.message.reply_text(t("access_denied"))
             return
     except Exception:
-        await update.message.reply_text("Access denied. (ACL check failed)")
+        await update.message.reply_text(t("access_denied_acl"))
         return
 
     user_name = update.effective_user.first_name
@@ -598,6 +599,8 @@ Hello {html.escape(user_name)}! Send a media file and choose an action from the 
 
 Send me a file to get started! 🚀
 """
+    # Arabic half of the welcome, so a mixed audience reads the same screen.
+    welcome_text += "\n\n" + t("start_ar", name=html.escape(user_name))
 
     await update.message.reply_text(welcome_text, parse_mode="HTML")
     logger.info(f"User {user_id} ({user_name}) started the bot")
@@ -666,6 +669,8 @@ When you receive the verification code:
 
 <b>Need help?</b> Just send a file and use the menus! 🎯
 """
+    # Arabic half of the feature guide.
+    help_text += "\n\n" + t("help_ar")
 
     await update.message.reply_text(help_text, parse_mode="HTML")
 
@@ -1097,12 +1102,12 @@ def setup_handlers(application: Application) -> None:
         # Only admin may manage allowed users. Fails closed: with ADMIN_USER_ID
         # unset nobody is an admin, so this cannot be reached by accident.
         if not is_admin_user(user_id):
-            await update.message.reply_text("Unauthorized: admin only")
+            await update.message.reply_text(t("unauthorized_admin"))
             return
 
         args = [str(arg).strip() for arg in (context.args or [])]
         if not args:
-            await update.message.reply_text("Usage: /admin add|remove|list <user_id>")
+            await update.message.reply_text(t("usage_admin"))
             return
 
         cmd = args[0].lower()
@@ -1122,7 +1127,7 @@ def setup_handlers(application: Application) -> None:
         try:
             target = int(args[1])
         except Exception:
-            await update.message.reply_text("Invalid user id")
+            await update.message.reply_text(t("invalid_user_id"))
             return
 
         # Both directions ask first: `remove` locks a user out, and `add` hands
@@ -1349,7 +1354,7 @@ def setup_handlers(application: Application) -> None:
         """Ask before cancelling one job."""
         args = [str(arg).strip() for arg in (context.args or [])]
         if not args:
-            await update.message.reply_text("Usage: /canceljob <job_id>")
+            await update.message.reply_text(t("usage_canceljob"))
             return
 
         job_id = args[0]
@@ -1365,7 +1370,7 @@ def setup_handlers(application: Application) -> None:
         """Ask before cancelling one sequential bulk batch."""
         args = [str(arg).strip() for arg in (context.args or [])]
         if not args:
-            await update.message.reply_text("Usage: /cancelbatch <batch_id>")
+            await update.message.reply_text(t("usage_cancelbatch"))
             return
         batch_id = args[0]
         await update.message.reply_text(
@@ -1478,7 +1483,7 @@ def setup_handlers(application: Application) -> None:
         ``scripts/cleanup_stale_redis.py`` afterwards.
         """
         if not _admin_only(update):
-            await update.message.reply_text("Unauthorized: admin only")
+            await update.message.reply_text(t("unauthorized_admin"))
             return
 
         await update.message.reply_text(
@@ -1511,7 +1516,7 @@ def setup_handlers(application: Application) -> None:
     async def clear_cache_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Wipe the Redis cache keys written by utils.cache and utils.route_cache."""
         if not _admin_only(update):
-            await update.message.reply_text("Unauthorized: admin only")
+            await update.message.reply_text(t("unauthorized_admin"))
             return
 
         # Two Yes buttons: the plain wipe only touches Redis, while the second
@@ -1548,7 +1553,7 @@ def setup_handlers(application: Application) -> None:
         account's metrics so /session_status starts fresh.
         """
         if not _admin_only(update):
-            await update.message.reply_text("Unauthorized: admin only")
+            await update.message.reply_text(t("unauthorized_admin"))
             return
 
         await update.message.reply_text(
@@ -1659,7 +1664,7 @@ def setup_handlers(application: Application) -> None:
         data = getattr(query, "data", None)
         if is_cancel(data):
             with contextlib.suppress(Exception):
-                await query.answer("Cancelled")
+                await query.answer(t("cancelled"))
             with contextlib.suppress(Exception):
                 await query.edit_message_text("❌ Cancelled.")
             raise ApplicationHandlerStop
@@ -1783,7 +1788,7 @@ def setup_handlers(application: Application) -> None:
         building on a dirty one.
         """
         if not _admin_only(update):
-            await update.message.reply_text("Unauthorized: admin only")
+            await update.message.reply_text(t("unauthorized_admin"))
             return
 
         await update.message.reply_text(
@@ -2698,6 +2703,16 @@ async def main(background: bool = False) -> None:
             async with application:
                 await application.initialize()
                 await application.start()
+                # Publish the command menu: it was never registered, so Telegram
+                # showed an empty list. Descriptions follow the UI language.
+                try:
+                    from telegram import BotCommand
+
+                    await application.bot.set_my_commands(
+                        [BotCommand(cmd, desc) for cmd, desc in command_menu()]
+                    )
+                except Exception:
+                    logger.debug("could not publish the command menu")
                 with contextlib.suppress(Exception):
                     BOT_READY.set()
 

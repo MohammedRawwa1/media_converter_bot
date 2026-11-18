@@ -47,6 +47,7 @@ try:
 except Exception:  # pragma: no cover - the module is always present in-tree
     MP3_METADATA_ARGS = ("-map_metadata", "0", "-id3v2_version", "3")
 
+from utils.i18n import t
 from utils.media_time import format_clock, segment_seconds_for_parts
 from utils.time_utils import utc_iso
 from utils.url_validation import _validate_url_safe
@@ -1150,7 +1151,9 @@ def _message_caption(message) -> str:
 #: a storage/job hash, a base64 blob. Some sources caption a file with its own
 #: reference; forwarding must not present that as the media's caption.
 _OPAQUE_CAPTION_MIN = 32
-_OPAQUE_CAPTION_CHARS = re.compile(r"^[A-Za-z0-9_\-=+/]+$")
+# ``\w`` is Unicode-aware: a base64/hash-like token written in Arabic, Persian
+# or Cyrillic letters is still a machine token, not a caption.
+_OPAQUE_CAPTION_CHARS = re.compile(r"^[\w\-=+/]+$", re.UNICODE)
 
 
 def _is_opaque_caption(text: str | None) -> bool:
@@ -8329,12 +8332,12 @@ class EnhancedMediaHandler:
         # Enforce access control for private bots
         try:
             if not is_user_allowed(user_id):
-                await update.message.reply_text("Access denied. This bot is private.")
+                await update.message.reply_text(t("access_denied"))
                 return
         except Exception:
             # If ACL check fails for any reason, default to deny-safe
             with contextlib.suppress(BadRequest):
-                await update.message.reply_text("Access denied. (ACL check failed)")
+                await update.message.reply_text(t("access_denied_acl"))
             return
 
         # Initialize user session

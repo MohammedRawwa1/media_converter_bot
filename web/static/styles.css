@@ -6,7 +6,7 @@
   --error:#dc2626;       /* red — error */
 }
 *{box-sizing:border-box}
-body{font-family:Inter,system-ui,Segoe UI,Roboto,Arial;margin:0;background:var(--bg);color:#111}
+body{font-family:Inter,system-ui,Segoe UI,Roboto,Arial,'Noto Naskh Arabic','Segoe UI',Tahoma;margin:0;background:var(--bg);color:#111}
 .container{max-width:920px;margin:32px auto;padding:20px}
 h1{margin:0 0 16px;font-size:1.5rem}
 form{display:flex;gap:12px;flex-wrap:wrap;align-items:center}
@@ -15,7 +15,7 @@ form{display:flex;gap:12px;flex-wrap:wrap;align-items:center}
 .file-cta{color:var(--muted)}
 .btn{background:var(--accent);color:#fff;border:none;padding:10px 14px;border-radius:8px;cursor:pointer;transition:opacity .2s;text-decoration:none;display:inline-block}
 .btn:hover{opacity:.85}
-.jobs{margin-top:20px;display:flex;flex-direction:column;gap:12px}
+.jobs{margin-top:20px;display:flex;flex-direction:column;gap:12px;unicode-bidi:plaintext}
 .job{background:var(--card);padding:12px;border-radius:8px;border:1px solid #e6e9ef;display:flex;flex-direction:column;transition:border-color .3s}
 .job:hover{border-color:#cbd5e1}
 .job-row{display:flex;justify-content:space-between;align-items:center;gap:12px}

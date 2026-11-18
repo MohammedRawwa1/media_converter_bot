@@ -9,6 +9,7 @@ import os
 import shutil
 import tempfile
 import time
+import unicodedata
 from datetime import UTC
 
 # Optional async file operations
@@ -18,6 +19,31 @@ except ImportError:
     aiofiles = None
 
 logger = logging.getLogger(__name__)
+
+
+# Characters the pipeline relies on keeping in a name, besides letters/digits.
+_FILENAME_SEPARATORS = frozenset("._-()[] ")
+
+
+def is_filename_char(ch: str) -> bool:
+    """Whether *ch* may appear in a sanitized filename.
+
+    Letters, combining marks and digits are kept for **every script**, so an
+    Arabic, Persian, Cyrillic, Greek or CJK title survives sanitizing instead
+    of collapsing to underscores. Only the separators above are kept besides
+    those. Unicode control/format characters (bidi overrides, zero-width
+    marks, nulls) are never kept - they are not letters in any sense and are
+    a filename-spoofing hazard.
+    """
+    if ch in _FILENAME_SEPARATORS:
+        return True
+    category = unicodedata.category(ch)
+    return category[0] in ("L", "M", "N")
+
+
+def sanitize_filename_chars(name: str, replacement: str = "_") -> str:
+    """Replace every unsafe filename character, keeping all scripts' letters."""
+    return "".join(ch if is_filename_char(ch) else replacement for ch in str(name))
 
 
 class AsyncFileLock:
@@ -577,8 +603,7 @@ def filename_from_url(url: str, default_ext: str = ".mp4", fallback_stem: str = 
         path = ""
 
     candidate = os.path.basename(unquote(path))
-    candidate = re.sub(r"[^A-Za-z0-9._\-()\[\] ]+", "_", candidate)
-    candidate = re.sub(r"_+", "_", candidate).strip("_. ")
+    candidate = re.sub(r"_+", "_", sanitize_filename_chars(candidate)).strip("_. ")
 
     stem, ext = os.path.splitext(candidate)
     if stem and ext.lower() in _MEDIA_EXT_HINTS:
@@ -611,8 +636,9 @@ async def sanitize_filename(name: str, max_len: int = 180) -> str:
         # Remove path parts
         base = os.path.basename(name)
 
-        # Replace any character that's not alnum, dot, underscore, hyphen, paren or brackets with underscore
-        sanitized = re.sub(r"[^A-Za-z0-9._\-()\[\]]+", "_", base)
+        # Replace unsafe characters (keeping letters of every script, e.g.
+        # Arabic) with underscore; see sanitize_filename_chars.
+        sanitized = sanitize_filename_chars(base)
 
         # Collapse multiple underscores
         sanitized = re.sub(r"_+", "_", sanitized)

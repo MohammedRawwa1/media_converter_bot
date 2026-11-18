@@ -64,8 +64,8 @@ MEDIA_MEMBER_EXTENSIONS = frozenset(file_utils.ALLOWED_EXTENSIONS - ARCHIVE_EXTE
 
 # A name is reduced to characters that are safe on disk, the same shape
 # ``file_utils.sanitize_filename`` produces. Separators never survive this, so a
-# member name cannot carry a path.
-_UNSAFE_NAME_RE = re.compile(r"[^A-Za-z0-9._\-()\[\] ]+")
+# member name cannot carry a path. Letters of every script are kept (see
+# ``file_utils.sanitize_filename_chars``), so Arabic/CJK names are not mangled.
 
 # A zip entry stores symlinks/hardlinks as a Unix mode in the high half of
 # ``external_attr``. Such an entry is a pointer, not content, so it is skipped.
@@ -168,7 +168,7 @@ def _safe_member_name(raw_name: object) -> str | None:
     if not parts or any(part == ".." for part in parts):
         return None
     base = parts[-1]
-    cleaned = _UNSAFE_NAME_RE.sub("_", base)
+    cleaned = file_utils.sanitize_filename_chars(base)
     cleaned = re.sub(r"_+", "_", cleaned).strip("_. ")
     return cleaned or None
 
