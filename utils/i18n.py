@@ -283,6 +283,62 @@ COMMANDS = [
             "ar": "\u0625\u0644\u063a\u0627\u0621 \u0643\u0644 \u0627\u0644\u0645\u0647\u0627\u0645 (\u0627\u0644\u0645\u0634\u0631\u0641)",
         },
     ),
+    (
+        "cancelbatch",
+        {
+            "en": "Cancel a batch",
+            "ar": "إلغاء دفعة",
+        },
+    ),
+    (
+        "bulk_url",
+        {
+            "en": "Process media from URLs",
+            "ar": "معالجة وسائط من الروابط",
+        },
+    ),
+    (
+        "addthumb",
+        {
+            "en": "Set a custom thumbnail (admin)",
+            "ar": "تعيين صورة مصغّرة مخصصة (المشرف)",
+        },
+    ),
+    (
+        "delthumb",
+        {
+            "en": "Delete the custom thumbnail (admin)",
+            "ar": "حذف الصورة المصغّرة المخصصة (المشرف)",
+        },
+    ),
+    (
+        "reset",
+        {
+            "en": "Reset your settings",
+            "ar": "إعادة تعيين إعداداتك",
+        },
+    ),
+    (
+        "recoverpyro",
+        {
+            "en": "Recover the Pyrogram session (admin)",
+            "ar": "استعادة جلسة Pyrogram (المشرف)",
+        },
+    ),
+    (
+        "clear_cache",
+        {
+            "en": "Clear the cache (admin)",
+            "ar": "مسح ذاكرة التخزين المؤقت (المشرف)",
+        },
+    ),
+    (
+        "worker_restart",
+        {
+            "en": "Restart the ffmpeg worker (admin)",
+            "ar": "إعادة تشغيل عامل ffmpeg (المشرف)",
+        },
+    ),
 ]
 
 
